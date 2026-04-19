@@ -271,6 +271,49 @@ def run_scenarios():
         r.fail(f"raw_input={d['samples'][0]['raw_input']} esperado 999")
     results.append(r)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # 13. node_id extremos: 0 y 255
+    # ─────────────────────────────────────────────────────────────────────────
+    r = Result("Escenario 13 — node_id=0 y node_id=255 son aceptados")
+    for nid in [0, 255]:
+        pkt = build_packet(nid, 1, 0, 0, [make_sample()] * 5)
+        d = parse_node_packet(pkt)
+        if d is None:
+            r.fail(f"Rechazó node_id={nid}")
+        elif d['node_id'] != nid:
+            r.fail(f"node_id={d['node_id']} esperado {nid}")
+    results.append(r)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 14. Seq rollover 65535→0 — sin falso positivo de drop
+    # ─────────────────────────────────────────────────────────────────────────
+    r = Result("Escenario 14 — Seq rollover 65535→0 → drops=0 (sin falso positivo)")
+    acc = NodeAccumulator(1)
+    for seq in [65534, 65535, 0, 1]:   # rollover correcto
+        pkt = build_packet(1, seq, 0, seq * 1000, [make_sample()] * 5)
+        d = parse_node_packet(pkt)
+        if d:
+            acc.add_batch(d)
+    if acc.drops != 0:
+        r.fail(f"drops={acc.drops} esperado 0 (rollover legítimo)")
+    results.append(r)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 15. Timestamp máximo uint64 (2^64-1) — sin crash
+    # ─────────────────────────────────────────────────────────────────────────
+    r = Result("Escenario 15 — timestamp_us = 2^64-1 (max uint64) → sin crash")
+    MAX_TS = (1 << 64) - 1
+    try:
+        pkt = build_packet(1, 0, 0, MAX_TS, [make_sample()] * 3)
+        d = parse_node_packet(pkt)
+        if d is None:
+            r.fail("Rechazó paquete con timestamp máximo")
+        elif d['timestamp_us'] != MAX_TS:
+            r.fail(f"timestamp_us={d['timestamp_us']} esperado {MAX_TS}")
+    except Exception as e:
+        r.fail(f"Excepción: {e}")
+    results.append(r)
+
     return results
 
 
