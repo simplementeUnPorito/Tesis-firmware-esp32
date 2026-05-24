@@ -1,35 +1,26 @@
 #include "psoc_spi.h"
 
-/* ── Sign extension for 24-bit samples from PSoC ────────────────────────────*/
-
 int32_t PsocSPI::_sign24(uint8_t b0, uint8_t b1, uint8_t b2)
 {
     uint32_t val = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16);
     return (val & 0x800000u) ? (int32_t)(val | 0xFF000000u) : (int32_t)val;
 }
 
-/* ── Initialization ──────────────────────────────────────────────────────────*/
-
 void PsocSPI::begin(BatchCallback cb)
 {
     _cb = cb;
-
     pinMode(PSOC_PIN_SS,   OUTPUT);
     pinMode(PSOC_PIN_DRDY, INPUT);
-    digitalWrite(PSOC_PIN_SS, HIGH);   /* deassert SS */
-
-    SPI.begin();   /* VSPI: SCK=18, MISO=19, MOSI=23, SS=5 by default */
+    digitalWrite(PSOC_PIN_SS, HIGH);
+    SPI.begin();
 }
-
-/* ── Polling ─────────────────────────────────────────────────────────────────*/
 
 void PsocSPI::poll()
 {
     if (digitalRead(PSOC_PIN_DRDY) == LOW) { return; }
 
-    /* DATA_READY asserted — perform SPI transaction */
     PsocBatch batch;
-    batch.timestamp_us = (uint64_t)micros();   /* replaced by NTP time in time_sync.h */
+    batch.timestamp_us = (uint64_t)micros();
 
     if (_readFrame() && _parseFrame(batch))
     {
@@ -44,26 +35,17 @@ void PsocSPI::poll()
     }
 }
 
-/* ── SPI read ────────────────────────────────────────────────────────────────*/
-
 bool PsocSPI::_readFrame()
 {
     SPI.beginTransaction(SPISettings(PSOC_SPI_CLK_HZ, MSBFIRST, PSOC_SPI_MODE));
     digitalWrite(PSOC_PIN_SS, LOW);
-
-    /* Clock out SPI_FRAME_BYTES bytes — MOSI ignored by PSoC slave */
-    for (int i = 0; i < SPI_FRAME_BYTES; i++)
-    {
+    for (int i = 0; i < SPI_FRAME_BYTES; i++) {
         _rxBuf[i] = SPI.transfer(0x00);
     }
-
     digitalWrite(PSOC_PIN_SS, HIGH);
     SPI.endTransaction();
-
-    return (_rxBuf[0] == PSOC_FRAME_MARKER);   /* basic sanity check */
+    return (_rxBuf[0] == PSOC_FRAME_MARKER);
 }
-
-/* ── Frame parser ────────────────────────────────────────────────────────────*/
 
 bool PsocSPI::_parseFrame(PsocBatch &out)
 {
@@ -76,8 +58,7 @@ bool PsocSPI::_parseFrame(PsocBatch &out)
     if (out.n_samples != SPI_BATCH_SAMPLES) { return false; }
 
     const uint8_t *p = &_rxBuf[6];
-    for (int i = 0; i < SPI_BATCH_SAMPLES; i++, p += 10)
-    {
+    for (int i = 0; i < SPI_BATCH_SAMPLES; i++, p += 10) {
         PsocSample &s  = out.samples[i];
         s.raw_input    = (int16_t)(p[0] | (p[1] << 8));
         s.post_analog  = _sign24(p[2], p[3], p[4]);
