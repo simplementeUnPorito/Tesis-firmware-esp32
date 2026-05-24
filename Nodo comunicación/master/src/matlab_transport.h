@@ -5,18 +5,28 @@
  * El ESP maestro se conecta al PC de MATLAB por USB (COM port).
  * El WiFi del maestro queda libre para WiFi AP + ESP-NOW con los esclavos.
  *
- * Protocolo (6 bytes por muestra) — idéntico al anterior:
- *   [0x56][node_id][type][b2][b1][b0]
- *   node_id : 0x00 = maestro (martillo), 0x01-0x0N = esclavos (geófonos)
- *   type    : 0x00 dato, 0x01 heartbeat, 0x07 ACK, 0xFE ready (n_nodes)
+ * Protocolo RX — dos formatos:
  *
- * Comandos MATLAB → maestro (4 bytes + checksum XOR):
- *   [0xAB][cmd][param][cmd^param]
- *   cmd 0xA1: stream on/off   param: 0/1
- *   cmd 0xA2: arm nodes       param: n_nodes esperados
- *   cmd 0xA3: start sampling  param: ignorado
- *   cmd 0xA4: stop sampling   param: ignorado
- *   cmd 0xA5: request status  param: ignorado
+ *   Comando estándar (4 bytes):
+ *     [0xAB][cmd][param][cmd^param]
+ *     cmd 0xA1: stream on/off   param: 0/1
+ *     cmd 0xA2: arm nodes       param: n_nodes esperados
+ *     cmd 0xA3: start sampling  param: ignorado
+ *     cmd 0xA4: stop sampling   param: ignorado
+ *     cmd 0xA5: request status  param: ignorado
+ *     cmd 0xA7: debug broadcast param: 0/1
+ *
+ *   Comando dirigido a esclavo (6 bytes):
+ *     [0xAB][0xBD][node_id][sub_cmd][param][node_id^sub_cmd^param]
+ *     sub_cmd 0xA6: set PGA gain    param: código 0-8
+ *     sub_cmd 0xA8: set TX mode     param: 0/1
+ *     sub_cmd 0xA9: set PGAvdac     param: código 0-8
+ *     sub_cmd 0xAA: set VDAC byte   param: 0-255
+ *
+ * Protocolo TX (6 bytes por paquete):
+ *   [0x56][node_id][type][b2][b1][b0]
+ *   node_id : 0x00 = maestro (martillo), 0x01-0x0N = esclavos
+ *   type    : 0x00 dato, 0x01 heartbeat, 0x07 ACK, 0xFE ready (n_nodes)
  */
 
 #include <Arduino.h>
@@ -24,6 +34,7 @@
 
 #define MATLAB_SERIAL_BAUD 115200
 #define MATLAB_PKT_HEADER  0x56u
+#define MATLAB_CMD_DIRECTED 0xBDu
 
 class MatlabTransport {
 public:
@@ -41,13 +52,20 @@ public:
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
 
-    struct RxCmd { uint8_t cmd; uint8_t param; bool valid; };
+    struct RxCmd {
+        uint8_t cmd;      /* 0xA1-0xA7: estándar | 0xBD: dirigido */
+        uint8_t param;    /* parámetro del comando estándar */
+        uint8_t node_id;  /* válido solo cuando cmd == 0xBD */
+        uint8_t sub_cmd;  /* válido solo cuando cmd == 0xBD */
+        bool    valid;
+    };
     RxCmd lastCmd() { RxCmd r = _lastCmd; _lastCmd.valid = false; return r; }
 
 private:
-    RxCmd   _lastCmd = {0, 0, false};
-    uint8_t _rxBuf[4];
-    uint8_t _rxIdx = 0;
+    RxCmd   _lastCmd    = {0, 0, 0, 0, false};
+    uint8_t _rxBuf[6];
+    uint8_t _rxIdx      = 0;
+    uint8_t _rxExpected = 4;
 
     void _write6(uint8_t nodeId, uint8_t type, int32_t val24);
     void _parseRx();
@@ -67,8 +85,16 @@ inline void MatlabTransport::begin(uint32_t baud)
 inline void MatlabTransport::loop()
 {
     while (Serial.available()) {
-        _rxBuf[_rxIdx++] = (uint8_t)Serial.read();
-        if (_rxIdx >= 4) { _parseRx(); _rxIdx = 0; }
+        uint8_t b = (uint8_t)Serial.read();
+        if (_rxIdx == 0 && b != 0xAB) continue;  /* esperar sync */
+        _rxBuf[_rxIdx++] = b;
+        if (_rxIdx == 2)
+            _rxExpected = (_rxBuf[1] == MATLAB_CMD_DIRECTED) ? 6 : 4;
+        if (_rxIdx >= _rxExpected) {
+            _parseRx();
+            _rxIdx      = 0;
+            _rxExpected = 4;
+        }
     }
 }
 
@@ -117,9 +143,21 @@ inline void MatlabTransport::sendReady(uint8_t nNodes)
 inline void MatlabTransport::_parseRx()
 {
     if (_rxBuf[0] != 0xAB) return;
-    uint8_t cmd   = _rxBuf[1];
-    uint8_t param = _rxBuf[2];
-    uint8_t cs    = _rxBuf[3];
-    if (cs != (uint8_t)(cmd ^ param)) { return; }
-    _lastCmd = { cmd, param, true };
+
+    if (_rxExpected == 6) {
+        /* Comando dirigido: [0xAB][0xBD][node_id][sub_cmd][param][cs] */
+        uint8_t node_id = _rxBuf[2];
+        uint8_t sub_cmd = _rxBuf[3];
+        uint8_t param   = _rxBuf[4];
+        uint8_t cs      = _rxBuf[5];
+        if (cs != (uint8_t)(node_id ^ sub_cmd ^ param)) return;
+        _lastCmd = { MATLAB_CMD_DIRECTED, param, node_id, sub_cmd, true };
+    } else {
+        /* Comando estándar: [0xAB][cmd][param][cs] */
+        uint8_t cmd   = _rxBuf[1];
+        uint8_t param = _rxBuf[2];
+        uint8_t cs    = _rxBuf[3];
+        if (cs != (uint8_t)(cmd ^ param)) return;
+        _lastCmd = { cmd, param, 0, 0, true };
+    }
 }

@@ -6,13 +6,16 @@
 
 #include <stdint.h>
 
-#define CMD_ARM       0x10
-#define CMD_ARM_ACK   0x11
-#define CMD_START     0x12
-#define CMD_STOP      0x13
-#define CMD_DEBUG     0x14
-#define CMD_DATA      0x20
-#define CMD_STATUS    0x30
+#define CMD_ARM        0x10
+#define CMD_ARM_ACK    0x11
+#define CMD_START      0x12
+#define CMD_STOP       0x13
+#define CMD_DEBUG      0x14   /* broadcast debug ramp — todos los esclavos */
+#define CMD_DATA       0x20
+#define CMD_SET_CONFIG 0x21   /* maestro → esclavo unicast: configurar parámetro */
+#define CMD_CFG_ACK    0x22   /* esclavo → maestro: confirmación de config */
+#define CMD_DEBUG_NODE 0x23   /* maestro → esclavo unicast: debug ramp individual */
+#define CMD_STATUS     0x30
 
 #pragma pack(push, 1)
 
@@ -51,6 +54,27 @@ struct MsgStatus {
     uint32_t batches_bad;
     uint32_t espnow_sent;
     uint32_t espnow_fail;
+};
+
+/* Fase 2: configuración individual por esclavo */
+struct MsgSetConfig {
+    uint8_t cmd;      /* CMD_SET_CONFIG */
+    uint8_t node_id;
+    uint8_t sub_cmd;  /* 0xA6=PGA, 0xA8=TXmode, 0xA9=PGAvdac, 0xAA=VDAC */
+    uint8_t param;
+};
+
+struct MsgCfgAck {
+    uint8_t cmd;      /* CMD_CFG_ACK */
+    uint8_t node_id;
+    uint8_t sub_cmd;
+    uint8_t ok;       /* 1=PSoC confirmó, 0=sin respuesta */
+};
+
+struct MsgDebugNode {
+    uint8_t cmd;      /* CMD_DEBUG_NODE */
+    uint8_t node_id;
+    uint8_t enable;   /* 1=activar ramp, 0=desactivar */
 };
 
 #pragma pack(pop)

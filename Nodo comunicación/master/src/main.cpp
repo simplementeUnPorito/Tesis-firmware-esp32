@@ -44,6 +44,7 @@ static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
 
 /* ── Pin GPIO hardware sync ───────────────────────────────────────────────── */
 #define SYNC_OUT_PIN 25   /* Salida: HIGH = muestrear, LOW = parar */
+#define LED_PIN      2    /* GPIO2 = LED azul integrado ESP32-DevKitC V4 */
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
 enum MasterState { IDLE, ARMING, ARMED, RUNNING, STOPPING };
@@ -59,6 +60,17 @@ static MatlabTransport matlab;
 
 /* ── Hammer timing ───────────────────────────────────────────────────────── */
 static uint32_t g_lastHammerUs = 0;
+
+/* ── Comando dirigido a un esclavo específico ────────────────────────────── */
+
+static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
+{
+    /* Fase 1: ACK inmediato siempre.
+     * Fase 2: reemplazar con esp_now_send unicast (MsgSetConfig) al esclavo. */
+    matlab.sendAck(node_id, sub_cmd, param);
+    Serial.printf("[MASTER] directed node=%d sub=0x%02X param=%d\n",
+                  node_id, sub_cmd, param);
+}
 
 /* ── Broadcast ESP-NOW a todos los esclavos ──────────────────────────────── */
 
@@ -113,8 +125,10 @@ static void onBatchReady(const ReassembledBatch &batch)
 
 /* ── Procesar comandos de MATLAB ─────────────────────────────────────────── */
 
-static void handleMatlabCmd(uint8_t cmd, uint8_t param)
+static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
 {
+    uint8_t cmd   = rxCmd.cmd;
+    uint8_t param = rxCmd.param;
     switch (cmd) {
         case 0xA1:   /* stream on/off */
             g_streaming = (param != 0);
@@ -149,13 +163,31 @@ static void handleMatlabCmd(uint8_t cmd, uint8_t param)
             matlab.sendReady(g_armedCount);
             break;
 
-        case 0xA7: {  /* debug mode on/off para todos los esclavos */
+        case 0xBD:   /* comando dirigido a esclavo específico */
+            handleDirectedCmd(rxCmd.node_id, rxCmd.sub_cmd, rxCmd.param);
+            break;
+
+        case 0xA7: {  /* debug mode on/off — maestro + esclavos */
+            if (param) {
+                /* Activar: maestro entra en RUNNING+streaming para enviar stub */
+                g_streaming  = true;
+                g_state      = RUNNING;
+                g_t_start_us = (uint64_t)micros();
+                digitalWrite(SYNC_OUT_PIN, HIGH);
+            } else {
+                /* Desactivar: volver a IDLE */
+                g_streaming = false;
+                g_state     = IDLE;
+                digitalWrite(SYNC_OUT_PIN, LOW);
+            }
+            /* Propagar a esclavos para su propio debug */
             MsgDebug dbg = { CMD_DEBUG, param };
             for (int i = 0; i < NUM_SLAVES; i++) {
                 esp_now_send(SLAVE_MACS[i], (uint8_t *)&dbg, sizeof(dbg));
             }
-            matlab.sendAck(0xFF, cmd, param);
-            Serial.printf("[MASTER] debug=%d broadcast\n", param);
+            matlab.sendAck(0x00, cmd, param);
+            Serial.printf("[MASTER] debug=%d (streaming=%d state=%d)\n",
+                          param, g_streaming, g_state);
             break;
         }
 
@@ -215,7 +247,7 @@ void loop()
     /* Procesar comandos de MATLAB */
     auto rxCmd = matlab.lastCmd();
     if (rxCmd.valid) {
-        handleMatlabCmd(rxCmd.cmd, rxCmd.param);
+        handleMatlabCmd(rxCmd);
     }
 
     /* Muestrar martillo a ~4 kHz */
@@ -262,7 +294,7 @@ void loop()
     if (!g_streaming && millis() - lastHbMs > 1000) {
         lastHbMs = millis();
         if (matlab.connected()) {
-            matlab.sendHeartbeat(0xFF, 0, 0, (uint8_t)g_state);
+            matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         }
     }
 }
