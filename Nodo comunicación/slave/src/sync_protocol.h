@@ -19,6 +19,7 @@
 #define CMD_CFG_ACK    0x22
 #define CMD_DEBUG_NODE 0x23
 #define CMD_STATUS     0x30
+#define CMD_HELLO      0x40   /* beacon diagnóstico: esclavo → maestro */
 
 #pragma pack(push, 1)
 
@@ -95,6 +96,11 @@ struct MsgDebugNode {
     uint8_t cmd;
     uint8_t node_id;
     uint8_t enable;
+};
+
+struct MsgHello {
+    uint8_t cmd;      /* CMD_HELLO */
+    uint8_t node_id;
 };
 
 #pragma pack(pop)

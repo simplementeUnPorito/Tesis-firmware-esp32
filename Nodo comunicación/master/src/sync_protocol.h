@@ -16,6 +16,7 @@
 #define CMD_CFG_ACK    0x22   /* esclavo → maestro: confirmación de config */
 #define CMD_DEBUG_NODE 0x23   /* maestro → esclavo unicast: debug ramp individual */
 #define CMD_STATUS     0x30
+#define CMD_HELLO      0x40   /* beacon diagnóstico: esclavo → maestro */
 
 #pragma pack(push, 1)
 
@@ -75,6 +76,11 @@ struct MsgDebugNode {
     uint8_t cmd;      /* CMD_DEBUG_NODE */
     uint8_t node_id;
     uint8_t enable;   /* 1=activar ramp, 0=desactivar */
+};
+
+struct MsgHello {
+    uint8_t cmd;      /* CMD_HELLO */
+    uint8_t node_id;
 };
 
 #pragma pack(pop)

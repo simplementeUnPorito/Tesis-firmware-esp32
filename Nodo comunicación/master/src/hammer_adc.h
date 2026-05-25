@@ -33,7 +33,7 @@
 /* Pines (solo usados cuando el flag correspondiente es 1) */
 #define HAMMER_BTN_PIN   34   /* ADC1_CH6 — divisor de tensión de la salida PCB */
 #define HAMMER_ACCEL_PIN 35   /* ADC1_CH7 — señal acelerómetro */
-#define HAMMER_SAMPLE_US 250  /* 4 kHz de muestreo (~4× la señal del martillo) */
+#define HAMMER_SAMPLE_US 980  /* ~1020 Hz de muestreo */
 
 struct HammerSample {
     int32_t  btn_raw;    /* fuerza del impacto (stub: cte) */
@@ -67,8 +67,7 @@ public:
         /* Convertir 0–4095 a valor centrado en 0 (referencia = mitad escala) */
         s.btn_raw = (int32_t)raw - 2048;
 #else
-        /* Stub: señal sinusoidal lenta para visualizar en MATLAB sin hardware */
-        s.btn_raw = (int32_t)(1000.0f * sinf((float)s.timestamp_us * 1e-6f * 2.0f * 3.14159f));
+        s.btn_raw = 0;   /* stub: 0 en reposo; el maestro inyecta rampa en modo test */
 #endif
 
 #if HAMMER_ACCEL_ENABLED

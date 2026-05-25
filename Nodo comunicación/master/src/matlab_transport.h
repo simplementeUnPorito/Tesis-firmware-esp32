@@ -50,6 +50,10 @@ public:
     void sendHeartbeat(uint8_t nodeId, uint8_t pga, uint8_t vdac, uint8_t mode);
     void sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val);
     void sendReady(uint8_t nNodes);
+    /* Diagnóstico: estado ESP-NOW del maestro al arrancar */
+    void sendStatus(uint8_t espnow_ok, uint8_t ap_ch);
+    /* Diagnóstico: maestro recibió HELLO de un esclavo */
+    void sendHelloNotif(uint8_t nodeId);
 
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
@@ -61,16 +65,30 @@ public:
         uint8_t sub_cmd;  /* válido solo cuando cmd == 0xBD */
         bool    valid;
     };
-    RxCmd lastCmd() { RxCmd r = _lastCmd; _lastCmd.valid = false; return r; }
+    /* Drain one command from the queue (returns {valid=false} when empty) */
+    RxCmd lastCmd() {
+        if (_cmdHead == _cmdTail) return {0,0,0,0,false};
+        RxCmd r = _cmdQueue[_cmdTail];
+        _cmdTail = (uint8_t)((_cmdTail + 1) % CMD_Q_SIZE);
+        return r;
+    }
+    bool hasCmd() const { return _cmdHead != _cmdTail; }
 
 private:
-    RxCmd   _lastCmd    = {0, 0, 0, 0, false};
+    static constexpr uint8_t CMD_Q_SIZE = 8;
+    RxCmd   _cmdQueue[CMD_Q_SIZE];
+    uint8_t _cmdHead    = 0;
+    uint8_t _cmdTail    = 0;
     uint8_t _rxBuf[6];
     uint8_t _rxIdx      = 0;
     uint8_t _rxExpected = 4;
 
     void _write6(uint8_t nodeId, uint8_t type, int32_t val24);
     void _parseRx();
+    void _pushCmd(const RxCmd &c) {
+        uint8_t next = (uint8_t)((_cmdHead + 1) % CMD_Q_SIZE);
+        if (next != _cmdTail) { _cmdQueue[_cmdHead] = c; _cmdHead = next; }
+    }
 };
 
 /* ── Implementación inline ─────────────────────────────────────────────── */
@@ -142,6 +160,20 @@ inline void MatlabTransport::sendReady(uint8_t nNodes)
     Serial.write(pkt, 6);
 }
 
+inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)
+{
+    /* node_id=0xFF, type=0xFD, b2=espnow_ok, b1=ap_ch, b0=0 */
+    uint8_t pkt[6] = { MATLAB_PKT_HEADER, 0xFF, 0xFD, espnow_ok, ap_ch, 0x00 };
+    Serial.write(pkt, 6);
+}
+
+inline void MatlabTransport::sendHelloNotif(uint8_t nodeId)
+{
+    /* node_id=slave, type=0xFD, b2=1 (hello flag), b1=0, b0=0 */
+    uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x01, 0x00, 0x00 };
+    Serial.write(pkt, 6);
+}
+
 inline void MatlabTransport::_parseRx()
 {
     if (_rxBuf[0] != 0xAB) return;
@@ -153,13 +185,13 @@ inline void MatlabTransport::_parseRx()
         uint8_t param   = _rxBuf[4];
         uint8_t cs      = _rxBuf[5];
         if (cs != (uint8_t)(node_id ^ sub_cmd ^ param)) return;
-        _lastCmd = { MATLAB_CMD_DIRECTED, param, node_id, sub_cmd, true };
+        _pushCmd({ MATLAB_CMD_DIRECTED, param, node_id, sub_cmd, true });
     } else {
         /* Comando estándar: [0xAB][cmd][param][cs] */
         uint8_t cmd   = _rxBuf[1];
         uint8_t param = _rxBuf[2];
         uint8_t cs    = _rxBuf[3];
         if (cs != (uint8_t)(cmd ^ param)) return;
-        _lastCmd = { cmd, param, 0, 0, true };
+        _pushCmd({ cmd, param, 0, 0, true });
     }
 }

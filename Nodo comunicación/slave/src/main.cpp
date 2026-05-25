@@ -24,12 +24,26 @@
 #ifndef NODE_ID
   #define NODE_ID 1
 #endif
+#ifndef SAMPLE_PULSE_PIN
+  #if defined(ESP8266)
+    #define SAMPLE_PULSE_PIN 2
+  #else
+    #define SAMPLE_PULSE_PIN 14
+  #endif
+#endif
+#ifndef SAMPLE_PULSE_IDLE
+  #if defined(ESP8266)
+    #define SAMPLE_PULSE_IDLE HIGH
+  #else
+    #define SAMPLE_PULSE_IDLE LOW
+  #endif
+#endif
+#ifndef SAMPLE_PULSE_US
+  #define SAMPLE_PULSE_US 2
+#endif
 
 /* MAC del ESP maestro — cambiar según el hardware */
 static const uint8_t MASTER_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-static const char *WIFI_SSID = "GeoNetwork";
-static const char *WIFI_PASS = "geophone2026";
 
 /* ── Pines GPIO hardware sync ─────────────────────────────────────────────── */
 #if defined(ESP8266)
@@ -54,6 +68,37 @@ static          uint8_t    g_tx_filtered = 0;
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static PsocSPI        psoc;
 static EspNowTransport transport;
+
+static inline uint8_t samplePulseActiveLevel()
+{
+    return (SAMPLE_PULSE_IDLE == LOW) ? HIGH : LOW;
+}
+
+static void samplePulseBegin()
+{
+#if SAMPLE_PULSE_PIN >= 0
+    pinMode(SAMPLE_PULSE_PIN, OUTPUT);
+    digitalWrite(SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE);
+#endif
+}
+
+static inline void samplePulse()
+{
+#if SAMPLE_PULSE_PIN >= 0
+    digitalWrite(SAMPLE_PULSE_PIN, samplePulseActiveLevel());
+#if SAMPLE_PULSE_US > 0
+    delayMicroseconds(SAMPLE_PULSE_US);
+#endif
+    digitalWrite(SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE);
+#endif
+}
+
+static void pulseSampleCount(uint8_t n)
+{
+    for (uint8_t i = 0; i < n; i++) {
+        samplePulse();
+    }
+}
 
 /* ── ISR GPIO hardware sync (IRAM para máxima velocidad) ────────────────── */
 void IRAM_ATTR onSyncEdge()
@@ -135,7 +180,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     if (len < 1) return;
     uint8_t cmd = data[0];
 
-    if (cmd == CMD_ARM && g_state == WAIT_ARM) {
+    if (cmd == CMD_ARM && (g_state == WAIT_ARM || g_state == ARMED)) {
         g_state = ARMED;
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, 0 };
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
@@ -172,6 +217,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 static void onBatch(const PsocBatch &batch)
 {
     if (g_state != SAMPLING) return;
+    pulseSampleCount(batch.n_samples);
     transport.sendBatch(batch, g_t_start_us, NODE_ID);
 }
 
@@ -181,21 +227,26 @@ void setup()
 {
     Serial.begin(115200);
     Serial.printf("[SLAVE %d] boot\n", NODE_ID);
+    samplePulseBegin();
+    Serial.printf("[SCOPE] sample pulse pin=%d idle=%d us=%d\n",
+                  SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE, SAMPLE_PULSE_US);
 
-    /* WiFi en modo station (necesario para habilitar ESP-NOW) */
+#if defined(ESP8266)
+    /* Modo AP oculto en canal 1: evita el background scanning que hace el
+     * ESP8266 en modo STA desconectado (recorre ch1-13 buscando APs y pierde
+     * paquetes ESP-NOW del canal 1 a distancia real). */
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("GeoSlave", "", 1, 1);   /* ssid, pass vacío, canal 1, oculto */
+    delay(100);
+    Serial.printf("[SLAVE] MAC: %s  ch=%d (AP-fixed)\n",
+                  WiFi.macAddress().c_str(), wifi_get_channel());
+#else
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
-        delay(200);
-        Serial.print(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[SLAVE] WiFi OK  IP=%s\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println("\n[SLAVE] WiFi timeout — ESP-NOW continúa de todas formas");
-    }
-    Serial.printf("[SLAVE] MAC: %s\n", WiFi.macAddress().c_str());
+    WiFi.disconnect();
+    delay(100);
+    Serial.printf("[SLAVE] MAC: %s  ch=%d\n",
+                  WiFi.macAddress().c_str(), WiFi.channel());
+#endif
 
     /* ESP-NOW */
     if (!transport.begin(MASTER_MAC)) {
@@ -223,10 +274,10 @@ void loop()
     /* Poll PSoC o generar debug ramp */
     if (g_state == SAMPLING) {
         if (g_debug_mode) {
-            /* Generar batch falso a ~30 ms (30 muestras @ 1 kHz simulada) */
-            static uint32_t lastDebugMs = 0;
-            if (millis() - lastDebugMs >= 30) {
-                lastDebugMs = millis();
+            /* Generar batch falso a 29412 µs (30 muestras @ 1020 Hz) */
+            static uint32_t lastDebugUs = 0;
+            if ((uint32_t)micros() - lastDebugUs >= 29412) {
+                lastDebugUs += 29412;
                 PsocBatch fake = {};
                 fake.seq         = (uint16_t)(g_debug_count / SPI_BATCH_SAMPLES);
                 fake.n_samples   = SPI_BATCH_SAMPLES;
@@ -237,7 +288,7 @@ void loop()
                     fake.samples[i].sample_flags = g_tx_filtered;
                     g_debug_count++;
                 }
-                transport.sendBatch(fake, g_t_start_us, NODE_ID);
+                onBatch(fake);
             }
         } else {
             psoc.poll();
@@ -248,6 +299,16 @@ void loop()
     if (g_state == STOPPED) {
         g_state = WAIT_ARM;
         Serial.printf("[SLAVE %d] volviendo a WAIT_ARM\n", NODE_ID);
+    }
+
+    /* HELLO beacon cada 2 s en WAIT_ARM — diagnóstico de ESP-NOW bidireccional */
+    static uint32_t lastHelloMs = 0;
+    if (g_state == WAIT_ARM && millis() - lastHelloMs >= 2000) {
+        lastHelloMs = millis();
+        MsgHello h = { CMD_HELLO, NODE_ID };
+        esp_err_t err = espnowSend(MASTER_MAC, (const uint8_t *)&h, sizeof(h));
+        Serial.printf("[SLAVE] HELLO tx err=%d txOK=%u txFail=%u\n",
+                      (int)err, transport.sentOK(), transport.sentFail());
     }
 
     /* Informe de estado cada 10 s */
