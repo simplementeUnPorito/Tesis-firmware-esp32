@@ -16,8 +16,6 @@
  */
 
 #include <Arduino.h>
-#include <WiFi.h>
-#include <esp_now.h>
 #include "psoc_spi.h"
 #include "espnow_transport.h"
 #include "sync_protocol.h"
@@ -34,8 +32,13 @@ static const char *WIFI_SSID = "GeoNetwork";
 static const char *WIFI_PASS = "geophone2026";
 
 /* ── Pines GPIO hardware sync ─────────────────────────────────────────────── */
-#define SYNC_IN_PIN      26   /* Entrada: flanco del maestro (level: HIGH=ON, LOW=OFF) */
-#define SYNC_TO_PSOC_PIN 27   /* Salida hacia PSoC SYNC_IN */
+#if defined(ESP8266)
+  #define SYNC_IN_PIN      5    /* NodeMCU/D1 mini D1 */
+  #define SYNC_TO_PSOC_PIN 16   /* NodeMCU/D1 mini D0 */
+#else
+  #define SYNC_IN_PIN      26   /* Entrada: flanco del maestro (level: HIGH=ON, LOW=OFF) */
+  #define SYNC_TO_PSOC_PIN 27   /* Salida hacia PSoC SYNC_IN */
+#endif
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
 enum SlaveState { WAIT_ARM, ARMED, SAMPLING, STOPPED };
@@ -43,6 +46,10 @@ static volatile SlaveState g_state       = WAIT_ARM;
 static volatile uint64_t   g_t_start_us  = 0;
 static volatile bool       g_debug_mode  = false;
 static          uint32_t   g_debug_count = 0;
+static          uint8_t    g_pga_code    = 0;
+static          uint8_t    g_pgavdac     = 0;
+static          uint8_t    g_vdac_byte   = 128;
+static          uint8_t    g_tx_filtered = 0;
 
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static PsocSPI        psoc;
@@ -63,15 +70,75 @@ void IRAM_ATTR onSyncEdge()
 
 /* ── Callbacks ESP-NOW ───────────────────────────────────────────────────── */
 
-static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
+static void sendCfgAck(uint8_t sub_cmd, uint8_t ok)
 {
+    MsgCfgAck ack = { CMD_CFG_ACK, NODE_ID, sub_cmd, ok };
+    espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+}
+
+static void setDebugMode(bool enable)
+{
+    g_debug_mode = enable;
+    g_debug_count = 0;
+    if (enable) {
+        g_t_start_us = (uint64_t)micros();
+        g_state = SAMPLING;
+    } else if (g_state == SAMPLING) {
+        g_state = STOPPED;
+    } else {
+        g_state = WAIT_ARM;
+    }
+}
+
+static void handleSetConfig(const MsgSetConfig *cfg)
+{
+    if (cfg->node_id != NODE_ID) return;
+
+    uint8_t ok = 1;
+    switch (cfg->sub_cmd) {
+        case 0xA6:
+            g_pga_code = cfg->param;
+            break;
+        case 0xA8:
+            g_tx_filtered = cfg->param ? 1 : 0;
+            break;
+        case 0xA9:
+            g_pgavdac = cfg->param;
+            break;
+        case 0xAA:
+            g_vdac_byte = cfg->param;
+            break;
+        default:
+            ok = 0;
+            break;
+    }
+    sendCfgAck(cfg->sub_cmd, ok);
+    Serial.printf("[SLAVE] cfg sub=0x%02X p=%u ok=%u\n",
+                  cfg->sub_cmd, cfg->param, ok);
+}
+
+static void handleDebugNode(const MsgDebugNode *dbg)
+{
+    if (dbg->node_id != NODE_ID) return;
+    setDebugMode(dbg->enable != 0);
+    sendCfgAck(0xA7, 1);
+    Serial.printf("[SLAVE] debug_node=%d\n", (int)g_debug_mode);
+}
+
+#if defined(ESP8266)
+static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len)
+#else
+static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
+#endif
+{
+    (void)mac;
     if (len < 1) return;
     uint8_t cmd = data[0];
 
     if (cmd == CMD_ARM && g_state == WAIT_ARM) {
         g_state = ARMED;
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, 0 };
-        esp_now_send(MASTER_MAC, (uint8_t *)&ack, sizeof(ack));
+        espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
         Serial.println("[SLAVE] ARMED");
     }
     else if (cmd == CMD_START && g_state == ARMED) {
@@ -79,7 +146,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         const MsgStart *msg = (const MsgStart *)data;
         g_t_start_us = msg->t_start_us;
         g_state = SAMPLING;
-        Serial.printf("[SLAVE] START(SW) t0=%llu\n", g_t_start_us);
+        Serial.printf("[SLAVE] START(SW) t0=%llu\n", (unsigned long long)g_t_start_us);
     }
     else if (cmd == CMD_STOP) {
         g_state = STOPPED;
@@ -87,11 +154,16 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     }
     else if (cmd == CMD_DEBUG) {
         const MsgDebug *d = (const MsgDebug *)data;
-        g_debug_mode  = (d->enable != 0);
-        g_debug_count = 0;
+        setDebugMode(d->enable != 0);
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, (uint8_t)(g_debug_mode ? 0xDD : 0x00) };
-        esp_now_send(MASTER_MAC, (uint8_t *)&ack, sizeof(ack));
+        espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
         Serial.printf("[SLAVE] debug=%d\n", (int)g_debug_mode);
+    }
+    else if (cmd == CMD_SET_CONFIG && len >= (int)sizeof(MsgSetConfig)) {
+        handleSetConfig((const MsgSetConfig *)data);
+    }
+    else if (cmd == CMD_DEBUG_NODE && len >= (int)sizeof(MsgDebugNode)) {
+        handleDebugNode((const MsgDebugNode *)data);
     }
 }
 
@@ -156,11 +228,13 @@ void loop()
             if (millis() - lastDebugMs >= 30) {
                 lastDebugMs = millis();
                 PsocBatch fake = {};
-                fake.seq         = (uint16_t)(g_debug_count >> 5);
+                fake.seq         = (uint16_t)(g_debug_count / SPI_BATCH_SAMPLES);
                 fake.n_samples   = SPI_BATCH_SAMPLES;
-                fake.timestamp_us= (uint64_t)micros();
+                fake.timestamp_us= (uint64_t)micros() - g_t_start_us;
                 for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
                     fake.samples[i].post_digital = (int32_t)(g_debug_count & 0xFFFFFF);
+                    fake.samples[i].gain_byte = g_pga_code;
+                    fake.samples[i].sample_flags = g_tx_filtered;
                     g_debug_count++;
                 }
                 transport.sendBatch(fake, g_t_start_us, NODE_ID);
@@ -185,7 +259,7 @@ void loop()
             psoc.batchesOK(), psoc.batchesBad(),
             transport.sentOK(), transport.sentFail()
         };
-        esp_now_send(MASTER_MAC, (uint8_t *)&st, sizeof(st));
+        espnowSend(MASTER_MAC, (const uint8_t *)&st, sizeof(st));
         Serial.printf("[SLAVE %d] bOK=%u bBad=%u txOK=%u txFail=%u state=%d\n",
                       NODE_ID,
                       psoc.batchesOK(), psoc.batchesBad(),

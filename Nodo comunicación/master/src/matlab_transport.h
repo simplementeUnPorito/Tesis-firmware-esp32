@@ -22,6 +22,7 @@
  *     sub_cmd 0xA8: set TX mode     param: 0/1
  *     sub_cmd 0xA9: set PGAvdac     param: código 0-8
  *     sub_cmd 0xAA: set VDAC byte   param: 0-255
+ *     sub_cmd 0xA7: debug node      param: 0/1
  *
  * Protocolo TX (6 bytes por paquete):
  *   [0x56][node_id][type][b2][b1][b0]
@@ -31,8 +32,9 @@
 
 #include <Arduino.h>
 #include "sync_protocol.h"
+#include "master_log.h"
 
-#define MATLAB_SERIAL_BAUD 115200
+#define MATLAB_SERIAL_BAUD 921600
 #define MATLAB_PKT_HEADER  0x56u
 #define MATLAB_CMD_DIRECTED 0xBDu
 
@@ -79,7 +81,7 @@ inline void MatlabTransport::begin(uint32_t baud)
     /* Esperar a que el host enumere el USB (hasta 2 s) */
     uint32_t t0 = millis();
     while (!Serial && millis() - t0 < 2000) {}
-    Serial.println("[SERIAL] MATLAB transport listo");
+    MASTER_LOG_PRINTLN("[SERIAL] MATLAB transport listo");
 }
 
 inline void MatlabTransport::loop()

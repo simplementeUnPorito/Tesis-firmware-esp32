@@ -21,6 +21,7 @@
 
 #include <Arduino.h>
 #include <stdint.h>
+#include "master_log.h"
 
 #ifndef HAMMER_BTN_ENABLED
   #define HAMMER_BTN_ENABLED   0
@@ -51,8 +52,8 @@ public:
 #if HAMMER_ACCEL_ENABLED
         pinMode(HAMMER_ACCEL_PIN, INPUT);
 #endif
-        Serial.printf("[HAMMER] BTN=%d ACCEL=%d\n",
-                      HAMMER_BTN_ENABLED, HAMMER_ACCEL_ENABLED);
+        MASTER_LOG_PRINTF("[HAMMER] BTN=%d ACCEL=%d\n",
+                          HAMMER_BTN_ENABLED, HAMMER_ACCEL_ENABLED);
     }
 
     /* Leer una muestra; llamar desde el loop con cadencia HAMMER_SAMPLE_US */

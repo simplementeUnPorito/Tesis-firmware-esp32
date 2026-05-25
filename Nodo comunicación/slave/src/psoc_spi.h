@@ -23,8 +23,14 @@
 
 #define PSOC_SPI_CLK_HZ   4000000UL
 #define PSOC_SPI_MODE     SPI_MODE0
-#define PSOC_PIN_SS       5
-#define PSOC_PIN_DRDY     4
+#if defined(ESP8266)
+  /* ESP8266 NodeMCU/D1 mini: D5=SCLK, D6=MISO, D7=MOSI, D8=SS. */
+  #define PSOC_PIN_SS     15
+  #define PSOC_PIN_DRDY   4
+#else
+  #define PSOC_PIN_SS     5
+  #define PSOC_PIN_DRDY   4
+#endif
 #define PSOC_FRAME_MARKER 0xAB
 
 #define SPI_BATCH_SAMPLES 30

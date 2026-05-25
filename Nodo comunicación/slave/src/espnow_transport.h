@@ -7,10 +7,9 @@
  */
 
 #include <Arduino.h>
-#include <esp_now.h>
-#include <WiFi.h>
 #include "psoc_spi.h"
 #include "sync_protocol.h"
+#include "espnow_compat.h"
 
 class EspNowTransport {
 public:
@@ -26,7 +25,11 @@ public:
     uint32_t sentFail() const { return _sentFail; }
 
     /* Callback de confirmación de envío (registrar antes de begin si se desea) */
+#if defined(ESP8266)
+    static void onSendCb(uint8_t *mac, uint8_t status);
+#else
     static void onSendCb(const uint8_t *mac, esp_now_send_status_t status);
+#endif
 
 private:
     uint8_t  _masterMac[6];
@@ -47,7 +50,11 @@ inline uint8_t EspNowTransport::_calcCrc(const uint8_t *data, size_t len)
     return crc;
 }
 
+#if defined(ESP8266)
+inline void EspNowTransport::onSendCb(uint8_t *, uint8_t status)
+#else
 inline void EspNowTransport::onSendCb(const uint8_t *, esp_now_send_status_t status)
+#endif
 {
     (void)status;   /* confirmación se maneja por contador en sendBatch */
 }
@@ -56,21 +63,18 @@ inline bool EspNowTransport::begin(const uint8_t *masterMac)
 {
     memcpy(_masterMac, masterMac, 6);
 
-    if (esp_now_init() != ESP_OK) {
+    if (!espnowInitOk()) {
         Serial.println("[ESPNOW] init failed");
         return false;
     }
+    espnowSetRole();
     esp_now_register_send_cb(onSendCb);
 
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, masterMac, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-    if (esp_now_add_peer(&peer) != ESP_OK) {
+    if (!espnowAddPeer(masterMac)) {
         Serial.println("[ESPNOW] add_peer failed");
         return false;
     }
-    Serial.println("[ESPNOW] ready");
+    Serial.printf("[ESPNOW] ready ch=%u\n", espnowCurrentChannel());
     return true;
 }
 
@@ -103,7 +107,7 @@ inline void EspNowTransport::_buildAndSend(const PsocBatch &batch, uint8_t part,
     /* CRC sobre todos los bytes del struct excepto el último (crc mismo) */
     msg.crc = _calcCrc((const uint8_t *)&msg, sizeof(msg) - 1);
 
-    esp_err_t err = esp_now_send(_masterMac, (const uint8_t *)&msg, sizeof(msg));
+    esp_err_t err = espnowSend(_masterMac, (const uint8_t *)&msg, sizeof(msg));
     if (err == ESP_OK) { _sentOK++; } else { _sentFail++; }
 }
 

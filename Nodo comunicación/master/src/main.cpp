@@ -17,7 +17,7 @@
  * Flags en platformio.ini:
  *   -DHAMMER_BTN_ENABLED=0    disable hammer hardware (stub sinusoidal)
  *   -DHAMMER_ACCEL_ENABLED=0  disable accel hardware  (stub plano)
- *   -DNUM_SLAVES=2            cuántos ARM_ACK esperar antes de reportar listo
+ *   -DNUM_SLAVES=3            cuántos esclavos soportar como máximo
  */
 
 #include <Arduino.h>
@@ -27,19 +27,24 @@
 #include "hammer_adc.h"
 #include "espnow_rx.h"
 #include "matlab_transport.h"
+#include "master_log.h"
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
 static const char *AP_SSID = "GeoNetwork";
 static const char *AP_PASS = "geophone2026";
+static const uint8_t ESPNOW_BROADCAST[6] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
 
 #ifndef NUM_SLAVES
-  #define NUM_SLAVES 2
+  #define NUM_SLAVES 3
 #endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
 static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01},   /* Esclavo 1 — reemplazar */
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02},   /* Esclavo 2 — reemplazar */
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x03},   /* Esclavo 3 — reemplazar */
 };
 
 /* ── Pin GPIO hardware sync ───────────────────────────────────────────────── */
@@ -50,8 +55,11 @@ static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
 enum MasterState { IDLE, ARMING, ARMED, RUNNING, STOPPING };
 static MasterState g_state       = IDLE;
 static uint8_t     g_armedCount  = 0;
+static uint8_t     g_expectedSlaves = NUM_SLAVES;
 static bool        g_streaming   = false;
+static bool        g_espnowReady = false;
 static uint64_t    g_t_start_us  = 0;
+static volatile uint32_t g_armAckMask = 0;
 
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static HammerADC      hammer;
@@ -61,26 +69,100 @@ static MatlabTransport matlab;
 /* ── Hammer timing ───────────────────────────────────────────────────────── */
 static uint32_t g_lastHammerUs = 0;
 
+static bool sameMac(const uint8_t a[6], const uint8_t b[6])
+{
+    return memcmp(a, b, 6) == 0;
+}
+
+static bool isConfiguredSlaveMac(const uint8_t mac[6])
+{
+    static const uint8_t ZERO_MAC[6] = {0, 0, 0, 0, 0, 0};
+    if (sameMac(mac, ZERO_MAC) || sameMac(mac, ESPNOW_BROADCAST)) return false;
+    return !(mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF &&
+             mac[3] == 0xFF && mac[4] == 0xFF);
+}
+
+static void addPeerIfNeeded(const uint8_t mac[6])
+{
+    if (esp_now_is_peer_exist(mac)) return;
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, mac, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+}
+
+static uint8_t countArmAcks(uint32_t mask)
+{
+    uint8_t n = 0;
+    for (uint8_t node = 1; node <= g_expectedSlaves; node++) {
+        if (mask & (1UL << node)) n++;
+    }
+    return n;
+}
+
+static void onArmAck(const MsgArmAck &msg)
+{
+    if (msg.node_id == 0 || msg.node_id > NUM_SLAVES) return;
+    if (msg.status == 0) {
+        g_armAckMask |= (1UL << msg.node_id);
+    }
+}
+
+static void onSlaveStatus(const MsgStatus &msg)
+{
+    (void)msg;
+}
+
+static void onCfgAck(const MsgCfgAck &msg)
+{
+    matlab.sendAck(msg.node_id, msg.sub_cmd, msg.ok);
+}
+
 /* ── Comando dirigido a un esclavo específico ────────────────────────────── */
 
 static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
 {
-    /* Fase 1: ACK inmediato siempre.
-     * Fase 2: reemplazar con esp_now_send unicast (MsgSetConfig) al esclavo. */
-    matlab.sendAck(node_id, sub_cmd, param);
-    Serial.printf("[MASTER] directed node=%d sub=0x%02X param=%d\n",
-                  node_id, sub_cmd, param);
+    if (node_id == 0 || node_id > NUM_SLAVES) {
+        matlab.sendAck(node_id, sub_cmd, 0);
+        return;
+    }
+    if (!g_espnowReady) {
+        matlab.sendAck(node_id, sub_cmd, 0);
+        return;
+    }
+
+    const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[node_id - 1])
+                       ? SLAVE_MACS[node_id - 1]
+                       : ESPNOW_BROADCAST;
+    esp_err_t err;
+    if (sub_cmd == 0xA7) {
+        MsgDebugNode msg = { CMD_DEBUG_NODE, node_id, param };
+        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+    } else {
+        MsgSetConfig msg = { CMD_SET_CONFIG, node_id, sub_cmd, param };
+        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+    }
+    if (err != ESP_OK) {
+        matlab.sendAck(node_id, sub_cmd, 0);
+    }
+    MASTER_LOG_PRINTF("[MASTER] directed node=%d sub=0x%02X param=%d err=%d\n",
+                      node_id, sub_cmd, param, (int)err);
 }
 
 /* ── Broadcast ESP-NOW a todos los esclavos ──────────────────────────────── */
 
 static void broadcastArm()
 {
-    MsgArm msg = { CMD_ARM };
-    for (int i = 0; i < NUM_SLAVES; i++) {
-        esp_now_send(SLAVE_MACS[i], (uint8_t *)&msg, sizeof(msg));
+    if (g_expectedSlaves == 0) {
+        MASTER_LOG_PRINTLN("[MASTER] ARM omitido (0 esclavos)");
+        return;
     }
-    Serial.println("[MASTER] ARM enviado");
+    MsgArm msg = { CMD_ARM };
+    if (g_espnowReady) {
+        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+    }
+    MASTER_LOG_PRINTLN("[MASTER] ARM enviado");
 }
 
 static void broadcastStart()
@@ -89,20 +171,20 @@ static void broadcastStart()
     /* GPIO primero — flanco hardware llega a los PSoC antes que el ESP-NOW */
     digitalWrite(SYNC_OUT_PIN, HIGH);
     MsgStart msg = { CMD_START, g_t_start_us };
-    for (int i = 0; i < NUM_SLAVES; i++) {
-        esp_now_send(SLAVE_MACS[i], (uint8_t *)&msg, sizeof(msg));
+    if (g_espnowReady) {
+        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
-    Serial.printf("[MASTER] START t0=%llu\n", g_t_start_us);
+    MASTER_LOG_PRINTF("[MASTER] START t0=%llu\n", g_t_start_us);
 }
 
 static void broadcastStop()
 {
     digitalWrite(SYNC_OUT_PIN, LOW);
     MsgStop msg = { CMD_STOP };
-    for (int i = 0; i < NUM_SLAVES; i++) {
-        esp_now_send(SLAVE_MACS[i], (uint8_t *)&msg, sizeof(msg));
+    if (g_espnowReady) {
+        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
-    Serial.println("[MASTER] STOP enviado");
+    MASTER_LOG_PRINTLN("[MASTER] STOP enviado");
 }
 
 /* ── Callback: batch reensamblado de un esclavo ─────────────────────────── */
@@ -133,12 +215,15 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
         case 0xA1:   /* stream on/off */
             g_streaming = (param != 0);
             matlab.sendAck(0xFF, cmd, g_streaming ? 1 : 0);
-            Serial.printf("[MASTER] stream %s\n", g_streaming ? "ON" : "OFF");
+            MASTER_LOG_PRINTF("[MASTER] stream %s\n", g_streaming ? "ON" : "OFF");
             break;
 
         case 0xA2:   /* ARM esclavos */
             if (g_state == IDLE || g_state == ARMED) {
+                g_expectedSlaves = param;
+                if (g_expectedSlaves > NUM_SLAVES) g_expectedSlaves = NUM_SLAVES;
                 g_armedCount = 0;
+                g_armAckMask = 0;
                 g_state = ARMING;
                 broadcastArm();
                 matlab.sendAck(0xFF, cmd, 0);
@@ -182,12 +267,12 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             }
             /* Propagar a esclavos para su propio debug */
             MsgDebug dbg = { CMD_DEBUG, param };
-            for (int i = 0; i < NUM_SLAVES; i++) {
-                esp_now_send(SLAVE_MACS[i], (uint8_t *)&dbg, sizeof(dbg));
+            if (g_espnowReady) {
+                esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&dbg, sizeof(dbg));
             }
             matlab.sendAck(0x00, cmd, param);
-            Serial.printf("[MASTER] debug=%d (streaming=%d state=%d)\n",
-                          param, g_streaming, g_state);
+            MASTER_LOG_PRINTF("[MASTER] debug=%d (streaming=%d state=%d)\n",
+                              param, g_streaming, g_state);
             break;
         }
 
@@ -200,41 +285,37 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
 
 void setup()
 {
-    Serial.begin(115200);
-    Serial.println("[MASTER] boot");
+    matlab.begin();
+    MASTER_LOG_PRINTLN("[MASTER] boot");
 
     /* WiFi AP */
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
-    Serial.printf("[MASTER] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
-    Serial.printf("[MASTER] MAC:   %s\n", WiFi.macAddress().c_str());
+    MASTER_LOG_PRINTF("[MASTER] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+    MASTER_LOG_PRINTF("[MASTER] MAC:   %s\n", WiFi.macAddress().c_str());
 
     /* ESP-NOW (convive con AP mode) */
-    if (!espnowRx.begin(onBatchReady)) {
-        Serial.println("[MASTER] ESP-NOW FAIL — halt");
-        while (true) { delay(1000); }
-    }
-
-    /* Registrar esclavos como peers para poder enviarles */
-    for (int i = 0; i < NUM_SLAVES; i++) {
-        esp_now_peer_info_t peer = {};
-        memcpy(peer.peer_addr, SLAVE_MACS[i], 6);
-        peer.channel = 0;
-        peer.encrypt = false;
-        esp_now_add_peer(&peer);
+    if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck)) {
+        MASTER_LOG_PRINTLN("[MASTER] ESP-NOW FAIL - USB test continues");
+    } else {
+        g_espnowReady = true;
+        /* Broadcast para ARM/START/STOP y MACs reales opcionales para unicast. */
+        addPeerIfNeeded(ESPNOW_BROADCAST);
+        for (int i = 0; i < NUM_SLAVES; i++) {
+            if (isConfiguredSlaveMac(SLAVE_MACS[i])) {
+                addPeerIfNeeded(SLAVE_MACS[i]);
+            }
+        }
     }
 
     /* GPIO hardware sync — salida hacia esclavos y PSoC */
     pinMode(SYNC_OUT_PIN, OUTPUT);
     digitalWrite(SYNC_OUT_PIN, LOW);
 
-    /* Serial USB para MATLAB */
-    matlab.begin();
-
     /* Martillo (stub o real según flags) */
     hammer.begin();
 
-    Serial.println("[MASTER] listo");
+    MASTER_LOG_PRINTLN("[MASTER] listo");
 }
 
 /* ── Loop ────────────────────────────────────────────────────────────────── */
@@ -265,9 +346,19 @@ void loop()
     static uint32_t armStartMs = 0;
     if (g_state == ARMING) {
         if (armStartMs == 0) armStartMs = millis();
-        if (millis() - armStartMs > 3000) {
+        uint8_t ackCount = countArmAcks(g_armAckMask);
+        if (ackCount != g_armedCount) {
+            g_armedCount = ackCount;
+            matlab.sendReady(g_armedCount);
+        }
+        if (g_armedCount >= g_expectedSlaves) {
+            g_state = ARMED;
+            matlab.sendReady(g_armedCount);
+            armStartMs = 0;
+        }
+        else if (millis() - armStartMs > 3000) {
             /* Timeout: reportar cuántos respondieron igual */
-            Serial.printf("[MASTER] ARM timeout — %d esclavos listos\n", g_armedCount);
+            MASTER_LOG_PRINTF("[MASTER] ARM timeout - %d esclavos listos\n", g_armedCount);
             g_state = ARMED;
             matlab.sendReady(g_armedCount);
             armStartMs = 0;
@@ -283,7 +374,7 @@ void loop()
         if (millis() - stopStartMs > 500) {
             g_state = IDLE;
             stopStartMs = 0;
-            Serial.println("[MASTER] IDLE");
+            MASTER_LOG_PRINTLN("[MASTER] IDLE");
         }
     } else {
         stopStartMs = 0;

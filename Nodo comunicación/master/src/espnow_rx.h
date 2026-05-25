@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include <esp_now.h>
 #include "sync_protocol.h"
+#include "master_log.h"
 
 #define MAX_NODES 8
 
@@ -24,12 +25,18 @@ struct ReassembledBatch {
 };
 
 typedef void (*BatchReadyCallback)(const ReassembledBatch &batch);
+typedef void (*ArmAckCallback)(const MsgArmAck &msg);
+typedef void (*StatusCallback)(const MsgStatus &msg);
+typedef void (*CfgAckCallback)(const MsgCfgAck &msg);
 
 class EspNowRx {
 public:
     static EspNowRx *instance;
 
-    bool begin(BatchReadyCallback cb);
+    bool begin(BatchReadyCallback cb,
+               ArmAckCallback armAckCb = nullptr,
+               StatusCallback statusCb = nullptr,
+               CfgAckCallback cfgAckCb = nullptr);
 
     /* Llamar desde el loop() o directamente del callback ESP-NOW */
     static void onRecv(const uint8_t *mac, const uint8_t *data, int len);
@@ -39,6 +46,9 @@ public:
 
 private:
     BatchReadyCallback _cb = nullptr;
+    ArmAckCallback     _armAckCb = nullptr;
+    StatusCallback     _statusCb = nullptr;
+    CfgAckCallback     _cfgAckCb = nullptr;
     ReassembledBatch   _bufs[MAX_NODES] = {};
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
@@ -46,6 +56,7 @@ private:
     void _handleData(const MsgData *msg);
     void _handleStatus(const MsgStatus *msg);
     void _handleArmAck(const MsgArmAck *msg);
+    void _handleCfgAck(const MsgCfgAck *msg);
 
     static uint8_t _calcCrc(const uint8_t *data, size_t len)
     {
@@ -57,16 +68,22 @@ private:
 
 EspNowRx *EspNowRx::instance = nullptr;
 
-inline bool EspNowRx::begin(BatchReadyCallback cb)
+inline bool EspNowRx::begin(BatchReadyCallback cb,
+                            ArmAckCallback armAckCb,
+                            StatusCallback statusCb,
+                            CfgAckCallback cfgAckCb)
 {
     _cb = cb;
+    _armAckCb = armAckCb;
+    _statusCb = statusCb;
+    _cfgAckCb = cfgAckCb;
     instance = this;
     if (esp_now_init() != ESP_OK) {
-        Serial.println("[ESPNOW-RX] init failed");
+        MASTER_LOG_PRINTLN("[ESPNOW-RX] init failed");
         return false;
     }
     esp_now_register_recv_cb(onRecv);
-    Serial.println("[ESPNOW-RX] ready");
+    MASTER_LOG_PRINTLN("[ESPNOW-RX] ready");
     return true;
 }
 
@@ -81,6 +98,8 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         instance->_handleArmAck((const MsgArmAck *)data);
     } else if (first == CMD_STATUS && (size_t)len >= sizeof(MsgStatus)) {
         instance->_handleStatus((const MsgStatus *)data);
+    } else if (first == CMD_CFG_ACK && (size_t)len >= sizeof(MsgCfgAck)) {
+        instance->_handleCfgAck((const MsgCfgAck *)data);
     }
 }
 
@@ -120,13 +139,22 @@ inline void EspNowRx::_handleData(const MsgData *msg)
 
 inline void EspNowRx::_handleArmAck(const MsgArmAck *msg)
 {
-    Serial.printf("[ESPNOW-RX] ARM_ACK node=%d status=%d\n",
-                  msg->node_id, msg->status);
+    MASTER_LOG_PRINTF("[ESPNOW-RX] ARM_ACK node=%d status=%d\n",
+                      msg->node_id, msg->status);
+    if (_armAckCb) { _armAckCb(*msg); }
 }
 
 inline void EspNowRx::_handleStatus(const MsgStatus *msg)
 {
-    Serial.printf("[ESPNOW-RX] STATUS node=%d bOK=%u bBad=%u txOK=%u txFail=%u\n",
-                  msg->node_id, msg->batches_ok, msg->batches_bad,
-                  msg->espnow_sent, msg->espnow_fail);
+    MASTER_LOG_PRINTF("[ESPNOW-RX] STATUS node=%d bOK=%u bBad=%u txOK=%u txFail=%u\n",
+                      msg->node_id, msg->batches_ok, msg->batches_bad,
+                      msg->espnow_sent, msg->espnow_fail);
+    if (_statusCb) { _statusCb(*msg); }
+}
+
+inline void EspNowRx::_handleCfgAck(const MsgCfgAck *msg)
+{
+    MASTER_LOG_PRINTF("[ESPNOW-RX] CFG_ACK node=%d sub=0x%02X ok=%d\n",
+                      msg->node_id, msg->sub_cmd, msg->ok);
+    if (_cfgAckCb) { _cfgAckCb(*msg); }
 }
