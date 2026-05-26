@@ -16,10 +16,13 @@ public:
     /* masterMac: dirección MAC del ESP maestro (6 bytes) */
     bool begin(const uint8_t *masterMac);
 
-    /* Envía un batch completo en 2 paquetes ESP-NOW.
-     * t_start_us: timestamp del maestro recibido en CMD_START.
-     * nodeId: identificador de este nodo. */
+    /* Envía un batch completo en 2 paquetes ESP-NOW (tiempo real). */
     void sendBatch(const PsocBatch &batch, uint64_t t_start_us, uint8_t nodeId);
+
+    /* Envía un batch desde el buffer de store-and-forward (30 SampleBytes ya convertidos). */
+    void sendStoredBatch(const SampleBytes *samples30, uint16_t seq,
+                         uint64_t timestamp_us, uint8_t nodeId);
+
 
     uint32_t sentOK()   const { return _sentOK; }
     uint32_t sentFail() const { return _sentFail; }
@@ -39,6 +42,8 @@ private:
     static uint8_t _calcCrc(const uint8_t *data, size_t len);
     void _buildAndSend(const PsocBatch &batch, uint8_t part,
                        uint64_t t_start_us, uint8_t nodeId);
+    void _buildAndSendRaw(const SampleBytes *samples15, uint8_t part,
+                          uint16_t seq, uint64_t timestamp_us, uint8_t nodeId);
 };
 
 /* ── Implementación inline ─────────────────────────────────────────────── */
@@ -117,3 +122,28 @@ inline void EspNowTransport::sendBatch(const PsocBatch &batch,
     _buildAndSend(batch, 0, t_start_us, nodeId);
     _buildAndSend(batch, 1, t_start_us, nodeId);
 }
+
+inline void EspNowTransport::_buildAndSendRaw(const SampleBytes *samples15, uint8_t part,
+                                               uint16_t seq, uint64_t timestamp_us,
+                                               uint8_t nodeId)
+{
+    MsgData msg = {};
+    msg.marker      = DATA_PKT_MARKER;
+    msg.node_id     = nodeId;
+    msg.seq         = seq;
+    msg.part        = part;
+    msg.n_samples   = SAMPLES_PER_PART;
+    msg.timestamp_us= timestamp_us;
+    memcpy(msg.samples, samples15, sizeof(SampleBytes) * SAMPLES_PER_PART);
+    msg.crc = _calcCrc((const uint8_t *)&msg, sizeof(msg) - 1);
+    esp_err_t err = espnowSend(_masterMac, (const uint8_t *)&msg, sizeof(msg));
+    if (err == ESP_OK) { _sentOK++; } else { _sentFail++; }
+}
+
+inline void EspNowTransport::sendStoredBatch(const SampleBytes *samples30, uint16_t seq,
+                                              uint64_t timestamp_us, uint8_t nodeId)
+{
+    _buildAndSendRaw(samples30,                    0, seq, timestamp_us, nodeId);
+    _buildAndSendRaw(samples30 + SAMPLES_PER_PART, 1, seq, timestamp_us, nodeId);
+}
+

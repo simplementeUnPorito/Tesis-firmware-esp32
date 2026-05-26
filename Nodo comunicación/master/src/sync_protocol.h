@@ -17,6 +17,8 @@
 #define CMD_DEBUG_NODE 0x23   /* maestro → esclavo unicast: debug ramp individual */
 #define CMD_STATUS     0x30
 #define CMD_HELLO      0x40   /* beacon diagnóstico: esclavo → maestro */
+#define CMD_SET_RECLEN 0x50   /* master → todos: cuántos batches grabar (respuesta: CMD_CFG_ACK sub=0x50) */
+#define CMD_REQ_BATCH  0x51   /* master → esclavo: pedir batch específico (respuesta: 2× MsgData) */
 
 #pragma pack(push, 1)
 
@@ -81,6 +83,17 @@ struct MsgDebugNode {
 struct MsgHello {
     uint8_t cmd;      /* CMD_HELLO */
     uint8_t node_id;
+};
+
+struct MsgSetRecLen {
+    uint8_t  cmd;        /* CMD_SET_RECLEN */
+    uint16_t n_batches;
+};
+
+struct MsgReqBatch {
+    uint8_t  cmd;       /* CMD_REQ_BATCH */
+    uint8_t  node_id;
+    uint16_t batch_seq;
 };
 
 #pragma pack(pop)

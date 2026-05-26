@@ -65,6 +65,12 @@ static          uint8_t    g_pgavdac     = 0;
 static          uint8_t    g_vdac_byte   = 128;
 static          uint8_t    g_tx_filtered = 0;
 
+/* ── Store-and-forward ───────────────────────────────────────────────────── */
+static uint16_t    g_rec_n_batches = 0;          /* 0 = modo streaming clásico */
+static SampleBytes *g_store_buf    = nullptr;    /* n_batches × 30 SampleBytes */
+static uint32_t   *g_store_ts_us   = nullptr;    /* timestamp relativo por batch */
+static uint16_t    g_store_fill    = 0;
+
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static PsocSPI        psoc;
 static EspNowTransport transport;
@@ -113,6 +119,10 @@ void IRAM_ATTR onSyncEdge()
     }
 }
 
+/* ── Forward declarations ────────────────────────────────────────────────── */
+static void allocStore(uint16_t n_batches);
+static void handleReqBatch(const MsgReqBatch *msg);
+
 /* ── Callbacks ESP-NOW ───────────────────────────────────────────────────── */
 
 static void sendCfgAck(uint8_t sub_cmd, uint8_t ok)
@@ -126,7 +136,8 @@ static void setDebugMode(bool enable)
     g_debug_mode = enable;
     g_debug_count = 0;
     if (enable) {
-        g_t_start_us = (uint64_t)micros();
+        g_store_fill  = 0;   /* reset store index para que cada test/debug empiece desde 0 */
+        g_t_start_us  = (uint64_t)micros();
         g_state = SAMPLING;
     } else if (g_state == SAMPLING) {
         g_state = STOPPED;
@@ -180,7 +191,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     if (len < 1) return;
     uint8_t cmd = data[0];
 
-    if (cmd == CMD_ARM && (g_state == WAIT_ARM || g_state == ARMED)) {
+    if (cmd == CMD_ARM && (g_state == WAIT_ARM || g_state == ARMED || g_state == STOPPED)) {
         g_state = ARMED;
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, 0 };
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
@@ -189,7 +200,9 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     else if (cmd == CMD_START && g_state == ARMED) {
         /* START por software: usar como fallback si no hay cable GPIO */
         const MsgStart *msg = (const MsgStart *)data;
-        g_t_start_us = msg->t_start_us;
+        g_t_start_us  = msg->t_start_us;
+        g_store_fill  = 0;   /* reset store index para nueva grabación */
+        g_debug_count = 0;
         g_state = SAMPLING;
         Serial.printf("[SLAVE] START(SW) t0=%llu\n", (unsigned long long)g_t_start_us);
     }
@@ -210,6 +223,46 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     else if (cmd == CMD_DEBUG_NODE && len >= (int)sizeof(MsgDebugNode)) {
         handleDebugNode((const MsgDebugNode *)data);
     }
+    else if (cmd == CMD_SET_RECLEN && len >= (int)sizeof(MsgSetRecLen)) {
+        const MsgSetRecLen *msg = (const MsgSetRecLen *)data;
+        allocStore(msg->n_batches);
+        /* Confirmar al maestro que el buffer está listo */
+        MsgCfgAck ack = { CMD_CFG_ACK, NODE_ID, CMD_SET_RECLEN,
+                          (uint8_t)(g_store_buf ? 1 : 0) };
+        espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+    }
+    else if (cmd == CMD_REQ_BATCH && len >= (int)sizeof(MsgReqBatch)) {
+        handleReqBatch((const MsgReqBatch *)data);
+    }
+}
+
+/* ── Store-and-forward helpers ───────────────────────────────────────────── */
+
+static void allocStore(uint16_t n_batches)
+{
+    free(g_store_buf);  free(g_store_ts_us);
+    g_store_buf    = nullptr;
+    g_store_ts_us  = nullptr;
+    g_store_fill   = 0;
+    g_rec_n_batches= n_batches;
+    if (n_batches == 0) return;
+    g_store_buf   = (SampleBytes *)malloc((size_t)n_batches * SPI_BATCH_SAMPLES * sizeof(SampleBytes));
+    g_store_ts_us = (uint32_t    *)malloc((size_t)n_batches * sizeof(uint32_t));
+    Serial.printf("[SLAVE] store alloc n=%u buf=%s\n", n_batches, g_store_buf ? "OK" : "FAIL");
+}
+
+static void handleReqBatch(const MsgReqBatch *msg)
+{
+    if (msg->node_id != NODE_ID) return;
+    uint16_t seq = msg->batch_seq;
+    if (seq >= g_store_fill || !g_store_buf) {
+        /* Batch fuera de rango: el master sabe cuántos hay, ignorar */
+        Serial.printf("[SLAVE] REQ_BATCH seq=%u fuera de rango fill=%u\n", seq, g_store_fill);
+        return;
+    }
+    const SampleBytes *s  = &g_store_buf[(size_t)seq * SPI_BATCH_SAMPLES];
+    uint64_t           ts = g_t_start_us + (uint64_t)g_store_ts_us[seq];
+    transport.sendStoredBatch(s, seq, ts, NODE_ID);
 }
 
 /* ── Callback PSoC — batch recibido ─────────────────────────────────────── */
@@ -218,7 +271,36 @@ static void onBatch(const PsocBatch &batch)
 {
     if (g_state != SAMPLING) return;
     pulseSampleCount(batch.n_samples);
-    transport.sendBatch(batch, g_t_start_us, NODE_ID);
+
+    /* Debug y real: el routing depende del modo store, no del origen del dato.
+       Si g_store_buf está allocado → acumula (también en debug).
+       Si no hay store buffer → transmite en tiempo real (streaming / TestEsclavo). */
+    if (g_store_buf && g_store_fill < g_rec_n_batches) {
+        /* Store-and-forward: acumular en RAM, sin RF */
+        SampleBytes *dst = &g_store_buf[(size_t)g_store_fill * SPI_BATCH_SAMPLES];
+        for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+            const PsocSample &s = batch.samples[i];
+            dst[i].raw_lo = (uint8_t)( s.raw_input         & 0xFF);
+            dst[i].raw_hi = (uint8_t)((s.raw_input  >> 8)  & 0xFF);
+            dst[i].alog0  = (uint8_t)( s.post_analog        & 0xFF);
+            dst[i].alog1  = (uint8_t)((s.post_analog >>  8) & 0xFF);
+            dst[i].alog2  = (uint8_t)((s.post_analog >> 16) & 0xFF);
+            dst[i].digi0  = (uint8_t)( s.post_digital        & 0xFF);
+            dst[i].digi1  = (uint8_t)((s.post_digital >>  8) & 0xFF);
+            dst[i].digi2  = (uint8_t)((s.post_digital >> 16) & 0xFF);
+            dst[i].gain   = s.gain_byte;
+            dst[i].flags  = s.sample_flags;
+        }
+        g_store_ts_us[g_store_fill] = (uint32_t)batch.timestamp_us;
+        g_store_fill++;
+        if (g_store_fill >= g_rec_n_batches) {
+            g_state = STOPPED;
+            Serial.printf("[SLAVE] FULL → STOPPED (%u batches)\n", g_store_fill);
+        }
+    } else if (!g_store_buf) {
+        /* Modo clásico sin store: enviar en tiempo real */
+        transport.sendBatch(batch, g_t_start_us, NODE_ID);
+    }
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
@@ -295,8 +377,12 @@ void loop()
         }
     }
 
-    /* Volver a esperar ARM después de STOP */
-    if (g_state == STOPPED) {
+    /* Volver a esperar ARM después de STOP.
+     * En modo store-and-forward (g_rec_n_batches > 0) permanecemos en STOPPED
+     * respondiendo CMD_REQ_BATCH hasta que el maestro haya pedido todos los batches.
+     * El maestro no envía ningún mensaje de "fin" — el slave sencillamente vuelve
+     * a WAIT_ARM cuando recibe un CMD_ARM nuevo. */
+    if (g_state == STOPPED && g_rec_n_batches == 0) {
         g_state = WAIT_ARM;
         Serial.printf("[SLAVE %d] volviendo a WAIT_ARM\n", NODE_ID);
     }

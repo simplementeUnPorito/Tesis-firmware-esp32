@@ -48,10 +48,10 @@ public:
 
 private:
     BatchReadyCallback _cb = nullptr;
-    ArmAckCallback     _armAckCb = nullptr;
-    StatusCallback     _statusCb = nullptr;
-    CfgAckCallback     _cfgAckCb = nullptr;
-    HelloCallback      _helloCb  = nullptr;
+    ArmAckCallback     _armAckCb  = nullptr;
+    StatusCallback     _statusCb  = nullptr;
+    CfgAckCallback     _cfgAckCb  = nullptr;
+    HelloCallback      _helloCb   = nullptr;
     ReassembledBatch   _bufs[MAX_NODES] = {};
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
@@ -172,3 +172,4 @@ inline void EspNowRx::_handleHello(const MsgHello *msg)
     MASTER_LOG_PRINTF("[ESPNOW-RX] HELLO node=%d\n", msg->node_id);
     if (_helloCb) { _helloCb(*msg); }
 }
+
