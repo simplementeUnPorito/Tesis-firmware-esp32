@@ -11,10 +11,11 @@
  *     [0xAB][cmd][param][cmd^param]
  *     cmd 0xA1: stream on/off   param: 0/1
  *     cmd 0xA2: arm nodes       param: n_nodes esperados
- *     cmd 0xA3: start sampling  param: ignorado
+ *     cmd 0xA3: start sampling  param: n_batches opcional (0=usar actual)
  *     cmd 0xA4: stop sampling   param: ignorado
  *     cmd 0xA5: request status  param: ignorado
  *     cmd 0xA7: debug broadcast param: 0/1
+ *     cmd 0xB0: scope multi-start param: n_batches, 0=cancelar
  *
  *   Comando dirigido a esclavo (6 bytes):
  *     [0xAB][0xBD][node_id][sub_cmd][param][node_id^sub_cmd^param]

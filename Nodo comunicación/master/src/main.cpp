@@ -28,6 +28,7 @@
 #include "espnow_rx.h"
 #include "matlab_transport.h"
 #include "master_log.h"
+#include "../../scope_measurement.h"
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
 static const char *AP_SSID = "GeoNetwork";
@@ -35,6 +36,7 @@ static const char *AP_PASS = "geophone2026";
 static const uint8_t ESPNOW_BROADCAST[6] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 };
+#define MATLAB_CMD_SCOPE_START 0xB0
 
 #ifndef NUM_SLAVES
   #define NUM_SLAVES 3
@@ -58,7 +60,16 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
   #define DEBUG_HW_START_IDLE LOW
 #endif
 #ifndef DEBUG_HW_START_US
-  #define DEBUG_HW_START_US 10
+  #define DEBUG_HW_START_US SCOPE_START_PULSE_US
+#endif
+#ifndef PRESTART_WAIT_MS
+  #define PRESTART_WAIT_MS 5000
+#endif
+#ifndef SCOPE_MULTI_START_COUNT
+  #define SCOPE_MULTI_START_COUNT 128
+#endif
+#ifndef SCOPE_MULTI_START_GAP_MS
+  #define SCOPE_MULTI_START_GAP_MS 1000
 #endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
@@ -73,8 +84,10 @@ static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
 #define LED_PIN      2    /* GPIO2 = LED azul integrado ESP32-DevKitC V4 */
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
-enum MasterState { IDLE, ARMING, ARMED, RUNNING, STOPPING, DUMPING };
+enum MasterState { IDLE, ARMING, ARMED, RUNNING, STOPPING, DUMPING, PRESTART, SCOPE_MULTI };
+enum PrestartAction { PRESTART_ACTION_START, PRESTART_ACTION_SCOPE_MULTI, PRESTART_ACTION_START_PROBE };
 static MasterState g_state       = IDLE;
+static PrestartAction g_prestartAction = PRESTART_ACTION_START;
 static uint8_t     g_armedCount  = 0;
 static uint8_t     g_expectedSlaves = NUM_SLAVES;
 static bool        g_streaming   = false;
@@ -85,6 +98,12 @@ static uint32_t    g_startCmdTxUs = 0;
 static uint32_t    g_startCmdToken = 0;
 static uint8_t     g_startProbeNode = 0;
 static volatile uint32_t g_armAckMask    = 0;
+static volatile bool     g_debugHwActive = false;
+static volatile uint32_t g_debugHwFallUs = 0;
+static uint32_t          g_prestartDueMs = 0;
+static uint16_t          g_scopeStartSent = 0;
+static uint32_t          g_scopeStartNextMs = 0;
+static uint8_t           g_prestartProbeNode = 0;
 
 /* ── Store-and-forward (dump request/response) ───────────────────────────── */
 static uint16_t g_rec_n_batches   = 0;   /* batches a grabar por slave */
@@ -100,6 +119,8 @@ static uint32_t g_dumpReqMs       = 0;   /* millis() del último REQ_BATCH envia
 static HammerIMU      hammer;
 static EspNowRx       espnowRx;
 static MatlabTransport matlab;
+
+static void beginPrestart(PrestartAction action);
 
 /* ── Hammer timing ───────────────────────────────────────────────────────── */
 static uint32_t g_lastHammerUs  = 0;
@@ -148,9 +169,23 @@ static inline void debugHardwareStartPulse()
 #if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
     digitalWrite(DEBUG_HW_START_PIN, debugHwActiveLevel());
 #if DEBUG_HW_START_US > 0
-    delayMicroseconds(DEBUG_HW_START_US);
-#endif
+    g_debugHwFallUs = (uint32_t)micros() + (uint32_t)DEBUG_HW_START_US;
+    g_debugHwActive = true;
+#else
     digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
+    g_debugHwActive = false;
+#endif
+#endif
+}
+
+static inline void debugHardwareService()
+{
+#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
+    if (g_debugHwActive &&
+        (int32_t)((uint32_t)micros() - g_debugHwFallUs) >= 0) {
+        digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
+        g_debugHwActive = false;
+    }
 #endif
 }
 
@@ -269,7 +304,16 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
     }
 
     if (sub_cmd == 0xAF) {
-        sendStartProbe(node_id);
+        if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
+            g_prestartProbeNode = node_id;
+            beginPrestart(PRESTART_ACTION_START_PROBE);
+            MASTER_LOG_PRINTF("[MASTER] START_PROBE node=%d scheduled after PRESTART\n",
+                              node_id);
+        } else {
+            matlab.sendAck(node_id, sub_cmd, 0);
+            MASTER_LOG_PRINTF("[MASTER] START_PROBE node=%d rejected state=%d\n",
+                              node_id, (int)g_state);
+        }
         return;
     }
 
@@ -292,6 +336,15 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
 }
 
 /* ── Broadcast ESP-NOW a todos los esclavos ──────────────────────────────── */
+
+static void broadcastRecordLength(uint16_t nBatches)
+{
+    MsgSetRecLen msg = { CMD_SET_RECLEN, nBatches };
+    if (g_espnowReady) {
+        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+    }
+    MASTER_LOG_PRINTF("[MASTER] SET_RECLEN=%u\n", nBatches);
+}
 
 static void broadcastArm()
 {
@@ -322,6 +375,25 @@ static void broadcastStart()
     MASTER_LOG_PRINTF("[MASTER] START t0=%llu\n", g_t_start_us);
 }
 
+static void broadcastScopeStart()
+{
+    debugHardwareStartPulse();
+    MsgScopeStart msg = { CMD_SCOPE_START };
+    if (g_espnowReady) {
+        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+    }
+    MASTER_LOG_PRINTLN("[MASTER] SCOPE_START");
+}
+
+static void broadcastDebug(uint8_t enable)
+{
+    MsgDebug msg = { CMD_DEBUG, enable ? (uint8_t)1 : (uint8_t)0 };
+    if (g_espnowReady) {
+        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+    }
+    MASTER_LOG_PRINTF("[MASTER] DEBUG broadcast=%u\n", (unsigned)enable);
+}
+
 static void broadcastStop()
 {
     digitalWrite(SYNC_OUT_PIN, LOW);
@@ -330,6 +402,27 @@ static void broadcastStop()
         esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTLN("[MASTER] STOP enviado");
+}
+
+static void beginPrestart(PrestartAction action)
+{
+    digitalWrite(SYNC_OUT_PIN, LOW);
+    g_prestartAction = action;
+    const char *actionName = "START";
+    if (action == PRESTART_ACTION_SCOPE_MULTI) {
+        actionName = "SCOPE_MULTI";
+    } else if (action == PRESTART_ACTION_START_PROBE) {
+        actionName = "START_PROBE";
+    }
+    g_armAckMask = 0;
+    g_armedCount = 0;
+    matlab.sendReady(g_armedCount);
+    broadcastRecordLength(g_rec_n_batches);
+    broadcastArm();
+    g_prestartDueMs = millis() + PRESTART_WAIT_MS;
+    g_state = PRESTART;
+    MASTER_LOG_PRINTF("[MASTER] PRESTART wait %u ms before %s\n",
+                      (unsigned)PRESTART_WAIT_MS, actionName);
 }
 
 /* ── Callback: batch reensamblado de un esclavo ─────────────────────────── */
@@ -395,11 +488,13 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             break;
 
         case 0xA3:   /* START */
-            if (g_state == ARMED || g_state == ARMING) {
+            if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
+                if (param > 0) {
+                    g_rec_n_batches = param;
+                }
                 g_debugRamp   = 0;
                 g_hammerCount = 0;
-                broadcastStart();
-                g_state = RUNNING;
+                beginPrestart(PRESTART_ACTION_START);
                 matlab.sendAck(0xFF, cmd, 1);
             }
             break;
@@ -414,23 +509,39 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             matlab.sendReady(g_armedCount);
             break;
 
+        case MATLAB_CMD_SCOPE_START:
+            if (param == 0) {
+                if (g_state == PRESTART || g_state == SCOPE_MULTI) {
+                    g_state = ARMED;
+                    MASTER_LOG_PRINTLN("[MASTER] SCOPE_MULTI cancelado");
+                }
+                matlab.sendAck(0xFF, cmd, 0);
+            } else if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
+                g_rec_n_batches = param;
+                g_scopeStartSent = 0;
+                beginPrestart(PRESTART_ACTION_SCOPE_MULTI);
+                matlab.sendAck(0xFF, cmd, 1);
+            }
+            break;
+
         case 0xBD:   /* comando dirigido a esclavo específico */
             handleDirectedCmd(rxCmd.node_id, rxCmd.sub_cmd, rxCmd.param);
             break;
 
-        case 0xA7: {  /* debug mode on/off — solo maestro, esclavos tienen su propio cmd */
+        case 0xA7: {  /* debug mode on/off — maestro y esclavos */
+            broadcastDebug(param ? 1 : 0);
             if (param) {
                 g_debugRamp   = 0;
                 g_hammerCount = 0;
                 g_testMode    = true;
                 g_streaming   = true;
-                if (g_rec_n_batches > 0 && (g_state == ARMED || g_state == ARMING)) {
+                if (g_rec_n_batches > 0 &&
+                    (g_state == ARMED || g_state == ARMING || g_state == PRESTART)) {
                     /* Store-and-forward: A7 solo prepara la rampa.
                        A3/START debe conservar el estado ARMED y disparar SYNC. */
                 } else {
                     g_state      = RUNNING;
                     g_t_start_us = (uint64_t)micros();
-                    digitalWrite(SYNC_OUT_PIN, HIGH);
                 }
             } else {
                 g_testMode  = false;
@@ -446,12 +557,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
 
         case 0xAE: {  /* SET_RECORD_LEN: n_batches a grabar (0 = modo streaming clásico) */
             g_rec_n_batches = param;
-            MsgSetRecLen msg = { CMD_SET_RECLEN, param };
-            if (g_espnowReady) {
-                esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
-            }
+            broadcastRecordLength(g_rec_n_batches);
             matlab.sendAck(0xFF, 0xAE, param);
-            MASTER_LOG_PRINTF("[MASTER] SET_RECLEN=%u\n", param);
             break;
         }
 
@@ -516,6 +623,8 @@ void setup()
 
 void loop()
 {
+    debugHardwareService();
+
     /* Gestionar conexión TCP de MATLAB */
     matlab.loop();
 
@@ -569,6 +678,53 @@ void loop()
         }
     } else {
         armStartMs = 0;
+    }
+
+    /* PRESTART: antes de cada START reenviar config/ARM, esperar fijo y recién disparar. */
+    if (g_state == PRESTART) {
+        uint8_t ackCount = countArmAcks(g_armAckMask);
+        if (ackCount != g_armedCount) {
+            g_armedCount = ackCount;
+            matlab.sendReady(g_armedCount);
+        }
+        if ((int32_t)(millis() - g_prestartDueMs) >= 0) {
+            if (g_prestartAction == PRESTART_ACTION_SCOPE_MULTI) {
+                broadcastScopeStart();
+                g_scopeStartSent++;
+                MASTER_LOG_PRINTF("[MASTER] SCOPE_MULTI %u/%u\n",
+                                  (unsigned)g_scopeStartSent,
+                                  (unsigned)SCOPE_MULTI_START_COUNT);
+                if (g_scopeStartSent >= SCOPE_MULTI_START_COUNT) {
+                    g_state = ARMED;
+                    matlab.sendReady(g_armedCount);
+                    MASTER_LOG_PRINTLN("[MASTER] SCOPE_MULTI completo -> ARMED");
+                } else {
+                    g_scopeStartNextMs = millis() + SCOPE_MULTI_START_GAP_MS;
+                    g_state = SCOPE_MULTI;
+                    MASTER_LOG_PRINTF("[MASTER] SCOPE_MULTI next PRESTART in %u ms\n",
+                                      (unsigned)SCOPE_MULTI_START_GAP_MS);
+                }
+            } else if (g_prestartAction == PRESTART_ACTION_START_PROBE) {
+                sendStartProbe(g_prestartProbeNode);
+                g_state = ARMED;
+                MASTER_LOG_PRINTF("[MASTER] PRESTART done -> START_PROBE node=%d\n",
+                                  g_prestartProbeNode);
+            } else {
+                broadcastStart();
+                g_state = RUNNING;
+                MASTER_LOG_PRINTLN("[MASTER] PRESTART done -> RUNNING");
+            }
+        }
+    }
+
+    /* STARTs falsos para osciloscopio: cada pulso repite PRESTART completo. */
+    if (g_state == SCOPE_MULTI) {
+        if (SCOPE_MULTI_START_COUNT <= 0) {
+            g_state = ARMED;
+            MASTER_LOG_PRINTLN("[MASTER] SCOPE_MULTI completo -> ARMED");
+        } else if ((int32_t)(millis() - g_scopeStartNextMs) >= 0) {
+            beginPrestart(PRESTART_ACTION_SCOPE_MULTI);
+        }
     }
 
     /* Transición STOPPING → DUMPING (store-and-forward) o → IDLE (clásico) */
@@ -628,7 +784,7 @@ void loop()
                 if (g_dumpSlaveIdx > g_armedCount) {
                     g_state = IDLE;
                     g_streaming = false;
-                    MASTER_LOG_PRINTLN("[MASTER] DUMP completo → IDLE");
+                    MASTER_LOG_PRINTLN("[MASTER] DUMP completo -> IDLE");
                 } else {
                     MASTER_LOG_PRINTF("[MASTER] DUMP slave %d/%d seq 0/%d\n",
                                       g_dumpSlaveIdx, g_armedCount, g_rec_n_batches);

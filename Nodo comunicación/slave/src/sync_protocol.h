@@ -23,6 +23,7 @@
 #define CMD_HELLO      0x40   /* beacon diagnóstico: esclavo → maestro */
 #define CMD_SET_RECLEN 0x50   /* master → todos: cuántos batches grabar (respuesta: CMD_CFG_ACK sub=0x50) */
 #define CMD_REQ_BATCH  0x51   /* master → esclavo: pedir batch específico (respuesta: 2× MsgData) */
+#define CMD_SCOPE_START 0x60  /* master → esclavos: pulso START falso, sin muestreo ni ACK */
 
 #pragma pack(push, 1)
 
@@ -124,6 +125,10 @@ struct MsgReqBatch {
     uint8_t  cmd;       /* CMD_REQ_BATCH */
     uint8_t  node_id;
     uint16_t batch_seq;
+};
+
+struct MsgScopeStart {
+    uint8_t cmd;        /* CMD_SCOPE_START */
 };
 
 #pragma pack(pop)

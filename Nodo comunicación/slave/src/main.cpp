@@ -19,6 +19,7 @@
 #include "psoc_spi.h"
 #include "espnow_transport.h"
 #include "sync_protocol.h"
+#include "../../scope_measurement.h"
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
 #ifndef NODE_ID
@@ -51,7 +52,7 @@
   #define DEBUG_HW_START_IDLE LOW
 #endif
 #ifndef DEBUG_HW_START_US
-  #define DEBUG_HW_START_US 10
+  #define DEBUG_HW_START_US SCOPE_START_PULSE_US
 #endif
 
 /* MAC del ESP maestro — cambiar según el hardware */
@@ -73,6 +74,8 @@ static volatile uint64_t   g_t_start_us  = 0;
 static volatile bool       g_debug_mode  = false;
 static          uint32_t   g_debug_count = 0;
 static volatile uint32_t   g_debug_last_us = 0;
+static volatile bool       g_debugHwActive = false;
+static volatile uint32_t   g_debugHwFallUs = 0;
 static          uint8_t    g_pga_code    = 0;
 static          uint8_t    g_pgavdac     = 0;
 static          uint8_t    g_vdac_byte   = 128;
@@ -130,9 +133,23 @@ static inline void debugHardwareStartPulse()
 #if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
     digitalWrite(DEBUG_HW_START_PIN, debugHwActiveLevel());
 #if DEBUG_HW_START_US > 0
-    delayMicroseconds(DEBUG_HW_START_US);
-#endif
+    g_debugHwFallUs = (uint32_t)micros() + (uint32_t)DEBUG_HW_START_US;
+    g_debugHwActive = true;
+#else
     digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
+    g_debugHwActive = false;
+#endif
+#endif
+}
+
+static inline void debugHardwareService()
+{
+#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
+    if (g_debugHwActive &&
+        (int32_t)((uint32_t)micros() - g_debugHwFallUs) >= 0) {
+        digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
+        g_debugHwActive = false;
+    }
 #endif
 }
 
@@ -149,6 +166,7 @@ void IRAM_ATTR onSyncEdge()
     int level = digitalRead(SYNC_IN_PIN);
     digitalWrite(SYNC_TO_PSOC_PIN, level);
     if (level == HIGH && (g_state == ARMED || g_state == WAIT_ARM)) {
+        debugHardwareStartPulse();   /* pulso inmediato: camino HW más rápido que ESP-NOW */
         uint32_t nowUs = (uint32_t)micros();
         g_t_start_us    = (uint64_t)nowUs;
         g_store_fill    = 0;
@@ -230,7 +248,8 @@ static void handleSetConfig(const MsgSetConfig *cfg)
 static void handleDebugNode(const MsgDebugNode *dbg)
 {
     if (dbg->node_id != NODE_ID) return;
-    setDebugMode(dbg->enable != 0);
+    bool enable = (dbg->enable != 0);
+    setDebugMode(enable);
     sendCfgAck(0xA7, 1);
     Serial.printf("[SLAVE] debug_node=%d\n", (int)g_debug_mode);
 }
@@ -251,6 +270,10 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
         Serial.println("[SLAVE] ARMED");
     }
+    else if (cmd == CMD_SCOPE_START && len >= (int)sizeof(MsgScopeStart)) {
+        debugHardwareStartPulse();
+        Serial.println("[SLAVE] SCOPE_START");
+    }
     else if (cmd == CMD_START && len >= (int)sizeof(MsgStart)) {
         const MsgStart *msg = (const MsgStart *)data;
         uint8_t targetNode = msg->target_node & 0x7Fu;
@@ -259,17 +282,18 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 
         uint32_t nowUs = (uint32_t)micros();
         uint32_t startToken = (uint32_t)msg->t_start_us;
-        debugHardwareStartPulse();
         if (probeOnly) {
             sendStartAck(2, startToken, nowUs);
             Serial.printf("[SLAVE] START probe token=%u\n", (unsigned)startToken);
             return;
         }
-        if (g_state != ARMED) {
+        bool startAllowed = (g_state == ARMED || g_state == STOPPED || g_state == WAIT_ARM);
+        if (!startAllowed) {
             sendStartAck(0, startToken, nowUs);
             Serial.printf("[SLAVE] START ignored state=%d\n", (int)g_state);
             return;
         }
+        debugHardwareStartPulse();   /* START real por ESP-NOW */
         /* START por software: usar como fallback si no hay cable GPIO */
         g_t_start_us    = msg->t_start_us;
         g_store_fill    = 0;   /* reset store index para nueva grabación */
@@ -283,9 +307,10 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_state = STOPPED;
         Serial.println("[SLAVE] STOP");
     }
-    else if (cmd == CMD_DEBUG) {
+    else if (cmd == CMD_DEBUG && len >= (int)sizeof(MsgDebug)) {
         const MsgDebug *d = (const MsgDebug *)data;
-        setDebugMode(d->enable != 0);
+        bool enable = (d->enable != 0);
+        setDebugMode(enable);
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, (uint8_t)(g_debug_mode ? 0xDD : 0x00) };
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
         Serial.printf("[SLAVE] debug=%d\n", (int)g_debug_mode);
@@ -414,8 +439,8 @@ void setup()
     }
     esp_now_register_recv_cb(onDataRecv);
 
-    /* GPIO hardware sync */
-    pinMode(SYNC_IN_PIN,      INPUT);
+    /* GPIO hardware sync — pull-down para evitar ISR espurias cuando no hay cable */
+    pinMode(SYNC_IN_PIN,      INPUT_PULLDOWN);
     pinMode(SYNC_TO_PSOC_PIN, OUTPUT);
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
     attachInterrupt(digitalPinToInterrupt(SYNC_IN_PIN), onSyncEdge, CHANGE);
@@ -430,6 +455,8 @@ void setup()
 
 void loop()
 {
+    debugHardwareService();
+
     /* Poll PSoC o generar debug ramp */
     if (g_state == SAMPLING) {
         if (g_debug_mode) {
