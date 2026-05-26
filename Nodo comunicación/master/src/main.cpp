@@ -17,6 +17,7 @@
  * Flags en platformio.ini:
  *   -DHAMMER_IMU_ENABLED=0    0=stub (sin hardware), 1=real (ver hammer_imu.h)
  *   -DNUM_SLAVES=3            cuántos esclavos soportar como máximo
+ *   -DDEBUG_HARDWARE=1        pulso GPIO al emitir CMD_START
  */
 
 #include <Arduino.h>
@@ -47,6 +48,18 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
 #ifndef SAMPLE_PULSE_US
   #define SAMPLE_PULSE_US 2
 #endif
+#ifndef DEBUG_HARDWARE
+  #define DEBUG_HARDWARE 0
+#endif
+#ifndef DEBUG_HW_START_PIN
+  #define DEBUG_HW_START_PIN -1
+#endif
+#ifndef DEBUG_HW_START_IDLE
+  #define DEBUG_HW_START_IDLE LOW
+#endif
+#ifndef DEBUG_HW_START_US
+  #define DEBUG_HW_START_US 10
+#endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
 static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
@@ -68,6 +81,9 @@ static bool        g_streaming   = false;
 static bool        g_espnowReady = false;
 static bool        g_testMode    = false;   /* rampa en stub martillo durante 0xA7 */
 static uint64_t    g_t_start_us  = 0;
+static uint32_t    g_startCmdTxUs = 0;
+static uint32_t    g_startCmdToken = 0;
+static uint8_t     g_startProbeNode = 0;
 static volatile uint32_t g_armAckMask    = 0;
 
 /* ── Store-and-forward (dump request/response) ───────────────────────────── */
@@ -95,11 +111,24 @@ static inline uint8_t samplePulseActiveLevel()
     return (SAMPLE_PULSE_IDLE == LOW) ? HIGH : LOW;
 }
 
+static inline uint8_t debugHwActiveLevel()
+{
+    return (DEBUG_HW_START_IDLE == LOW) ? HIGH : LOW;
+}
+
 static void samplePulseBegin()
 {
 #if SAMPLE_PULSE_PIN >= 0
     pinMode(SAMPLE_PULSE_PIN, OUTPUT);
     digitalWrite(SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE);
+#endif
+}
+
+static void debugHardwareBegin()
+{
+#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
+    pinMode(DEBUG_HW_START_PIN, OUTPUT);
+    digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
 #endif
 }
 
@@ -111,6 +140,17 @@ static inline void samplePulse()
     delayMicroseconds(SAMPLE_PULSE_US);
 #endif
     digitalWrite(SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE);
+#endif
+}
+
+static inline void debugHardwareStartPulse()
+{
+#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
+    digitalWrite(DEBUG_HW_START_PIN, debugHwActiveLevel());
+#if DEBUG_HW_START_US > 0
+    delayMicroseconds(DEBUG_HW_START_US);
+#endif
+    digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
 #endif
 }
 
@@ -169,6 +209,24 @@ static void onHello(const MsgHello &msg)
     matlab.sendHelloNotif(msg.node_id);
 }
 
+static void onStartAck(const MsgStartAck &msg)
+{
+    if (msg.node_id == 0 || msg.node_id > NUM_SLAVES || g_startCmdTxUs == 0) return;
+    if (msg.start_token != g_startCmdToken) {
+        MASTER_LOG_PRINTF("[MASTER] START_ACK stale node=%d token=%u expected=%u\n",
+                          msg.node_id, (unsigned)msg.start_token,
+                          (unsigned)g_startCmdToken);
+        return;
+    }
+    uint32_t rttUs = (uint32_t)((uint32_t)micros() - g_startCmdTxUs);
+    uint32_t tofUs = rttUs / 2U;
+    if (msg.status != 0 || msg.node_id == g_startProbeNode) {
+        matlab.sendStartLatency(msg.node_id, tofUs);
+    }
+    MASTER_LOG_PRINTF("[MASTER] START_ACK node=%d status=%d rtt=%u us tof~=%u us\n",
+                      msg.node_id, msg.status, (unsigned)rttUs, (unsigned)tofUs);
+}
+
 static void requestBatch(uint8_t nodeId, uint16_t seq)
 {
     const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[nodeId - 1])
@@ -177,6 +235,24 @@ static void requestBatch(uint8_t nodeId, uint16_t seq)
     MsgReqBatch msg = { CMD_REQ_BATCH, nodeId, seq };
     if (g_espnowReady) { esp_now_send(dst, (uint8_t *)&msg, sizeof(msg)); }
     MASTER_LOG_PRINTF("[MASTER] REQ_BATCH node=%d seq=%d\n", nodeId, seq);
+}
+
+static void sendStartProbe(uint8_t nodeId)
+{
+    const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[nodeId - 1])
+                       ? SLAVE_MACS[nodeId - 1]
+                       : ESPNOW_BROADCAST;
+    uint64_t t0 = (uint64_t)micros();
+    MsgStart msg = { CMD_START, t0, (uint8_t)(0x80u | nodeId) };
+    g_startProbeNode = nodeId;
+    g_startCmdToken  = (uint32_t)t0;
+    g_startCmdTxUs   = (uint32_t)micros();
+    esp_err_t err = g_espnowReady
+                  ? esp_now_send(dst, (uint8_t *)&msg, sizeof(msg))
+                  : ESP_FAIL;
+    matlab.sendAck(nodeId, 0xAF, err == ESP_OK ? 1 : 0);
+    MASTER_LOG_PRINTF("[MASTER] START_PROBE node=%d token=%u err=%d\n",
+                      nodeId, (unsigned)g_startCmdToken, (int)err);
 }
 
 /* ── Comando dirigido a un esclavo específico ────────────────────────────── */
@@ -189,6 +265,11 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
     }
     if (!g_espnowReady) {
         matlab.sendAck(node_id, sub_cmd, 0);
+        return;
+    }
+
+    if (sub_cmd == 0xAF) {
+        sendStartProbe(node_id);
         return;
     }
 
@@ -228,10 +309,14 @@ static void broadcastArm()
 static void broadcastStart()
 {
     g_t_start_us = (uint64_t)micros();
+    g_startProbeNode = 0;
+    g_startCmdToken = (uint32_t)g_t_start_us;
     /* GPIO primero — flanco hardware llega a los PSoC antes que el ESP-NOW */
     digitalWrite(SYNC_OUT_PIN, HIGH);
-    MsgStart msg = { CMD_START, g_t_start_us };
+    debugHardwareStartPulse();
+    MsgStart msg = { CMD_START, g_t_start_us, 0 };
     if (g_espnowReady) {
+        g_startCmdTxUs = (uint32_t)micros();
         esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] START t0=%llu\n", g_t_start_us);
@@ -382,8 +467,12 @@ void setup()
     matlab.begin();
     MASTER_LOG_PRINTLN("[MASTER] boot");
     samplePulseBegin();
+    debugHardwareBegin();
     MASTER_LOG_PRINTF("[SCOPE] sample pulse pin=%d idle=%d us=%d\n",
                       SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE, SAMPLE_PULSE_US);
+    MASTER_LOG_PRINTF("[SCOPE] debugHardware=%d start pin=%d idle=%d us=%d\n",
+                      DEBUG_HARDWARE, DEBUG_HW_START_PIN,
+                      DEBUG_HW_START_IDLE, DEBUG_HW_START_US);
 
     /* WiFi AP_STA — AP_STA es necesario para que los action frames de ESP-NOW
      * sean compatibles con esclavos ESP8266 en modo STA no conectado.
@@ -397,7 +486,7 @@ void setup()
                       WiFi.softAPmacAddress().c_str(), WiFi.softAPChannel());
 
     /* ESP-NOW (convive con AP mode) */
-    if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck, onHello)) {
+    if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck, onHello, onStartAck)) {
         MASTER_LOG_PRINTLN("[MASTER] ESP-NOW FAIL - USB test continues");
     } else {
         g_espnowReady = true;

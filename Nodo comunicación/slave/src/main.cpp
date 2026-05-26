@@ -41,6 +41,18 @@
 #ifndef SAMPLE_PULSE_US
   #define SAMPLE_PULSE_US 2
 #endif
+#ifndef DEBUG_HARDWARE
+  #define DEBUG_HARDWARE 0
+#endif
+#ifndef DEBUG_HW_START_PIN
+  #define DEBUG_HW_START_PIN -1
+#endif
+#ifndef DEBUG_HW_START_IDLE
+  #define DEBUG_HW_START_IDLE LOW
+#endif
+#ifndef DEBUG_HW_START_US
+  #define DEBUG_HW_START_US 10
+#endif
 
 /* MAC del ESP maestro — cambiar según el hardware */
 static const uint8_t MASTER_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -81,11 +93,24 @@ static inline uint8_t samplePulseActiveLevel()
     return (SAMPLE_PULSE_IDLE == LOW) ? HIGH : LOW;
 }
 
+static inline uint8_t debugHwActiveLevel()
+{
+    return (DEBUG_HW_START_IDLE == LOW) ? HIGH : LOW;
+}
+
 static void samplePulseBegin()
 {
 #if SAMPLE_PULSE_PIN >= 0
     pinMode(SAMPLE_PULSE_PIN, OUTPUT);
     digitalWrite(SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE);
+#endif
+}
+
+static void debugHardwareBegin()
+{
+#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
+    pinMode(DEBUG_HW_START_PIN, OUTPUT);
+    digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
 #endif
 }
 
@@ -97,6 +122,17 @@ static inline void samplePulse()
     delayMicroseconds(SAMPLE_PULSE_US);
 #endif
     digitalWrite(SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE);
+#endif
+}
+
+static inline void debugHardwareStartPulse()
+{
+#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
+    digitalWrite(DEBUG_HW_START_PIN, debugHwActiveLevel());
+#if DEBUG_HW_START_US > 0
+    delayMicroseconds(DEBUG_HW_START_US);
+#endif
+    digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
 #endif
 }
 
@@ -133,6 +169,12 @@ static void handleReqBatch(const MsgReqBatch *msg);
 static void sendCfgAck(uint8_t sub_cmd, uint8_t ok)
 {
     MsgCfgAck ack = { CMD_CFG_ACK, NODE_ID, sub_cmd, ok };
+    espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+}
+
+static void sendStartAck(uint8_t status, uint32_t startToken, uint32_t rxUs)
+{
+    MsgStartAck ack = { CMD_START_ACK, NODE_ID, status, startToken, rxUs };
     espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
 }
 
@@ -209,15 +251,32 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
         Serial.println("[SLAVE] ARMED");
     }
-    else if (cmd == CMD_START && g_state == ARMED) {
-        /* START por software: usar como fallback si no hay cable GPIO */
+    else if (cmd == CMD_START && len >= (int)sizeof(MsgStart)) {
         const MsgStart *msg = (const MsgStart *)data;
+        uint8_t targetNode = msg->target_node & 0x7Fu;
+        bool probeOnly = (msg->target_node & 0x80u) != 0;
+        if (targetNode != 0 && targetNode != NODE_ID) return;
+
         uint32_t nowUs = (uint32_t)micros();
+        uint32_t startToken = (uint32_t)msg->t_start_us;
+        debugHardwareStartPulse();
+        if (probeOnly) {
+            sendStartAck(2, startToken, nowUs);
+            Serial.printf("[SLAVE] START probe token=%u\n", (unsigned)startToken);
+            return;
+        }
+        if (g_state != ARMED) {
+            sendStartAck(0, startToken, nowUs);
+            Serial.printf("[SLAVE] START ignored state=%d\n", (int)g_state);
+            return;
+        }
+        /* START por software: usar como fallback si no hay cable GPIO */
         g_t_start_us    = msg->t_start_us;
         g_store_fill    = 0;   /* reset store index para nueva grabación */
         g_debug_count   = 0;
         g_debug_last_us = nowUs;
         g_state = SAMPLING;
+        sendStartAck(1, startToken, nowUs);
         Serial.printf("[SLAVE] START(SW) t0=%llu\n", (unsigned long long)g_t_start_us);
     }
     else if (cmd == CMD_STOP) {
@@ -324,8 +383,12 @@ void setup()
     Serial.begin(115200);
     Serial.printf("[SLAVE %d] boot\n", NODE_ID);
     samplePulseBegin();
+    debugHardwareBegin();
     Serial.printf("[SCOPE] sample pulse pin=%d idle=%d us=%d\n",
                   SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE, SAMPLE_PULSE_US);
+    Serial.printf("[SCOPE] debugHardware=%d start pin=%d idle=%d us=%d\n",
+                  DEBUG_HARDWARE, DEBUG_HW_START_PIN,
+                  DEBUG_HW_START_IDLE, DEBUG_HW_START_US);
 
 #if defined(ESP8266)
     /* Modo AP oculto en canal 1: evita el background scanning que hace el

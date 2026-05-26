@@ -27,7 +27,8 @@
  * Protocolo TX (6 bytes por paquete):
  *   [0x56][node_id][type][b2][b1][b0]
  *   node_id : 0x00 = maestro (martillo), 0x01-0x0N = esclavos
- *   type    : 0x00 dato, 0x01 heartbeat, 0x07 ACK, 0xFE ready (n_nodes)
+ *   type    : 0x00 dato, 0x01 heartbeat, 0x07 ACK, 0xFC START RTT/2 us,
+ *             0xFE ready (n_nodes)
  */
 
 #include <Arduino.h>
@@ -50,6 +51,7 @@ public:
     void sendHeartbeat(uint8_t nodeId, uint8_t pga, uint8_t vdac, uint8_t mode);
     void sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val);
     void sendReady(uint8_t nNodes);
+    void sendStartLatency(uint8_t nodeId, uint32_t tofUs);
     /* Diagnóstico: estado ESP-NOW del maestro al arrancar */
     void sendStatus(uint8_t espnow_ok, uint8_t ap_ch);
     /* Diagnóstico: maestro recibió HELLO de un esclavo */
@@ -158,6 +160,12 @@ inline void MatlabTransport::sendReady(uint8_t nNodes)
 {
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, 0xFF, 0xFE, nNodes, 0x00, 0x00 };
     Serial.write(pkt, 6);
+}
+
+inline void MatlabTransport::sendStartLatency(uint8_t nodeId, uint32_t tofUs)
+{
+    if (tofUs > 0xFFFFFFu) tofUs = 0xFFFFFFu;
+    _write6(nodeId, 0xFC, (int32_t)tofUs);
 }
 
 inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)

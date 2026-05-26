@@ -11,6 +11,7 @@
 #define CMD_START      0x12
 #define CMD_STOP       0x13
 #define CMD_DEBUG      0x14   /* broadcast debug ramp — todos los esclavos */
+#define CMD_START_ACK  0x15   /* esclavo → maestro: recibió CMD_START */
 #define CMD_DATA       0x20
 #define CMD_SET_CONFIG 0x21   /* maestro → esclavo unicast: configurar parámetro */
 #define CMD_CFG_ACK    0x22   /* esclavo → maestro: confirmación de config */
@@ -24,7 +25,14 @@
 
 struct MsgArm    { uint8_t cmd; };
 struct MsgArmAck { uint8_t cmd; uint8_t node_id; uint8_t status; };
-struct MsgStart  { uint8_t cmd; uint64_t t_start_us; };
+struct MsgStart  { uint8_t cmd; uint64_t t_start_us; uint8_t target_node; };
+struct MsgStartAck {
+    uint8_t  cmd;
+    uint8_t  node_id;
+    uint8_t  status;       /* 0=ignorado, 1=start real, 2=probe */
+    uint32_t start_token;  /* low32(t_start_us), para asociar ACK con envío */
+    uint32_t rx_us;
+};
 struct MsgStop   { uint8_t cmd; };
 struct MsgDebug  { uint8_t cmd; uint8_t enable; };
 
