@@ -60,6 +60,7 @@ static volatile SlaveState g_state       = WAIT_ARM;
 static volatile uint64_t   g_t_start_us  = 0;
 static volatile bool       g_debug_mode  = false;
 static          uint32_t   g_debug_count = 0;
+static volatile uint32_t   g_debug_last_us = 0;
 static          uint8_t    g_pga_code    = 0;
 static          uint8_t    g_pgavdac     = 0;
 static          uint8_t    g_vdac_byte   = 128;
@@ -112,7 +113,11 @@ void IRAM_ATTR onSyncEdge()
     int level = digitalRead(SYNC_IN_PIN);
     digitalWrite(SYNC_TO_PSOC_PIN, level);
     if (level == HIGH && (g_state == ARMED || g_state == WAIT_ARM)) {
-        g_t_start_us = (uint64_t)micros();
+        uint32_t nowUs = (uint32_t)micros();
+        g_t_start_us    = (uint64_t)nowUs;
+        g_store_fill    = 0;
+        g_debug_count   = 0;
+        g_debug_last_us = nowUs;
         g_state = SAMPLING;
     } else if (level == LOW && g_state == SAMPLING) {
         g_state = STOPPED;
@@ -135,13 +140,20 @@ static void setDebugMode(bool enable)
 {
     g_debug_mode = enable;
     g_debug_count = 0;
+    g_debug_last_us = (uint32_t)micros();
     if (enable) {
         g_store_fill  = 0;   /* reset store index para que cada test/debug empiece desde 0 */
-        g_t_start_us  = (uint64_t)micros();
-        g_state = SAMPLING;
+        if (g_rec_n_batches == 0) {
+            /* Modo streaming/test: A7 arranca la rampa inmediatamente. */
+            g_t_start_us = (uint64_t)g_debug_last_us;
+            g_state = SAMPLING;
+        } else if (g_state == WAIT_ARM || g_state == STOPPED) {
+            /* Store-and-forward: A7 solo selecciona debug; START/SYNC arranca. */
+            g_state = ARMED;
+        }
     } else if (g_state == SAMPLING) {
         g_state = STOPPED;
-    } else {
+    } else if (g_rec_n_batches == 0) {
         g_state = WAIT_ARM;
     }
 }
@@ -200,9 +212,11 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     else if (cmd == CMD_START && g_state == ARMED) {
         /* START por software: usar como fallback si no hay cable GPIO */
         const MsgStart *msg = (const MsgStart *)data;
-        g_t_start_us  = msg->t_start_us;
-        g_store_fill  = 0;   /* reset store index para nueva grabación */
-        g_debug_count = 0;
+        uint32_t nowUs = (uint32_t)micros();
+        g_t_start_us    = msg->t_start_us;
+        g_store_fill    = 0;   /* reset store index para nueva grabación */
+        g_debug_count   = 0;
+        g_debug_last_us = nowUs;
         g_state = SAMPLING;
         Serial.printf("[SLAVE] START(SW) t0=%llu\n", (unsigned long long)g_t_start_us);
     }
@@ -357,9 +371,9 @@ void loop()
     if (g_state == SAMPLING) {
         if (g_debug_mode) {
             /* Generar batch falso a 29412 µs (30 muestras @ 1020 Hz) */
-            static uint32_t lastDebugUs = 0;
-            if ((uint32_t)micros() - lastDebugUs >= 29412) {
-                lastDebugUs += 29412;
+            uint32_t nowUs = (uint32_t)micros();
+            if ((uint32_t)(nowUs - g_debug_last_us) >= 29412) {
+                g_debug_last_us += 29412;
                 PsocBatch fake = {};
                 fake.seq         = (uint16_t)(g_debug_count / SPI_BATCH_SAMPLES);
                 fake.n_samples   = SPI_BATCH_SAMPLES;

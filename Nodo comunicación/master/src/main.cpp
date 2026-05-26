@@ -251,7 +251,16 @@ static void broadcastStop()
 
 static void onBatchReady(const ReassembledBatch &batch)
 {
-    if (!g_streaming && g_state != DUMPING) return;
+    if (g_state == DUMPING) {
+        if (batch.node_id != g_dumpSlaveIdx || batch.seq != g_dumpBatchSeq) {
+            MASTER_LOG_PRINTF("[MASTER] DUMP ignore node=%d seq=%d expected node=%d seq=%d\n",
+                              batch.node_id, batch.seq,
+                              g_dumpSlaveIdx, g_dumpBatchSeq);
+            return;
+        }
+    } else if (!g_streaming) {
+        return;
+    }
 
     /* Reenviar las 30 muestras (post_digital) al MATLAB */
     for (int i = 0; i < SAMPLES_PER_PART * 2; i++) {
@@ -265,9 +274,7 @@ static void onBatchReady(const ReassembledBatch &batch)
     }
 
     /* Durante dump: marcar batch como recibido si es el que esperábamos */
-    if (g_state == DUMPING
-        && batch.node_id == g_dumpSlaveIdx
-        && batch.seq     == g_dumpBatchSeq) {
+    if (g_state == DUMPING) {
         g_dumpBatchRx = true;
     }
 }
@@ -332,9 +339,14 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
                 g_hammerCount = 0;
                 g_testMode    = true;
                 g_streaming   = true;
-                g_state       = RUNNING;
-                g_t_start_us  = (uint64_t)micros();
-                digitalWrite(SYNC_OUT_PIN, HIGH);
+                if (g_rec_n_batches > 0 && (g_state == ARMED || g_state == ARMING)) {
+                    /* Store-and-forward: A7 solo prepara la rampa.
+                       A3/START debe conservar el estado ARMED y disparar SYNC. */
+                } else {
+                    g_state      = RUNNING;
+                    g_t_start_us = (uint64_t)micros();
+                    digitalWrite(SYNC_OUT_PIN, HIGH);
+                }
             } else {
                 g_testMode  = false;
                 g_streaming = false;

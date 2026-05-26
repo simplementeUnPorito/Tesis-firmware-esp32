@@ -20,6 +20,7 @@ struct ReassembledBatch {
     uint8_t     global_flags;
     uint64_t    timestamp_us;
     SampleBytes samples[SAMPLES_PER_PART * 2];  /* 30 muestras */
+    bool        active;
     bool        part_rx[2];
     bool        complete() const { return part_rx[0] && part_rx[1]; }
 };
@@ -123,9 +124,11 @@ inline void EspNowRx::_handleData(const MsgData *msg)
 
     ReassembledBatch &buf = _bufs[nid];
 
-    /* Reset si es nuevo seq */
-    if (buf.seq != msg->seq) {
+    /* Reset si es un batch nuevo. Importante: seq puede ser 0, igual que
+       el valor por defecto del buffer limpio, asi que no alcanza con seq. */
+    if (!buf.active || buf.node_id != nid || buf.seq != msg->seq) {
         buf = {};
+        buf.active       = true;
         buf.node_id      = nid;
         buf.seq          = msg->seq;
         buf.timestamp_us = msg->timestamp_us;
