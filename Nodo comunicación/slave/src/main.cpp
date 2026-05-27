@@ -10,7 +10,8 @@
  *
  * Estados:
  *   WAIT_ARM  → espera CMD_ARM del maestro
- *   ARMED     → envía CMD_ARM_ACK, espera CMD_START
+ *   ARMED     → envia CMD_ARM_ACK, espera PRESTART
+ *   HOT_WAIT  → PRESTART recibido; no hace nada salvo esperar START/consulta
  *   SAMPLING  → lee PSoC y envía batches
  *   STOPPED   → vuelve a WAIT_ARM al recibir CMD_STOP
  */
@@ -54,6 +55,17 @@
 #ifndef DEBUG_HW_START_US
   #define DEBUG_HW_START_US SCOPE_START_PULSE_US
 #endif
+#ifndef DEBUG_COM
+  #define DEBUG_COM 1
+#endif
+
+#if DEBUG_COM
+  #define SLAVE_LOG_PRINTLN(...) Serial.println(__VA_ARGS__)
+  #define SLAVE_LOG_PRINTF(...)  Serial.printf(__VA_ARGS__)
+#else
+  #define SLAVE_LOG_PRINTLN(...) do {} while (0)
+  #define SLAVE_LOG_PRINTF(...)  do {} while (0)
+#endif
 
 /* MAC del ESP maestro — cambiar según el hardware */
 static const uint8_t MASTER_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -68,7 +80,7 @@ static const uint8_t MASTER_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 #endif
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
-enum SlaveState { WAIT_ARM, ARMED, SAMPLING, STOPPED };
+enum SlaveState { WAIT_ARM, ARMED, HOT_WAIT, SAMPLING, STOPPED };
 static volatile SlaveState g_state       = WAIT_ARM;
 static volatile uint64_t   g_t_start_us  = 0;
 static volatile bool       g_debug_mode  = false;
@@ -164,8 +176,8 @@ static void pulseSampleCount(uint8_t n)
 void IRAM_ATTR onSyncEdge()
 {
     int level = digitalRead(SYNC_IN_PIN);
-    digitalWrite(SYNC_TO_PSOC_PIN, level);
-    if (level == HIGH && (g_state == ARMED || g_state == WAIT_ARM)) {
+    if (level == HIGH && g_state == HOT_WAIT) {
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
         debugHardwareStartPulse();   /* pulso inmediato: camino HW más rápido que ESP-NOW */
         uint32_t nowUs = (uint32_t)micros();
         g_t_start_us    = (uint64_t)nowUs;
@@ -174,7 +186,10 @@ void IRAM_ATTR onSyncEdge()
         g_debug_last_us = nowUs;
         g_state = SAMPLING;
     } else if (level == LOW && g_state == SAMPLING) {
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_state = STOPPED;
+    } else if (g_state != SAMPLING) {
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
     }
 }
 
@@ -196,6 +211,35 @@ static void sendStartAck(uint8_t status, uint32_t startToken, uint32_t rxUs)
     espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
 }
 
+static bool storeReadyForHotWait()
+{
+    return (g_rec_n_batches == 0) || (g_store_buf != nullptr && g_store_ts_us != nullptr);
+}
+
+static void enterHotWait(uint16_t n_batches)
+{
+    allocStore(n_batches);
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    g_t_start_us    = 0;
+    g_store_fill    = 0;
+    g_debug_count   = 0;
+    g_debug_last_us = (uint32_t)micros();
+    g_state = HOT_WAIT;
+    SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT n=%u ready=%u\n",
+                     n_batches, (unsigned)storeReadyForHotWait());
+}
+
+static void sendHotWaitAck()
+{
+    uint8_t ok = (g_state == HOT_WAIT && storeReadyForHotWait()) ? 1 : 0;
+    MsgHotWaitAck ack = {
+        CMD_HOTWAIT_ACK, NODE_ID, ok, (uint8_t)g_state, g_rec_n_batches
+    };
+    espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+    SLAVE_LOG_PRINTF("[SLAVE] HOTWAIT_ACK ok=%u state=%u n=%u\n",
+                     ok, (unsigned)g_state, g_rec_n_batches);
+}
+
 static void setDebugMode(bool enable)
 {
     g_debug_mode = enable;
@@ -203,7 +247,7 @@ static void setDebugMode(bool enable)
     g_debug_last_us = (uint32_t)micros();
     if (enable) {
         g_store_fill  = 0;   /* reset store index para que cada test/debug empiece desde 0 */
-        if (g_rec_n_batches == 0) {
+        if (g_rec_n_batches == 0 && g_state != HOT_WAIT) {
             /* Modo streaming/test: A7 arranca la rampa inmediatamente. */
             g_t_start_us = (uint64_t)g_debug_last_us;
             g_state = SAMPLING;
@@ -213,7 +257,7 @@ static void setDebugMode(bool enable)
         }
     } else if (g_state == SAMPLING) {
         g_state = STOPPED;
-    } else if (g_rec_n_batches == 0) {
+    } else if (g_rec_n_batches == 0 && g_state != HOT_WAIT) {
         g_state = WAIT_ARM;
     }
 }
@@ -241,8 +285,8 @@ static void handleSetConfig(const MsgSetConfig *cfg)
             break;
     }
     sendCfgAck(cfg->sub_cmd, ok);
-    Serial.printf("[SLAVE] cfg sub=0x%02X p=%u ok=%u\n",
-                  cfg->sub_cmd, cfg->param, ok);
+    SLAVE_LOG_PRINTF("[SLAVE] cfg sub=0x%02X p=%u ok=%u\n",
+                     cfg->sub_cmd, cfg->param, ok);
 }
 
 static void handleDebugNode(const MsgDebugNode *dbg)
@@ -251,7 +295,7 @@ static void handleDebugNode(const MsgDebugNode *dbg)
     bool enable = (dbg->enable != 0);
     setDebugMode(enable);
     sendCfgAck(0xA7, 1);
-    Serial.printf("[SLAVE] debug_node=%d\n", (int)g_debug_mode);
+    SLAVE_LOG_PRINTF("[SLAVE] debug_node=%d\n", (int)g_debug_mode);
 }
 
 #if defined(ESP8266)
@@ -264,15 +308,32 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     if (len < 1) return;
     uint8_t cmd = data[0];
 
-    if (cmd == CMD_ARM && (g_state == WAIT_ARM || g_state == ARMED || g_state == STOPPED)) {
+    if (cmd == CMD_ARM &&
+        (g_state == WAIT_ARM || g_state == ARMED || g_state == HOT_WAIT || g_state == STOPPED)) {
         g_state = ARMED;
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, 0 };
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
-        Serial.println("[SLAVE] ARMED");
+        SLAVE_LOG_PRINTLN("[SLAVE] ARMED");
+    }
+    else if (cmd == CMD_PRESTART && len >= (int)sizeof(MsgPrestart)) {
+        const MsgPrestart *msg = (const MsgPrestart *)data;
+        enterHotWait(msg->n_batches);
+    }
+    else if (cmd == CMD_HOTWAIT_QUERY && len >= (int)sizeof(MsgHotWaitQuery)) {
+        const MsgHotWaitQuery *msg = (const MsgHotWaitQuery *)data;
+        if (msg->node_id == NODE_ID) {
+            sendHotWaitAck();
+        }
     }
     else if (cmd == CMD_SCOPE_START && len >= (int)sizeof(MsgScopeStart)) {
-        debugHardwareStartPulse();
-        Serial.println("[SLAVE] SCOPE_START");
+        if (g_state == HOT_WAIT && storeReadyForHotWait()) {
+            debugHardwareStartPulse();
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+            SLAVE_LOG_PRINTLN("[SLAVE] SCOPE_START");
+        } else {
+            SLAVE_LOG_PRINTF("[SLAVE] SCOPE_START ignored state=%d ready=%u\n",
+                             (int)g_state, (unsigned)storeReadyForHotWait());
+        }
     }
     else if (cmd == CMD_START && len >= (int)sizeof(MsgStart)) {
         const MsgStart *msg = (const MsgStart *)data;
@@ -283,17 +344,27 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         uint32_t nowUs = (uint32_t)micros();
         uint32_t startToken = (uint32_t)msg->t_start_us;
         if (probeOnly) {
-            sendStartAck(2, startToken, nowUs);
-            Serial.printf("[SLAVE] START probe token=%u\n", (unsigned)startToken);
+            sendStartAck((g_state == HOT_WAIT && storeReadyForHotWait()) ? 2 : 0,
+                         startToken, nowUs);
+            SLAVE_LOG_PRINTF("[SLAVE] START probe token=%u state=%d\n",
+                             (unsigned)startToken, (int)g_state);
             return;
         }
-        bool startAllowed = (g_state == ARMED || g_state == STOPPED || g_state == WAIT_ARM);
+        if (g_state == SAMPLING) {
+            sendStartAck(1, startToken, nowUs);
+            SLAVE_LOG_PRINTF("[SLAVE] START already sampling token=%u\n",
+                             (unsigned)startToken);
+            return;
+        }
+        bool startAllowed = (g_state == HOT_WAIT && storeReadyForHotWait());
         if (!startAllowed) {
             sendStartAck(0, startToken, nowUs);
-            Serial.printf("[SLAVE] START ignored state=%d\n", (int)g_state);
+            SLAVE_LOG_PRINTF("[SLAVE] START ignored state=%d ready=%u\n",
+                             (int)g_state, (unsigned)storeReadyForHotWait());
             return;
         }
         debugHardwareStartPulse();   /* START real por ESP-NOW */
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
         /* START por software: usar como fallback si no hay cable GPIO */
         g_t_start_us    = msg->t_start_us;
         g_store_fill    = 0;   /* reset store index para nueva grabación */
@@ -301,11 +372,12 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_debug_last_us = nowUs;
         g_state = SAMPLING;
         sendStartAck(1, startToken, nowUs);
-        Serial.printf("[SLAVE] START(SW) t0=%llu\n", (unsigned long long)g_t_start_us);
+        SLAVE_LOG_PRINTF("[SLAVE] START(SW) t0=%llu\n", (unsigned long long)g_t_start_us);
     }
     else if (cmd == CMD_STOP) {
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_state = STOPPED;
-        Serial.println("[SLAVE] STOP");
+        SLAVE_LOG_PRINTLN("[SLAVE] STOP");
     }
     else if (cmd == CMD_DEBUG && len >= (int)sizeof(MsgDebug)) {
         const MsgDebug *d = (const MsgDebug *)data;
@@ -313,7 +385,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         setDebugMode(enable);
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, (uint8_t)(g_debug_mode ? 0xDD : 0x00) };
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
-        Serial.printf("[SLAVE] debug=%d\n", (int)g_debug_mode);
+        SLAVE_LOG_PRINTF("[SLAVE] debug=%d\n", (int)g_debug_mode);
     }
     else if (cmd == CMD_SET_CONFIG && len >= (int)sizeof(MsgSetConfig)) {
         handleSetConfig((const MsgSetConfig *)data);
@@ -326,7 +398,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         allocStore(msg->n_batches);
         /* Confirmar al maestro que el buffer está listo */
         MsgCfgAck ack = { CMD_CFG_ACK, NODE_ID, CMD_SET_RECLEN,
-                          (uint8_t)(g_store_buf ? 1 : 0) };
+                          (uint8_t)((msg->n_batches == 0 || storeReadyForHotWait()) ? 1 : 0) };
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
     }
     else if (cmd == CMD_REQ_BATCH && len >= (int)sizeof(MsgReqBatch)) {
@@ -346,7 +418,14 @@ static void allocStore(uint16_t n_batches)
     if (n_batches == 0) return;
     g_store_buf   = (SampleBytes *)malloc((size_t)n_batches * SPI_BATCH_SAMPLES * sizeof(SampleBytes));
     g_store_ts_us = (uint32_t    *)malloc((size_t)n_batches * sizeof(uint32_t));
-    Serial.printf("[SLAVE] store alloc n=%u buf=%s\n", n_batches, g_store_buf ? "OK" : "FAIL");
+    if (!g_store_buf || !g_store_ts_us) {
+        free(g_store_buf);
+        free(g_store_ts_us);
+        g_store_buf = nullptr;
+        g_store_ts_us = nullptr;
+    }
+    SLAVE_LOG_PRINTF("[SLAVE] store alloc n=%u buf=%s\n",
+                     n_batches, storeReadyForHotWait() ? "OK" : "FAIL");
 }
 
 static void handleReqBatch(const MsgReqBatch *msg)
@@ -354,8 +433,10 @@ static void handleReqBatch(const MsgReqBatch *msg)
     if (msg->node_id != NODE_ID) return;
     uint16_t seq = msg->batch_seq;
     if (seq >= g_store_fill || !g_store_buf) {
-        /* Batch fuera de rango: el master sabe cuántos hay, ignorar */
-        Serial.printf("[SLAVE] REQ_BATCH seq=%u fuera de rango fill=%u\n", seq, g_store_fill);
+        /* Batch fuera de rango: notificar al master para que avance sin esperar timeout */
+        MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
+        espnowSend(MASTER_MAC, (const uint8_t *)&nack, sizeof(nack));
+        SLAVE_LOG_PRINTF("[SLAVE] REQ_BATCH NACK seq=%u fill=%u\n", seq, g_store_fill);
         return;
     }
     const SampleBytes *s  = &g_store_buf[(size_t)seq * SPI_BATCH_SAMPLES];
@@ -393,7 +474,8 @@ static void onBatch(const PsocBatch &batch)
         g_store_fill++;
         if (g_store_fill >= g_rec_n_batches) {
             g_state = STOPPED;
-            Serial.printf("[SLAVE] FULL → STOPPED (%u batches)\n", g_store_fill);
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+            SLAVE_LOG_PRINTF("[SLAVE] FULL -> STOPPED (%u batches)\n", g_store_fill);
         }
     } else if (!g_store_buf) {
         /* Modo clásico sin store: enviar en tiempo real */
@@ -405,15 +487,17 @@ static void onBatch(const PsocBatch &batch)
 
 void setup()
 {
+#if DEBUG_COM
     Serial.begin(115200);
-    Serial.printf("[SLAVE %d] boot\n", NODE_ID);
+#endif
+    SLAVE_LOG_PRINTF("[SLAVE %d] boot\n", NODE_ID);
     samplePulseBegin();
     debugHardwareBegin();
-    Serial.printf("[SCOPE] sample pulse pin=%d idle=%d us=%d\n",
-                  SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE, SAMPLE_PULSE_US);
-    Serial.printf("[SCOPE] debugHardware=%d start pin=%d idle=%d us=%d\n",
-                  DEBUG_HARDWARE, DEBUG_HW_START_PIN,
-                  DEBUG_HW_START_IDLE, DEBUG_HW_START_US);
+    SLAVE_LOG_PRINTF("[SCOPE] sample pulse pin=%d idle=%d us=%d\n",
+                     SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE, SAMPLE_PULSE_US);
+    SLAVE_LOG_PRINTF("[SCOPE] debugHardware=%d start pin=%d idle=%d us=%d\n",
+                     DEBUG_HARDWARE, DEBUG_HW_START_PIN,
+                     DEBUG_HW_START_IDLE, DEBUG_HW_START_US);
 
 #if defined(ESP8266)
     /* Modo AP oculto en canal 1: evita el background scanning que hace el
@@ -422,19 +506,19 @@ void setup()
     WiFi.mode(WIFI_AP);
     WiFi.softAP("GeoSlave", "", 1, 1);   /* ssid, pass vacío, canal 1, oculto */
     delay(100);
-    Serial.printf("[SLAVE] MAC: %s  ch=%d (AP-fixed)\n",
-                  WiFi.macAddress().c_str(), wifi_get_channel());
+    SLAVE_LOG_PRINTF("[SLAVE] MAC: %s  ch=%d (AP-fixed)\n",
+                     WiFi.macAddress().c_str(), wifi_get_channel());
 #else
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(100);
-    Serial.printf("[SLAVE] MAC: %s  ch=%d\n",
-                  WiFi.macAddress().c_str(), WiFi.channel());
+    SLAVE_LOG_PRINTF("[SLAVE] MAC: %s  ch=%d\n",
+                     WiFi.macAddress().c_str(), WiFi.channel());
 #endif
 
     /* ESP-NOW */
     if (!transport.begin(MASTER_MAC)) {
-        Serial.println("[SLAVE] ESP-NOW FAIL — halt");
+        SLAVE_LOG_PRINTLN("[SLAVE] ESP-NOW FAIL - halt");
         while (true) { delay(1000); }
     }
     esp_now_register_recv_cb(onDataRecv);
@@ -448,7 +532,7 @@ void setup()
     /* SPI → PSoC */
     psoc.begin(onBatch);
 
-    Serial.printf("[SLAVE %d] listo, esperando ARM\n", NODE_ID);
+    SLAVE_LOG_PRINTF("[SLAVE %d] listo, esperando ARM\n", NODE_ID);
 }
 
 /* ── Loop ────────────────────────────────────────────────────────────────── */
@@ -488,7 +572,7 @@ void loop()
      * a WAIT_ARM cuando recibe un CMD_ARM nuevo. */
     if (g_state == STOPPED && g_rec_n_batches == 0) {
         g_state = WAIT_ARM;
-        Serial.printf("[SLAVE %d] volviendo a WAIT_ARM\n", NODE_ID);
+        SLAVE_LOG_PRINTF("[SLAVE %d] volviendo a WAIT_ARM\n", NODE_ID);
     }
 
     /* HELLO beacon cada 2 s en WAIT_ARM — diagnóstico de ESP-NOW bidireccional */
@@ -497,13 +581,13 @@ void loop()
         lastHelloMs = millis();
         MsgHello h = { CMD_HELLO, NODE_ID };
         esp_err_t err = espnowSend(MASTER_MAC, (const uint8_t *)&h, sizeof(h));
-        Serial.printf("[SLAVE] HELLO tx err=%d txOK=%u txFail=%u\n",
-                      (int)err, transport.sentOK(), transport.sentFail());
+        SLAVE_LOG_PRINTF("[SLAVE] HELLO tx err=%d txOK=%u txFail=%u\n",
+                         (int)err, transport.sentOK(), transport.sentFail());
     }
 
     /* Informe de estado cada 10 s */
     static uint32_t last_status = 0;
-    if (millis() - last_status > 10000) {
+    if (g_state != HOT_WAIT && millis() - last_status > 10000) {
         last_status = millis();
         MsgStatus st = {
             CMD_STATUS, NODE_ID,
@@ -511,10 +595,10 @@ void loop()
             transport.sentOK(), transport.sentFail()
         };
         espnowSend(MASTER_MAC, (const uint8_t *)&st, sizeof(st));
-        Serial.printf("[SLAVE %d] bOK=%u bBad=%u txOK=%u txFail=%u state=%d\n",
-                      NODE_ID,
-                      psoc.batchesOK(), psoc.batchesBad(),
-                      transport.sentOK(), transport.sentFail(),
-                      (int)g_state);
+        SLAVE_LOG_PRINTF("[SLAVE %d] bOK=%u bBad=%u txOK=%u txFail=%u state=%d\n",
+                         NODE_ID,
+                         psoc.batchesOK(), psoc.batchesBad(),
+                         transport.sentOK(), transport.sentFail(),
+                         (int)g_state);
     }
 }

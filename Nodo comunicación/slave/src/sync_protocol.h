@@ -24,6 +24,9 @@
 #define CMD_SET_RECLEN 0x50   /* master → todos: cuántos batches grabar (respuesta: CMD_CFG_ACK sub=0x50) */
 #define CMD_REQ_BATCH  0x51   /* master → esclavo: pedir batch específico (respuesta: 2× MsgData) */
 #define CMD_SCOPE_START 0x60  /* master → esclavos: pulso START falso, sin muestreo ni ACK */
+#define CMD_PRESTART    0x61  /* master → todos: entrar en HOT_WAIT con n_batches listo */
+#define CMD_HOTWAIT_QUERY 0x62 /* master → esclavo: consultar si está en HOT_WAIT */
+#define CMD_HOTWAIT_ACK 0x63  /* esclavo → master: confirma HOT_WAIT */
 
 #pragma pack(push, 1)
 
@@ -129,6 +132,24 @@ struct MsgReqBatch {
 
 struct MsgScopeStart {
     uint8_t cmd;        /* CMD_SCOPE_START */
+};
+
+struct MsgPrestart {
+    uint8_t  cmd;       /* CMD_PRESTART */
+    uint16_t n_batches;
+};
+
+struct MsgHotWaitQuery {
+    uint8_t cmd;        /* CMD_HOTWAIT_QUERY */
+    uint8_t node_id;
+};
+
+struct MsgHotWaitAck {
+    uint8_t  cmd;       /* CMD_HOTWAIT_ACK */
+    uint8_t  node_id;
+    uint8_t  ok;        /* 1=HOT_WAIT listo, 0=no listo */
+    uint8_t  state;
+    uint16_t n_batches;
 };
 
 #pragma pack(pop)

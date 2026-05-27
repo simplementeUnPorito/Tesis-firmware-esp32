@@ -11,6 +11,18 @@
 #include "sync_protocol.h"
 #include "espnow_compat.h"
 
+#ifndef DEBUG_COM
+  #define DEBUG_COM 1
+#endif
+
+#if DEBUG_COM
+  #define ESPNOW_LOG_PRINTLN(...) Serial.println(__VA_ARGS__)
+  #define ESPNOW_LOG_PRINTF(...)  Serial.printf(__VA_ARGS__)
+#else
+  #define ESPNOW_LOG_PRINTLN(...) do {} while (0)
+  #define ESPNOW_LOG_PRINTF(...)  do {} while (0)
+#endif
+
 class EspNowTransport {
 public:
     /* masterMac: dirección MAC del ESP maestro (6 bytes) */
@@ -69,17 +81,17 @@ inline bool EspNowTransport::begin(const uint8_t *masterMac)
     memcpy(_masterMac, masterMac, 6);
 
     if (!espnowInitOk()) {
-        Serial.println("[ESPNOW] init failed");
+        ESPNOW_LOG_PRINTLN("[ESPNOW] init failed");
         return false;
     }
     espnowSetRole();
     esp_now_register_send_cb(onSendCb);
 
     if (!espnowAddPeer(masterMac)) {
-        Serial.println("[ESPNOW] add_peer failed");
+        ESPNOW_LOG_PRINTLN("[ESPNOW] add_peer failed");
         return false;
     }
-    Serial.printf("[ESPNOW] ready ch=%u\n", espnowCurrentChannel());
+    ESPNOW_LOG_PRINTF("[ESPNOW] ready ch=%u\n", espnowCurrentChannel());
     return true;
 }
 

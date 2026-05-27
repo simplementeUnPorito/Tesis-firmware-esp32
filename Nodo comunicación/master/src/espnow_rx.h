@@ -31,6 +31,7 @@ typedef void (*StatusCallback)(const MsgStatus &msg);
 typedef void (*CfgAckCallback)(const MsgCfgAck &msg);
 typedef void (*HelloCallback)(const MsgHello &msg);
 typedef void (*StartAckCallback)(const MsgStartAck &msg);
+typedef void (*HotWaitAckCallback)(const MsgHotWaitAck &msg);
 
 class EspNowRx {
 public:
@@ -41,7 +42,8 @@ public:
                StatusCallback statusCb = nullptr,
                CfgAckCallback cfgAckCb = nullptr,
                HelloCallback helloCb = nullptr,
-               StartAckCallback startAckCb = nullptr);
+               StartAckCallback startAckCb = nullptr,
+               HotWaitAckCallback hotWaitAckCb = nullptr);
 
     /* Llamar desde el loop() o directamente del callback ESP-NOW */
     static void onRecv(const uint8_t *mac, const uint8_t *data, int len);
@@ -56,6 +58,7 @@ private:
     CfgAckCallback     _cfgAckCb  = nullptr;
     HelloCallback      _helloCb   = nullptr;
     StartAckCallback   _startAckCb = nullptr;
+    HotWaitAckCallback _hotWaitAckCb = nullptr;
     ReassembledBatch   _bufs[MAX_NODES] = {};
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
@@ -66,6 +69,7 @@ private:
     void _handleCfgAck(const MsgCfgAck *msg);
     void _handleHello(const MsgHello *msg);
     void _handleStartAck(const MsgStartAck *msg);
+    void _handleHotWaitAck(const MsgHotWaitAck *msg);
 
     static uint8_t _calcCrc(const uint8_t *data, size_t len)
     {
@@ -82,7 +86,8 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
                             StatusCallback statusCb,
                             CfgAckCallback cfgAckCb,
                             HelloCallback helloCb,
-                            StartAckCallback startAckCb)
+                            StartAckCallback startAckCb,
+                            HotWaitAckCallback hotWaitAckCb)
 {
     _cb = cb;
     _armAckCb = armAckCb;
@@ -90,6 +95,7 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
     _cfgAckCb = cfgAckCb;
     _helloCb  = helloCb;
     _startAckCb = startAckCb;
+    _hotWaitAckCb = hotWaitAckCb;
     instance = this;
     if (esp_now_init() != ESP_OK) {
         MASTER_LOG_PRINTLN("[ESPNOW-RX] init failed");
@@ -117,6 +123,8 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         instance->_handleHello((const MsgHello *)data);
     } else if (first == CMD_START_ACK && (size_t)len >= sizeof(MsgStartAck)) {
         instance->_handleStartAck((const MsgStartAck *)data);
+    } else if (first == CMD_HOTWAIT_ACK && (size_t)len >= sizeof(MsgHotWaitAck)) {
+        instance->_handleHotWaitAck((const MsgHotWaitAck *)data);
     }
 }
 
@@ -190,4 +198,11 @@ inline void EspNowRx::_handleStartAck(const MsgStartAck *msg)
                       msg->node_id, msg->status,
                       (unsigned)msg->start_token, (unsigned)msg->rx_us);
     if (_startAckCb) { _startAckCb(*msg); }
+}
+
+inline void EspNowRx::_handleHotWaitAck(const MsgHotWaitAck *msg)
+{
+    MASTER_LOG_PRINTF("[ESPNOW-RX] HOTWAIT_ACK node=%d ok=%d state=%d n=%u\n",
+                      msg->node_id, msg->ok, msg->state, msg->n_batches);
+    if (_hotWaitAckCb) { _hotWaitAckCb(*msg); }
 }

@@ -10,8 +10,8 @@
  * Flujo de sincronización:
  *   MATLAB → cmd 0xA2 (ARM)   → maestro broadcast CMD_ARM a esclavos
  *   Esclavos responden CMD_ARM_ACK
- *   MATLAB → cmd 0xA3 (START) → maestro graba t_start_us, broadcast CMD_START
- *   Todos los nodos inician muestreo simultáneamente
+ *   MATLAB → cmd 0xA3 (START) → maestro manda PRESTART, verifica HOT_WAIT
+ *   y recién entonces emite CMD_START.
  *   MATLAB → cmd 0xA4 (STOP)  → maestro broadcast CMD_STOP
  *
  * Flags en platformio.ini:
@@ -62,14 +62,23 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
 #ifndef DEBUG_HW_START_US
   #define DEBUG_HW_START_US SCOPE_START_PULSE_US
 #endif
-#ifndef PRESTART_WAIT_MS
-  #define PRESTART_WAIT_MS 5000
-#endif
 #ifndef SCOPE_MULTI_START_COUNT
   #define SCOPE_MULTI_START_COUNT 128
 #endif
 #ifndef SCOPE_MULTI_START_GAP_MS
   #define SCOPE_MULTI_START_GAP_MS 1000
+#endif
+#ifndef HOTWAIT_QUERY_DELAY_MS
+  #define HOTWAIT_QUERY_DELAY_MS 20
+#endif
+#ifndef HOTWAIT_QUERY_TIMEOUT_MS
+  #define HOTWAIT_QUERY_TIMEOUT_MS 120
+#endif
+#ifndef HOTWAIT_QUERY_RETRIES
+  #define HOTWAIT_QUERY_RETRIES 3
+#endif
+#ifndef HOTWAIT_SETTLE_MS
+  #define HOTWAIT_SETTLE_MS 50
 #endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
@@ -100,10 +109,17 @@ static uint8_t     g_startProbeNode = 0;
 static volatile uint32_t g_armAckMask    = 0;
 static volatile bool     g_debugHwActive = false;
 static volatile uint32_t g_debugHwFallUs = 0;
-static uint32_t          g_prestartDueMs = 0;
 static uint16_t          g_scopeStartSent = 0;
 static uint32_t          g_scopeStartNextMs = 0;
 static uint8_t           g_prestartProbeNode = 0;
+static uint32_t          g_hotWaitAckMask = 0;
+static uint8_t           g_hotWaitQueryNode = 1;
+static uint8_t           g_hotWaitRetries = 0;
+static uint8_t           g_hotWaitReadyCount = 0;
+static bool              g_hotWaitQueryInFlight = false;
+static bool              g_hotWaitSettling = false;
+static uint32_t          g_hotWaitQueryMs = 0;
+static uint32_t          g_hotWaitSettleDueMs = 0;
 
 /* ── Store-and-forward (dump request/response) ───────────────────────────── */
 static uint16_t g_rec_n_batches   = 0;   /* batches a grabar por slave */
@@ -112,8 +128,8 @@ static uint16_t g_dumpBatchSeq    = 0;   /* batch actual siendo pedido */
 static bool     g_dumpBatchRx     = false;
 static uint8_t  g_dumpRetries     = 0;
 static uint32_t g_dumpReqMs       = 0;   /* millis() del último REQ_BATCH enviado */
-#define DUMP_MAX_RETRIES  3
-#define DUMP_BATCH_TIMEOUT_MS 800
+#define DUMP_MAX_RETRIES  30
+#define DUMP_BATCH_TIMEOUT_MS 300
 
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static HammerIMU      hammer;
@@ -221,6 +237,20 @@ static uint8_t countArmAcks(uint32_t mask)
     return n;
 }
 
+static uint8_t countHotWaitAcks(uint32_t mask)
+{
+    uint8_t n = 0;
+    for (uint8_t node = 1; node <= g_expectedSlaves; node++) {
+        if (mask & (1UL << node)) n++;
+    }
+    return n;
+}
+
+static bool hotWaitAcked(uint8_t node)
+{
+    return (g_hotWaitAckMask & (1UL << node)) != 0;
+}
+
 static void onArmAck(const MsgArmAck &msg)
 {
     if (msg.node_id == 0 || msg.node_id > NUM_SLAVES) return;
@@ -236,6 +266,15 @@ static void onSlaveStatus(const MsgStatus &msg)
 
 static void onCfgAck(const MsgCfgAck &msg)
 {
+    /* REQ_BATCH NACK: slave tiene menos batches que los pedidos → avanzar sin timeout */
+    if (msg.sub_cmd == CMD_REQ_BATCH && !msg.ok &&
+        g_state == DUMPING && msg.node_id == g_dumpSlaveIdx) {
+        MASTER_LOG_PRINTF("[MASTER] DUMP NACK slave=%d fill exhausted -> next\n",
+                          g_dumpSlaveIdx);
+        g_dumpBatchSeq = g_rec_n_batches;
+        g_dumpBatchRx  = true;
+        return;
+    }
     matlab.sendAck(msg.node_id, msg.sub_cmd, msg.ok);
 }
 
@@ -260,6 +299,17 @@ static void onStartAck(const MsgStartAck &msg)
     }
     MASTER_LOG_PRINTF("[MASTER] START_ACK node=%d status=%d rtt=%u us tof~=%u us\n",
                       msg.node_id, msg.status, (unsigned)rttUs, (unsigned)tofUs);
+}
+
+static void onHotWaitAck(const MsgHotWaitAck &msg)
+{
+    if (msg.node_id == 0 || msg.node_id > NUM_SLAVES) return;
+    if (msg.ok && msg.node_id <= g_expectedSlaves) {
+        g_hotWaitAckMask |= (1UL << msg.node_id);
+    }
+    MASTER_LOG_PRINTF("[MASTER] HOTWAIT_ACK node=%d ok=%d state=%d n=%u mask=0x%08X\n",
+                      msg.node_id, msg.ok, msg.state, msg.n_batches,
+                      (unsigned)g_hotWaitAckMask);
 }
 
 static void requestBatch(uint8_t nodeId, uint16_t seq)
@@ -304,16 +354,11 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
     }
 
     if (sub_cmd == 0xAF) {
-        if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
-            g_prestartProbeNode = node_id;
-            beginPrestart(PRESTART_ACTION_START_PROBE);
-            MASTER_LOG_PRINTF("[MASTER] START_PROBE node=%d scheduled after PRESTART\n",
-                              node_id);
-        } else {
-            matlab.sendAck(node_id, sub_cmd, 0);
-            MASTER_LOG_PRINTF("[MASTER] START_PROBE node=%d rejected state=%d\n",
-                              node_id, (int)g_state);
-        }
+        /* Probe directo: no necesita PRESTART — solo mide RTT al esclavo */
+        g_prestartProbeNode = node_id;
+        sendStartProbe(node_id);
+        MASTER_LOG_PRINTF("[MASTER] START_PROBE direct node=%d state=%d\n",
+                          node_id, (int)g_state);
         return;
     }
 
@@ -344,6 +389,28 @@ static void broadcastRecordLength(uint16_t nBatches)
         esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] SET_RECLEN=%u\n", nBatches);
+}
+
+static void broadcastPrestart(uint16_t nBatches)
+{
+    MsgPrestart msg = { CMD_PRESTART, nBatches };
+    if (g_espnowReady) {
+        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+    }
+    MASTER_LOG_PRINTF("[MASTER] PRESTART sent n=%u\n", nBatches);
+}
+
+static void sendHotWaitQuery(uint8_t nodeId)
+{
+    const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[nodeId - 1])
+                       ? SLAVE_MACS[nodeId - 1]
+                       : ESPNOW_BROADCAST;
+    MsgHotWaitQuery msg = { CMD_HOTWAIT_QUERY, nodeId };
+    if (g_espnowReady) {
+        esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+    }
+    MASTER_LOG_PRINTF("[MASTER] HOTWAIT_QUERY node=%d retry=%d\n",
+                      nodeId, g_hotWaitRetries);
 }
 
 static void broadcastArm()
@@ -414,15 +481,62 @@ static void beginPrestart(PrestartAction action)
     } else if (action == PRESTART_ACTION_START_PROBE) {
         actionName = "START_PROBE";
     }
-    g_armAckMask = 0;
-    g_armedCount = 0;
-    matlab.sendReady(g_armedCount);
-    broadcastRecordLength(g_rec_n_batches);
-    broadcastArm();
-    g_prestartDueMs = millis() + PRESTART_WAIT_MS;
+    g_hotWaitAckMask = 0;
+    g_hotWaitQueryNode = 1;
+    g_hotWaitRetries = 0;
+    g_hotWaitReadyCount = 0;
+    g_hotWaitQueryInFlight = false;
+    g_hotWaitSettling = false;
+    g_hotWaitQueryMs = millis() + HOTWAIT_QUERY_DELAY_MS;
     g_state = PRESTART;
-    MASTER_LOG_PRINTF("[MASTER] PRESTART wait %u ms before %s\n",
-                      (unsigned)PRESTART_WAIT_MS, actionName);
+    matlab.sendReady(0);
+    broadcastPrestart(g_rec_n_batches);
+    MASTER_LOG_PRINTF("[MASTER] PRESTART HOT_WAIT before %s n=%u queryDelay=%u ms\n",
+                      actionName, g_rec_n_batches,
+                      (unsigned)HOTWAIT_QUERY_DELAY_MS);
+}
+
+static void abortPrestart(const char *reason)
+{
+    MASTER_LOG_PRINTF("[MASTER] PRESTART abort: %s ready=%u/%u\n",
+                      reason, g_hotWaitReadyCount, g_expectedSlaves);
+    g_hotWaitQueryInFlight = false;
+    g_hotWaitSettling = false;
+    g_state = ARMED;
+    matlab.sendReady(g_hotWaitReadyCount);
+}
+
+static void finishPrestartAction()
+{
+    if (g_prestartAction == PRESTART_ACTION_SCOPE_MULTI) {
+        broadcastScopeStart();
+        g_scopeStartSent++;
+        MASTER_LOG_PRINTF("[MASTER] SCOPE_MULTI %u/%u\n",
+                          (unsigned)g_scopeStartSent,
+                          (unsigned)SCOPE_MULTI_START_COUNT);
+        if (g_scopeStartSent >= SCOPE_MULTI_START_COUNT) {
+            g_state = ARMED;
+            matlab.sendReady(g_hotWaitReadyCount);
+            MASTER_LOG_PRINTLN("[MASTER] SCOPE_MULTI completo -> ARMED");
+        } else {
+            g_scopeStartNextMs = millis() + SCOPE_MULTI_START_GAP_MS;
+            g_state = SCOPE_MULTI;
+            MASTER_LOG_PRINTF("[MASTER] SCOPE_MULTI next PRESTART in %u ms\n",
+                              (unsigned)SCOPE_MULTI_START_GAP_MS);
+        }
+    } else if (g_prestartAction == PRESTART_ACTION_START_PROBE) {
+        sendStartProbe(g_prestartProbeNode);
+        g_state = ARMED;
+        MASTER_LOG_PRINTF("[MASTER] HOT_WAIT done -> START_PROBE node=%d\n",
+                          g_prestartProbeNode);
+    } else {
+        /* Actualizar g_armedCount con los slaves que confirmaron HOT_WAIT,
+           para que DUMP solo pida datos a los que realmente grabaron. */
+        g_armedCount = g_hotWaitReadyCount;
+        broadcastStart();
+        g_state = RUNNING;
+        MASTER_LOG_PRINTLN("[MASTER] HOT_WAIT done -> RUNNING");
+    }
 }
 
 /* ── Callback: batch reensamblado de un esclavo ─────────────────────────── */
@@ -517,7 +631,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
                 }
                 matlab.sendAck(0xFF, cmd, 0);
             } else if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
-                g_rec_n_batches = param;
+                (void)param;
+                g_rec_n_batches = 0;   /* START falso: no preparar buffers ni dump */
                 g_scopeStartSent = 0;
                 beginPrestart(PRESTART_ACTION_SCOPE_MULTI);
                 matlab.sendAck(0xFF, cmd, 1);
@@ -593,7 +708,8 @@ void setup()
                       WiFi.softAPmacAddress().c_str(), WiFi.softAPChannel());
 
     /* ESP-NOW (convive con AP mode) */
-    if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck, onHello, onStartAck)) {
+    if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck,
+                        onHello, onStartAck, onHotWaitAck)) {
         MASTER_LOG_PRINTLN("[MASTER] ESP-NOW FAIL - USB test continues");
     } else {
         g_espnowReady = true;
@@ -680,39 +796,52 @@ void loop()
         armStartMs = 0;
     }
 
-    /* PRESTART: antes de cada START reenviar config/ARM, esperar fijo y recién disparar. */
+    /* PRESTART: entrar en HOT_WAIT, consultar esclavos en orden y recién disparar. */
     if (g_state == PRESTART) {
-        uint8_t ackCount = countArmAcks(g_armAckMask);
-        if (ackCount != g_armedCount) {
-            g_armedCount = ackCount;
-            matlab.sendReady(g_armedCount);
+        uint8_t readyCount = countHotWaitAcks(g_hotWaitAckMask);
+        if (readyCount != g_hotWaitReadyCount) {
+            g_hotWaitReadyCount = readyCount;
+            matlab.sendReady(g_hotWaitReadyCount);
         }
-        if ((int32_t)(millis() - g_prestartDueMs) >= 0) {
-            if (g_prestartAction == PRESTART_ACTION_SCOPE_MULTI) {
-                broadcastScopeStart();
-                g_scopeStartSent++;
-                MASTER_LOG_PRINTF("[MASTER] SCOPE_MULTI %u/%u\n",
-                                  (unsigned)g_scopeStartSent,
-                                  (unsigned)SCOPE_MULTI_START_COUNT);
-                if (g_scopeStartSent >= SCOPE_MULTI_START_COUNT) {
-                    g_state = ARMED;
-                    matlab.sendReady(g_armedCount);
-                    MASTER_LOG_PRINTLN("[MASTER] SCOPE_MULTI completo -> ARMED");
+
+        if (g_expectedSlaves == 0 && !g_hotWaitSettling) {
+            g_hotWaitSettling = true;
+            g_hotWaitSettleDueMs = millis() + HOTWAIT_SETTLE_MS;
+        }
+
+        if (g_hotWaitSettling) {
+            if ((int32_t)(millis() - g_hotWaitSettleDueMs) >= 0) {
+                finishPrestartAction();
+            }
+        } else {
+            while (g_hotWaitQueryNode <= g_expectedSlaves &&
+                   hotWaitAcked(g_hotWaitQueryNode)) {
+                g_hotWaitQueryNode++;
+                g_hotWaitRetries = 0;
+                g_hotWaitQueryInFlight = false;
+                g_hotWaitQueryMs = millis();
+            }
+
+            if (g_hotWaitQueryNode > g_expectedSlaves) {
+                g_hotWaitSettling = true;
+                g_hotWaitSettleDueMs = millis() + HOTWAIT_SETTLE_MS;
+                MASTER_LOG_PRINTF("[MASTER] HOT_WAIT all ready, settle %u ms\n",
+                                  (unsigned)HOTWAIT_SETTLE_MS);
+            } else if (!g_hotWaitQueryInFlight &&
+                       (int32_t)(millis() - g_hotWaitQueryMs) >= 0) {
+                sendHotWaitQuery(g_hotWaitQueryNode);
+                g_hotWaitQueryInFlight = true;
+                g_hotWaitQueryMs = millis();
+            } else if (g_hotWaitQueryInFlight &&
+                       millis() - g_hotWaitQueryMs > HOTWAIT_QUERY_TIMEOUT_MS) {
+                if (g_hotWaitRetries < HOTWAIT_QUERY_RETRIES) {
+                    g_hotWaitRetries++;
+                    broadcastPrestart(g_rec_n_batches);
+                    sendHotWaitQuery(g_hotWaitQueryNode);
+                    g_hotWaitQueryMs = millis();
                 } else {
-                    g_scopeStartNextMs = millis() + SCOPE_MULTI_START_GAP_MS;
-                    g_state = SCOPE_MULTI;
-                    MASTER_LOG_PRINTF("[MASTER] SCOPE_MULTI next PRESTART in %u ms\n",
-                                      (unsigned)SCOPE_MULTI_START_GAP_MS);
+                    abortPrestart("HOT_WAIT timeout");
                 }
-            } else if (g_prestartAction == PRESTART_ACTION_START_PROBE) {
-                sendStartProbe(g_prestartProbeNode);
-                g_state = ARMED;
-                MASTER_LOG_PRINTF("[MASTER] PRESTART done -> START_PROBE node=%d\n",
-                                  g_prestartProbeNode);
-            } else {
-                broadcastStart();
-                g_state = RUNNING;
-                MASTER_LOG_PRINTLN("[MASTER] PRESTART done -> RUNNING");
             }
         }
     }
