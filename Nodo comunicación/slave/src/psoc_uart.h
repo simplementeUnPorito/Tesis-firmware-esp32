@@ -41,7 +41,6 @@
 #define PSOC_CMD_VDAC      0xAA
 #define PSOC_CMD_SETN      0xA3
 #define PSOC_CMD_PRESTART  0xB1
-#define PSOC_CMD_VIEW      0xB2
 #define PSOC_CMD_DEBUG     0xB3
 
 struct PsocSample {
@@ -67,10 +66,9 @@ public:
     void begin(BatchCallback cb = nullptr, HardwareSerial *serial = nullptr);
     void poll();                 /* drena UART y ensambla frames */
 
-    /* Comandos hacia el PSoC */
+    /* Comandos hacia el PSoC (el arranque real es por el pin SYNC, no por UART) */
     void setN(uint16_t n);
     void preStart();
-    void captureNow();
     void setVdac(uint8_t v);
     void setPga(uint8_t code);
     void setPgavdac(uint8_t code);

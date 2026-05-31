@@ -90,7 +90,9 @@ static uint32_t   *g_store_ts_us   = nullptr;    /* timestamp relativo por batch
 static uint16_t    g_store_fill    = 0;
 
 /* ── Modo "Ver" (disparo único, streaming en vivo de un nodo) ────────────── */
-static volatile uint16_t g_view_remaining = 0;   /* lotes en vivo restantes (0=off) */
+static volatile uint16_t g_view_remaining   = 0; /* lotes en vivo restantes (0=off) */
+static volatile bool     g_view_armPending  = false;
+static volatile uint32_t g_view_armDueUs    = 0; /* cuándo levantar el flanco */
 
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static PsocUART       psoc;
@@ -394,16 +396,20 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         handleDebugNode((const MsgDebugNode *)data);
     }
     else if (cmd == CMD_VIEW && len >= (int)sizeof(MsgView)) {
-        /* "Ver": disparo único, streaming en vivo de un solo nodo. */
+        /* "Ver": disparo único, streaming en vivo de un solo nodo.
+         * El arranque del PSoC es SIEMPRE por flanco: armamos por UART y
+         * levantamos el pin SYNC_TO_PSOC (igual que un START normal). */
         const MsgView *msg = (const MsgView *)data;
         if (msg->node_id != NODE_ID) return;
         allocStore(0);                 /* sin store-and-forward → envío en vivo */
         g_view_remaining = msg->n;
-        g_t_start_us     = (uint64_t)micros();
         g_store_fill     = 0;
-        g_state          = SAMPLING;
         psoc.setN(msg->n);
-        psoc.captureNow();             /* PSoC arranca solo, sin SYNC */
+        psoc.preStart();               /* arma el PSoC (espera flanco) */
+        /* Levantar el flanco unos ms después, para dar tiempo a que el PSoC
+         * procese el pre-start por UART antes de recibir el flanco. */
+        g_view_armPending = true;
+        g_view_armDueUs   = (uint32_t)micros() + 3000u;
         sendCfgAck(CMD_VIEW, 1);
         SLAVE_LOG_PRINTF("[SLAVE] VIEW n=%u\n", msg->n);
         LOGM("VIEW", "n=%u", msg->n);
@@ -474,9 +480,21 @@ static void onBatch(const PsocBatch &batch)
     if (g_state != SAMPLING) return;
     pulseSampleCount(batch.n_samples);
 
-    /* Debug y real: el routing depende del modo store, no del origen del dato.
-       Si g_store_buf está allocado → acumula (también en debug).
-       Si no hay store buffer → transmite en tiempo real (streaming / TestEsclavo). */
+    /* "Ver": disparo único en vivo. Tiene prioridad sobre el store para no
+       depender del orden de llegada de SET_RECLEN vs CMD_VIEW. */
+    if (g_view_remaining > 0) {
+        transport.sendBatch(batch, g_t_start_us, NODE_ID);
+        LOGM("BATCH", "seq=%u,view=1", batch.seq);
+        if (--g_view_remaining == 0) {
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);   /* baja el flanco → para */
+            g_state = STOPPED;
+            SLAVE_LOG_PRINTF("[SLAVE] VIEW done\n");
+            LOGM("VIEWDONE", "");
+        }
+        return;
+    }
+
+    /* Routing normal: si g_store_buf está allocado → acumula; si no → en vivo. */
     if (g_store_buf && g_store_fill < g_rec_n_batches) {
         /* Store-and-forward: acumular en RAM, sin RF */
         SampleBytes *dst = &g_store_buf[(size_t)g_store_fill * SPI_BATCH_SAMPLES];
@@ -501,17 +519,9 @@ static void onBatch(const PsocBatch &batch)
             SLAVE_LOG_PRINTF("[SLAVE] FULL -> STOPPED (%u batches)\n", g_store_fill);
         }
     } else if (!g_store_buf) {
-        /* Sin store: enviar en tiempo real (streaming / "Ver") */
+        /* Sin store: enviar en tiempo real (streaming clásico) */
         transport.sendBatch(batch, g_t_start_us, NODE_ID);
         LOGM("BATCH", "seq=%u,live=1", batch.seq);
-        if (g_view_remaining > 0) {
-            /* "Ver" es disparo único: tras N lotes volvemos a reposo. */
-            if (--g_view_remaining == 0) {
-                g_state = STOPPED;
-                SLAVE_LOG_PRINTF("[SLAVE] VIEW done\n");
-                LOGM("VIEWDONE", "");
-            }
-        }
     }
 }
 
@@ -571,6 +581,17 @@ void setup()
 void loop()
 {
     debugEspHardwareService();
+
+    /* "Ver": levantar el flanco hacia el PSoC tras el pequeño retardo de arme. */
+    if (g_view_armPending &&
+        (int32_t)((uint32_t)micros() - g_view_armDueUs) >= 0) {
+        g_view_armPending = false;
+        g_t_start_us = (uint64_t)micros();
+        debugEspHardwareStartPulse();
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);   /* flanco de subida → arranca */
+        g_state = SAMPLING;
+        SLAVE_LOG_PRINTF("[SLAVE] VIEW flanco arriba\n");
+    }
 
     /* Drenar siempre la UART del PSoC (onBatch ignora si no está SAMPLING). */
     if (g_state == SAMPLING && g_debug_mode) {
