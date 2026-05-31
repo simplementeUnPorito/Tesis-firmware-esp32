@@ -1,17 +1,11 @@
 #pragma once
+/*
+ * master_log.h — shim de compatibilidad.
+ *
+ * El logging real vive en debug_log.h (sistema unificado humano+máquina,
+ * gateado por DBG_ENABLE). Las macros MASTER_LOG_* se definen allí.
+ * El stream del maestro es Serial1 (definir -DDBG_STREAM=Serial1 en
+ * platformio.ini) para no corromper el binario 0x56 hacia MATLAB por Serial.
+ */
 
-#include <Arduino.h>
-
-#ifndef MASTER_SERIAL_LOG
-#define MASTER_SERIAL_LOG 0
-#endif
-
-#if MASTER_SERIAL_LOG
-#define MASTER_LOG_PRINT(...)   Serial.print(__VA_ARGS__)
-#define MASTER_LOG_PRINTLN(...) Serial.println(__VA_ARGS__)
-#define MASTER_LOG_PRINTF(...)  Serial.printf(__VA_ARGS__)
-#else
-#define MASTER_LOG_PRINT(...)   do {} while (0)
-#define MASTER_LOG_PRINTLN(...) do {} while (0)
-#define MASTER_LOG_PRINTF(...)  do {} while (0)
-#endif
+#include "debug_log.h"

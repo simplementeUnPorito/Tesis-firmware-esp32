@@ -11,19 +11,24 @@
  *     [0xAB][cmd][param][cmd^param]
  *     cmd 0xA1: stream on/off   param: 0/1
  *     cmd 0xA2: arm nodes       param: n_nodes esperados
- *     cmd 0xA3: start sampling  param: n_batches opcional (0=usar actual)
  *     cmd 0xA4: stop sampling   param: ignorado
  *     cmd 0xA5: request status  param: ignorado
  *     cmd 0xA7: debug broadcast param: 0/1
  *     cmd 0xB0: scope multi-start param: n_batches, 0=cancelar
  *
+ *   Comando "set N" 16 bits (5 bytes):
+ *     [0xAB][cmd][n_lo][n_hi][cmd^n_lo^n_hi]
+ *     cmd 0xA3: start sampling  N = n_lo|n_hi<<8 (lotes, 0=usar actual)
+ *     cmd 0xAE: set record len  N = n_lo|n_hi<<8
+ *
  *   Comando dirigido a esclavo (6 bytes):
  *     [0xAB][0xBD][node_id][sub_cmd][param][node_id^sub_cmd^param]
  *     sub_cmd 0xA6: set PGA gain    param: código 0-8
- *     sub_cmd 0xA8: set TX mode     param: 0/1
  *     sub_cmd 0xA9: set PGAvdac     param: código 0-8
  *     sub_cmd 0xAA: set VDAC byte   param: 0-255
- *     sub_cmd 0xA7: debug node      param: 0/1
+ *     sub_cmd 0xA7: debug node ESP  param: 0/1
+ *     sub_cmd 0xB2: ver (captura única) param: ignorado
+ *     sub_cmd 0xB3: debug PSoC rampa param: 0/1
  *
  * Protocolo TX (6 bytes por paquete):
  *   [0x56][node_id][type][b2][b1][b0]
@@ -48,7 +53,6 @@ public:
     void loop();
 
     void sendSample(uint8_t nodeId, int32_t value24);
-    void sendHammer(int32_t value24);
     void sendHeartbeat(uint8_t nodeId, uint8_t pga, uint8_t vdac, uint8_t mode);
     void sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val);
     void sendReady(uint8_t nNodes);
@@ -62,15 +66,16 @@ public:
     bool connected() const { return true; }
 
     struct RxCmd {
-        uint8_t cmd;      /* 0xA1-0xA7: estándar | 0xBD: dirigido */
-        uint8_t param;    /* parámetro del comando estándar */
-        uint8_t node_id;  /* válido solo cuando cmd == 0xBD */
-        uint8_t sub_cmd;  /* válido solo cuando cmd == 0xBD */
-        bool    valid;
+        uint8_t  cmd;      /* 0xA1-0xA7: estándar | 0xBD: dirigido */
+        uint8_t  param;    /* parámetro del comando estándar (= value & 0xFF) */
+        uint8_t  node_id;  /* válido solo cuando cmd == 0xBD */
+        uint8_t  sub_cmd;  /* válido solo cuando cmd == 0xBD */
+        uint16_t value;    /* valor 16 bits para 0xA3/0xAE (set N) */
+        bool     valid;
     };
     /* Drain one command from the queue (returns {valid=false} when empty) */
     RxCmd lastCmd() {
-        if (_cmdHead == _cmdTail) return {0,0,0,0,false};
+        if (_cmdHead == _cmdTail) return {0,0,0,0,0,false};
         RxCmd r = _cmdQueue[_cmdTail];
         _cmdTail = (uint8_t)((_cmdTail + 1) % CMD_Q_SIZE);
         return r;
@@ -111,8 +116,12 @@ inline void MatlabTransport::loop()
         uint8_t b = (uint8_t)Serial.read();
         if (_rxIdx == 0 && b != 0xAB) continue;  /* esperar sync */
         _rxBuf[_rxIdx++] = b;
-        if (_rxIdx == 2)
-            _rxExpected = (_rxBuf[1] == MATLAB_CMD_DIRECTED) ? 6 : 4;
+        if (_rxIdx == 2) {
+            uint8_t c = _rxBuf[1];
+            if (c == MATLAB_CMD_DIRECTED)            _rxExpected = 6;
+            else if (c == 0xA3 || c == 0xAE)         _rxExpected = 5; /* set N 16 bits */
+            else                                     _rxExpected = 4;
+        }
         if (_rxIdx >= _rxExpected) {
             _parseRx();
             _rxIdx      = 0;
@@ -137,11 +146,6 @@ inline void MatlabTransport::_write6(uint8_t nodeId, uint8_t type, int32_t val24
 inline void MatlabTransport::sendSample(uint8_t nodeId, int32_t value24)
 {
     _write6(nodeId, 0x00, value24);
-}
-
-inline void MatlabTransport::sendHammer(int32_t value24)
-{
-    _write6(0x00, 0x00, value24);
 }
 
 inline void MatlabTransport::sendHeartbeat(uint8_t nodeId, uint8_t pga,
@@ -194,13 +198,22 @@ inline void MatlabTransport::_parseRx()
         uint8_t param   = _rxBuf[4];
         uint8_t cs      = _rxBuf[5];
         if (cs != (uint8_t)(node_id ^ sub_cmd ^ param)) return;
-        _pushCmd({ MATLAB_CMD_DIRECTED, param, node_id, sub_cmd, true });
+        _pushCmd({ MATLAB_CMD_DIRECTED, param, node_id, sub_cmd, param, true });
+    } else if (_rxExpected == 5) {
+        /* set N (16 bits): [0xAB][cmd][n_lo][n_hi][cmd^n_lo^n_hi] */
+        uint8_t cmd  = _rxBuf[1];
+        uint8_t nlo  = _rxBuf[2];
+        uint8_t nhi  = _rxBuf[3];
+        uint8_t cs   = _rxBuf[4];
+        if (cs != (uint8_t)(cmd ^ nlo ^ nhi)) return;
+        uint16_t val = (uint16_t)nlo | ((uint16_t)nhi << 8);
+        _pushCmd({ cmd, nlo, 0, 0, val, true });
     } else {
         /* Comando estándar: [0xAB][cmd][param][cs] */
         uint8_t cmd   = _rxBuf[1];
         uint8_t param = _rxBuf[2];
         uint8_t cs    = _rxBuf[3];
         if (cs != (uint8_t)(cmd ^ param)) return;
-        _pushCmd({ cmd, param, 0, 0, true });
+        _pushCmd({ cmd, param, 0, 0, param, true });
     }
 }

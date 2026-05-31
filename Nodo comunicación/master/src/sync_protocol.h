@@ -16,6 +16,8 @@
 #define CMD_SET_CONFIG 0x21   /* maestro → esclavo unicast: configurar parámetro */
 #define CMD_CFG_ACK    0x22   /* esclavo → maestro: confirmación de config */
 #define CMD_DEBUG_NODE 0x23   /* maestro → esclavo unicast: debug ramp individual */
+#define CMD_VIEW       0x24   /* maestro → esclavo unicast: captura única "Ver" (N lotes) */
+#define CMD_DEBUG_PSOC 0x25   /* maestro → esclavo unicast: rampa de debug del PSoC */
 #define CMD_STATUS     0x30
 #define CMD_HELLO      0x40   /* beacon diagnóstico: esclavo → maestro */
 #define CMD_SET_RECLEN 0x50   /* master → todos: cuántos batches grabar (respuesta: CMD_CFG_ACK sub=0x50) */
@@ -75,7 +77,7 @@ struct MsgStatus {
 struct MsgSetConfig {
     uint8_t cmd;      /* CMD_SET_CONFIG */
     uint8_t node_id;
-    uint8_t sub_cmd;  /* 0xA6=PGA, 0xA8=TXmode, 0xA9=PGAvdac, 0xAA=VDAC */
+    uint8_t sub_cmd;  /* 0xA6=PGA, 0xA9=PGAvdac, 0xAA=VDAC */
     uint8_t param;
 };
 
@@ -90,6 +92,18 @@ struct MsgDebugNode {
     uint8_t cmd;      /* CMD_DEBUG_NODE */
     uint8_t node_id;
     uint8_t enable;   /* 1=activar ramp, 0=desactivar */
+};
+
+struct MsgView {
+    uint8_t  cmd;     /* CMD_VIEW */
+    uint8_t  node_id;
+    uint16_t n;       /* lotes a capturar en disparo único */
+};
+
+struct MsgDebugPsoc {
+    uint8_t cmd;      /* CMD_DEBUG_PSOC */
+    uint8_t node_id;
+    uint8_t enable;   /* 1=rampa PSoC ON, 0=OFF */
 };
 
 struct MsgHello {

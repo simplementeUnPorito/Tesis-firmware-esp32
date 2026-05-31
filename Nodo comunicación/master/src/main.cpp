@@ -4,30 +4,32 @@
  * Roles:
  *   1. WiFi AP ("GeoNetwork") para que MATLAB y esclavos se conecten.
  *   2. ESP-NOW: recibe batches de los esclavos, les envía ARM/START/STOP.
- *   3. TCP server en puerto 5005: stream de datos hacia MATLAB.
- *   4. Muestreo de aceleración del martillo via IMU (~1020 Hz).
+ *   3. USB serie hacia MATLAB (datos binarios 0x56) + Serial1 para logging.
+ *
+ * El maestro ya NO muestrea el martillo: el martillo es un esclavo normal.
  *
  * Flujo de sincronización:
  *   MATLAB → cmd 0xA2 (ARM)   → maestro broadcast CMD_ARM a esclavos
  *   Esclavos responden CMD_ARM_ACK
  *   MATLAB → cmd 0xA3 (START) → maestro manda PRESTART, verifica HOT_WAIT
- *   y recién entonces emite CMD_START.
+ *   y recién entonces emite CMD_START (por ESP-NOW; el pin SYNC_OUT es solo
+ *   marcador de osciloscopio y NO llega a los esclavos).
  *   MATLAB → cmd 0xA4 (STOP)  → maestro broadcast CMD_STOP
  *
  * Flags en platformio.ini:
- *   -DHAMMER_IMU_ENABLED=0    0=stub (sin hardware), 1=real (ver hammer_imu.h)
  *   -DNUM_SLAVES=3            cuántos esclavos soportar como máximo
- *   -DDEBUG_HARDWARE=1        pulso GPIO al emitir CMD_START
+ *   -DDEBUG_HARDWARE=1        pulso GPIO de scope al emitir CMD_START
+ *   -DDBG_ENABLE=1            logging (humano+máquina) por Serial1
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include "sync_protocol.h"
-#include "hammer_imu.h"
 #include "espnow_rx.h"
 #include "matlab_transport.h"
 #include "master_log.h"
+#include "debug_log.h"
 #include "../../scope_measurement.h"
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
@@ -88,9 +90,19 @@ static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x03},   /* Esclavo 3 — reemplazar */
 };
 
-/* ── Pin GPIO hardware sync ───────────────────────────────────────────────── */
-#define SYNC_OUT_PIN 25   /* Salida: HIGH = muestrear, LOW = parar */
+/* ── Pin GPIO de scope ────────────────────────────────────────────────────────
+ * SYNC_OUT_PIN es SOLO marcador de osciloscopio: NO está cableado a los esclavos
+ * (el START real viaja por ESP-NOW). Se compila a nada si DEBUG_HARDWARE=0. */
+#define SYNC_OUT_PIN 25
 #define LED_PIN      2    /* GPIO2 = LED azul integrado ESP32-DevKitC V4 */
+
+#if DEBUG_HARDWARE
+  static inline void syncOutBegin()        { pinMode(SYNC_OUT_PIN, OUTPUT); digitalWrite(SYNC_OUT_PIN, LOW); }
+  static inline void syncOutWrite(uint8_t l){ digitalWrite(SYNC_OUT_PIN, l); }
+#else
+  static inline void syncOutBegin()        {}
+  static inline void syncOutWrite(uint8_t) {}
+#endif
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
 enum MasterState { IDLE, ARMING, ARMED, RUNNING, STOPPING, DUMPING, PRESTART, SCOPE_MULTI };
@@ -132,16 +144,12 @@ static uint32_t g_dumpReqMs       = 0;   /* millis() del último REQ_BATCH envia
 #define DUMP_BATCH_TIMEOUT_MS 300
 
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
-static HammerIMU      hammer;
 static EspNowRx       espnowRx;
 static MatlabTransport matlab;
 
 static void beginPrestart(PrestartAction action);
 
-/* ── Hammer timing ───────────────────────────────────────────────────────── */
-static uint32_t g_lastHammerUs  = 0;
-static uint32_t g_debugRamp     = 0;
-static uint32_t g_hammerCount   = 0;   /* muestras enviadas en la grabación actual */
+static uint32_t g_debugRamp     = 0;   /* (reservado para tests) */
 
 static inline uint8_t samplePulseActiveLevel()
 {
@@ -161,7 +169,7 @@ static void samplePulseBegin()
 #endif
 }
 
-static void debugHardwareBegin()
+static void debugEspHardwareBegin()
 {
 #if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
     pinMode(DEBUG_HW_START_PIN, OUTPUT);
@@ -180,7 +188,7 @@ static inline void samplePulse()
 #endif
 }
 
-static inline void debugHardwareStartPulse()
+static inline void debugEspHardwareStartPulse()
 {
 #if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
     digitalWrite(DEBUG_HW_START_PIN, debugHwActiveLevel());
@@ -194,7 +202,7 @@ static inline void debugHardwareStartPulse()
 #endif
 }
 
-static inline void debugHardwareService()
+static inline void debugEspHardwareService()
 {
 #if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
     if (g_debugHwActive &&
@@ -369,6 +377,17 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
     if (sub_cmd == 0xA7) {
         MsgDebugNode msg = { CMD_DEBUG_NODE, node_id, param };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+    } else if (sub_cmd == 0xB2) {
+        /* "Ver": captura única de N lotes en vivo desde un solo nodo. */
+        g_streaming = true;
+        MsgView msg = { CMD_VIEW, node_id, g_rec_n_batches ? g_rec_n_batches : (uint16_t)1 };
+        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        LOGM("VIEW", "node=%d,n=%u", node_id, msg.n);
+    } else if (sub_cmd == 0xB3) {
+        /* Debug PSoC: rampa on/off en el PSoC del nodo. */
+        MsgDebugPsoc msg = { CMD_DEBUG_PSOC, node_id, param };
+        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        LOGM("DBGPSOC", "node=%d,en=%d", node_id, param);
     } else {
         MsgSetConfig msg = { CMD_SET_CONFIG, node_id, sub_cmd, param };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
@@ -432,8 +451,8 @@ static void broadcastStart()
     g_startProbeNode = 0;
     g_startCmdToken = (uint32_t)g_t_start_us;
     /* GPIO primero — flanco hardware llega a los PSoC antes que el ESP-NOW */
-    digitalWrite(SYNC_OUT_PIN, HIGH);
-    debugHardwareStartPulse();
+    syncOutWrite(HIGH);
+    debugEspHardwareStartPulse();
     MsgStart msg = { CMD_START, g_t_start_us, 0 };
     if (g_espnowReady) {
         g_startCmdTxUs = (uint32_t)micros();
@@ -444,7 +463,7 @@ static void broadcastStart()
 
 static void broadcastScopeStart()
 {
-    debugHardwareStartPulse();
+    debugEspHardwareStartPulse();
     MsgScopeStart msg = { CMD_SCOPE_START };
     if (g_espnowReady) {
         esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
@@ -463,7 +482,7 @@ static void broadcastDebug(uint8_t enable)
 
 static void broadcastStop()
 {
-    digitalWrite(SYNC_OUT_PIN, LOW);
+    syncOutWrite(LOW);
     MsgStop msg = { CMD_STOP };
     if (g_espnowReady) {
         esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
@@ -473,7 +492,7 @@ static void broadcastStop()
 
 static void beginPrestart(PrestartAction action)
 {
-    digitalWrite(SYNC_OUT_PIN, LOW);
+    syncOutWrite(LOW);
     g_prestartAction = action;
     const char *actionName = "START";
     if (action == PRESTART_ACTION_SCOPE_MULTI) {
@@ -577,6 +596,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
 {
     uint8_t cmd   = rxCmd.cmd;
     uint8_t param = rxCmd.param;
+    LOGM("CMD", "cmd=0x%02X,param=%d,value=%u,node=%d,sub=0x%02X",
+         cmd, param, rxCmd.value, rxCmd.node_id, rxCmd.sub_cmd);
     switch (cmd) {
         case 0xA1:   /* stream on/off */
             g_streaming = (param != 0);
@@ -601,13 +622,12 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             }
             break;
 
-        case 0xA3:   /* START */
+        case 0xA3:   /* START — N de 16 bits en rxCmd.value */
             if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
-                if (param > 0) {
-                    g_rec_n_batches = param;
+                if (rxCmd.value > 0) {
+                    g_rec_n_batches = rxCmd.value;
                 }
-                g_debugRamp   = 0;
-                g_hammerCount = 0;
+                g_debugRamp = 0;
                 beginPrestart(PRESTART_ACTION_START);
                 matlab.sendAck(0xFF, cmd, 1);
             }
@@ -647,7 +667,6 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             broadcastDebug(param ? 1 : 0);
             if (param) {
                 g_debugRamp   = 0;
-                g_hammerCount = 0;
                 g_testMode    = true;
                 g_streaming   = true;
                 if (g_rec_n_batches > 0 &&
@@ -662,7 +681,7 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
                 g_testMode  = false;
                 g_streaming = false;
                 g_state     = IDLE;
-                digitalWrite(SYNC_OUT_PIN, LOW);
+                syncOutWrite(LOW);
             }
             matlab.sendAck(0x00, cmd, param);
             MASTER_LOG_PRINTF("[MASTER] debug=%d (streaming=%d state=%d)\n",
@@ -670,10 +689,10 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             break;
         }
 
-        case 0xAE: {  /* SET_RECORD_LEN: n_batches a grabar (0 = modo streaming clásico) */
-            g_rec_n_batches = param;
+        case 0xAE: {  /* SET_RECORD_LEN: n_batches (16 bits en rxCmd.value) */
+            g_rec_n_batches = rxCmd.value;
             broadcastRecordLength(g_rec_n_batches);
-            matlab.sendAck(0xFF, 0xAE, param);
+            matlab.sendAck(0xFF, 0xAE, (uint8_t)(g_rec_n_batches & 0xFF));
             break;
         }
 
@@ -687,9 +706,14 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
 void setup()
 {
     matlab.begin();
+    /* Log del maestro por Serial1 (Serial = binario 0x56 hacia MATLAB).
+     * Pines configurables por -DDBG_LOG_RX / -DDBG_LOG_TX en platformio.ini. */
+#if DBG_ENABLE
+    Serial1.begin(DBG_LOG_BAUD, SERIAL_8N1, DBG_LOG_RX, DBG_LOG_TX);
+#endif
     MASTER_LOG_PRINTLN("[MASTER] boot");
     samplePulseBegin();
-    debugHardwareBegin();
+    debugEspHardwareBegin();
     MASTER_LOG_PRINTF("[SCOPE] sample pulse pin=%d idle=%d us=%d\n",
                       SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE, SAMPLE_PULSE_US);
     MASTER_LOG_PRINTF("[SCOPE] debugHardware=%d start pin=%d idle=%d us=%d\n",
@@ -725,21 +749,18 @@ void setup()
     /* Informar a MATLAB el estado de ESP-NOW y el canal del AP */
     matlab.sendStatus(g_espnowReady ? 1 : 0, 1);  /* canal fijo = 1 */
 
-    /* GPIO hardware sync — salida hacia esclavos y PSoC */
-    pinMode(SYNC_OUT_PIN, OUTPUT);
-    digitalWrite(SYNC_OUT_PIN, LOW);
-
-    /* Martillo (stub o real según flags) */
-    hammer.begin();
+    /* Pin de scope (solo osciloscopio; gateado por DEBUG_HARDWARE) */
+    syncOutBegin();
 
     MASTER_LOG_PRINTLN("[MASTER] listo");
+    LOGM("BOOT", "slaves=%d,espnow=%u", NUM_SLAVES, (unsigned)g_espnowReady);
 }
 
 /* ── Loop ────────────────────────────────────────────────────────────────── */
 
 void loop()
 {
-    debugHardwareService();
+    debugEspHardwareService();
 
     /* Gestionar conexión TCP de MATLAB */
     matlab.loop();
@@ -749,26 +770,7 @@ void loop()
         handleMatlabCmd(matlab.lastCmd());
     }
 
-    /* Muestrar martillo a ~1020 Hz */
-    uint32_t nowUs = (uint32_t)micros();
-    if ((uint32_t)(nowUs - g_lastHammerUs) >= HAMMER_SAMPLE_US) {
-        g_lastHammerUs = nowUs;
-        if (g_streaming && g_state == RUNNING) {
-            int32_t val;
-            if (g_testMode) {
-                val = (int32_t)(g_debugRamp++ & 0xFFFFFF);
-            } else {
-                val = hammer.readAccel();
-            }
-            matlab.sendHammer(val);
-            samplePulse();
-            g_hammerCount++;
-            if (g_rec_n_batches > 0 && g_hammerCount >= (uint32_t)g_rec_n_batches * 30) {
-                g_streaming = false;
-                MASTER_LOG_PRINTF("[MASTER] hammer stop (%u muestras)\n", g_hammerCount);
-            }
-        }
-    }
+    /* El maestro ya NO muestrea martillo: ahora es un esclavo normal. */
 
     /* Detectar transición ARMING → ARMED cuando llegan suficientes ACK
      * (los ACK se imprimieron en espnow_rx.h; acá solo chequeamos con timeout) */

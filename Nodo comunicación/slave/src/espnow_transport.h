@@ -7,21 +7,13 @@
  */
 
 #include <Arduino.h>
-#include "psoc_spi.h"
+#include "psoc_uart.h"
 #include "sync_protocol.h"
 #include "espnow_compat.h"
+#include "debug_log.h"
 
-#ifndef DEBUG_COM
-  #define DEBUG_COM 1
-#endif
-
-#if DEBUG_COM
-  #define ESPNOW_LOG_PRINTLN(...) Serial.println(__VA_ARGS__)
-  #define ESPNOW_LOG_PRINTF(...)  Serial.printf(__VA_ARGS__)
-#else
-  #define ESPNOW_LOG_PRINTLN(...) do {} while (0)
-  #define ESPNOW_LOG_PRINTF(...)  do {} while (0)
-#endif
+#define ESPNOW_LOG_PRINTLN(...) MASTER_LOG_PRINTLN(__VA_ARGS__)
+#define ESPNOW_LOG_PRINTF(...)  MASTER_LOG_PRINTF(__VA_ARGS__)
 
 class EspNowTransport {
 public:
