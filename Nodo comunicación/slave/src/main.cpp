@@ -77,8 +77,7 @@ static volatile uint64_t   g_t_start_us  = 0;
 static volatile bool       g_debug_mode  = false;
 static          uint32_t   g_debug_count = 0;
 static volatile uint32_t   g_debug_last_us = 0;
-static volatile bool       g_debugHwActive = false;
-static volatile uint32_t   g_debugHwFallUs = 0;
+/* g_debugHwActive / g_debugHwFallUs viven en scope_pulse.h */
 static          uint8_t    g_pga_code    = 0;
 static          uint8_t    g_pgavdac     = 0;
 static          uint8_t    g_vdac_byte   = 128;
@@ -98,67 +97,8 @@ static volatile uint32_t g_view_armDueUs    = 0; /* cuándo levantar el flanco *
 static PsocUART       psoc;
 static EspNowTransport transport;
 
-static inline uint8_t samplePulseActiveLevel()
-{
-    return (SAMPLE_PULSE_IDLE == LOW) ? HIGH : LOW;
-}
-
-static inline uint8_t debugHwActiveLevel()
-{
-    return (DEBUG_HW_START_IDLE == LOW) ? HIGH : LOW;
-}
-
-static void samplePulseBegin()
-{
-#if SAMPLE_PULSE_PIN >= 0
-    pinMode(SAMPLE_PULSE_PIN, OUTPUT);
-    digitalWrite(SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE);
-#endif
-}
-
-static void debugEspHardwareBegin()
-{
-#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
-    pinMode(DEBUG_HW_START_PIN, OUTPUT);
-    digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
-#endif
-}
-
-static inline void samplePulse()
-{
-#if SAMPLE_PULSE_PIN >= 0
-    digitalWrite(SAMPLE_PULSE_PIN, samplePulseActiveLevel());
-#if SAMPLE_PULSE_US > 0
-    delayMicroseconds(SAMPLE_PULSE_US);
-#endif
-    digitalWrite(SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE);
-#endif
-}
-
-static inline void debugEspHardwareStartPulse()
-{
-#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
-    digitalWrite(DEBUG_HW_START_PIN, debugHwActiveLevel());
-#if DEBUG_HW_START_US > 0
-    g_debugHwFallUs = (uint32_t)micros() + (uint32_t)DEBUG_HW_START_US;
-    g_debugHwActive = true;
-#else
-    digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
-    g_debugHwActive = false;
-#endif
-#endif
-}
-
-static inline void debugEspHardwareService()
-{
-#if DEBUG_HARDWARE && DEBUG_HW_START_PIN >= 0
-    if (g_debugHwActive &&
-        (int32_t)((uint32_t)micros() - g_debugHwFallUs) >= 0) {
-        digitalWrite(DEBUG_HW_START_PIN, DEBUG_HW_START_IDLE);
-        g_debugHwActive = false;
-    }
-#endif
-}
+/* Helpers de pulsos GPIO de osciloscopio (módulo aparte). */
+#include "scope_pulse.h"
 
 static void pulseSampleCount(uint8_t n)
 {
