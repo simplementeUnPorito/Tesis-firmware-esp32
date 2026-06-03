@@ -29,7 +29,7 @@ typedef void (*BatchReadyCallback)(const ReassembledBatch &batch);
 typedef void (*ArmAckCallback)(const MsgArmAck &msg);
 typedef void (*StatusCallback)(const MsgStatus &msg);
 typedef void (*CfgAckCallback)(const MsgCfgAck &msg);
-typedef void (*HelloCallback)(const MsgHello &msg);
+typedef void (*HelloCallback)(const MsgHello &msg, const uint8_t senderMac[6]);
 typedef void (*StartAckCallback)(const MsgStartAck &msg);
 typedef void (*HotWaitAckCallback)(const MsgHotWaitAck &msg);
 
@@ -67,7 +67,7 @@ private:
     void _handleStatus(const MsgStatus *msg);
     void _handleArmAck(const MsgArmAck *msg);
     void _handleCfgAck(const MsgCfgAck *msg);
-    void _handleHello(const MsgHello *msg);
+    void _handleHello(const MsgHello *msg, const uint8_t senderMac[6]);
     void _handleStartAck(const MsgStartAck *msg);
     void _handleHotWaitAck(const MsgHotWaitAck *msg);
 
@@ -120,7 +120,7 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
     } else if (first == CMD_CFG_ACK && (size_t)len >= sizeof(MsgCfgAck)) {
         instance->_handleCfgAck((const MsgCfgAck *)data);
     } else if (first == CMD_HELLO && (size_t)len >= sizeof(MsgHello)) {
-        instance->_handleHello((const MsgHello *)data);
+        instance->_handleHello((const MsgHello *)data, mac);
     } else if (first == CMD_START_ACK && (size_t)len >= sizeof(MsgStartAck)) {
         instance->_handleStartAck((const MsgStartAck *)data);
     } else if (first == CMD_HOTWAIT_ACK && (size_t)len >= sizeof(MsgHotWaitAck)) {
@@ -186,10 +186,13 @@ inline void EspNowRx::_handleCfgAck(const MsgCfgAck *msg)
     if (_cfgAckCb) { _cfgAckCb(*msg); }
 }
 
-inline void EspNowRx::_handleHello(const MsgHello *msg)
+inline void EspNowRx::_handleHello(const MsgHello *msg, const uint8_t senderMac[6])
 {
-    MASTER_LOG_PRINTF("[ESPNOW-RX] HELLO node=%d\n", msg->node_id);
-    if (_helloCb) { _helloCb(*msg); }
+    MASTER_LOG_PRINTF("[ESPNOW-RX] HELLO node=%d mac=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                      msg->node_id,
+                      senderMac[0], senderMac[1], senderMac[2],
+                      senderMac[3], senderMac[4], senderMac[5]);
+    if (_helloCb) { _helloCb(*msg, senderMac); }
 }
 
 inline void EspNowRx::_handleStartAck(const MsgStartAck *msg)

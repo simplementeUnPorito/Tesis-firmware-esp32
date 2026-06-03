@@ -6,7 +6,7 @@ muestreo levantando el pin `SYNC_TO_PSOC`. Un esclavo puede ser un geófono o el
 martillo (mismo firmware; cambia solo el hardware del PSoC).
 
 ## Enlace con el PSoC (`psoc_uart.*`)
-- **Serial2** (ESP32): `PSOC_UART_RX=16`, `PSOC_UART_TX=17`, `PSOC_UART_BAUD=460800`.
+- **Serial2** (ESP32): `PSOC_UART_RX=16`, `PSOC_UART_TX=17`, `PSOC_UART_BAUD=115200`.
 - Recibe frames de 95 B (raw 24-bit → `PsocBatch`); envía comandos
   `setN / preStart / setVdac / setPga / setPgavdac / debugRamp`.
 - El **arranque del PSoC es siempre por el pin** `SYNC_TO_PSOC` (flanco), no por UART.

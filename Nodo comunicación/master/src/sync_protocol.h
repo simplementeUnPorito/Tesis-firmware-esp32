@@ -71,6 +71,7 @@ struct MsgStatus {
     uint32_t batches_bad;
     uint32_t espnow_sent;
     uint32_t espnow_fail;
+    uint8_t  psoc_ok;   /* 1=PSoC detectado, 0=no */
 };
 
 /* Fase 2: configuración individual por esclavo */
@@ -109,6 +110,7 @@ struct MsgDebugPsoc {
 struct MsgHello {
     uint8_t cmd;      /* CMD_HELLO */
     uint8_t node_id;
+    uint8_t psoc_ok;  /* 1=PSoC detectado en boot, 0=no detectado */
 };
 
 struct MsgSetRecLen {
