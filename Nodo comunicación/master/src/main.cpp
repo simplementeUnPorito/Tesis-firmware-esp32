@@ -25,6 +25,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include "sync_protocol.h"
 #include "espnow_rx.h"
 #include "matlab_transport.h"
@@ -100,6 +101,9 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
 #ifndef DUMP_NACK_RETRY_DELAY_MS
   #define DUMP_NACK_RETRY_DELAY_MS 100
 #endif
+#ifndef PSOC_CAPTURE_MAX_BATCHES
+  #define PSOC_CAPTURE_MAX_BATCHES 512
+#endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
 static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
@@ -124,7 +128,7 @@ static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
 enum MasterState { IDLE, ARMING, ARMED, RUNNING, STOPPING, DUMPING, PRESTART, SCOPE_MULTI };
-enum PrestartAction { PRESTART_ACTION_START, PRESTART_ACTION_SCOPE_MULTI, PRESTART_ACTION_START_PROBE };
+enum PrestartAction { PRESTART_ACTION_START, PRESTART_ACTION_SCOPE_MULTI, PRESTART_ACTION_START_PROBE, PRESTART_ACTION_VER };
 static MasterState g_state       = IDLE;
 static PrestartAction g_prestartAction = PRESTART_ACTION_START;
 static uint8_t     g_armedCount  = 0;
@@ -174,6 +178,8 @@ static MatlabTransport matlab;
 
 static void beginDump(const char *reason);
 static void beginPrestart(PrestartAction action);
+static void beacon_pause(void);
+static void beacon_resume(void);
 
 static uint32_t g_debugRamp     = 0;   /* (reservado para tests) */
 
@@ -221,6 +227,16 @@ static uint8_t countHotWaitAcks(uint32_t mask)
     return n;
 }
 
+static uint16_t clampRecordBatches(uint16_t n)
+{
+    if (n > PSOC_CAPTURE_MAX_BATCHES) {
+        MASTER_LOG_PRINTF("[MASTER] n_batches %u > PSoC max %u, clamp\n",
+                          n, (unsigned)PSOC_CAPTURE_MAX_BATCHES);
+        return (uint16_t)PSOC_CAPTURE_MAX_BATCHES;
+    }
+    return n;
+}
+
 static MasterState armedOrIdleState()
 {
     g_armedCount = countArmAcks(g_armAckMask);
@@ -254,6 +270,23 @@ static void onSlaveStatus(const MsgStatus &msg)
 
 static void onCfgAck(const MsgCfgAck &msg)
 {
+    /* VER ok=1: esclavo confirmó HOT_WAIT → iniciar HOTWAIT_QUERY/START igual que START */
+    if (msg.sub_cmd == CMD_VIEW && msg.ok == 1 &&
+        g_viewDump && msg.node_id == g_viewNode && g_state == RUNNING) {
+        MASTER_LOG_PRINTF("[MASTER] VIEW HOT_WAIT ready node=%d -> VER PRESTART\n", msg.node_id);
+        LOGM("VIEW_HOTWAIT_READY", "node=%d", msg.node_id);
+        g_hotWaitAckMask        = 0;
+        g_hotWaitQueryNode      = g_viewNode;
+        g_hotWaitRetries        = 0;
+        g_hotWaitReadyCount     = 0;
+        g_hotWaitQueryInFlight  = false;
+        g_hotWaitSettling       = false;
+        g_hotWaitQueryMs        = millis() + HOTWAIT_QUERY_DELAY_MS;
+        g_prestartAction        = PRESTART_ACTION_VER;
+        g_state                 = PRESTART;
+        beacon_pause();   /* pausar al inicio del PRESTART VER */
+    }
+    /* VER ok=2: captura completada → volcar datos */
     if (msg.sub_cmd == CMD_VIEW && msg.ok == 2 &&
         g_viewDump && msg.node_id == g_viewNode && g_state == RUNNING) {
         MASTER_LOG_PRINTF("[MASTER] VIEW capture done node=%d -> DUMP\n", msg.node_id);
@@ -332,6 +365,25 @@ static uint32_t captureDurationMs(uint16_t nBatches)
     return (samples * 1000UL + (ADC_SAMPLE_RATE_HZ - 1)) / ADC_SAMPLE_RATE_HZ;
 }
 
+/* ── Beacon pause/resume — sin RF durante captura ─────────────────────────── */
+static void beacon_pause(void)
+{
+    wifi_config_t ap_cfg = {};
+    esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
+    ap_cfg.ap.beacon_interval = 60000u;   /* max documentado TU ≈ 61 s */
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    MASTER_LOG_PRINTLN("[MASTER] beacon pausado (captura activa)");
+}
+
+static void beacon_resume(void)
+{
+    wifi_config_t ap_cfg = {};
+    esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
+    ap_cfg.ap.beacon_interval = 1000u;    /* 1000 TU ≈ 1.024 s */
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    MASTER_LOG_PRINTLN("[MASTER] beacon resumido (inicio dump)");
+}
+
 static void scheduleStoreDump(uint16_t nBatches)
 {
     if (nBatches == 0 || (g_armedCount == 0 && !g_viewDump)) {
@@ -348,6 +400,7 @@ static void scheduleStoreDump(uint16_t nBatches)
 
 static void beginDump(const char *reason)
 {
+    beacon_resume();
     g_captureDumpDueMs = 0;
     g_dumpRetryPaused = false;
     g_dumpRetryDueMs = 0;
@@ -550,6 +603,7 @@ static void broadcastStop()
 
 static void beginPrestart(PrestartAction action)
 {
+    beacon_pause();   /* pausar beacon al inicio de PRESTART — toma efecto antes del START */
     syncOutWrite(LOW);
     g_prestartAction = action;
     const char *actionName = "START";
@@ -611,6 +665,28 @@ static void finishPrestartAction()
         matlab.sendReady(g_armedCount);
         MASTER_LOG_PRINTF("[MASTER] HOT_WAIT done -> START_PROBE node=%d\n",
                           g_prestartProbeNode);
+    } else if (g_prestartAction == PRESTART_ACTION_VER) {
+        /* VER: CMD_START dirigido solo al nodo de VIEW (igual que START pero unicast) */
+        g_t_start_us    = (uint64_t)micros();
+        g_startProbeNode = 0;
+        g_startCmdToken  = (uint32_t)g_t_start_us;
+        syncOutWrite(HIGH);
+        debugEspHardwareStartPulse();
+        {
+            const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[g_viewNode - 1])
+                               ? SLAVE_MACS[g_viewNode - 1]
+                               : ESPNOW_BROADCAST;
+            MsgStart msg = { CMD_START, g_t_start_us, g_viewNode };
+            if (g_espnowReady) {
+                g_startCmdTxUs = (uint32_t)micros();
+                esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+            }
+        }
+        g_captureDumpDueMs = 0;   /* dump al recibir VIEW_DONE del esclavo */
+        g_state = RUNNING;
+        matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+        MASTER_LOG_PRINTF("[MASTER] VER HOT_WAIT done -> CMD_START node=%d\n", g_viewNode);
+        LOGM("VER_START", "node=%d", g_viewNode);
     } else {
         /* No modificar g_armedCount: intentar dump desde todos los slaves ARM'd.
            Los que no grabaron responderán NACK y se saltean via retry. */
@@ -712,7 +788,7 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
                 g_viewNode = 0;
                 g_viewBatchesRemaining = 0;
-                g_rec_n_batches = rxCmd.value;
+                g_rec_n_batches = clampRecordBatches(rxCmd.value);
                 g_debugRamp = 0;
                 g_streaming = true;
                 beginPrestart(PRESTART_ACTION_START);
@@ -783,7 +859,7 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
         }
 
         case 0xAE: {  /* SET_RECORD_LEN: n_batches (16 bits en rxCmd.value) */
-            g_rec_n_batches = rxCmd.value;
+            g_rec_n_batches = clampRecordBatches(rxCmd.value);
             broadcastRecordLength(g_rec_n_batches);
             matlab.sendAck(0xFF, 0xAE, (uint8_t)(g_rec_n_batches & 0xFF));
             break;
@@ -819,6 +895,15 @@ void setup()
      * que el ESP8266 puede descartar si no reconoce ese BSSID. */
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS, 1);   /* canal 1 fijo */
+    /* Aumentar intervalo de beacon para reducir interferencia RF en el ADC.
+     * El default (100 TU ≈ 100 ms) genera spikes de 10 Hz visibles en el geófono.
+     * ESP-NOW no depende de beacons, así que 1000 ms no afecta la comunicación. */
+    {
+        wifi_config_t ap_cfg = {};
+        esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
+        ap_cfg.ap.beacon_interval = 1000;   /* 1000 TU ≈ 1024 ms */
+        esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    }
     MASTER_LOG_PRINTF("[MASTER] AP IP:     %s\n", WiFi.softAPIP().toString().c_str());
     MASTER_LOG_PRINTF("[MASTER] STA MAC:   %s\n", WiFi.macAddress().c_str());
     MASTER_LOG_PRINTF("[MASTER] AP MAC:    %s  ch=%d\n",
@@ -903,55 +988,86 @@ void loop()
         armLastTxMs = 0;
     }
 
-    /* PRESTART: entrar en HOT_WAIT, consultar esclavos en orden y recién disparar. */
+    /* PRESTART: entrar en HOT_WAIT, consultar esclavos y recién disparar. */
     if (g_state == PRESTART) {
-        uint8_t readyCount = countHotWaitAcks(g_hotWaitAckMask);
-        if (readyCount != g_hotWaitReadyCount) {
-            g_hotWaitReadyCount = readyCount;
-        }
-
-        if (g_expectedSlaves == 0 && !g_hotWaitSettling) {
-            g_hotWaitSettling = true;
-            g_hotWaitSettleDueMs = millis() + HOTWAIT_SETTLE_MS;
-        }
-
-        if (g_hotWaitSettling) {
-            if ((int32_t)(millis() - g_hotWaitSettleDueMs) >= 0) {
-                finishPrestartAction();
-            }
-        } else {
-            while (g_hotWaitQueryNode <= g_expectedSlaves &&
-                   hotWaitAcked(g_hotWaitQueryNode)) {
-                g_hotWaitQueryNode++;
-                g_hotWaitRetries = 0;
-                g_hotWaitQueryInFlight = false;
-                g_hotWaitQueryMs = millis();
-            }
-
-            if (g_hotWaitQueryNode > g_expectedSlaves) {
-                g_hotWaitSettling = true;
+        if (g_prestartAction == PRESTART_ACTION_VER) {
+            /* VER PRESTART: solo consultar al nodo de VIEW — sin broadcastPrestart */
+            if (g_hotWaitSettling) {
+                if ((int32_t)(millis() - g_hotWaitSettleDueMs) >= 0) {
+                    finishPrestartAction();
+                }
+            } else if (hotWaitAcked(g_viewNode)) {
+                g_hotWaitSettling    = true;
                 g_hotWaitSettleDueMs = millis() + HOTWAIT_SETTLE_MS;
-                MASTER_LOG_PRINTF("[MASTER] HOT_WAIT all ready, settle %u ms\n",
-                                  (unsigned)HOTWAIT_SETTLE_MS);
+                MASTER_LOG_PRINTF("[MASTER] VER HOT_WAIT ok node=%d, settle %u ms\n",
+                                  g_viewNode, (unsigned)HOTWAIT_SETTLE_MS);
             } else if (!g_hotWaitQueryInFlight &&
                        (int32_t)(millis() - g_hotWaitQueryMs) >= 0) {
-                sendHotWaitQuery(g_hotWaitQueryNode);
+                sendHotWaitQuery(g_viewNode);
                 g_hotWaitQueryInFlight = true;
-                g_hotWaitQueryMs = millis();
+                g_hotWaitQueryMs       = millis();
             } else if (g_hotWaitQueryInFlight &&
                        millis() - g_hotWaitQueryMs > HOTWAIT_QUERY_TIMEOUT_MS) {
                 if (g_hotWaitRetries < HOTWAIT_QUERY_RETRIES) {
                     g_hotWaitRetries++;
-                    broadcastPrestart(g_rec_n_batches);
-                    sendHotWaitQuery(g_hotWaitQueryNode);
+                    sendHotWaitQuery(g_viewNode);
                     g_hotWaitQueryMs = millis();
                 } else {
-                    /* Timeout agotado: saltar este slave y continuar con el siguiente */
-                    MASTER_LOG_PRINTF("[MASTER] HOT_WAIT skip node=%d\n", g_hotWaitQueryNode);
+                    MASTER_LOG_PRINTF("[MASTER] VER HOT_WAIT timeout node=%d -> continuar\n",
+                                      g_viewNode);
+                    g_hotWaitSettling    = true;
+                    g_hotWaitSettleDueMs = millis() + HOTWAIT_SETTLE_MS;
+                }
+            }
+        } else {
+            /* PRESTART normal: consultar esclavos en orden */
+            uint8_t readyCount = countHotWaitAcks(g_hotWaitAckMask);
+            if (readyCount != g_hotWaitReadyCount) {
+                g_hotWaitReadyCount = readyCount;
+            }
+
+            if (g_expectedSlaves == 0 && !g_hotWaitSettling) {
+                g_hotWaitSettling    = true;
+                g_hotWaitSettleDueMs = millis() + HOTWAIT_SETTLE_MS;
+            }
+
+            if (g_hotWaitSettling) {
+                if ((int32_t)(millis() - g_hotWaitSettleDueMs) >= 0) {
+                    finishPrestartAction();
+                }
+            } else {
+                while (g_hotWaitQueryNode <= g_expectedSlaves &&
+                       hotWaitAcked(g_hotWaitQueryNode)) {
                     g_hotWaitQueryNode++;
                     g_hotWaitRetries = 0;
                     g_hotWaitQueryInFlight = false;
                     g_hotWaitQueryMs = millis();
+                }
+
+                if (g_hotWaitQueryNode > g_expectedSlaves) {
+                    g_hotWaitSettling    = true;
+                    g_hotWaitSettleDueMs = millis() + HOTWAIT_SETTLE_MS;
+                    MASTER_LOG_PRINTF("[MASTER] HOT_WAIT all ready, settle %u ms\n",
+                                      (unsigned)HOTWAIT_SETTLE_MS);
+                } else if (!g_hotWaitQueryInFlight &&
+                           (int32_t)(millis() - g_hotWaitQueryMs) >= 0) {
+                    sendHotWaitQuery(g_hotWaitQueryNode);
+                    g_hotWaitQueryInFlight = true;
+                    g_hotWaitQueryMs       = millis();
+                } else if (g_hotWaitQueryInFlight &&
+                           millis() - g_hotWaitQueryMs > HOTWAIT_QUERY_TIMEOUT_MS) {
+                    if (g_hotWaitRetries < HOTWAIT_QUERY_RETRIES) {
+                        g_hotWaitRetries++;
+                        broadcastPrestart(g_rec_n_batches);
+                        sendHotWaitQuery(g_hotWaitQueryNode);
+                        g_hotWaitQueryMs = millis();
+                    } else {
+                        MASTER_LOG_PRINTF("[MASTER] HOT_WAIT skip node=%d\n", g_hotWaitQueryNode);
+                        g_hotWaitQueryNode++;
+                        g_hotWaitRetries = 0;
+                        g_hotWaitQueryInFlight = false;
+                        g_hotWaitQueryMs       = millis();
+                    }
                 }
             }
         }
@@ -1026,7 +1142,6 @@ void loop()
                 uint8_t dumpLimit = g_viewDump ? g_viewNode : g_armedCount;
                 if (g_dumpSlaveIdx > dumpLimit) {
                     if (g_viewDump) {
-                        /* VIEW terminó: liberar buffer del esclavo y limpiar estado */
                         broadcastRecordLength(0);
                         g_viewDump = false;
                         g_viewNode = 0;

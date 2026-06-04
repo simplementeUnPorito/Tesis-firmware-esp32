@@ -52,6 +52,9 @@
 #ifndef DEBUG_HW_START_US
   #define DEBUG_HW_START_US SCOPE_START_PULSE_US
 #endif
+#ifndef PSOC_CAPTURE_MAX_BATCHES
+  #define PSOC_CAPTURE_MAX_BATCHES 512
+#endif
 /* Logging (humano + máquina) en debug_log.h, gateado por DBG_ENABLE. */
 
 /* MAC del ESP maestro. El valor real debe venir de platformio.ini. */
@@ -119,9 +122,7 @@ static uint32_t   *g_store_ts_us   = nullptr;    /* timestamp relativo por batch
 static uint16_t    g_store_fill    = 0;
 
 /* ── Modo "Ver" (disparo único, store primero y dump después) ────────────── */
-static volatile uint16_t g_view_remaining   = 0; /* legado live deshabilitado */
-static volatile bool     g_view_armPending  = false;
-static volatile uint32_t g_view_armDueUs    = 0; /* cuándo levantar el flanco */
+static volatile uint16_t g_view_remaining    = 0; /* legado live deshabilitado */
 static volatile bool     g_view_store_active = false;
 
 #define PSOC_CFG_ACK_TIMEOUT_MS 250u
@@ -132,13 +133,6 @@ static EspNowTransport transport;
 
 /* Helpers de pulsos GPIO de osciloscopio (módulo aparte). */
 #include "scope_pulse.h"
-
-static void pulseSampleCount(uint8_t n)
-{
-    for (uint8_t i = 0; i < n; i++) {
-        samplePulse();
-    }
-}
 
 static void logPsocUartDiag(const char *tag)
 {
@@ -233,7 +227,7 @@ static void waitForPsocConfigAck(uint8_t sub_cmd, uint8_t param)
 
 static void servicePsocConfigAck()
 {
-    if (g_state == SAMPLING || g_view_armPending) {
+    if (g_state == SAMPLING) {
         return;   /* Nunca emitir ACK/timeout por radio durante la captura. */
     }
 
@@ -280,8 +274,17 @@ static bool storeReadyForHotWait()
     return (g_rec_n_batches == 0) || (g_store_buf != nullptr && g_store_ts_us != nullptr);
 }
 
+static uint16_t clampPsocCaptureBatches(uint16_t n)
+{
+    if (n > PSOC_CAPTURE_MAX_BATCHES) {
+        return (uint16_t)PSOC_CAPTURE_MAX_BATCHES;
+    }
+    return n;
+}
+
 static void enterHotWait(uint16_t n_batches)
 {
+    n_batches = clampPsocCaptureBatches(n_batches);
     allocStore(n_batches);
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
     g_t_start_us     = 0;
@@ -335,7 +338,7 @@ static void debugEspSetRamp(bool enable)
 static void handleSetConfig(const MsgSetConfig *cfg)
 {
     if (cfg->node_id != NODE_ID) return;
-    if (g_state == SAMPLING || g_view_armPending) {
+    if (g_state == SAMPLING) {
         SLAVE_LOG_PRINTF("[SLAVE] cfg ignored during capture sub=0x%02X\n",
                          cfg->sub_cmd);
         LOGM("CFG_IGN_CAPTURE", "sub=0x%02X", cfg->sub_cmd);
@@ -407,7 +410,13 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     if (len < 1) return;
     uint8_t cmd = data[0];
     if (g_state == SAMPLING && cmd != CMD_STOP) {
-        return;   /* Nada de ACK/log/radio mientras el ADC está muestreando. */
+        /* En debug/test, VER puede interrumpir para evitar race condition */
+        if (g_debug_mode && cmd == CMD_VIEW) {
+            g_debug_mode = false;
+            g_state = STOPPED;
+        } else {
+            return;   /* No ACK/radio durante muestreo real. */
+        }
     }
     LOGM("RX", "cmd=0x%02X,len=%d,state=%d", cmd, len, (int)g_state);
 
@@ -485,7 +494,6 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
             g_view_remaining = 0;
         }
         psoc.debugRamp(false);      /* por seguridad: cortar cualquier debug PSoC */
-        g_view_armPending = false;
         g_view_store_active = false;
         g_state = STOPPED;
         SLAVE_LOG_PRINTLN("[SLAVE] STOP");
@@ -505,9 +513,11 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         handleDebugNode((const MsgDebugNode *)data);
     }
     else if (cmd == CMD_VIEW && len >= (int)sizeof(MsgView)) {
-        /* "Ver": disparo único — guarda en RAM primero (sin TX ESP-NOW durante el
-         * muestreo), luego el maestro hace dump vía REQ_BATCH. Así se elimina la
-         * interferencia de RF que ensuciaba la señal en el modo live anterior. */
+        /* "Ver": igual que PRESTART en el flujo START.
+         * El esclavo entra en HOT_WAIT y espera CMD_START del maestro
+         * (el maestro hace HOTWAIT_QUERY → START dirigido a este nodo).
+         * Sin auto-arme: todo el muestreo empieza solo cuando el maestro
+         * confirma que no hay RF pendiente, igual que en START normal. */
         const MsgView *msg = (const MsgView *)data;
         if (msg->node_id != NODE_ID) return;
         uint16_t n = msg->n ? msg->n : 1;
@@ -518,20 +528,17 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_debug_mode = false;
         psoc.debugRamp(false);
-        enterHotWait(n);               /* store-then-dump: no hay TX durante muestreo */
+        enterHotWait(n);
         uint8_t ok = storeReadyForHotWait() ? 1u : 0u;
         if (ok) {
             g_view_store_active = true;
-            g_view_armPending = true;
-            g_view_armDueUs   = (uint32_t)micros() + 3000u;
         } else {
-            g_view_armPending = false;
             g_view_store_active = false;
             g_state = STOPPED;
         }
         sendCfgAck(CMD_VIEW, ok);
-        SLAVE_LOG_PRINTF("[SLAVE] VIEW n=%u (store sync ok=%u)\n", n, ok);
-        LOGM("VIEW", "n=%u,store=1,sync=1,ok=%u", n, ok);
+        SLAVE_LOG_PRINTF("[SLAVE] VIEW n=%u HOT_WAIT ok=%u (esperando CMD_START)\n", n, ok);
+        LOGM("VIEW", "n=%u,store=1,hotwait=1,ok=%u", n, ok);
     }
     else if (cmd == CMD_DEBUG_PSOC && len >= (int)sizeof(MsgDebugPsoc)) {
         const MsgDebugPsoc *msg = (const MsgDebugPsoc *)data;
@@ -558,6 +565,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 
 static void allocStore(uint16_t n_batches)
 {
+    n_batches = clampPsocCaptureBatches(n_batches);
     free(g_store_buf);  free(g_store_ts_us);
     g_store_buf    = nullptr;
     g_store_ts_us  = nullptr;
@@ -583,8 +591,7 @@ static void handleReqBatch(const MsgReqBatch *msg)
     if (g_state == SAMPLING) {
         return;   /* No TX ESP-NOW mientras el ADC está capturando. */
     }
-    if (g_view_armPending ||
-        (g_view_store_active && g_store_fill < g_rec_n_batches)) {
+    if (g_view_store_active && g_store_fill < g_rec_n_batches) {
         SLAVE_LOG_PRINTF("[SLAVE] REQ_BATCH ignored during capture seq=%u fill=%u/%u state=%d\n",
                          seq, g_store_fill, g_rec_n_batches, (int)g_state);
         return;
@@ -607,7 +614,6 @@ static void onBatch(const PsocBatch &batch)
 {
     if (g_state != SAMPLING) return;
     g_psocConnected = true;
-    pulseSampleCount(batch.n_samples);
 
     if (g_view_remaining > 0) {
         g_view_remaining = 0;   /* fail-safe: VIEW live no debe transmitir mientras muestrea */
@@ -643,8 +649,25 @@ static void onBatch(const PsocBatch &batch)
                 LOGM("VIEWDONE", "store=1,n=%u", g_store_fill);
             }
         }
-    } else {
-        /* Sin store no hay fallback live: no transmitir RF mientras el ADC muestrea. */
+    } else if (g_debug_mode) {
+        /* Test: transmitir en vivo la rampa (no es señal ADC real, RF no afecta). */
+        SampleBytes sb[SPI_BATCH_SAMPLES];
+        for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+            const PsocSample &ps = batch.samples[i];
+            sb[i].raw_lo = (uint8_t)( ps.raw_input          & 0xFF);
+            sb[i].raw_hi = (uint8_t)((ps.raw_input   >>  8) & 0xFF);
+            sb[i].alog0  = (uint8_t)( ps.post_analog         & 0xFF);
+            sb[i].alog1  = (uint8_t)((ps.post_analog  >>  8) & 0xFF);
+            sb[i].alog2  = (uint8_t)((ps.post_analog  >> 16) & 0xFF);
+            sb[i].digi0  = (uint8_t)( ps.post_digital         & 0xFF);
+            sb[i].digi1  = (uint8_t)((ps.post_digital >>  8) & 0xFF);
+            sb[i].digi2  = (uint8_t)((ps.post_digital >> 16) & 0xFF);
+            sb[i].gain   = ps.gain_byte;
+            sb[i].flags  = ps.sample_flags;
+        }
+        uint64_t ts = g_t_start_us + (uint64_t)batch.timestamp_us;
+        transport.sendStoredBatch(sb, g_store_fill, ts, NODE_ID);
+        g_store_fill++;
     }
 }
 
@@ -719,25 +742,8 @@ void setup()
 
 void loop()
 {
-    debugEspHardwareService();
-
-    /* "Ver": levantar el flanco hacia el PSoC tras el pequeño retardo de arme. */
-    if (g_view_armPending &&
-        (int32_t)((uint32_t)micros() - g_view_armDueUs) >= 0) {
-        g_view_armPending = false;
-        if (g_state == HOT_WAIT && storeReadyForHotWait()) {
-            g_t_start_us = (uint64_t)micros();
-            g_store_fill = 0;
-            g_debug_count = 0;
-            g_debug_last_us = (uint32_t)g_t_start_us;
-            digitalWrite(SYNC_TO_PSOC_PIN, HIGH);   /* flanco de subida -> arranca */
-            g_state = SAMPLING;
-        } else {
-            SLAVE_LOG_PRINTF("[SLAVE] VIEW flanco cancelado state=%d ready=%u\n",
-                             (int)g_state, (unsigned)storeReadyForHotWait());
-            LOGM("VIEW_CANCEL", "state=%d,ready=%u",
-                 (int)g_state, (unsigned)storeReadyForHotWait());
-        }
+    if (g_state != SAMPLING) {
+        debugEspHardwareService();
     }
 
     /* Drenar siempre la UART del PSoC (onBatch ignora si no está SAMPLING). */
@@ -806,7 +812,7 @@ void loop()
 
     /* Informe de estado cada 10 s */
     static uint32_t last_status = 0;
-    if (g_state != HOT_WAIT && g_state != SAMPLING && !g_view_armPending &&
+    if (g_state != HOT_WAIT && g_state != SAMPLING &&
         millis() - last_status > 10000) {
         last_status = millis();
         MsgStatus st = {
