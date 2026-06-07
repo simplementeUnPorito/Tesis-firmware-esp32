@@ -804,7 +804,7 @@ void loop()
     static uint32_t lastHelloMs = 0;
     if (g_state == WAIT_ARM && millis() - lastHelloMs >= 2000) {
         lastHelloMs = millis();
-        MsgHello h = { CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected };
+        MsgHello h = { CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected, psoc.sampleRate() };
         esp_err_t err = espnowSend(MASTER_MAC, (const uint8_t *)&h, sizeof(h));
         SLAVE_LOG_PRINTF("[SLAVE] HELLO tx err=%d txOK=%u txFail=%u\n",
                          (int)err, transport.sentOK(), transport.sentFail());

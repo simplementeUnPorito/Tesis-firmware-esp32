@@ -130,9 +130,10 @@ struct MsgDebugPsoc {
 };
 
 struct MsgHello {
-    uint8_t cmd;      /* CMD_HELLO */
-    uint8_t node_id;
-    uint8_t psoc_ok;  /* 1=PSoC detectado en boot, 0=no detectado */
+    uint8_t  cmd;         /* CMD_HELLO */
+    uint8_t  node_id;
+    uint8_t  psoc_ok;     /* 1=PSoC detectado en boot, 0=no detectado */
+    uint16_t sample_rate; /* ADC sample rate en Hz reportado por PSoC; 0=desconocido */
 };
 
 struct MsgSetRecLen {

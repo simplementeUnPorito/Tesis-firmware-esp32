@@ -72,6 +72,8 @@ void PsocUART::poll()
                 _ser->write(pong, sizeof(pong));
             } else if (_buf[1] == PSOC_CTRL_CFG_ACK) {
                 continue;   /* frame corto: [AB][C2][cmd][val][crc] */
+            } else if (_buf[1] == PSOC_CTRL_FS_REPORT) {
+                continue;   /* frame corto: [AB][C3][fs_lo][fs_hi][crc] */
             } else {
                 _badLen++;
             }
@@ -81,6 +83,11 @@ void PsocUART::poll()
         if (_idx >= PSOC_CTRL_ACK_BYTES && _buf[1] == PSOC_CTRL_CFG_ACK) {
             _idx = 0;
             _parseConfigAck();
+            continue;
+        }
+        if (_idx >= PSOC_CTRL_ACK_BYTES && _buf[1] == PSOC_CTRL_FS_REPORT) {
+            _idx = 0;
+            _parseFsReport();
             continue;
         }
         if (_idx >= PSOC_FRAME_BYTES) {
@@ -180,6 +187,19 @@ void PsocUART::setPgavdac(uint8_t code){ _sendCmd1(PSOC_CMD_PGAVDAC, code); }
 void PsocUART::debugRamp(bool en)      { _sendCmd1(PSOC_CMD_DEBUG, en ? 1 : 0); }
 void PsocUART::requestStatus()         { _sendCmd1(PSOC_CMD_STATUS, 0); }
 void PsocUART::sendPong()              { _sendCmd1(PSOC_CTRL_PONG, 0); }
+
+void PsocUART::_parseFsReport()
+{
+    const uint8_t fs_lo = _buf[2];
+    const uint8_t fs_hi = _buf[3];
+    const uint8_t crc   = _buf[4];
+    if (crc != (uint8_t)(PSOC_CTRL_FS_REPORT ^ fs_lo ^ fs_hi)) {
+        _badLen++;
+        return;
+    }
+    const uint16_t fs = (uint16_t)fs_lo | ((uint16_t)fs_hi << 8);
+    if (fs > 0) { _sampleRate = fs; }
+}
 
 bool PsocUART::probe(uint32_t timeoutMs)
 {

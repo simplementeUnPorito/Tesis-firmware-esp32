@@ -47,9 +47,10 @@
 #define PSOC_CMD_START_NOW 0xB4
 
 /* Control PSoC -> ESP */
-#define PSOC_CTRL_PING     0xC0
-#define PSOC_CTRL_PONG     0xC1
-#define PSOC_CTRL_CFG_ACK  0xC2
+#define PSOC_CTRL_PING      0xC0
+#define PSOC_CTRL_PONG      0xC1
+#define PSOC_CTRL_CFG_ACK   0xC2
+#define PSOC_CTRL_FS_REPORT 0xC3  /* PSoC → ESP: frecuencia de muestreo ADC */
 
 struct PsocSample {
     int16_t  raw_input;
@@ -90,6 +91,7 @@ public:
      * y solo como fallback activa la rampa para firmware PSoC viejo. */
     bool probe(uint32_t timeoutMs = 150);
 
+    uint16_t sampleRate() const { return _sampleRate; }
     bool     lastOK()     const { return _lastOK; }
     uint32_t batchesOK()  const { return _batchesOK; }
     uint32_t batchesBad() const { return _batchesBad; }
@@ -117,6 +119,7 @@ private:
     uint32_t        _badLen    = 0;
     uint32_t        _pingsRx   = 0;
     uint32_t        _configAcksRx = 0;
+    uint16_t        _sampleRate = 0;
     bool            _cfgAckPending = false;
     uint8_t         _cfgAckCmd = 0;
     uint8_t         _cfgAckVal = 0;
@@ -129,6 +132,7 @@ private:
 
     void _parseFrame();
     void _parseConfigAck();
+    void _parseFsReport();
     void _noteRxByte(uint8_t b);
     void _sendCmd1(uint8_t cmd, uint8_t p);
     void _sendCmd2(uint8_t cmd, uint8_t p1, uint8_t p2);

@@ -59,8 +59,8 @@ public:
     void sendStartLatency(uint8_t nodeId, uint32_t tofUs);
     /* Diagnóstico: estado ESP-NOW del maestro al arrancar */
     void sendStatus(uint8_t espnow_ok, uint8_t ap_ch);
-    /* Diagnóstico: maestro recibió HELLO de un esclavo (incluye estado PSoC + MAC) */
-    void sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok = 0, const uint8_t mac[6] = nullptr);
+    /* Diagnóstico: maestro recibió HELLO de un esclavo (incluye estado PSoC + MAC + FS) */
+    void sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok = 0, const uint8_t mac[6] = nullptr, uint16_t fs = 0);
 
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
@@ -180,10 +180,11 @@ inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)
     Serial.write(pkt, 6);
 }
 
-inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6])
+inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6], uint16_t fs)
 {
-    /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=0 */
-    uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x01, psoc_ok, 0x00 };
+    /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
+    uint8_t fs_code = (fs >= 100u) ? (uint8_t)(fs / 100u) : 0u;
+    uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x01, psoc_ok, fs_code };
     Serial.write(pkt, 6);
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */

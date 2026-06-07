@@ -316,8 +316,8 @@ static void onCfgAck(const MsgCfgAck &msg)
 
 static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
 {
-    MASTER_LOG_PRINTF("[MASTER] HELLO node=%d psoc=%d\n", msg.node_id, msg.psoc_ok);
-    matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac);
+    MASTER_LOG_PRINTF("[MASTER] HELLO node=%d psoc=%d fs=%u\n", msg.node_id, msg.psoc_ok, msg.sample_rate);
+    matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate);
 }
 
 static void onStartAck(const MsgStartAck &msg)
