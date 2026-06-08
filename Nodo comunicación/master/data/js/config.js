@@ -33,13 +33,20 @@ export const SUBCMD_VER = 0xB2;
 export const SUBCMD_LATENCY = 0xAF;
 
 // Acquisition parameters
-export const FS = 1020;
+// NOTE: there is intentionally NO nominal/default sample-rate constant here.
+// The PSoC's ADC rate depends on its analog front-end programming and can be
+// reconfigured at any time, so Fs must ALWAYS come from the slave's HELLO
+// (see effectiveFs() in data_store.js) — never a guessed fallback.
 export const SAMPLES_PER_BATCH = 30;
 export const PSOC_CAPTURE_MAX_BATCHES = 512;
 export const TEST_DEFAULT_SECONDS = 0.2;
-export const DISP_SAMP = FS * 3;
+// Placeholder sample counts for buffer/display sizing before any slave's
+// HELLO reports the real Fs — syncDataBufferForFs()/applyDisplayWindow()
+// (app.js) resize these for real the moment Fs becomes known, so the exact
+// values here only need to be "reasonable", not tied to any real rate.
+export const DISP_SAMP = 3000;
 export const MAX_BUF_S = 10;
-export const MAX_BUF = FS * MAX_BUF_S;
+export const MAX_BUF = 30000;
 
 // Nodes
 export const MAX_NODES = 4;

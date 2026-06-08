@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=plot-zoom-1">
+  <link rel="stylesheet" href="/css/style.css?v=field-loop-4">
 </head>
 <body>
   <header>
@@ -12,83 +12,106 @@
     <div class="status-bar">
       <span>WS: <strong id="conn-status" class="bad">desconectado</strong></span>
       <span>Estado: <strong id="master-state">--</strong></span>
-      <span>Fs: <strong id="global-fs">1020 Hz nominal</strong></span>
+      <span>Fs: <strong id="global-fs">esperando…</strong></span>
       <button id="btn-connect">Reconectar</button>
       <button id="btn-theme">Modo claro</button>
     </div>
   </header>
 
-  <section class="panel">
-    <h2>Captura</h2>
-    <div class="row">
-      <label>ARM n_esclavos <input id="arm-n" type="number" min="0" max="3" value="0"></label>
-      <button id="btn-arm">ARM</button>
-    </div>
-    <div class="row">
-      <label>Duración <input id="capture-secs" type="number" min="0.1" max="120" step="0.1" value="1.0"> s</label>
-      <button id="btn-start">START</button>
-      <span id="capture-batches" class="status-text">--</span>
-    </div>
-    <div class="row">
-      <button id="btn-stop">STOP</button>
-      <button id="btn-status">STATUS</button>
-    </div>
-  </section>
-
-  <section class="panel">
-    <h2>Gráficas</h2>
-    <div class="row">
-      <label>Ventana <input id="disp-secs" type="number" min="1" max="10" step="1" value="3"> s</label>
-      <span class="plot-tools">
-        <button id="btn-plot-zoom-out" title="Alejar">−</button>
-        <button id="btn-plot-zoom-in" title="Acercar">+</button>
-        <button id="btn-plot-reset" title="Restablecer">Reset</button>
-      </span>
-    </div>
-    <div id="plots" class="plot-area"></div>
-  </section>
-
-  <section class="panel">
-    <h2>Nodos</h2>
-    <div class="node-list">
-      <div class="node-row" id="node-1">
-        <span class="name">Esclavo 1</span>
-        <span class="raw">--</span>
-        <span class="stats">--</span>
-        <span class="cfg">--</span>
+  <main class="app-layout">
+    <section class="panel plot-panel">
+      <h2>Gráficas</h2>
+      <div class="row plot-toolbar">
+        <label>Ventana <input id="disp-secs" type="number" min="1" max="10" step="1" value="3"> s</label>
+        <span class="plot-tools">
+          <button id="btn-plot-zoom-out" title="Alejar">−</button>
+          <button id="btn-plot-zoom-in" title="Acercar">+</button>
+          <button id="btn-plot-reset" title="Restablecer">Reset</button>
+        </span>
+        <span class="plot-tools">
+          <label><input id="chk-show-raw" type="checkbox" checked> Cruda</label>
+          <label><input id="chk-show-filt" type="checkbox" checked> Filtrada</label>
+        </span>
       </div>
-      <div class="node-row" id="node-2">
-        <span class="name">Esclavo 2</span>
-        <span class="raw">--</span>
-        <span class="stats">--</span>
-        <span class="cfg">--</span>
+      <div id="plots" class="plot-area"></div>
+    </section>
+
+    <aside class="control-sidebar">
+      <nav class="tab-bar" role="tablist" aria-label="Configuración">
+        <button id="tab-btn-capture" class="tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="tab-capture" data-tab-target="tab-capture">Captura</button>
+        <button id="tab-btn-nodes" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-nodes" data-tab-target="tab-nodes">Nodos</button>
+        <button id="tab-btn-slaves" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-slaves" data-tab-target="tab-slaves">Esclavos</button>
+        <button id="tab-btn-export" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-export" data-tab-target="tab-export">Export</button>
+        <button id="tab-btn-log" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-log" data-tab-target="tab-log">Log</button>
+      </nav>
+
+      <div class="tab-stack">
+        <section id="tab-capture" class="panel tab-page active" role="tabpanel" aria-labelledby="tab-btn-capture">
+          <h2>Captura</h2>
+          <div class="row">
+            <label>ARM n_esclavos <input id="arm-n" type="number" min="0" max="3" value="0"></label>
+            <button id="btn-arm">ARM</button>
+          </div>
+          <div class="row">
+            <label>Fs manual <input id="manual-fs-hz" type="number" min="1" step="1" placeholder="Hz, si no llega por HELLO"></label>
+            <button id="btn-manual-fs">Aplicar Fs</button>
+          </div>
+          <div class="row">
+            <label>Duración <input id="capture-secs" type="number" min="0.1" max="120" step="0.1" value="1.0"> s</label>
+            <button id="btn-start">START</button>
+            <span id="capture-batches" class="status-text">--</span>
+          </div>
+          <div class="row">
+            <button id="btn-stop">STOP</button>
+            <button id="btn-status">STATUS</button>
+          </div>
+        </section>
+
+        <section id="tab-nodes" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-nodes">
+          <h2>Nodos</h2>
+          <div class="node-list">
+            <div class="node-row" id="node-1">
+              <span class="name">Esclavo 1</span>
+              <span class="raw">--</span>
+              <span class="stats">--</span>
+              <span class="cfg">--</span>
+            </div>
+            <div class="node-row" id="node-2">
+              <span class="name">Esclavo 2</span>
+              <span class="raw">--</span>
+              <span class="stats">--</span>
+              <span class="cfg">--</span>
+            </div>
+            <div class="node-row" id="node-3">
+              <span class="name">Esclavo 3</span>
+              <span class="raw">--</span>
+              <span class="stats">--</span>
+              <span class="cfg">--</span>
+            </div>
+          </div>
+        </section>
+
+        <div id="tab-slaves" class="tab-page" role="tabpanel" aria-labelledby="tab-btn-slaves">
+          <div id="slave-panels" class="slave-panels"></div>
+        </div>
+
+        <section id="tab-export" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-export">
+          <h2>Exportar</h2>
+          <div class="row">
+            <label>Nombre <input id="export-name" type="text" value="muestra"></label>
+            <button id="btn-export">Descargar ZIP</button>
+          </div>
+          <div id="export-status" class="status-text">--</div>
+        </section>
+
+        <section id="tab-log" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-log">
+          <h2>Log</h2>
+          <div id="log" class="log"></div>
+        </section>
       </div>
-      <div class="node-row" id="node-3">
-        <span class="name">Esclavo 3</span>
-        <span class="raw">--</span>
-        <span class="stats">--</span>
-        <span class="cfg">--</span>
-      </div>
-    </div>
-  </section>
+    </aside>
+  </main>
 
-  <div id="slave-panels"></div>
-
-  <section class="panel">
-    <h2>Exportar</h2>
-    <div class="row">
-      <label>Nombre <input id="export-name" type="text" value="muestra"></label>
-      <label><input id="chk-export-csv" type="checkbox"> CSV</label>
-      <button id="btn-export">Descargar ZIP</button>
-    </div>
-    <div id="export-status" class="status-text">--</div>
-  </section>
-
-  <section class="panel">
-    <h2>Log</h2>
-    <div id="log" class="log"></div>
-  </section>
-
-  <script type="module" src="/js/app.js?v=plot-zoom-1"></script>
+  <script type="module" src="/js/app.js?v=field-loop-4"></script>
 </body>
 </html>

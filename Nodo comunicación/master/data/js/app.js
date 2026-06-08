@@ -2,14 +2,14 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js';
-import { WsClient } from './ws_client.js';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js';
-import { DataStore, effectiveFs } from './data_store.js';
-import { PlotArea } from './plot.js?v=plot-zoom-1';
-import { SlavePanel } from './slave_panel.js';
-import { compileFirCmd, firFilter, harmonicNotch, lastFirError } from './signal_proc.js';
-import { buildCaptureZip, downloadBlob } from './export.js';
+import * as cfg from './config.js?v=field-loop-4';
+import { WsClient } from './ws_client.js?v=field-loop-4';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-4';
+import { DataStore, effectiveFs } from './data_store.js?v=field-loop-4';
+import { PlotArea } from './plot.js?v=field-loop-4';
+import { SlavePanel } from './slave_panel.js?v=field-loop-4';
+import { compileFirCmd, firFilter, harmonicNotch, lastFirError } from './signal_proc.js?v=field-loop-4';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-4';
 
 const $ = (id) => document.getElementById(id);
 
@@ -25,6 +25,7 @@ let masterState = 0;
 let activeSlaveCount = 0;
 
 const SETTINGS_PREFIX = 'geophone_scope_web.';
+const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz`;
 
 function clamp(value, lo, hi) {
   return Math.max(lo, Math.min(hi, value));
@@ -69,6 +70,15 @@ function loadSlaveBool(chIndex, name, fallback) {
   return raw === '1' || raw === 'true' || raw === 'on';
 }
 
+function saveGlobalFs(fsHz) {
+  if (!(fsHz > 0)) return;
+  try {
+    localStorage.setItem(GLOBAL_FS_KEY, String(Math.round(fsHz)));
+  } catch (_) {
+    // localStorage can be disabled on some phone browser/privacy modes.
+  }
+}
+
 function anySlaveFsKnown() {
   for (let i = 1; i < cfg.MAX_NODES; i++) {
     if (data.nodes[i].fsKnown) return true;
@@ -76,6 +86,9 @@ function anySlaveFsKnown() {
   return false;
 }
 
+// Returns the Fs reported by the hardware (Hz), or 0 if no slave has sent its
+// HELLO yet. NEVER substitute a guessed/nominal value here — the PSoC is the
+// only source of truth for its own configured sample rate, and it can change.
 function currentFsHz() {
   return effectiveFs(data);
 }
@@ -87,8 +100,11 @@ function captureSeconds() {
   return clamp(secs, 0.1, 120);
 }
 
+// Returns 0 (meaning "cannot compute yet") when Fs is still unknown — the
+// caller must check for that instead of silently capturing with a wrong rate.
 function batchesForSeconds(seconds) {
   const fs = currentFsHz();
+  if (!fs) return 0;
   const batches = Math.ceil((seconds * fs) / cfg.SAMPLES_PER_BATCH);
   return clamp(Math.max(1, batches), 1, cfg.PSOC_CAPTURE_MAX_BATCHES);
 }
@@ -98,12 +114,18 @@ function captureBatches() {
 }
 
 function secondsForBatches(nBatches) {
-  return (nBatches * cfg.SAMPLES_PER_BATCH) / currentFsHz();
+  const fs = currentFsHz();
+  return fs ? (nBatches * cfg.SAMPLES_PER_BATCH) / fs : 0;
 }
 
 function updateCapturePreview() {
   const el = $('capture-batches');
   if (!el) return;
+  const fs = currentFsHz();
+  if (!fs) {
+    el.textContent = 'esperando Fs del esclavo (HELLO)…';
+    return;
+  }
   const secs = captureSeconds();
   const n = batchesForSeconds(secs);
   const actualSecs = secondsForBatches(n);
@@ -114,8 +136,8 @@ function updateCapturePreview() {
 function updateGlobalFsDisplay() {
   const el = $('global-fs');
   if (el) {
-    const suffix = anySlaveFsKnown() ? '' : ' nominal';
-    el.textContent = `${currentFsHz().toFixed(0)} Hz${suffix}`;
+    const fs = currentFsHz();
+    el.textContent = fs ? `${fs.toFixed(0)} Hz` : 'esperando…';
   }
   updateCapturePreview();
 }
@@ -182,15 +204,19 @@ function setActiveSlaveCount(nSlaves, zeroMeansAll = false) {
 }
 
 function applyDisplayWindow() {
+  const fs = currentFsHz();
+  if (!fs) return;   // nothing sensible to size the window to yet
   const secs = parseInt($('disp-secs').value, 10) || 1;
-  plotArea.setDisplaySamples(Math.round(secs * currentFsHz()));
+  plotArea.setDisplaySamples(Math.round(secs * fs));
   updateCapturePreview();
 }
 
 function syncDataBufferForFs() {
+  const fs = currentFsHz();
+  if (!fs) return;   // wait for the real Fs — never size buffers off a guess
   const maxSamples = Math.max(
     cfg.SAMPLES_PER_BATCH,
-    Math.round(cfg.MAX_BUF_S * currentFsHz()),
+    Math.round(cfg.MAX_BUF_S * fs),
   );
   data.resizeAll(maxSamples);
 }
@@ -314,7 +340,7 @@ function recompileNodeFirForFs(chIndex) {
   return true;
 }
 
-function updateNodeFsFromHello(chIndex, fsHz) {
+function applyGlobalFs(fsHz, logMessage = '') {
   if (!(fsHz > 0)) return;
   const wasKnown = anySlaveFsKnown();
   let changed = false;
@@ -334,7 +360,23 @@ function updateNodeFsFromHello(chIndex, fsHz) {
   applyDisplayWindow();
   updateGlobalFsDisplay();
   for (let i = 1; i < cfg.MAX_NODES; i++) renderNodeRow(i);
-  appendLog(`Fs global actualizado por S${chIndex}: ${fsHz} Hz`);
+  if (logMessage) appendLog(logMessage);
+}
+
+function updateNodeFsFromHello(chIndex, fsHz) {
+  if (!(fsHz > 0)) return;
+  saveSlaveSetting(chIndex, 'fs_hz', Math.round(fsHz));
+  saveGlobalFs(fsHz);
+  applyGlobalFs(fsHz, `Fs global actualizado por S${chIndex}: ${fsHz} Hz`);
+}
+
+function restoreFsFromLocalCache() {
+  const raw = loadSetting(GLOBAL_FS_KEY);
+  const fsHz = raw === null ? NaN : parseFloat(raw);
+  if (!(fsHz > 0)) return;
+  applyGlobalFs(fsHz, `Fs restaurado de cache local: ${fsHz} Hz`);
+  const manualInput = $('manual-fs-hz');
+  if (manualInput) manualInput.value = String(Math.round(fsHz));
 }
 
 function schedulePgaLockTimeout(chIndex, expectedCode) {
@@ -395,6 +437,10 @@ function onPgaChanged(chIndex, pgaCode) {
 }
 
 function onVerRequested(chIndex) {
+  if (!currentFsHz()) {
+    appendLog(`VER Slave ${chIndex} cancelado: esperando Fs real del esclavo (HELLO no recibido aun)`);
+    return;
+  }
   const n = captureBatches();
   const secs = secondsForBatches(n);
   prepareNodeCapture(chIndex);
@@ -478,7 +524,6 @@ function onExportRequested() {
       nSlaves: activeSlaveCount,
       nBatches,
       displaySecs,
-      includeCsv: $('chk-export-csv').checked,
     });
     downloadBlob(blob, filename);
     $('export-status').textContent =
@@ -557,7 +602,10 @@ function onNotchHarmChanged(chIndex, harmonics) {
 function loadSlavePanelState(chIndex, panel) {
   const nd = data.nodes[chIndex];
   const alias = loadSetting(settingKey(chIndex, 'alias'));
-  if (alias) panel.setAlias(alias);
+  if (alias) {
+    nd.alias = alias;
+    panel.setAlias(alias);
+  }
 
   nd.pgavdac = loadSlaveInt(chIndex, 'pgavdac_code', nd.pgavdac, 0, cfg.GAIN_CODES.length - 1);
   nd.vdacByte = loadSlaveInt(chIndex, 'vdac_byte', nd.vdacByte, cfg.VDAC_MIN, cfg.VDAC_MAX);
@@ -594,6 +642,7 @@ function loadSlavePanelState(chIndex, panel) {
 
 function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('alias-changed', (ev) => {
+    data.nodes[chIndex].alias = ev.detail;
     saveSlaveSetting(chIndex, 'alias', ev.detail);
   });
   panel.addEventListener('vdac-changed', (ev) => onVdacChanged(chIndex, ev.detail));
@@ -702,7 +751,12 @@ function renderTick() {
   }
   const rawBufs = data.nodes.map((nd) => (nd.rawBuf.length ? nd.rawBuf.toArray() : null));
   const filtBufs = data.nodes.map((nd) => (nd.filtBuf.length ? nd.filtBuf.toArray() : null));
-  plotArea.update(rawBufs, filtBufs, fs);
+  // Linear-phase FIR of length N has constant group delay (N-1)/2: its first
+  // (N-1)/2 outputs are pure startup transient. PlotArea discards that many
+  // leading samples so the transient never appears and the rest aligns
+  // index-for-index with raw.
+  const filtTrims = data.nodes.map((nd) => (nd.filtB ? (nd.filtB.length - 1) / 2 : 0));
+  plotArea.update(rawBufs, filtBufs, fs, filtTrims);
 
   updateGlobalFsDisplay();
   for (let i = 1; i <= activeSlaveCount; i++) {
@@ -721,6 +775,20 @@ function initTheme() {
   applyTheme(saved === 'light');
 }
 
+function initTabs() {
+  const tabs = Array.from(document.querySelectorAll('.tab-btn[data-tab-target]'));
+  const pages = Array.from(document.querySelectorAll('.tab-page'));
+  const activate = (targetId) => {
+    for (const tab of tabs) {
+      const active = tab.dataset.tabTarget === targetId;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+    for (const page of pages) page.classList.toggle('active', page.id === targetId);
+  };
+  for (const tab of tabs) tab.addEventListener('click', () => activate(tab.dataset.tabTarget));
+}
+
 $('btn-theme').addEventListener('click', () => {
   const light = !document.body.classList.contains('light');
   applyTheme(light);
@@ -732,7 +800,9 @@ $('btn-theme').addEventListener('click', () => {
 });
 
 initTheme();
+initTabs();
 buildSlavePanels();
+restoreFsFromLocalCache();
 setConnIndicator(false);
 setMasterState(masterState);
 setActiveSlaveCount(activeSlaveCount);
@@ -790,7 +860,25 @@ $('btn-arm').addEventListener('click', () => {
   sendStd(cfg.CMD_ARM, n);
 });
 
+// Manual override for when no slave's HELLO carries Fs (e.g. master rebooted
+// while slaves were already armed — HELLO is only beaconed from WAIT_ARM).
+// All slaves share the same hardware Fs, so one operator-entered value covers
+// every node, exactly like a real HELLO would via applyGlobalFs().
+$('btn-manual-fs').addEventListener('click', () => {
+  const fsHz = parseFloat($('manual-fs-hz').value);
+  if (!(fsHz > 0)) {
+    appendLog('Fs manual invalida: ingresa un valor en Hz > 0');
+    return;
+  }
+  saveGlobalFs(fsHz);
+  applyGlobalFs(fsHz, `Fs aplicada manualmente: ${fsHz} Hz`);
+});
+
 $('btn-start').addEventListener('click', () => {
+  if (!currentFsHz()) {
+    appendLog('START cancelado: esperando Fs real del esclavo (HELLO no recibido aun)');
+    return;
+  }
   const n = captureBatches();
   const secs = secondsForBatches(n);
   data.clearAll();
@@ -813,6 +901,14 @@ $('btn-export').addEventListener('click', onExportRequested);
 $('btn-plot-zoom-in').addEventListener('click', () => plotArea.zoomBy(1.5, 0.5));
 $('btn-plot-zoom-out').addEventListener('click', () => plotArea.zoomBy(1 / 1.5, 0.5));
 $('btn-plot-reset').addEventListener('click', () => plotArea.resetView());
+
+// Display-only curve visibility — saving/export always keeps raw AND filtered regardless of these.
+function applyCurveVisibility() {
+  plotArea.setCurveVisibility($('chk-show-raw').checked, $('chk-show-filt').checked);
+}
+$('chk-show-raw').addEventListener('change', applyCurveVisibility);
+$('chk-show-filt').addEventListener('change', applyCurveVisibility);
+applyCurveVisibility();
 
 $('disp-secs').addEventListener('change', applyDisplayWindow);
 $('capture-secs').addEventListener('change', () => {

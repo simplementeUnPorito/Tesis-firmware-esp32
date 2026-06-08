@@ -28,11 +28,15 @@ typedef void (*WebRelayClientHook)();
 static WebRelayClientHook g_webRelayClientHook = nullptr;
 
 static constexpr size_t WEB_RELAY_PKT_LEN = 6;
-static constexpr size_t WEB_RELAY_TX_PKTS = 96;
+static constexpr size_t WEB_RELAY_TX_PKTS = 300;
 static constexpr size_t WEB_RELAY_TX_BYTES = WEB_RELAY_TX_PKTS * WEB_RELAY_PKT_LEN;
+static constexpr size_t WEB_RELAY_DUMP_BATCH_BYTES = 30 * WEB_RELAY_PKT_LEN;
+static constexpr size_t WEB_RELAY_QUEUE_SOFT_MAX = 12;
+static constexpr uint32_t WEB_RELAY_FLUSH_MS = 8u;
 static uint8_t  g_webRelayTxBuf[WEB_RELAY_TX_BYTES];
 static size_t   g_webRelayTxLen = 0;
 static uint32_t g_webRelayTxFirstMs = 0;
+static uint32_t g_webRelayDropCount = 0;
 #if defined(ESP32)
 static portMUX_TYPE g_webRelayTxMux = portMUX_INITIALIZER_UNLOCKED;
 #endif
@@ -190,7 +194,29 @@ static void webRelayFlush()
     webRelayTxUnlock();
 
     if (len == 0) return;
-    if (ws.count() > 0) ws.binaryAll(out, len);
+    if (ws.count() == 0) return;
+
+    if (!ws.availableForWriteAll()) {
+        webRelayTxLock();
+        if (g_webRelayTxLen == 0 && len <= WEB_RELAY_TX_BYTES) {
+            memcpy(g_webRelayTxBuf, out, len);
+            g_webRelayTxLen = len;
+            if (g_webRelayTxFirstMs == 0) g_webRelayTxFirstMs = millis();
+        } else {
+            g_webRelayDropCount++;
+            MASTER_LOG_PRINTF("[WEB] WS cola llena: drop %u (%u bytes)\n",
+                              (unsigned)g_webRelayDropCount, (unsigned)len);
+        }
+        webRelayTxUnlock();
+        return;
+    }
+
+    AsyncWebSocket::SendStatus st = ws.binaryAll(out, len);
+    if (st != AsyncWebSocket::ENQUEUED) {
+        g_webRelayDropCount++;
+        MASTER_LOG_PRINTF("[WEB] WS envio parcial/drop %u status=%d bytes=%u\n",
+                          (unsigned)g_webRelayDropCount, (int)st, (unsigned)len);
+    }
 }
 
 static void webRelayService()
@@ -199,9 +225,33 @@ static void webRelayService()
     webRelayTxLock();
     due = (g_webRelayTxLen > 0 &&
            g_webRelayTxFirstMs != 0 &&
-           (uint32_t)(millis() - g_webRelayTxFirstMs) >= 2u);
+           (uint32_t)(millis() - g_webRelayTxFirstMs) >= WEB_RELAY_FLUSH_MS);
     webRelayTxUnlock();
     if (due) webRelayFlush();
+}
+
+inline bool webRelayReadyForDumpRequest()
+{
+    webRelayService();
+    if (ws.count() == 0) return true;
+
+    size_t pending = 0;
+    webRelayTxLock();
+    pending = g_webRelayTxLen;
+    webRelayTxUnlock();
+
+    if (pending + WEB_RELAY_DUMP_BATCH_BYTES > WEB_RELAY_TX_BYTES) {
+        webRelayFlush();
+        return false;
+    }
+    if (!ws.availableForWriteAll()) return false;
+
+    for (auto &c : ws.getClients()) {
+        if (c.status() == WS_CONNECTED && c.queueLen() >= WEB_RELAY_QUEUE_SOFT_MAX) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void webRelayPacket(const uint8_t pkt[6])

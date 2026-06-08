@@ -1208,7 +1208,7 @@ void loop()
     if (g_state == DUMPING) {
         bool advance = false;
 
-        if (g_dumpBatchRx) {
+        if (g_dumpBatchRx && webRelayReadyForDumpRequest()) {
             g_dumpBatchRx = false;
             g_dumpRetries = 0;
             g_dumpRetryPaused = false;

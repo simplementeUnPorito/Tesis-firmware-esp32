@@ -5,7 +5,7 @@
 // Phase 4 alongside signal_proc.js; the serial debug-COM log group is desktop/
 // USB-only (lists local PC ports) and has no phone-browser equivalent.
 
-import * as cfg from './config.js';
+import * as cfg from './config.js?v=field-loop-2';
 
 // Ganancia máxima del PGAvdac — valores más altos añaden demasiado ruido (mirrors SlaveTab._PGAVDAC_MAX_GAIN)
 const PGAVDAC_MAX_GAIN = 8;

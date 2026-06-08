@@ -4,7 +4,7 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js';
+import * as cfg from './config.js?v=field-loop-2';
 
 const RAW_COLOR = 'rgb(80, 140, 255)';
 const FILT_COLOR = 'rgb(255, 80, 80)';
@@ -41,14 +41,16 @@ function fmtVolt(v) {
   return v.toFixed(3);
 }
 
-function minMax(arr) {
+function minMax(arr, start = 0, end = arr.length) {
   let lo = Infinity, hi = -Infinity;
-  for (let i = 0; i < arr.length; i++) {
+  const from = Math.max(0, start | 0);
+  const to = Math.min(arr.length, Math.max(from, end | 0));
+  for (let i = from; i < to; i++) {
     const v = arr[i];
     if (v < lo) lo = v;
     if (v > hi) hi = v;
   }
-  return { lo, hi };
+  return Number.isFinite(lo) && Number.isFinite(hi) ? { lo, hi } : null;
 }
 
 function cssVar(el, name, fallback) {
@@ -66,10 +68,12 @@ class ChannelPlot {
     this.title = title;
     this._raw = null;    // Float64Array | null — already windowed to the display tail
     this._filt = null;   // Float64Array | null
-    this._fs = cfg.FS;
+    this._fs = 0;        // 0 = Fs not yet reported by hardware — don't draw a time axis
     this._xStartSamp = 0;
     this._xSpanSamp = cfg.DISP_SAMP;
     this._visible = true;
+    this._showRaw = true;
+    this._showFilt = true;
     this._handlers = handlers;
     this._dragLastX = null;
 
@@ -94,13 +98,23 @@ class ChannelPlot {
 
   get visible() { return this._visible; }
 
-  /** raw/filt: Float64Array|null, already windowed. fs: Hz, for the time axis. */
-  setData(raw, filt, fs, xStartSamp, xSpanSamp) {
+  /** Show/hide the raw and/or filtered curve independently of whether data exists for them. */
+  setCurveVisibility(showRaw, showFilt) {
+    this._showRaw = showRaw !== false;
+    this._showFilt = showFilt !== false;
+  }
+
+  /** raw/filt: Float64Array|null, already windowed. fs: Hz, for the time axis.
+   *  filtTrimSamp: count of leading filtered samples to discard before
+   *  drawing (0 → keep all). See PlotArea.update for why. */
+  setData(raw, filt, fs, xStartSamp, xSpanSamp, filtTrimSamp = 0) {
     this._raw = (raw && raw.length) ? raw : null;
     this._filt = (filt && filt.length) ? filt : null;
-    this._fs = fs || cfg.FS;
+    // No nominal fallback: Fs comes only from the hardware HELLO. 0 = unknown.
+    this._fs = fs || 0;
     this._xStartSamp = Math.max(0, xStartSamp | 0);
     this._xSpanSamp = Math.max(1, xSpanSamp | 0);
+    this._filtTrimSamp = filtTrimSamp || 0;
   }
 
   clear() {
@@ -129,27 +143,52 @@ class ChannelPlot {
       this._handlers.onZoom(factor, frac);
     }, { passive: false });
 
+    // A press that doesn't move (beyond CLICK_SLOP) is a click-to-zoom:
+    // left button (or plain tap) zooms in, right button or shift-click zooms
+    // out, anchored at the clicked x position. A press that moves pans, same
+    // as before. This replaces dblclick-to-reset (the toolbar Reset button
+    // covers that) since the two gestures would otherwise both fire on a
+    // double-click and fight each other.
+    const CLICK_SLOP = 4;
     this.canvas.addEventListener('pointerdown', (ev) => {
       this._dragLastX = ev.clientX;
+      this._downX = ev.clientX;
+      this._downY = ev.clientY;
+      this._downButton = ev.button;
+      this._dragMoved = false;
       this.canvas.setPointerCapture(ev.pointerId);
     });
     this.canvas.addEventListener('pointermove', (ev) => {
-      if (this._dragLastX === null || !this._handlers.onPan) return;
+      if (this._dragLastX === null) return;
+      if (!this._dragMoved
+          && (Math.abs(ev.clientX - this._downX) > CLICK_SLOP
+              || Math.abs(ev.clientY - this._downY) > CLICK_SLOP)) {
+        this._dragMoved = true;
+      }
+      if (!this._handlers.onPan) return;
       const dx = ev.clientX - this._dragLastX;
       this._dragLastX = ev.clientX;
       const rect = this.canvas.getBoundingClientRect();
       this._handlers.onPan(-dx / Math.max(1, rect.width));
     });
-    const endDrag = () => { this._dragLastX = null; };
+    const endDrag = (ev) => {
+      if (this._dragLastX !== null && !this._dragMoved && this._handlers.onZoom) {
+        const rect = this.canvas.getBoundingClientRect();
+        const frac = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+        const zoomOut = this._downButton === 2 || ev.shiftKey;
+        this._handlers.onZoom(zoomOut ? 1 / 1.5 : 1.5, frac);
+      }
+      this._dragLastX = null;
+    };
     this.canvas.addEventListener('pointerup', endDrag);
-    this.canvas.addEventListener('pointercancel', endDrag);
-    this.canvas.addEventListener('dblclick', () => {
-      if (this._handlers.onReset) this._handlers.onReset();
-    });
+    this.canvas.addEventListener('pointercancel', () => { this._dragLastX = null; });
+    // Right-click drives zoom-out (above) instead of opening a context menu.
+    this.canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
   }
 
   draw() {
     if (!this._visible) return;
+    if (!this._fs) return;   // Fs not yet reported — nothing meaningful to plot
     const ctx = this._ctx;
     const dpr = window.devicePixelRatio || 1;
     const W = this.canvas.width;
@@ -178,15 +217,25 @@ class ChannelPlot {
     const xHi = (this._xStartSamp + this._xSpanSamp) / this._fs;
     const xSpan = Math.max(1 / this._fs, xHi - xLo);
 
+    const showRaw = this._showRaw && raw;
+    const showFilt = this._showFilt && filt;
     let yLo = -1, yHi = 1;
-    if (raw || filt) {
+    if (showRaw || showFilt) {
       let lo = Infinity, hi = -Infinity;
-      if (raw)  { const r = minMax(raw);  lo = Math.min(lo, r.lo); hi = Math.max(hi, r.hi); }
-      if (filt) { const r = minMax(filt); lo = Math.min(lo, r.lo); hi = Math.max(hi, r.hi); }
-      if (lo === hi) { lo -= 1; hi += 1; }
-      const pad = (hi - lo) * 0.08;
-      yLo = lo - pad;
-      yHi = hi + pad;
+      if (showRaw) {
+        const r = minMax(raw);
+        if (r) { lo = Math.min(lo, r.lo); hi = Math.max(hi, r.hi); }
+      }
+      if (showFilt) {
+        const r = minMax(filt, this._filtTrimSamp);
+        if (r) { lo = Math.min(lo, r.lo); hi = Math.max(hi, r.hi); }
+      }
+      if (Number.isFinite(lo) && Number.isFinite(hi)) {
+        if (lo === hi) { lo -= 1; hi += 1; }
+        const pad = (hi - lo) * 0.08;
+        yLo = lo - pad;
+        yHi = hi + pad;
+      }
     }
 
     const xTo = (t) => m.left + ((t - xLo) / xSpan) * plotW;
@@ -230,22 +279,30 @@ class ChannelPlot {
     ctx.beginPath();
     ctx.rect(m.left, m.top, plotW, plotH);
     ctx.clip();
-    const drawCurve = (data, color) => {
-      if (!data || data.length < 2) return;
+    const drawCurve = (data, color, trimSamp) => {
+      if (!data || data.length < 2 + trimSamp) return;
       ctx.strokeStyle = color;
       ctx.lineWidth = Math.max(1, dpr);
       ctx.beginPath();
       const len = data.length;
-      for (let i = 0; i < len; i++) {
-        const px = xTo((this._xStartSamp + i) / this._fs);
+      let started = false;
+      for (let i = trimSamp; i < len; i++) {
+        // filt[trimSamp + k] is the group-delay-compensated sample that lines
+        // up with raw[k] (k = i - trimSamp); plot it at raw[k]'s x-position,
+        // not at its own raw index, or the curve ends up shifted right by an
+        // extra trimSamp samples on top of the filter's own group delay.
+        const px = xTo((this._xStartSamp + i - trimSamp) / this._fs);
         const py = yTo(data[i]);
-        if (i === 0) ctx.moveTo(px, py);
+        if (!started) { ctx.moveTo(px, py); started = true; }
         else ctx.lineTo(px, py);
       }
       ctx.stroke();
     };
-    drawCurve(raw, RAW_COLOR);
-    drawCurve(filt, FILT_COLOR);
+    if (this._showRaw) drawCurve(raw, RAW_COLOR, 0);
+    // Linear-phase FIR of length N has constant group delay (N-1)/2: its
+    // first (N-1)/2 outputs are pure startup transient. Discard them so the
+    // rest aligns index-for-index with raw, and the transient never appears.
+    if (this._showFilt) drawCurve(filt, FILT_COLOR, this._filtTrimSamp);
     ctx.restore();
 
     // Title (top-left) + legend (top-right)
@@ -257,13 +314,15 @@ class ChannelPlot {
 
     let lx = W - m.right;
     ctx.textAlign = 'right';
-    if (filt) {
+    if (filt && this._showFilt) {
       ctx.fillStyle = FILT_COLOR;
       ctx.fillText('Filtrada', lx, 4 * dpr);
       lx -= ctx.measureText('Filtrada').width + 14 * dpr;
     }
-    ctx.fillStyle = RAW_COLOR;
-    ctx.fillText('Cruda', lx, 4 * dpr);
+    if (this._showRaw) {
+      ctx.fillStyle = RAW_COLOR;
+      ctx.fillText('Cruda', lx, 4 * dpr);
+    }
 
     // Y-axis unit label (rotated)
     ctx.save();
@@ -294,18 +353,26 @@ export class PlotArea {
     this._zoom = 1;
     this._panSamp = 0;
     this._followTail = true;
+    this._showRaw = true;
+    this._showFilt = true;
     this._lastMaxLen = 0;
     this._plots = [];
     const handlers = {
       onZoom: (factor, anchor) => this.zoomBy(factor, anchor),
       onPan: (frac) => this.panByFraction(frac),
-      onReset: () => this.resetView(),
     };
     for (let i = 0; i < cfg.MAX_NODES; i++) {
       this._plots.push(new ChannelPlot(container, cfg.NODE_NAMES[i], handlers));
     }
     // Master slot (index 0) hidden by default — gateway only, not plotted.
     this._plots[0].setVisible(false);
+  }
+
+  /** Show/hide the raw and/or filtered curves across every plot (display only — saving always keeps both). */
+  setCurveVisibility(showRaw, showFilt) {
+    this._showRaw = showRaw !== false;
+    this._showFilt = showFilt !== false;
+    for (const p of this._plots) p.setCurveVisibility(this._showRaw, this._showFilt);
   }
 
   /** Change the width of the X-axis window, in samples. */
@@ -366,8 +433,14 @@ export class PlotArea {
    * @param {Array<Float64Array|null>} filtBufs same, filtered (null/empty hides the filt curve)
    * @param {number} [fs]  Sample rate for the shared time axis (mirrors _effective_fs; the
    *                       slave plots are X-linked, so they must share one timescale).
+   * @param {Array<number>} [filtTrims] per-node count of leading filtered samples to
+   *                       discard before drawing (mirrors _render's filt_trims —
+   *                       (N-1)/2 for an N-tap linear-phase FIR, 0 when no filter is
+   *                       active). That many samples are the filter's startup
+   *                       transient; dropping them both hides that transient and
+   *                       re-aligns what's left with raw at the same x positions.
    */
-  update(rawBufs, filtBufs, fs) {
+  update(rawBufs, filtBufs, fs, filtTrims) {
     this._lastMaxLen = 0;
     for (let i = 0; i < this._plots.length; i++) {
       const rawLen = rawBufs[i] ? rawBufs[i].length : 0;
@@ -387,9 +460,16 @@ export class PlotArea {
       const start = this._panSamp;
       const end = start + viewSamples;
       const rawTail = (raw && raw.length) ? raw.subarray(Math.min(start, raw.length), Math.min(end, raw.length)) : null;
-      const filtTail = (filt && filt.length) ? filt.subarray(Math.min(start, filt.length), Math.min(end, filt.length)) : null;
 
-      p.setData(rawTail, filtTail, fs || cfg.FS, start, viewSamples);
+      const filtTrim = (filtTrims && filtTrims[i]) || 0;
+      // The filtered curve is drawn as filt[trim + k] at raw[k]'s x-position.
+      // Include trim extra samples on the right so the visible filtered trace
+      // still reaches rawTail's right edge after drawCurve discards the lead-in.
+      const filtEnd = end + filtTrim;
+      const filtTail = (filt && filt.length) ? filt.subarray(Math.min(start, filt.length), Math.min(filtEnd, filt.length)) : null;
+      // No nominal fallback: fs is 0 until the hardware reports it, and
+      // setData/draw treat 0 as "don't draw a time axis yet".
+      p.setData(rawTail, filtTail, fs || 0, start, viewSamples, filtTrim);
       p.draw();
     }
   }

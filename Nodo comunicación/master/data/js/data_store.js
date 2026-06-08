@@ -3,7 +3,7 @@
 // are backed by a fixed-capacity RingBuffer (Float64Array) instead of a
 // maxlen-deque, since JS has no built-in bounded queue with O(1) push+evict.
 
-import * as cfg from './config.js';
+import * as cfg from './config.js?v=field-loop-2';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -103,9 +103,10 @@ export class NodeData {
     this.psocOk = null;   // null until first HELLO
     this.mac = '';
 
-    // ADC sample rate — depends on the analog front-end / PSoC programming,
-    // so it must come from the hardware (HELLO b0 = fs/100), not a static constant.
-    this.fs = cfg.FS;       // nominal default until reported
+    // ADC sample rate — depends on the analog front-end / PSoC programming
+    // (and can be reconfigured), so it must ALWAYS come from the hardware
+    // (HELLO b0 = fs/100). No nominal/guessed value: 0 means "not yet known".
+    this.fs = 0;
     this.fsKnown = false;   // true once a HELLO reported fs > 0
 
     // Batch / statistics
@@ -125,6 +126,7 @@ export class NodeData {
     this.visible = nodeIndex > 0;
 
     this.slaveId = nodeIndex === 0 ? 'M' : `S${nodeIndex}`;
+    this.alias = nodeIndex === 0 ? 'Maestro' : (['Hammer', 'Geo1', 'Geo2'][nodeIndex - 1] || `Slave${nodeIndex}`);
 
     // Pending commands tracking: subCmd -> { param, sendTime, retries }
     this.pending = new Map();
@@ -200,17 +202,18 @@ export class DataStore {
 }
 
 /**
- * Sample rate to use for batch/duration/display/notch calculations.
+ * Sample rate to use for batch/duration/display/notch/export calculations.
  *
  * The ADC rate depends on how the analog front-end / PSoC is programmed and
- * can differ from the nominal cfg.FS, so prefer the value reported by the
- * first slave that has sent a HELLO; fall back to cfg.FS until any slave has
- * reported. Mirrors MainWindow._effective_fs.
+ * can be changed at any time, so there is NO nominal/guessed fallback: this
+ * returns the value reported by the first slave that has sent a HELLO, or
+ * 0 if no slave has reported one yet — callers must treat 0 as "unknown"
+ * and wait, never substitute a constant. Mirrors MainWindow._effective_fs.
  */
 export function effectiveFs(dataStore) {
   for (let i = 1; i < dataStore.nodes.length; i++) {
     const nd = dataStore.nodes[i];
     if (nd.fsKnown) return nd.fs;
   }
-  return cfg.FS;
+  return 0;
 }
