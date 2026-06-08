@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Geophone Scope — Maestro</title>
+  <link rel="stylesheet" href="/css/style.css?v=plot-zoom-1">
+</head>
+<body>
+  <header>
+    <h1>Geophone Scope</h1>
+    <div class="status-bar">
+      <span>WS: <strong id="conn-status" class="bad">desconectado</strong></span>
+      <span>Estado: <strong id="master-state">--</strong></span>
+      <span>Fs: <strong id="global-fs">1020 Hz nominal</strong></span>
+      <button id="btn-connect">Reconectar</button>
+      <button id="btn-theme">Modo claro</button>
+    </div>
+  </header>
+
+  <section class="panel">
+    <h2>Captura</h2>
+    <div class="row">
+      <label>ARM n_esclavos <input id="arm-n" type="number" min="0" max="3" value="0"></label>
+      <button id="btn-arm">ARM</button>
+    </div>
+    <div class="row">
+      <label>Duración <input id="capture-secs" type="number" min="0.1" max="120" step="0.1" value="1.0"> s</label>
+      <button id="btn-start">START</button>
+      <span id="capture-batches" class="status-text">--</span>
+    </div>
+    <div class="row">
+      <button id="btn-stop">STOP</button>
+      <button id="btn-status">STATUS</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Gráficas</h2>
+    <div class="row">
+      <label>Ventana <input id="disp-secs" type="number" min="1" max="10" step="1" value="3"> s</label>
+      <span class="plot-tools">
+        <button id="btn-plot-zoom-out" title="Alejar">−</button>
+        <button id="btn-plot-zoom-in" title="Acercar">+</button>
+        <button id="btn-plot-reset" title="Restablecer">Reset</button>
+      </span>
+    </div>
+    <div id="plots" class="plot-area"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Nodos</h2>
+    <div class="node-list">
+      <div class="node-row" id="node-1">
+        <span class="name">Esclavo 1</span>
+        <span class="raw">--</span>
+        <span class="stats">--</span>
+        <span class="cfg">--</span>
+      </div>
+      <div class="node-row" id="node-2">
+        <span class="name">Esclavo 2</span>
+        <span class="raw">--</span>
+        <span class="stats">--</span>
+        <span class="cfg">--</span>
+      </div>
+      <div class="node-row" id="node-3">
+        <span class="name">Esclavo 3</span>
+        <span class="raw">--</span>
+        <span class="stats">--</span>
+        <span class="cfg">--</span>
+      </div>
+    </div>
+  </section>
+
+  <div id="slave-panels"></div>
+
+  <section class="panel">
+    <h2>Exportar</h2>
+    <div class="row">
+      <label>Nombre <input id="export-name" type="text" value="muestra"></label>
+      <label><input id="chk-export-csv" type="checkbox"> CSV</label>
+      <button id="btn-export">Descargar ZIP</button>
+    </div>
+    <div id="export-status" class="status-text">--</div>
+  </section>
+
+  <section class="panel">
+    <h2>Log</h2>
+    <div id="log" class="log"></div>
+  </section>
+
+  <script type="module" src="/js/app.js?v=plot-zoom-1"></script>
+</body>
+</html>

@@ -45,12 +45,19 @@
 #define MATLAB_PKT_HEADER  0x56u
 #define MATLAB_CMD_DIRECTED 0xBDu
 
+/* Hook opcional: se invoca con cada paquete saliente de 6 bytes para que se
+ * pueda espejar a otro destino (p.ej. WebSocket de la interfaz web — ver
+ * web_relay.h). No introduce ningún costo si no se registra (puntero null). */
+typedef void (*MatlabPacketRelay)(const uint8_t pkt[6]);
+
 class MatlabTransport {
 public:
     /* Inicializar Serial USB */
     void begin(uint32_t baud = MATLAB_SERIAL_BAUD);
     /* Llamar desde loop() para leer comandos entrantes */
     void loop();
+    /* Registrar (o quitar con nullptr) un espejo de los paquetes salientes */
+    void setPacketRelay(MatlabPacketRelay relay) { _relay = relay; }
 
     void sendSample(uint8_t nodeId, int32_t value24);
     void sendHeartbeat(uint8_t nodeId, uint8_t pga, uint8_t vdac, uint8_t mode);
@@ -90,8 +97,15 @@ private:
     uint8_t _rxBuf[6];
     uint8_t _rxIdx      = 0;
     uint8_t _rxExpected = 4;
+    MatlabPacketRelay _relay = nullptr;
 
     void _write6(uint8_t nodeId, uint8_t type, int32_t val24);
+    /* Único punto de salida — escribe por USB y, si hay un relay registrado,
+     * espeja el mismo paquete (p.ej. hacia los clientes WS de la web UI). */
+    void _emit(const uint8_t pkt[6]) {
+        Serial.write(pkt, 6);
+        if (_relay) _relay(pkt);
+    }
     void _parseRx();
     void _pushCmd(const RxCmd &c) {
         uint8_t next = (uint8_t)((_cmdHead + 1) % CMD_Q_SIZE);
@@ -140,7 +154,7 @@ inline void MatlabTransport::_write6(uint8_t nodeId, uint8_t type, int32_t val24
         (uint8_t)((val24 >>  8) & 0xFF),
         (uint8_t)( val24        & 0xFF)
     };
-    Serial.write(pkt, 6);
+    _emit(pkt);
 }
 
 inline void MatlabTransport::sendSample(uint8_t nodeId, int32_t value24)
@@ -152,19 +166,19 @@ inline void MatlabTransport::sendHeartbeat(uint8_t nodeId, uint8_t pga,
                                             uint8_t vdac, uint8_t mode)
 {
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0x01, pga, vdac, mode };
-    Serial.write(pkt, 6);
+    _emit(pkt);
 }
 
 inline void MatlabTransport::sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val)
 {
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0x07, cmd, val, 0x00 };
-    Serial.write(pkt, 6);
+    _emit(pkt);
 }
 
 inline void MatlabTransport::sendReady(uint8_t nNodes)
 {
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, 0xFF, 0xFE, nNodes, 0x00, 0x00 };
-    Serial.write(pkt, 6);
+    _emit(pkt);
 }
 
 inline void MatlabTransport::sendStartLatency(uint8_t nodeId, uint32_t tofUs)
@@ -177,7 +191,7 @@ inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)
 {
     /* node_id=0xFF, type=0xFD, b2=espnow_ok, b1=ap_ch, b0=0 */
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, 0xFF, 0xFD, espnow_ok, ap_ch, 0x00 };
-    Serial.write(pkt, 6);
+    _emit(pkt);
 }
 
 inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6], uint16_t fs)
@@ -185,15 +199,15 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
     /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
     uint8_t fs_code = (fs >= 100u) ? (uint8_t)(fs / 100u) : 0u;
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x01, psoc_ok, fs_code };
-    Serial.write(pkt, 6);
+    _emit(pkt);
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */
         uint8_t m0[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x02, mac[0], mac[1] };
         uint8_t m1[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x03, mac[2], mac[3] };
         uint8_t m2[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x04, mac[4], mac[5] };
-        Serial.write(m0, 6);
-        Serial.write(m1, 6);
-        Serial.write(m2, 6);
+        _emit(m0);
+        _emit(m1);
+        _emit(m2);
     }
 }
 

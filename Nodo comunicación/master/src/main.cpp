@@ -31,6 +31,7 @@
 #include "matlab_transport.h"
 #include "master_log.h"
 #include "debug_log.h"
+#include "web_server.h"
 #include "../../scope_measurement.h"
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
@@ -158,7 +159,10 @@ static uint32_t          g_hotWaitSettleDueMs = 0;
 static uint16_t g_rec_n_batches   = 0;   /* batches a grabar por slave */
 static uint8_t  g_dumpSlaveIdx    = 0;   /* esclavo siendo dumpeado (1-N) */
 static uint16_t g_dumpBatchSeq    = 0;   /* batch actual siendo pedido */
-static bool     g_dumpBatchRx     = false;
+static volatile bool     g_dumpBatchRx        = false;
+static volatile bool     g_dumpBatchDelivered = false;  /* evita duplicados node/seq */
+static volatile uint8_t  g_dumpDeliveredNode  = 0;
+static volatile uint16_t g_dumpDeliveredSeq   = 0;
 static uint8_t  g_dumpRetries     = 0;
 static uint32_t g_dumpReqMs       = 0;   /* millis() del último REQ_BATCH enviado */
 static bool     g_dumpRetryPaused = false;
@@ -166,6 +170,20 @@ static uint32_t g_dumpRetryDueMs  = 0;
 static uint32_t g_captureDumpDueMs = 0;
 #define DUMP_MAX_RETRIES  30
 #define DUMP_BATCH_TIMEOUT_MS 300
+
+static inline void dumpDeliveryGuardReset()
+{
+    g_dumpBatchDelivered = false;
+    g_dumpDeliveredNode = 0;
+    g_dumpDeliveredSeq = 0;
+}
+
+static inline void dumpDeliveryGuardMark(uint8_t nodeId, uint16_t seq)
+{
+    g_dumpDeliveredNode = nodeId;
+    g_dumpDeliveredSeq = seq;
+    g_dumpBatchDelivered = true;
+}
 
 /* ── "Ver" (un solo nodo, N batches, store-then-dump = sin RF durante muestreo) */
 static uint8_t  g_viewNode = 0;
@@ -175,6 +193,15 @@ static bool     g_viewDump = false;            /* dump de un solo nodo tras VIEW
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static EspNowRx       espnowRx;
 static MatlabTransport matlab;
+
+struct CachedHello {
+    bool valid = false;
+    uint8_t psoc_ok = 0;
+    uint16_t sample_rate = 0;
+    uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
+};
+static CachedHello g_cachedHello[NUM_SLAVES + 1];
+static volatile bool g_webReplayCachedState = false;
 
 static void beginDump(const char *reason);
 static void beginPrestart(PrestartAction action);
@@ -235,6 +262,24 @@ static uint16_t clampRecordBatches(uint16_t n)
         return (uint16_t)PSOC_CAPTURE_MAX_BATCHES;
     }
     return n;
+}
+
+static void requestWebCachedStateReplay()
+{
+    g_webReplayCachedState = true;
+}
+
+static void sendCachedStateToWeb()
+{
+    matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+    matlab.sendReady(g_armedCount);
+    for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
+        const CachedHello &h = g_cachedHello[node];
+        if (h.valid) {
+            matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate);
+        }
+    }
+    MASTER_LOG_PRINTLN("[WEB] cached READY/HELLO replay sent");
 }
 
 static MasterState armedOrIdleState()
@@ -308,6 +353,7 @@ static void onCfgAck(const MsgCfgAck &msg)
                               g_dumpSlaveIdx);
             g_dumpBatchSeq = g_rec_n_batches;
             g_dumpBatchRx  = true;
+            dumpDeliveryGuardReset();
         }
         return;
     }
@@ -317,6 +363,13 @@ static void onCfgAck(const MsgCfgAck &msg)
 static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
 {
     MASTER_LOG_PRINTF("[MASTER] HELLO node=%d psoc=%d fs=%u\n", msg.node_id, msg.psoc_ok, msg.sample_rate);
+    if (msg.node_id > 0 && msg.node_id <= NUM_SLAVES) {
+        CachedHello &h = g_cachedHello[msg.node_id];
+        h.valid = true;
+        h.psoc_ok = msg.psoc_ok;
+        h.sample_rate = msg.sample_rate;
+        memcpy(h.mac, senderMac, 6);
+    }
     matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate);
 }
 
@@ -368,11 +421,19 @@ static uint32_t captureDurationMs(uint16_t nBatches)
 /* ── Beacon pause/resume — sin RF durante captura ─────────────────────────── */
 static void beacon_pause(void)
 {
+    /* Mantener el AP visible durante capturas web.
+     *
+     * La pausa RF anterior usaba beacon_interval=60000 TU (~61 s). Eso protege
+     * más contra beacons, pero Windows/telefonos abandonan GeoNetwork en
+     * capturas reales y la pagina queda inaccesible durante minutos. Como el
+     * muestreo real queda guardado en RAM en los esclavos y el dump ocurre
+     * despues, preferimos mantener la asociacion WiFi viva con beacons lentos.
+     */
     wifi_config_t ap_cfg = {};
     esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
-    ap_cfg.ap.beacon_interval = 60000u;   /* max documentado TU ≈ 61 s */
+    ap_cfg.ap.beacon_interval = 1000u;    /* ~1.024 s: visible, poco trafico */
     esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    MASTER_LOG_PRINTLN("[MASTER] beacon pausado (captura activa)");
+    MASTER_LOG_PRINTLN("[MASTER] beacon lento (captura activa, AP visible)");
 }
 
 static void beacon_resume(void)
@@ -412,6 +473,7 @@ static void beginDump(const char *reason)
         g_dumpSlaveIdx = g_viewDump ? g_viewNode : 1;
         g_dumpBatchSeq = 0;
         g_dumpBatchRx  = false;
+        dumpDeliveryGuardReset();
         g_dumpRetries  = 0;
         matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         requestBatch(g_dumpSlaveIdx, g_dumpBatchSeq);
@@ -490,6 +552,7 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
         g_dumpSlaveIdx = 0;
         g_dumpBatchSeq = 0;
         g_dumpBatchRx = false;
+        dumpDeliveryGuardReset();
         MsgView msg = { CMD_VIEW, node_id, n };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
         g_captureDumpDueMs = 0;      /* el dump arranca solo con VIEW_DONE del esclavo */
@@ -711,6 +774,19 @@ static void onBatchReady(const ReassembledBatch &batch)
                               g_dumpSlaveIdx, g_dumpBatchSeq);
             return;
         }
+        if (g_dumpBatchDelivered &&
+            g_dumpDeliveredNode == batch.node_id &&
+            g_dumpDeliveredSeq == batch.seq) {
+            MASTER_LOG_PRINTF("[MASTER] DUMP duplicate delivered ignored node=%d seq=%d\n",
+                              batch.node_id, batch.seq);
+            return;
+        }
+        if (g_dumpBatchRx) {
+            MASTER_LOG_PRINTF("[MASTER] DUMP duplicate ignored node=%d seq=%d\n",
+                              batch.node_id, batch.seq);
+            return;
+        }
+        dumpDeliveryGuardMark(batch.node_id, batch.seq);
     } else if (!g_streaming) {
         return;
     }
@@ -807,7 +883,7 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             break;
 
         case 0xA5:   /* STATUS */
-            matlab.sendReady(g_armedCount);
+            sendCachedStateToWeb();
             break;
 
         case MATLAB_CMD_SCOPE_START:
@@ -894,7 +970,11 @@ void setup()
      * El modo puro WIFI_AP lleva el AP MAC como BSSID en el action frame,
      * que el ESP8266 puede descartar si no reconoce ese BSSID. */
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASS, 1);   /* canal 1 fijo */
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
+                      IPAddress(192, 168, 4, 1),
+                      IPAddress(255, 255, 255, 0));
+    bool apOk = WiFi.softAP(AP_SSID, AP_PASS, 1);   /* canal 1 fijo */
+    MASTER_LOG_PRINTF("[MASTER] softAP %s\n", apOk ? "OK" : "FAIL");
     /* Aumentar intervalo de beacon para reducir interferencia RF en el ADC.
      * El default (100 TU ≈ 100 ms) genera spikes de 10 Hz visibles en el geófono.
      * ESP-NOW no depende de beacons, así que 1000 ms no afecta la comunicación. */
@@ -908,6 +988,16 @@ void setup()
     MASTER_LOG_PRINTF("[MASTER] STA MAC:   %s\n", WiFi.macAddress().c_str());
     MASTER_LOG_PRINTF("[MASTER] AP MAC:    %s  ch=%d\n",
                       WiFi.softAPmacAddress().c_str(), 1);
+
+    /* Interfaz web de campo — sirve la SPA desde LittleFS sobre el AP propio
+     * (192.168.4.1). No requiere router: el celular se conecta directo a
+     * GeoNetwork. Ver web_server.h / web_relay.h. */
+    if (webServerBegin()) {
+        /* Espejar cada paquete de 6 bytes que ya va hacia MATLAB también
+         * hacia los clientes WS — protocol.js decodifica el mismo framing. */
+        matlab.setPacketRelay(webRelayPacket);
+        webRelaySetClientHook(requestWebCachedStateReplay);
+    }
 
     /* ESP-NOW (convive con AP mode) */
     if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck,
@@ -946,6 +1036,18 @@ void loop()
     /* Procesar TODOS los comandos encolados (evita pérdida de A1+A3 back-to-back) */
     while (matlab.hasCmd()) {
         handleMatlabCmd(matlab.lastCmd());
+    }
+
+    /* Comandos llegados por la interfaz web (mismo despachador — ver
+     * web_relay.h: se decodifican a RxCmd para no duplicar lógica). */
+    while (webRelayHasCmd()) {
+        handleMatlabCmd(webRelayPopCmd());
+    }
+    webRelayService();
+
+    if (g_webReplayCachedState) {
+        g_webReplayCachedState = false;
+        sendCachedStateToWeb();
     }
 
     /* El maestro ya NO muestrea martillo: ahora es un esclavo normal. */
@@ -1135,6 +1237,7 @@ void loop()
 
         if (advance) {
             g_dumpBatchSeq++;
+            dumpDeliveryGuardReset();
             if (g_dumpBatchSeq >= g_rec_n_batches) {
                 g_dumpBatchSeq = 0;
                 g_dumpSlaveIdx++;
@@ -1153,6 +1256,7 @@ void loop()
                     g_rec_n_batches = 0;
                     g_captureDumpDueMs = 0;
                     g_dumpRetryPaused = false;
+                    dumpDeliveryGuardReset();
                     matlab.sendReady(g_armedCount);
                     matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
                     MASTER_LOG_PRINTF("[MASTER] DUMP completo -> %s\n",
@@ -1179,4 +1283,5 @@ void loop()
             matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         }
     }
+    webRelayService();
 }
