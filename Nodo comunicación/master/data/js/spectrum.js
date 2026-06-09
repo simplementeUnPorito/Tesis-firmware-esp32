@@ -1,7 +1,7 @@
 // spectrum.js — per-channel FFT magnitude spectrum, plain canvas.
 // Uses Hanning window + radix-2 Cooley-Tukey FFT, no external libraries.
 
-import * as cfg from './config.js?v=field-loop-11';
+import * as cfg from './config.js?v=field-loop-18';
 
 // ── FFT ──────────────────────────────────────────────────────────────────────
 

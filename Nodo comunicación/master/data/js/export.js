@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-loop-11';
+import * as cfg from './config.js?v=field-loop-18';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-loop-11';
+import { effectiveFs } from './data_store.js?v=field-loop-18';
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -101,8 +101,6 @@ function nodeMetadata(nd, index, paths, connected) {
     visible: !!nd.visible,
     fir_cmd: nd.filtCmd || '',
     dc_remove: !!nd.dcRemove,
-    notch_enabled: !!nd.notchEnabled,
-    notch_harm: nd.notchHarm,
     drift_hist: nd.driftHist.slice(),
     latency_hist: nd.latencyHist.slice(),
     health: nd.health,
@@ -180,7 +178,6 @@ export function buildCaptureZip(dataStore, options = {}) {
     signal_units: 'V',
     adc_counts_per_volt: cfg.ADC_COUNTS_PER_VOLT,
     vdac_step_volts: cfg.VDAC_STEP,
-    notch_f0: cfg.NOTCH_F0,
     display_secs: options.displaySecs ?? null,
     max_buf_secs: options.maxBufSecs ?? cfg.MAX_BUF_S,
     visible_nodes: visibleNodes,

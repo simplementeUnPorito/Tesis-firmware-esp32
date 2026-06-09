@@ -91,7 +91,7 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
   #define ARM_TIMEOUT_MS 3000
 #endif
 #ifndef ADC_SAMPLE_RATE_HZ
-  #define ADC_SAMPLE_RATE_HZ 1020
+  #define ADC_SAMPLE_RATE_HZ 3000
 #endif
 #ifndef STORE_CAPTURE_MARGIN_MS
   #define STORE_CAPTURE_MARGIN_MS 750
@@ -412,10 +412,20 @@ static void requestBatch(uint8_t nodeId, uint16_t seq)
     MASTER_LOG_PRINTF("[MASTER] REQ_BATCH node=%d seq=%d\n", nodeId, seq);
 }
 
+static uint16_t effectiveSampleRateHz()
+{
+    for (uint8_t i = 1; i <= NUM_SLAVES; i++) {
+        if (g_cachedHello[i].valid && g_cachedHello[i].sample_rate > 0)
+            return g_cachedHello[i].sample_rate;
+    }
+    return ADC_SAMPLE_RATE_HZ;
+}
+
 static uint32_t captureDurationMs(uint16_t nBatches)
 {
     uint32_t samples = (uint32_t)nBatches * (uint32_t)(SAMPLES_PER_PART * 2);
-    return (samples * 1000UL + (ADC_SAMPLE_RATE_HZ - 1)) / ADC_SAMPLE_RATE_HZ;
+    uint16_t fs = effectiveSampleRateHz();
+    return (samples * 1000UL + (fs - 1)) / fs;
 }
 
 /* ── Beacon pause/resume — sin RF durante captura ─────────────────────────── */

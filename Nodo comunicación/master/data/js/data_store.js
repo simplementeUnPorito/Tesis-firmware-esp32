@@ -3,7 +3,7 @@
 // are backed by a fixed-capacity RingBuffer (Float64Array) instead of a
 // maxlen-deque, since JS has no built-in bounded queue with O(1) push+evict.
 
-import * as cfg from './config.js?v=field-loop-11';
+import * as cfg from './config.js?v=field-loop-18';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -88,10 +88,6 @@ export class NodeData {
     this.filtB = null;     // Float64Array of coefficients
     this.filtZi = null;    // Float64Array filter delay-line state
     this.filtCmd = '';
-
-    // Notch (least-squares harmonic fit, recomputed over the full capture)
-    this.notchEnabled = false;
-    this.notchHarm = cfg.NOTCH_DEFAULT_HARM;
 
     // DC removal
     this.dcRemove = false;
@@ -205,7 +201,7 @@ export class DataStore {
 }
 
 /**
- * Sample rate to use for batch/duration/display/notch/export calculations.
+ * Sample rate to use for batch/duration/display/export calculations.
  *
  * The ADC rate depends on how the analog front-end / PSoC is programmed and
  * can be changed at any time, so there is NO nominal/guessed fallback: this

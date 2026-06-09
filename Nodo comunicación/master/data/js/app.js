@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-loop-11';
-import { WsClient } from './ws_client.js?v=field-loop-11';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-11';
-import { DataStore, effectiveFs } from './data_store.js?v=field-loop-11';
-import { PlotArea } from './plot.js?v=field-loop-11';
-import { SpectrumArea } from './spectrum.js?v=field-loop-11';
-import { SlavePanel } from './slave_panel.js?v=field-loop-11';
-import { compileFirCmd, firFilter, harmonicNotch, lastFirError } from './signal_proc.js?v=field-loop-11';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-11';
+import * as cfg from './config.js?v=field-loop-18';
+import { WsClient } from './ws_client.js?v=field-loop-18';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-18';
+import { DataStore, effectiveFs } from './data_store.js?v=field-loop-18';
+import { PlotArea } from './plot.js?v=field-loop-18';
+import { SpectrumArea } from './spectrum.js?v=field-loop-18';
+import { SlavePanel } from './slave_panel.js?v=field-loop-18';
+import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-18';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-18';
 
 const $ = (id) => document.getElementById(id);
 
@@ -364,18 +364,14 @@ function handleData(nd, pkt) {
   nd.totalSamples++;
   if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
 
-  // FIR + DC removal stream sample-by-sample. The harmonic notch fits the
-  // complete buffer, so renderTick() rebuilds filtBuf while it is enabled.
-  if (!nd.notchEnabled) {
-    let filtVal = rawVal;
-    if (nd.filtB) {
-      const result = firFilter(nd.filtB, new Float64Array([rawVal]), nd.filtZi);
-      nd.filtZi = result.zi;
-      filtVal = result.y[0];
-    }
-    if (nd.dcRemove && nd.rawBuf.length > 1) filtVal -= nd.rawSum / nd.rawBuf.length;
-    nd.filtBuf.push(filtVal);
+  let filtVal = rawVal;
+  if (nd.filtB) {
+    const result = firFilter(nd.filtB, new Float64Array([rawVal]), nd.filtZi);
+    nd.filtZi = result.zi;
+    filtVal = result.y[0];
   }
+  if (nd.dcRemove && nd.rawBuf.length > 1) filtVal -= nd.rawSum / nd.rawBuf.length;
+  nd.filtBuf.push(filtVal);
 }
 
 function fillRingBuffer(ring, arr) {
@@ -402,16 +398,15 @@ function reprocessFiltBuf(chIndex) {
     nd.filtZi = null;
   }
 
-  if (nd.dcRemove && raw.length > 1) {
+  if (nd.dcRemove && arr.length > 1) {
     let mean = 0;
-    for (let i = 0; i < raw.length; i++) mean += raw[i];
-    mean /= raw.length;
+    for (let i = 0; i < arr.length; i++) mean += arr[i];
+    mean /= arr.length;
     const out = new Float64Array(arr.length);
     for (let i = 0; i < arr.length; i++) out[i] = arr[i] - mean;
     arr = out;
   }
 
-  if (nd.notchEnabled) arr = harmonicNotch(arr, nd.fs, cfg.NOTCH_F0, nd.notchHarm);
   fillRingBuffer(nd.filtBuf, arr);
 }
 
@@ -608,9 +603,6 @@ function onLatencyRequested(chIndex) {
 
 function onExportRequested() {
   try {
-    for (let i = 0; i < cfg.MAX_NODES; i++) {
-      if (data.nodes[i].notchEnabled) reprocessFiltBuf(i);
-    }
     const displaySecs = parseInt($('disp-secs').value, 10) || null;
     const nBatches = captureBatches();
     const baseName = ($('export-name').value || cfg.DEFAULT_SAVE_NAME).trim() || cfg.DEFAULT_SAVE_NAME;
@@ -680,20 +672,6 @@ function onDcRemoveToggled(chIndex, enabled) {
   saveSlaveSetting(chIndex, 'dc_remove', nd.dcRemove ? 1 : 0);
 }
 
-function onNotchToggled(chIndex, enabled) {
-  const nd = data.nodes[chIndex];
-  nd.notchEnabled = !!enabled;
-  reprocessFiltBuf(chIndex);
-  saveSlaveSetting(chIndex, 'notch_enabled', nd.notchEnabled ? 1 : 0);
-}
-
-function onNotchHarmChanged(chIndex, harmonics) {
-  const nd = data.nodes[chIndex];
-  nd.notchHarm = clamp(parseInt(harmonics, 10) || cfg.NOTCH_DEFAULT_HARM, 1, 5);
-  if (nd.notchEnabled) reprocessFiltBuf(chIndex);
-  saveSlaveSetting(chIndex, 'notch_harm', nd.notchHarm);
-}
-
 function loadSlavePanelState(chIndex, panel) {
   const nd = data.nodes[chIndex];
   const alias = loadSetting(settingKey(chIndex, 'alias'));
@@ -706,15 +684,11 @@ function loadSlavePanelState(chIndex, panel) {
   nd.vdacByte = loadSlaveInt(chIndex, 'vdac_byte', nd.vdacByte, cfg.VDAC_MIN, cfg.VDAC_MAX);
   nd.pgaCode = loadSlaveInt(chIndex, 'pga_code', nd.pgaCode, 0, cfg.GAIN_CODES.length - 1);
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
-  nd.notchEnabled = loadSlaveBool(chIndex, 'notch_enabled', nd.notchEnabled);
-  nd.notchHarm = loadSlaveInt(chIndex, 'notch_harm', nd.notchHarm, 1, 5);
 
   panel.setPgavdac(nd.pgavdac);
   panel.setVdac(nd.vdacByte);
   panel.setPga(nd.pgaCode);
   panel.setDcRemove(nd.dcRemove);
-  panel.setNotchEnabled(nd.notchEnabled);
-  panel.setNotchHarmonics(nd.notchHarm);
   nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
   panel.setOffset(nd.hammerOffset);
 
@@ -752,8 +726,6 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('fir-apply', (ev) => onFirApply(chIndex, ev.detail.cmd));
   panel.addEventListener('fir-remove', () => onFirRemove(chIndex));
   panel.addEventListener('dc-remove-toggled', (ev) => onDcRemoveToggled(chIndex, !!ev.detail.enabled));
-  panel.addEventListener('notch-toggled', (ev) => onNotchToggled(chIndex, !!ev.detail.enabled));
-  panel.addEventListener('notch-harm-changed', (ev) => onNotchHarmChanged(chIndex, ev.detail.harmonics));
   panel.addEventListener('test-requested', () => onTestRequested(chIndex));
   panel.addEventListener('ver-requested', () => onVerRequested(chIndex));
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
@@ -851,9 +823,6 @@ function handleStatus(pkt, idx) {
 
 function renderTick() {
   const fs = effectiveFs(data);
-  for (let i = 1; i < cfg.MAX_NODES; i++) {
-    if (data.nodes[i].notchEnabled) reprocessFiltBuf(i);
-  }
   const rawBufs = data.nodes.map((nd) => (nd.rawBuf.length ? nd.rawBuf.toArray() : null));
   const filtBufs = data.nodes.map((nd) => (nd.filtBuf.length ? nd.filtBuf.toArray() : null));
   // Linear-phase FIR of length N has constant group delay (N-1)/2: its first
@@ -1044,7 +1013,10 @@ $('btn-spectrum').addEventListener('click', () => {
 
 // Display-only curve visibility — saving/export always keeps raw AND filtered regardless of these.
 function applyCurveVisibility() {
-  plotArea.setCurveVisibility($('chk-show-raw').checked, $('chk-show-filt').checked);
+  plotArea.setCurveVisibility(
+    $('chk-show-raw').checked,
+    $('chk-show-filt').checked,
+  );
 }
 $('chk-show-raw').addEventListener('change', applyCurveVisibility);
 $('chk-show-filt').addEventListener('change', applyCurveVisibility);

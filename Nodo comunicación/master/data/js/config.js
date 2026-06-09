@@ -92,8 +92,4 @@ export const RETRY_SEC = 1.5;
 export const START_LATENCY_PROBES = 12;
 export const START_LATENCY_PROBE_GAP_S = 0.04;
 
-// Notch defaults
-export const NOTCH_F0 = 50.0;
-export const NOTCH_DEFAULT_HARM = 3;
-
 export const DEFAULT_SAVE_NAME = 'muestra';

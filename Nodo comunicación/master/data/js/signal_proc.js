@@ -1,6 +1,6 @@
-// signal_proc.js - FIR presets, DC removal, and harmonic-notch helpers.
+// signal_proc.js - FIR presets and DC removal helpers.
 // Mirrors python/geophone_scope/signal_proc.py for the web UI subset:
-// lp/hp/bp/bs FIR presets only, streaming FIR state, full-buffer DC/notch.
+// lp/hp/bp/bs FIR presets only, streaming FIR state, full-buffer DC removal.
 
 let firCompileError = '';
 
@@ -106,8 +106,8 @@ function parseParts(cmd) {
  *   lp <cutoff>
  *   hp <cutoff>
  *   bp <low> <high>
- *   bs/sb/notch <low> <high>
- *   bs/sb/notch <center>  (center +/- 5 Hz)
+ *   bs/sb/bandstop/stopband <low> <high>
+ *   bs/sb/bandstop/stopband <center>  (center +/- 5 Hz)
  *   numtaps <n> ...       (explicit tap count; even values are rounded up)
  */
 export function compileFirCmd(cmd, fs) {
@@ -126,7 +126,7 @@ export function compileFirCmd(cmd, fs) {
     } else if (ftype === 'bp' || ftype === 'bandpass') {
       if (parts.length < 3) throw new Error('bp needs <low> <high>');
       b = bandpass(nTaps, Number(parts[1]), Number(parts[2]), fs);
-    } else if (['bs', 'sb', 'bandstop', 'stopband', 'notch'].includes(ftype)) {
+    } else if (['bs', 'sb', 'bandstop', 'stopband'].includes(ftype)) {
       if (parts.length < 2) throw new Error('bs/sb needs <center> or <low> <high>');
       let low;
       let high;
@@ -188,83 +188,5 @@ export function dcRemove(buf) {
   const mean = sum / x.length;
   const out = new Float64Array(x.length);
   for (let i = 0; i < x.length; i++) out[i] = x[i] - mean;
-  return out;
-}
-
-function solveLinearSystem(a, b) {
-  const n = b.length;
-  const aug = Array.from({ length: n }, (_, r) => {
-    const row = new Float64Array(n + 1);
-    for (let c = 0; c < n; c++) row[c] = a[r][c];
-    row[n] = b[r];
-    return row;
-  });
-
-  for (let col = 0; col < n; col++) {
-    let pivot = col;
-    let best = Math.abs(aug[col][col]);
-    for (let r = col + 1; r < n; r++) {
-      const v = Math.abs(aug[r][col]);
-      if (v > best) { best = v; pivot = r; }
-    }
-    if (best < 1e-12) return null;
-    if (pivot !== col) [aug[pivot], aug[col]] = [aug[col], aug[pivot]];
-
-    const div = aug[col][col];
-    for (let c = col; c <= n; c++) aug[col][c] /= div;
-    for (let r = 0; r < n; r++) {
-      if (r === col) continue;
-      const factor = aug[r][col];
-      if (Math.abs(factor) < 1e-20) continue;
-      for (let c = col; c <= n; c++) aug[r][c] -= factor * aug[col][c];
-    }
-  }
-
-  const x = new Float64Array(n);
-  for (let r = 0; r < n; r++) x[r] = aug[r][n];
-  return x;
-}
-
-export function harmonicNotch(xIn, fs, f0, nHarmonics) {
-  const x = ArrayBuffer.isView(xIn) ? xIn : new Float64Array(xIn);
-  const n = x.length;
-  const harms = Math.max(0, Math.floor(nHarmonics));
-  if (!n || harms <= 0 || !Number.isFinite(fs) || fs <= 0) return new Float64Array(x);
-
-  const cols = harms * 2;
-  const ata = Array.from({ length: cols }, () => new Float64Array(cols));
-  const atx = new Float64Array(cols);
-
-  for (let i = 0; i < n; i++) {
-    const row = new Float64Array(cols);
-    let c = 0;
-    for (let k = 1; k <= harms; k++) {
-      const angle = 2.0 * Math.PI * (k * f0) / fs * i;
-      row[c++] = Math.cos(angle);
-      row[c++] = Math.sin(angle);
-    }
-    for (let r = 0; r < cols; r++) {
-      atx[r] += row[r] * x[i];
-      for (let c2 = r; c2 < cols; c2++) ata[r][c2] += row[r] * row[c2];
-    }
-  }
-  for (let r = 0; r < cols; r++) {
-    for (let c = 0; c < r; c++) ata[r][c] = ata[c][r];
-  }
-
-  const coeff = solveLinearSystem(ata, atx);
-  if (!coeff) return new Float64Array(x);
-
-  const out = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    let fitted = 0;
-    let c = 0;
-    for (let k = 1; k <= harms; k++) {
-      const angle = 2.0 * Math.PI * (k * f0) / fs * i;
-      fitted += coeff[c++] * Math.cos(angle);
-      fitted += coeff[c++] * Math.sin(angle);
-    }
-    out[i] = x[i] - fitted;
-  }
   return out;
 }

@@ -1,11 +1,11 @@
-// slave_panel.js — per-slave config panel: PGA/VDAC, MAC, FIR/DC/notch,
+// slave_panel.js — per-slave config panel: PGA/VDAC, MAC, FIR/DC,
 // test/ver/send-all/latency-probe, statistics. Mirrors gui/slave_tab.py (SlaveTab — the *view*:
 // builds DOM, dispatches CustomEvents instead of pyqtSignals; app.js owns the
-// _on_* business logic, mirroring MainWindow). FIR/DC/notch controls land in
+// _on_* business logic, mirroring MainWindow). FIR/DC controls land in
 // Phase 4 alongside signal_proc.js; the serial debug-COM log group is desktop/
 // USB-only (lists local PC ports) and has no phone-browser equivalent.
 
-import * as cfg from './config.js?v=field-loop-11';
+import * as cfg from './config.js?v=field-loop-18';
 
 // Ganancia máxima del PGAvdac — valores más altos añaden demasiado ruido (mirrors SlaveTab._PGAVDAC_MAX_GAIN)
 const PGAVDAC_MAX_GAIN = 8;
@@ -109,7 +109,6 @@ function setDot(d, state, okTip, badTip, unkTip) {
  * Events: 'alias-changed' {alias}, 'vdac-changed' {byte},
  *         'pgavdac-changed' {code}, 'pga-changed' {code},
  *         'fir-apply' {cmd}, 'fir-remove', 'dc-remove-toggled' {enabled},
- *         'notch-toggled' {enabled}, 'notch-harm-changed' {harmonics},
  *         'test-requested', 'ver-requested', 'send-all-requested',
  *         'latency-requested', 'offset-changed' {offset}
  */
@@ -235,26 +234,6 @@ export class SlavePanel extends EventTarget {
     this._lblDcVal = el('span', 'dc-label', 'DC: --');
     firBox.appendChild(row(labeled('Remove DC', this._cbDcRemove), this._lblDcVal, this._lblFirStatus));
     root.appendChild(firBox);
-
-    // Least-squares 50 Hz harmonic notch
-    const notchBox = el('div', 'filter-box');
-    notchBox.appendChild(el('div', 'subhead', '50 Hz Notch'));
-    this._cbNotch = el('input');
-    this._cbNotch.type = 'checkbox';
-    this._cbNotch.addEventListener('change', () => {
-      this._dispatch('notch-toggled', { enabled: this._cbNotch.checked });
-    });
-    this._spnNotchHarm = el('input');
-    this._spnNotchHarm.type = 'number';
-    this._spnNotchHarm.min = '1';
-    this._spnNotchHarm.max = '5';
-    this._spnNotchHarm.step = '1';
-    this._spnNotchHarm.value = String(cfg.NOTCH_DEFAULT_HARM);
-    this._spnNotchHarm.addEventListener('change', () => {
-      this._dispatch('notch-harm-changed', { harmonics: parseInt(this._spnNotchHarm.value, 10) || 1 });
-    });
-    notchBox.appendChild(row(labeled('Enable', this._cbNotch), labeled('Harmonics', this._spnNotchHarm)));
-    root.appendChild(notchBox);
 
     // Test / Ver / latency / send-all
     this._btnTest = el('button', null, 'Test');
@@ -396,15 +375,6 @@ export class SlavePanel extends EventTarget {
 
   setDcValue(v) {
     this._lblDcVal.textContent = (v === null || v === undefined) ? 'DC: --' : `DC: ${v.toFixed(5)} V`;
-  }
-
-  setNotchEnabled(enabled) {
-    this._cbNotch.checked = !!enabled;
-  }
-
-  setNotchHarmonics(n) {
-    const val = Math.max(1, Math.min(5, parseInt(n, 10) || cfg.NOTCH_DEFAULT_HARM));
-    this._spnNotchHarm.value = String(val);
   }
 
   /** vdac_byte: update the VDAC widgets without re-emitting (avoids feedback loop). */
