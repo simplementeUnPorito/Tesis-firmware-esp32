@@ -49,6 +49,11 @@ inline bool webServerBegin()
         request->send(200, "text/plain", body);
     });
 
+    webServer.on("/ws-reset", HTTP_GET, [](AsyncWebServerRequest *request) {
+        webRelayCloseAll();
+        request->send(200, "text/plain", "ok\nws=reset\n");
+    });
+
     webServer.on("/", HTTP_GET, [fsOk](AsyncWebServerRequest *request) {
         if (fsOk && LittleFS.exists("/index.html")) {
             request->send(LittleFS, "/index.html", "text/html");

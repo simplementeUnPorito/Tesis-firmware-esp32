@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-loop-2';
+import * as cfg from './config.js?v=field-loop-11';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-loop-2';
+import { effectiveFs } from './data_store.js?v=field-loop-11';
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -55,6 +55,23 @@ function slaveConnectedForExport(nd, index, nSlaves) {
     && (nd.fsKnown || !!nd.mac || nd.rawBuf.length > 0 || nd.filtBuf.length > 0);
 }
 
+function slaveTypeRank(alias) {
+  const idx = cfg.SLAVE_TYPE_ORDER.indexOf(String(alias || '').trim());
+  return idx >= 0 ? idx : cfg.SLAVE_TYPE_ORDER.length;
+}
+
+function orderedSlaveIndices(dataStore, limit = cfg.MAX_NODES - 1) {
+  const maxIndex = Math.min(dataStore.nodes.length - 1, limit);
+  const indices = [];
+  for (let i = 1; i <= maxIndex; i++) indices.push(i);
+  indices.sort((a, b) => {
+    const ar = slaveTypeRank(dataStore.nodes[a]?.alias);
+    const br = slaveTypeRank(dataStore.nodes[b]?.alias);
+    return (ar - br) || (a - b);
+  });
+  return indices;
+}
+
 function nodeMetadata(nd, index, paths, connected) {
   return {
     index,
@@ -79,6 +96,7 @@ function nodeMetadata(nd, index, paths, connected) {
     pgavdac_code: nd.pgavdac,
     pgavdac_gain: gainValue(nd.pgavdac),
     psoc_ok: nd.psocOk,
+    hammer_offset_m: nd.hammerOffset ?? 0,
     mac: nd.mac || '',
     visible: !!nd.visible,
     fir_cmd: nd.filtCmd || '',
@@ -103,39 +121,48 @@ export function buildCaptureZip(dataStore, options = {}) {
   const visibleNodes = [];
   const exportedNodes = [];
   const usedDirs = new Set(['maestro']);
+  const connectedByNode = new Map();
+  const pathsByNode = new Map();
 
-  for (let i = 0; i < dataStore.nodes.length; i++) {
+  for (const i of orderedSlaveIndices(dataStore, nSlaves)) {
     const nd = dataStore.nodes[i];
-    let paths = null;
     const connected = slaveConnectedForExport(nd, i, nSlaves);
+    connectedByNode.set(i, connected);
+    if (!connected) continue;
 
-    if (connected) {
-      const raw = nd.rawBuf.toArray();
-      const filt = nd.filtBuf.toArray();
-      const dirBase = slugPart(nd.alias || cfg.NODE_NAMES[i], `slave${i}`);
-      const dir = uniqueDir(dirBase, usedDirs, i);
-      paths = {
-        dir,
-        raw: `${dir}/raw_f32le.bin`,
-        filt: `${dir}/filt_f32le.bin`,
-        rawCsv: `${dir}/raw.csv`,
-        filtCsv: `${dir}/filt.csv`,
-      };
-      files.push({ name: paths.raw, data: float32Bytes(raw) });
-      files.push({ name: paths.filt, data: float32Bytes(filt) });
+    const raw = nd.rawBuf.toArray();
+    const filt = nd.filtBuf.toArray();
+    const dirBase = slugPart(nd.alias || cfg.NODE_NAMES[i], `slave${i}`);
+    const dir = uniqueDir(dirBase, usedDirs, i);
+    const paths = {
+      dir,
+      raw: `${dir}/raw_f32le.bin`,
+      filt: `${dir}/filt_f32le.bin`,
+      rawCsv: `${dir}/raw.csv`,
+      filtCsv: `${dir}/filt.csv`,
+    };
+    pathsByNode.set(i, paths);
+    files.push({ name: paths.raw, data: float32Bytes(raw) });
+    files.push({ name: paths.filt, data: float32Bytes(filt) });
 
-      // CSV is always saved alongside the binary dump (no opt-out): it's the
-      // human-readable record needed to reconstruct/study a capture later.
-      // nd.fs is only ever the value reported by the slave's HELLO — never a
-      // guessed/nominal constant — so the CSV time column matches reality.
-      files.push({ name: paths.rawCsv, data: csvText(raw, nd.fs) });
-      files.push({ name: paths.filtCsv, data: csvText(filt, nd.fs) });
+    // CSV is always saved alongside the binary dump (no opt-out): it's the
+    // human-readable record needed to reconstruct/study a capture later.
+    // nd.fs is only ever the value reported by the slave's HELLO - never a
+    // guessed/nominal constant - so the CSV time column matches reality.
+    files.push({ name: paths.rawCsv, data: csvText(raw, nd.fs) });
+    files.push({ name: paths.filtCsv, data: csvText(filt, nd.fs) });
 
-      visibleNodes.push(i);
-      exportedNodes.push(i);
-    }
+    visibleNodes.push(i);
+    exportedNodes.push(i);
+  }
 
-    nodes.push(nodeMetadata(nd, i, paths, connected));
+  nodes.push(nodeMetadata(dataStore.nodes[0], 0, null, false));
+  for (const i of orderedSlaveIndices(dataStore, cfg.MAX_NODES - 1)) {
+    const nd = dataStore.nodes[i];
+    const connected = connectedByNode.has(i)
+      ? connectedByNode.get(i)
+      : slaveConnectedForExport(nd, i, nSlaves);
+    nodes.push(nodeMetadata(nd, i, pathsByNode.get(i) || null, connected));
   }
 
   const metadata = {

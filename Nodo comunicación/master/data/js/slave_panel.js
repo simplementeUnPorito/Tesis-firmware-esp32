@@ -5,7 +5,7 @@
 // Phase 4 alongside signal_proc.js; the serial debug-COM log group is desktop/
 // USB-only (lists local PC ports) and has no phone-browser equivalent.
 
-import * as cfg from './config.js?v=field-loop-2';
+import * as cfg from './config.js?v=field-loop-11';
 
 // Ganancia máxima del PGAvdac — valores más altos añaden demasiado ruido (mirrors SlaveTab._PGAVDAC_MAX_GAIN)
 const PGAVDAC_MAX_GAIN = 8;
@@ -111,7 +111,7 @@ function setDot(d, state, okTip, badTip, unkTip) {
  *         'fir-apply' {cmd}, 'fir-remove', 'dc-remove-toggled' {enabled},
  *         'notch-toggled' {enabled}, 'notch-harm-changed' {harmonics},
  *         'test-requested', 'ver-requested', 'send-all-requested',
- *         'latency-requested'
+ *         'latency-requested', 'offset-changed' {offset}
  */
 export class SlavePanel extends EventTarget {
   constructor(chIndex) {
@@ -140,12 +140,25 @@ export class SlavePanel extends EventTarget {
 
     // Identificación
     this._ddType = el('select');
-    for (const t of ['Hammer', 'Geo1', 'Geo2']) this._ddType.appendChild(new Option(t, t));
+    for (const t of cfg.SLAVE_TYPE_ORDER) this._ddType.appendChild(new Option(t, t));
     const typeDefaults = { 1: 'Hammer', 2: 'Geo1', 3: 'Geo2' };
     this._ddType.value = typeDefaults[this.chIndex] ?? 'Geo1';
     this._ddType.addEventListener('change', () => this._dispatch('alias-changed', this._ddType.value));
     this._lblMac = el('span', 'mac-label', 'MAC: —');
     root.appendChild(row(labeled('Tipo', this._ddType), this._lblMac));
+
+    // Distancia al hammer (fuente sísmica)
+    this._inpOffset = el('input');
+    this._inpOffset.type = 'number';
+    this._inpOffset.min = '0';
+    this._inpOffset.step = '0.5';
+    this._inpOffset.value = '0';
+    this._inpOffset.placeholder = 'dist. al hammer';
+    this._inpOffset.title = 'Distancia desde el hammer (fuente) hasta este receptor [m]';
+    this._inpOffset.addEventListener('change', () => {
+      this._dispatch('offset-changed', parseFloat(this._inpOffset.value) || 0);
+    });
+    root.appendChild(row(labeled('Offset m', this._inpOffset)));
 
     // VRef DC (VDAC)
     this._efTargetV = el('input');
@@ -438,6 +451,10 @@ export class SlavePanel extends EventTarget {
       f2: parseFloat(this._firF2.value),
       taps: parseInt(this._firTaps.value, 10) || 101,
     };
+  }
+
+  setOffset(v) {
+    this._inpOffset.value = String(Number.isFinite(v) ? v : 0);
   }
 
   getGainTargetV() { return new Map(this._gainTargetV); }

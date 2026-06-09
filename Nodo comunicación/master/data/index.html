@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-loop-4">
+  <link rel="stylesheet" href="/css/style.css?v=field-loop-11">
 </head>
 <body>
   <header>
@@ -27,13 +27,17 @@
           <button id="btn-plot-zoom-out" title="Alejar">−</button>
           <button id="btn-plot-zoom-in" title="Acercar">+</button>
           <button id="btn-plot-reset" title="Restablecer">Reset</button>
+          <button id="btn-cursor-1" title="Cursor 1: click en la grafica para medir tiempo y amplitud">Cursor 1</button>
+          <button id="btn-cursor-2" title="Cursor 2: click en la grafica para medir tiempo y amplitud">Cursor 2</button>
+          <button id="btn-spectrum" title="Mostrar espectro de frecuencias (FFT)">Espectro</button>
         </span>
         <span class="plot-tools">
           <label><input id="chk-show-raw" type="checkbox" checked> Cruda</label>
-          <label><input id="chk-show-filt" type="checkbox" checked> Filtrada</label>
+          <label><input id="chk-show-filt" type="checkbox" checked> Filtrada <span id="wave-velocity" class="velocity-readout"></span></label>
         </span>
       </div>
       <div id="plots" class="plot-area"></div>
+      <div id="spectra" class="plot-area spectrum-area" hidden></div>
     </section>
 
     <aside class="control-sidebar">
@@ -112,6 +116,6 @@
     </aside>
   </main>
 
-  <script type="module" src="/js/app.js?v=field-loop-4"></script>
+  <script type="module" src="/js/app.js?v=field-loop-11"></script>
 </body>
 </html>

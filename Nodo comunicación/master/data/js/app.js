@@ -2,20 +2,22 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-loop-4';
-import { WsClient } from './ws_client.js?v=field-loop-4';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-4';
-import { DataStore, effectiveFs } from './data_store.js?v=field-loop-4';
-import { PlotArea } from './plot.js?v=field-loop-4';
-import { SlavePanel } from './slave_panel.js?v=field-loop-4';
-import { compileFirCmd, firFilter, harmonicNotch, lastFirError } from './signal_proc.js?v=field-loop-4';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-4';
+import * as cfg from './config.js?v=field-loop-11';
+import { WsClient } from './ws_client.js?v=field-loop-11';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-11';
+import { DataStore, effectiveFs } from './data_store.js?v=field-loop-11';
+import { PlotArea } from './plot.js?v=field-loop-11';
+import { SpectrumArea } from './spectrum.js?v=field-loop-11';
+import { SlavePanel } from './slave_panel.js?v=field-loop-11';
+import { compileFirCmd, firFilter, harmonicNotch, lastFirError } from './signal_proc.js?v=field-loop-11';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-11';
 
 const $ = (id) => document.getElementById(id);
 
 const ws = new WsClient(`ws://${location.host}/ws`);
 const data = new DataStore();
 const plotArea = new PlotArea($('plots'));
+const spectrumArea = new SpectrumArea($('spectra'));
 const slavePanels = new Array(cfg.MAX_NODES).fill(null);
 const macPartial = new Map();
 const pgaLockTimers = new Map();
@@ -182,6 +184,100 @@ function appendLog(msg) {
   log.scrollTop = log.scrollHeight;
 }
 
+async function resetWsLock() {
+  try {
+    await fetch('/ws-reset', { cache: 'no-store' });
+    appendLog('WS lock liberado; reconectando');
+  } catch (_) {
+    appendLog('WS lock reset fallo; intento reconectar igual');
+  }
+}
+
+function slaveTypeRank(alias) {
+  const idx = cfg.SLAVE_TYPE_ORDER.indexOf(String(alias || '').trim());
+  return idx >= 0 ? idx : cfg.SLAVE_TYPE_ORDER.length;
+}
+
+function compareSlaveIndices(a, b) {
+  const ar = slaveTypeRank(data.nodes[a]?.alias);
+  const br = slaveTypeRank(data.nodes[b]?.alias);
+  return (ar - br) || (a - b);
+}
+
+function orderedSlaveIndices(visibleOnly = false) {
+  const indices = [];
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (!visibleOnly || data.nodes[i].visible) indices.push(i);
+  }
+  indices.sort(compareSlaveIndices);
+  return indices;
+}
+
+function nodeTitle(i) {
+  if (i <= 0) return cfg.NODE_NAMES[i] || 'Maestro';
+  const alias = data.nodes[i].alias || cfg.NODE_NAMES[i] || `S${i}`;
+  return `${alias} (S${i})`;
+}
+
+function refreshSlavePresentationOrder() {
+  const titles = data.nodes.map((_, i) => nodeTitle(i));
+  plotArea.setNodeTitles(titles);
+  spectrumArea.setNodeTitles(titles);
+
+  const visibleNodes = orderedSlaveIndices(true);
+  plotArea.setActiveNodes(visibleNodes);
+  spectrumArea.setActiveNodes(visibleNodes);
+
+  const nodeList = document.querySelector('.node-list');
+  if (nodeList) {
+    for (const idx of orderedSlaveIndices(false)) {
+      const row = $(`node-${idx}`);
+      if (row) nodeList.appendChild(row);
+    }
+  }
+}
+
+function nodeIndexByType(type) {
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (data.nodes[i].alias === type) return i;
+  }
+  return -1;
+}
+
+function formatVelocity(v) {
+  if (!(v > 0)) return '';
+  if (v >= 1000) return `v≈${(v / 1000).toFixed(2)} km/s`;
+  if (v >= 100) return `v≈${v.toFixed(0)} m/s`;
+  if (v >= 10) return `v≈${v.toFixed(1)} m/s`;
+  return `v≈${v.toFixed(2)} m/s`;
+}
+
+function setWaveVelocityReadout(text) {
+  const el = $('wave-velocity');
+  if (el) el.textContent = text || '';
+}
+
+function updateWaveVelocityLabel(fs) {
+  const [c1, c2] = plotArea.getCursorSamples();
+  const geo1Idx = nodeIndexByType('Geo1');
+  const geo2Idx = nodeIndexByType('Geo2');
+  if (!(fs > 0) || c1 === null || c2 === null || geo1Idx < 0 || geo2Idx < 0) {
+    setWaveVelocityReadout('');
+    return;
+  }
+
+  const geo1Offset = data.nodes[geo1Idx].hammerOffset;
+  const geo2Offset = data.nodes[geo2Idx].hammerOffset;
+  const distanceM = Math.abs(geo2Offset - geo1Offset);
+  const dtS = Math.abs(c2 - c1) / fs;
+  if (!(distanceM > 0) || !(dtS > 0)) {
+    setWaveVelocityReadout('');
+    return;
+  }
+
+  setWaveVelocityReadout(formatVelocity(distanceM / dtS));
+}
+
 function setActiveSlaveCount(nSlaves, zeroMeansAll = false) {
   const maxSlaves = cfg.MAX_NODES - 1;
   const parsed = Number.isFinite(nSlaves) ? nSlaves : 0;
@@ -189,17 +285,15 @@ function setActiveSlaveCount(nSlaves, zeroMeansAll = false) {
     ? maxSlaves
     : clamp(parsed, 0, maxSlaves);
   activeSlaveCount = count;
-  const visibleNodes = [];
   for (let i = 1; i < cfg.MAX_NODES; i++) {
     const visible = i <= count;
     data.nodes[i].visible = visible;
-    if (visible) visibleNodes.push(i);
     const row = $(`node-${i}`);
     if (row) row.hidden = !visible;
     const panel = panelFor(i);
     if (panel) panel.setVisible(visible);
   }
-  plotArea.setActiveNodes(visibleNodes);
+  refreshSlavePresentationOrder();
   updateCapturePreview();
 }
 
@@ -226,6 +320,7 @@ function renderNodeRow(i) {
   const nd = data.nodes[i];
   const row = $(`node-${i}`);
   if (!row) return;
+  row.querySelector('.name').textContent = nodeTitle(i);
   const tail = nd.rawBuf.tail(1);
   const raw = tail.length ? tail[0] : null;
   row.querySelector('.raw').textContent = (raw === null) ? '--' : `${raw.toFixed(4)} V`;
@@ -620,6 +715,9 @@ function loadSlavePanelState(chIndex, panel) {
   panel.setDcRemove(nd.dcRemove);
   panel.setNotchEnabled(nd.notchEnabled);
   panel.setNotchHarmonics(nd.notchHarm);
+  nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
+  panel.setOffset(nd.hammerOffset);
+
   panel.setFirPreset(
     loadSetting(settingKey(chIndex, 'fir_type')) || 'lp',
     loadSlaveFloat(chIndex, 'fir_f1', 10),
@@ -644,6 +742,9 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('alias-changed', (ev) => {
     data.nodes[chIndex].alias = ev.detail;
     saveSlaveSetting(chIndex, 'alias', ev.detail);
+    renderNodeRow(chIndex);
+    refreshSlavePresentationOrder();
+    appendLog(`Orden de salida: ${orderedSlaveIndices(true).map((idx) => nodeTitle(idx)).join(', ') || '--'}`);
   });
   panel.addEventListener('vdac-changed', (ev) => onVdacChanged(chIndex, ev.detail));
   panel.addEventListener('pgavdac-changed', (ev) => onPgavdacChanged(chIndex, ev.detail));
@@ -657,6 +758,10 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('ver-requested', () => onVerRequested(chIndex));
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
   panel.addEventListener('latency-requested', () => onLatencyRequested(chIndex));
+  panel.addEventListener('offset-changed', (ev) => {
+    data.nodes[chIndex].hammerOffset = ev.detail;
+    saveSlaveSetting(chIndex, 'hammer_offset_m', ev.detail);
+  });
 }
 
 function buildSlavePanels() {
@@ -756,7 +861,9 @@ function renderTick() {
   // leading samples so the transient never appears and the rest aligns
   // index-for-index with raw.
   const filtTrims = data.nodes.map((nd) => (nd.filtB ? (nd.filtB.length - 1) / 2 : 0));
+  updateWaveVelocityLabel(fs);
   plotArea.update(rawBufs, filtBufs, fs, filtTrims);
+  if (!$('spectra').hidden) spectrumArea.update(rawBufs, fs);
 
   updateGlobalFsDisplay();
   for (let i = 1; i <= activeSlaveCount; i++) {
@@ -811,6 +918,18 @@ setInterval(renderTick, cfg.RENDER_PERIOD_MS);
 
 ws.addEventListener('connection', (ev) => {
   setConnIndicator(ev.detail);
+  if (ev.detail) {
+    // Ask for cached READY/HELLO immediately and once more if Fs is still
+    // missing. This keeps Fs hardware-sourced, without requiring manual input
+    // after a browser reconnect or master reboot.
+    sendStd(cfg.CMD_STATUS, 0);
+    setTimeout(() => {
+      if (ws.connected && !currentFsHz()) sendStd(cfg.CMD_STATUS, 0);
+    }, 800);
+    setTimeout(() => {
+      if (ws.connected && !currentFsHz()) sendStd(cfg.CMD_STATUS, 0);
+    }, 2500);
+  }
 });
 
 ws.addEventListener('log', (ev) => appendLog(ev.detail));
@@ -852,7 +971,11 @@ ws.addEventListener('packet', (ev) => {
 
 // Controls
 
-$('btn-connect').addEventListener('click', () => ws.start());
+$('btn-connect').addEventListener('click', async () => {
+  ws.stop();
+  await resetWsLock();
+  ws.start();
+});
 
 $('btn-arm').addEventListener('click', () => {
   const n = clamp(parseInt($('arm-n').value, 10) || 0, 0, cfg.MAX_NODES - 1);
@@ -883,6 +1006,7 @@ $('btn-start').addEventListener('click', () => {
   const secs = secondsForBatches(n);
   data.clearAll();
   plotArea.clearAll();
+  spectrumArea.clearAll();
   sendStd16(cfg.CMD_START, n);
   appendLog(`START: ${n} lotes (~${secs.toFixed(2)} s real)`);
 });
@@ -901,6 +1025,22 @@ $('btn-export').addEventListener('click', onExportRequested);
 $('btn-plot-zoom-in').addEventListener('click', () => plotArea.zoomBy(1.5, 0.5));
 $('btn-plot-zoom-out').addEventListener('click', () => plotArea.zoomBy(1 / 1.5, 0.5));
 $('btn-plot-reset').addEventListener('click', () => plotArea.resetView());
+
+function setCursorEditMode(mode) {
+  const buttons = [$('btn-cursor-1'), $('btn-cursor-2')];
+  const wasActive = buttons[mode].classList.contains('active');
+  for (const btn of buttons) btn.classList.remove('active');
+  plotArea.setCursorMode(wasActive ? null : mode);
+  if (!wasActive) buttons[mode].classList.add('active');
+}
+
+$('btn-cursor-1').addEventListener('click', () => setCursorEditMode(0));
+$('btn-cursor-2').addEventListener('click', () => setCursorEditMode(1));
+
+$('btn-spectrum').addEventListener('click', () => {
+  const active = $('btn-spectrum').classList.toggle('active');
+  $('spectra').hidden = !active;
+});
 
 // Display-only curve visibility — saving/export always keeps raw AND filtered regardless of these.
 function applyCurveVisibility() {

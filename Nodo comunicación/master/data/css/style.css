@@ -297,9 +297,23 @@ button:active { background: var(--input-active); }
   align-items: center;
 }
 
+.velocity-readout {
+  color: #50dca0;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  min-width: 5.5rem;
+  white-space: nowrap;
+}
+
 .plot-tools button {
   min-width: 2.25rem;
   padding: 0.25rem 0.45rem;
+}
+
+.plot-tools button.active {
+  background: var(--tab-active-bg);
+  color: var(--tab-active-fg);
+  border-color: var(--heading);
 }
 
 .plot-wrap {

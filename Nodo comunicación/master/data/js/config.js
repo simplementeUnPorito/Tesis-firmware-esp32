@@ -51,6 +51,7 @@ export const MAX_BUF = 30000;
 // Nodes
 export const MAX_NODES = 4;
 export const NODE_NAMES = ['Maestro', 'Esclavo 1', 'Esclavo 2', 'Esclavo 3'];
+export const SLAVE_TYPE_ORDER = ['Hammer', 'Geo1', 'Geo2'];
 export const MASTER_NODE_ID = 0xFF;
 
 // PGA

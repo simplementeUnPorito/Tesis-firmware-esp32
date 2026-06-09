@@ -421,27 +421,14 @@ static uint32_t captureDurationMs(uint16_t nBatches)
 /* ── Beacon pause/resume — sin RF durante captura ─────────────────────────── */
 static void beacon_pause(void)
 {
-    /* Mantener el AP visible durante capturas web.
-     *
-     * La pausa RF anterior usaba beacon_interval=60000 TU (~61 s). Eso protege
-     * más contra beacons, pero Windows/telefonos abandonan GeoNetwork en
-     * capturas reales y la pagina queda inaccesible durante minutos. Como el
-     * muestreo real queda guardado en RAM en los esclavos y el dump ocurre
-     * despues, preferimos mantener la asociacion WiFi viva con beacons lentos.
-     */
-    wifi_config_t ap_cfg = {};
-    esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
-    ap_cfg.ap.beacon_interval = 1000u;    /* ~1.024 s: visible, poco trafico */
-    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    /* El beacon ya está en 1000 TU desde setup(). No llamamos
+     * esp_wifi_set_config() aquí porque reinicializar la config del AP
+     * puede desconectar brevemente a los clientes WiFi activos. */
     MASTER_LOG_PRINTLN("[MASTER] beacon lento (captura activa, AP visible)");
 }
 
 static void beacon_resume(void)
 {
-    wifi_config_t ap_cfg = {};
-    esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
-    ap_cfg.ap.beacon_interval = 1000u;    /* 1000 TU ≈ 1.024 s */
-    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
     MASTER_LOG_PRINTLN("[MASTER] beacon resumido (inicio dump)");
 }
 
@@ -1275,11 +1262,13 @@ void loop()
         }
     }
 
-    /* Heartbeat al MATLAB cada ~1 s cuando no hay stream activo */
+    /* Heartbeat cada ~1 s cuando no hay stream activo.
+     * Se envía siempre que haya un cliente WS o MATLAB conectado — sin esto,
+     * el navegador del teléfono cierra la conexión WebSocket "inactiva". */
     static uint32_t lastHbMs = 0;
     if (!g_streaming && millis() - lastHbMs > 1000) {
         lastHbMs = millis();
-        if (matlab.connected()) {
+        if (matlab.connected() || ws.count() > 0) {
             matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         }
     }

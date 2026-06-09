@@ -4,10 +4,14 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-loop-2';
+import * as cfg from './config.js?v=field-loop-11';
 
 const RAW_COLOR = 'rgb(80, 140, 255)';
 const FILT_COLOR = 'rgb(255, 80, 80)';
+const CURSOR_STYLES = [
+  { label: 'C1', line: 'rgba(255,230,80,0.9)', stroke: 'rgba(255,230,80,0.65)', text: '#ffe980' },
+  { label: 'C2', line: 'rgba(80,220,255,0.9)', stroke: 'rgba(80,220,255,0.65)', text: '#80eaff' },
+];
 
 const MARGIN = { left: 46, right: 10, top: 20, bottom: 20 };
 
@@ -76,6 +80,8 @@ class ChannelPlot {
     this._showFilt = true;
     this._handlers = handlers;
     this._dragLastX = null;
+    this._cursorMode = null;
+    this._cursorSamps = [null, null];
 
     this.wrap = document.createElement('div');
     this.wrap.className = 'plot-wrap';
@@ -98,6 +104,10 @@ class ChannelPlot {
 
   get visible() { return this._visible; }
 
+  setTitle(title) {
+    this.title = title || this.title;
+  }
+
   /** Show/hide the raw and/or filtered curve independently of whether data exists for them. */
   setCurveVisibility(showRaw, showFilt) {
     this._showRaw = showRaw !== false;
@@ -115,6 +125,20 @@ class ChannelPlot {
     this._xStartSamp = Math.max(0, xStartSamp | 0);
     this._xSpanSamp = Math.max(1, xSpanSamp | 0);
     this._filtTrimSamp = filtTrimSamp || 0;
+  }
+
+  setCursors(samps) {
+    this._cursorSamps = CURSOR_STYLES.map((_, i) => {
+      const samp = samps && samps[i];
+      return (Number.isFinite(samp) && samp >= 0) ? samp : null;
+    });
+  }
+
+  setCursorMode(mode) {
+    this._cursorMode = Number.isInteger(mode) && mode >= 0 && mode < CURSOR_STYLES.length
+      ? mode
+      : null;
+    this.canvas.style.cursor = this._cursorMode !== null ? 'crosshair' : '';
   }
 
   clear() {
@@ -172,11 +196,15 @@ class ChannelPlot {
       this._handlers.onPan(-dx / Math.max(1, rect.width));
     });
     const endDrag = (ev) => {
-      if (this._dragLastX !== null && !this._dragMoved && this._handlers.onZoom) {
+      if (this._dragLastX !== null && !this._dragMoved) {
         const rect = this.canvas.getBoundingClientRect();
         const frac = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-        const zoomOut = this._downButton === 2 || ev.shiftKey;
-        this._handlers.onZoom(zoomOut ? 1 / 1.5 : 1.5, frac);
+        if (this._cursorMode !== null && this._handlers.onCursorClick) {
+          this._handlers.onCursorClick(frac);
+        } else if (this._handlers.onZoom) {
+          const zoomOut = this._downButton === 2 || ev.shiftKey;
+          this._handlers.onZoom(zoomOut ? 1 / 1.5 : 1.5, frac);
+        }
       }
       this._dragLastX = null;
     };
@@ -261,14 +289,16 @@ class ChannelPlot {
 
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
-    for (const t of niceTicks(xLo, xHi, 5)) {
+    for (const tMs of niceTicks(xLo * 1000, xHi * 1000, 5)) {
+      const t = tMs / 1000;
       if (t < xLo - 1e-9 || t > xHi + 1e-9) continue;
       const px = xTo(t);
       ctx.beginPath();
       ctx.moveTo(px, m.top);
       ctx.lineTo(px, m.top + plotH);
       ctx.stroke();
-      ctx.fillText(`${t.toFixed(t < 1 ? 2 : 1)}s`, px, m.top + plotH + 5 * dpr);
+      const lbl = Math.abs(tMs) >= 10000 ? `${(tMs / 1000).toFixed(1)}s` : `${tMs.toFixed(0)}ms`;
+      ctx.fillText(lbl, px, m.top + plotH + 5 * dpr);
     }
 
     ctx.strokeStyle = colors.border;
@@ -305,6 +335,72 @@ class ChannelPlot {
     if (this._showFilt) drawCurve(filt, FILT_COLOR, this._filtTrimSamp);
     ctx.restore();
 
+    // Cursors - vertical dashed lines + readout boxes.
+    const deltaMs = (this._cursorSamps[0] !== null && this._cursorSamps[1] !== null)
+      ? ((this._cursorSamps[1] - this._cursorSamps[0]) / this._fs) * 1000
+      : null;
+    let nextBoxY = m.top + 5 * dpr;
+    for (let ci = 0; ci < CURSOR_STYLES.length; ci++) {
+      const cursorSamp = this._cursorSamps[ci];
+      if (cursorSamp === null) continue;
+      const cursorT = cursorSamp / this._fs;
+      if (cursorT < xLo - 1e-9 || cursorT > xHi + 1e-9) continue;
+
+      const style = CURSOR_STYLES[ci];
+      const cpx = xTo(cursorT);
+      ctx.save();
+      ctx.strokeStyle = style.line;
+      ctx.lineWidth = dpr;
+      ctx.setLineDash([5 * dpr, 3 * dpr]);
+      ctx.beginPath();
+      ctx.moveTo(cpx, m.top);
+      ctx.lineTo(cpx, m.top + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.font = `${Math.round(10 * dpr)}px ui-monospace, monospace`;
+      ctx.fillStyle = style.text;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(style.label, cpx, m.top + 2 * dpr);
+
+      const relIdx = cursorSamp - this._xStartSamp;
+      const tMs = cursorT * 1000;
+      const lines = [`${style.label} t: ${tMs.toFixed(2)} ms`];
+      if (this._raw && relIdx >= 0 && relIdx < this._raw.length)
+        lines.push(`raw: ${fmtVolt(this._raw[relIdx])} V`);
+      const filtIdx = relIdx + (this._filtTrimSamp || 0);
+      if (this._filt && filtIdx >= 0 && filtIdx < this._filt.length)
+        lines.push(`filt: ${fmtVolt(this._filt[filtIdx])} V`);
+      if (ci === 1 && deltaMs !== null) lines.push(`dt: ${deltaMs.toFixed(2)} ms`);
+
+      const lineH = 13 * dpr;
+      const pad = 5 * dpr;
+      const boxW = Math.max(...lines.map((l) => ctx.measureText(l).width)) + pad * 2 + 4 * dpr;
+      const boxH = lines.length * lineH + pad * 2;
+      let bx = cpx + 8 * dpr;
+      if (bx + boxW > m.left + plotW - 2 * dpr) bx = cpx - boxW - 8 * dpr;
+      const maxBoxY = Math.max(m.top + pad, m.top + plotH - boxH - 2 * dpr);
+      const by = Math.min(nextBoxY, maxBoxY);
+      nextBoxY = by + boxH + 4 * dpr;
+
+      ctx.fillStyle = 'rgba(20,20,20,0.85)';
+      ctx.strokeStyle = style.stroke;
+      ctx.lineWidth = dpr;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(bx, by, boxW, boxH, 3 * dpr);
+      else ctx.rect(bx, by, boxW, boxH);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = style.text;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      for (let li = 0; li < lines.length; li++)
+        ctx.fillText(lines[li], bx + pad, by + pad + li * lineH);
+      ctx.restore();
+    }
+
     // Title (top-left) + legend (top-right)
     ctx.font = `${Math.round(11 * dpr)}px system-ui, sans-serif`;
     ctx.fillStyle = colors.title;
@@ -313,15 +409,21 @@ class ChannelPlot {
     ctx.fillText(this.title, m.left, 4 * dpr);
 
     let lx = W - m.right;
+    const minLegendX = m.left + ctx.measureText(this.title).width + 16 * dpr;
+    const drawLegendItem = (text, color) => {
+      const width = ctx.measureText(text).width;
+      if (lx - width < minLegendX) return false;
+      ctx.fillStyle = color;
+      ctx.fillText(text, lx, 4 * dpr);
+      lx -= width + 14 * dpr;
+      return true;
+    };
     ctx.textAlign = 'right';
     if (filt && this._showFilt) {
-      ctx.fillStyle = FILT_COLOR;
-      ctx.fillText('Filtrada', lx, 4 * dpr);
-      lx -= ctx.measureText('Filtrada').width + 14 * dpr;
+      drawLegendItem('Filtrada', FILT_COLOR);
     }
     if (this._showRaw) {
-      ctx.fillStyle = RAW_COLOR;
-      ctx.fillText('Cruda', lx, 4 * dpr);
+      drawLegendItem('Cruda', RAW_COLOR);
     }
 
     // Y-axis unit label (rotated)
@@ -356,10 +458,18 @@ export class PlotArea {
     this._showRaw = true;
     this._showFilt = true;
     this._lastMaxLen = 0;
+    this._cursorMode = null;
+    this._cursorSamps = [null, null];
     this._plots = [];
     const handlers = {
       onZoom: (factor, anchor) => this.zoomBy(factor, anchor),
       onPan: (frac) => this.panByFraction(frac),
+      onCursorClick: (frac) => {
+        if (this._cursorMode === null) return;
+        this._cursorSamps[this._cursorMode] = Math.round(
+          this._panSamp + clamp(frac, 0, 1) * this._viewSamples(),
+        );
+      },
     };
     for (let i = 0; i < cfg.MAX_NODES; i++) {
       this._plots.push(new ChannelPlot(container, cfg.NODE_NAMES[i], handlers));
@@ -411,6 +521,23 @@ export class PlotArea {
     this._zoom = 1;
     this._followTail = true;
     this._clampPan();
+  }
+
+  setCursorMode(mode) {
+    this._cursorMode = Number.isInteger(mode) && mode >= 0 && mode < CURSOR_STYLES.length
+      ? mode
+      : null;
+    for (const p of this._plots) p.setCursorMode(this._cursorMode);
+  }
+
+  getCursorSamples() {
+    return this._cursorSamps.slice();
+  }
+
+  setNodeTitles(titles) {
+    for (let i = 0; i < this._plots.length; i++) {
+      if (titles && titles[i]) this._plots[i].setTitle(titles[i]);
+    }
   }
 
   /** Show only the given node indices, in the given order (mirrors set_active_nodes). */
@@ -470,6 +597,7 @@ export class PlotArea {
       // No nominal fallback: fs is 0 until the hardware reports it, and
       // setData/draw treat 0 as "don't draw a time axis yet".
       p.setData(rawTail, filtTail, fs || 0, start, viewSamples, filtTrim);
+      p.setCursors(this._cursorSamps);
       p.draw();
     }
   }

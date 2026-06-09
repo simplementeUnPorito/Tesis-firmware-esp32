@@ -228,6 +228,15 @@ static void webRelayService()
            (uint32_t)(millis() - g_webRelayTxFirstMs) >= WEB_RELAY_FLUSH_MS);
     webRelayTxUnlock();
     if (due) webRelayFlush();
+
+    /* Ping periódico para detectar conexiones muertas y limpiarlas.
+     * Sin ping, un cliente con TCP zombi sigue en WS_CONNECTED para siempre
+     * y bloquea reconexiones del mismo dispositivo. */
+    static uint32_t g_wsPingMs = 0;
+    if (ws.count() > 0 && (uint32_t)(millis() - g_wsPingMs) > 10000u) {
+        ws.pingAll();
+        g_wsPingMs = millis();
+    }
 }
 
 inline bool webRelayReadyForDumpRequest()
@@ -294,27 +303,27 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
 {
     switch (type) {
         case WS_EVT_CONNECT: {
-            /* Limitar a 1 cliente concurrente — RAM/heap ajustados, y evita
-             * que dos teléfonos compitan por el control del maestro.
-             *
-             * IMPORTANTE: rechazar al recién llegado, NO desalojar al que ya
-             * está. Desalojar provoca una guerra de reconexión infinita: el
-             * cliente expulsado reintenta (ws_client.js reconecta solo, desde
-             * 1 s de backoff), expulsa al nuevo, que reintenta, etc. — eso es
-             * el "conectado/desconectado todo el rato" que se veía en campo. */
-            bool busy = false;
+            /* Un cliente a la vez: el primero que entra queda como dueño.
+             * No expulsamos al dueño, ni siquiera si el nuevo viene de la
+             * misma IP. En navegadores, dos sockets del mismo tab/equipo
+             * pueden solaparse durante una recarga o reconexión y terminar
+             * pateándose en bucle. */
+            bool rejected = false;
             for (auto &c : server->getClients()) {
-                if (c.id() != client->id() && c.status() == WS_CONNECTED) { busy = true; break; }
-            }
-            if (busy) {
-                MASTER_LOG_PRINTF("[WEB] WS cliente #%u rechazado (ya hay otro conectado, %s)\n",
-                                  client->id(), client->remoteIP().toString().c_str());
-                client->close();
+                if (c.id() == client->id() || c.status() != WS_CONNECTED) continue;
+                MASTER_LOG_PRINTF("[WEB] WS rechazado #%u (lock: dueño #%u %s)\n",
+                                  client->id(), c.id(),
+                                  c.remoteIP().toString().c_str());
+                client->text("{\"type\":\"busy\",\"reason\":\"ws_lock\"}");
+                client->close(1008, "busy");
+                rejected = true;
                 break;
             }
-            MASTER_LOG_PRINTF("[WEB] WS cliente #%u conectado (%s)\n",
-                              client->id(), client->remoteIP().toString().c_str());
-            if (g_webRelayClientHook) g_webRelayClientHook();
+            if (!rejected) {
+                MASTER_LOG_PRINTF("[WEB] WS #%u conectado (%s)\n",
+                                  client->id(), client->remoteIP().toString().c_str());
+                if (g_webRelayClientHook) g_webRelayClientHook();
+            }
             break;
         }
         case WS_EVT_DISCONNECT:

@@ -800,9 +800,15 @@ void loop()
         }
     }
 
-    /* HELLO beacon cada 2 s en WAIT_ARM — diagnóstico de ESP-NOW bidireccional */
+    /* HELLO/Fs cada 2 s mientras no haya captura ni dump pendiente.
+     * Si el maestro se reinicia con los esclavos ya ARMED, necesita recuperar
+     * este dato sin obligar al operador a cargar Fs manualmente en la web. */
     static uint32_t lastHelloMs = 0;
-    if (g_state == WAIT_ARM && millis() - lastHelloMs >= 2000) {
+    if (g_view_remaining == 0 &&
+        g_state != SAMPLING &&
+        g_state != HOT_WAIT &&
+        !(g_state == STOPPED && g_rec_n_batches > 0) &&
+        millis() - lastHelloMs >= 2000) {
         lastHelloMs = millis();
         MsgHello h = { CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected, psoc.sampleRate() };
         esp_err_t err = espnowSend(MASTER_MAC, (const uint8_t *)&h, sizeof(h));
