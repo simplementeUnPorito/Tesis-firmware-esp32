@@ -100,7 +100,7 @@ struct MsgStatus {
 struct MsgSetConfig {
     uint8_t cmd;
     uint8_t node_id;
-    uint8_t sub_cmd;
+    uint8_t sub_cmd;  /* 0xA6=PGA, 0xB5=calibrar PSoC; 0xA9/0xAA legacy */
     uint8_t param;
 };
 

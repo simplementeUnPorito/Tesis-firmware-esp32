@@ -4,7 +4,7 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-loop-18';
+import * as cfg from './config.js?v=field-loop-19';
 
 const RAW_COLOR = 'rgb(80, 140, 255)';
 const FILT_COLOR = 'rgb(255, 80, 80)';
@@ -482,7 +482,10 @@ export class PlotArea {
   setCurveVisibility(showRaw, showFilt) {
     this._showRaw = showRaw !== false;
     this._showFilt = showFilt !== false;
-    for (const p of this._plots) p.setCurveVisibility(this._showRaw, this._showFilt);
+    for (const p of this._plots) {
+      p.setCurveVisibility(this._showRaw, this._showFilt);
+      if (p.visible) p.draw();
+    }
   }
 
   /** Change the width of the X-axis window, in samples. */

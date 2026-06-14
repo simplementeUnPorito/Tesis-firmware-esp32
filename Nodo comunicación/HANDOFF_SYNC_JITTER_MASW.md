@@ -1,4 +1,4 @@
-# Handoff: Sincronización PSoC↔ESP — jitter de arranque y techo de frecuencia para MASW
+7# Handoff: Sincronización PSoC↔ESP — jitter de arranque y techo de frecuencia para MASW
 
 Resumen de una sesión de revisión de código (sin cambios aplicados todavía) sobre
 la cadena de disparo de muestreo `master ESP → esclavo ESP → PSoC`, pensando en

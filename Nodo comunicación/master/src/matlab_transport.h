@@ -24,11 +24,12 @@
  *   Comando dirigido a esclavo (6 bytes):
  *     [0xAB][0xBD][node_id][sub_cmd][param][node_id^sub_cmd^param]
  *     sub_cmd 0xA6: set PGA gain    param: código 0-8
- *     sub_cmd 0xA9: set PGAvdac     param: código 0-8
- *     sub_cmd 0xAA: set VDAC byte   param: 0-255
+ *     sub_cmd 0xA9: legacy PGAvdac  param: código 0-8
+ *     sub_cmd 0xAA: legacy VDAC     param: 0-255
  *     sub_cmd 0xA7: debug node ESP  param: 0/1
  *     sub_cmd 0xB2: ver (captura única) param: ignorado
  *     sub_cmd 0xB3: debug PSoC rampa param: 0/1
+ *     sub_cmd 0xB5: calibrar PSoC   param: 1
  *
  * Protocolo TX (6 bytes por paquete):
  *   [0x56][node_id][type][b2][b1][b0]

@@ -25,6 +25,7 @@ void PsocUART::begin(BatchCallback cb, HardwareSerial *serial)
 #if defined(ESP8266)
     _ser->begin(PSOC_UART_BAUD);
 #else
+    _ser->setRxBufferSize(PSOC_UART_RX_BUFFER_SIZE);
     _ser->begin(PSOC_UART_BAUD, SERIAL_8N1, PSOC_UART_RX, PSOC_UART_TX);
     /* El TX actual del PSoC esta como open-drain-low. Esto no reemplaza al
      * pull-up externo a 3V3, pero ayuda a que la linea no quede flotando. */
@@ -32,6 +33,11 @@ void PsocUART::begin(BatchCallback cb, HardwareSerial *serial)
     gpio_pullup_en((gpio_num_t)PSOC_UART_RX);
 #endif
     _idx = 0;
+}
+
+void PsocUART::onDiag(DiagCallback cb)
+{
+    _diagCb = cb;
 }
 
 void PsocUART::_noteRxByte(uint8_t b)
@@ -74,6 +80,8 @@ void PsocUART::poll()
                 continue;   /* frame corto: [AB][C2][cmd][val][crc] */
             } else if (_buf[1] == PSOC_CTRL_FS_REPORT) {
                 continue;   /* frame corto: [AB][C3][fs_lo][fs_hi][crc] */
+            } else if (_buf[1] == PSOC_CTRL_DIAG_EVT) {
+                continue;   /* frame corto: [AB][C4][event][val][state][crc] */
             } else {
                 _badLen++;
             }
@@ -88,6 +96,11 @@ void PsocUART::poll()
         if (_idx >= PSOC_CTRL_ACK_BYTES && _buf[1] == PSOC_CTRL_FS_REPORT) {
             _idx = 0;
             _parseFsReport();
+            continue;
+        }
+        if (_idx >= PSOC_CTRL_DIAG_BYTES && _buf[1] == PSOC_CTRL_DIAG_EVT) {
+            _idx = 0;
+            _parseDiagEvent();
             continue;
         }
         if (_idx >= PSOC_FRAME_BYTES) {
@@ -184,6 +197,7 @@ void PsocUART::startNow()              { _sendCmd1(PSOC_CMD_START_NOW, 0); }
 void PsocUART::setVdac(uint8_t v)      { _sendCmd1(PSOC_CMD_VDAC, v); }
 void PsocUART::setPga(uint8_t code)    { _sendCmd1(PSOC_CMD_PGA, code); }
 void PsocUART::setPgavdac(uint8_t code){ _sendCmd1(PSOC_CMD_PGAVDAC, code); }
+void PsocUART::calibrate()             { _sendCmd1(PSOC_CMD_CALIBRATE, 1); }
 void PsocUART::debugRamp(bool en)      { _sendCmd1(PSOC_CMD_DEBUG, en ? 1 : 0); }
 void PsocUART::requestStatus()         { _sendCmd1(PSOC_CMD_STATUS, 0); }
 void PsocUART::sendPong()              { _sendCmd1(PSOC_CTRL_PONG, 0); }
@@ -201,17 +215,38 @@ void PsocUART::_parseFsReport()
     if (fs > 0) { _sampleRate = fs; }
 }
 
+void PsocUART::_parseDiagEvent()
+{
+    const uint8_t event = _buf[2];
+    const uint8_t value = _buf[3];
+    const uint8_t psocState = _buf[4];
+    const uint8_t crc = _buf[5];
+    if (crc != (uint8_t)(PSOC_CTRL_DIAG_EVT ^ event ^ value ^ psocState)) {
+        _lastOK = false;
+        _badLen++;
+        return;
+    }
+
+    _lastOK = true;
+    _diagEventsRx++;
+    if (_diagCb) {
+        PsocDiagEvent ev = { event, value, psocState, millis() };
+        _diagCb(ev);
+    }
+}
+
 bool PsocUART::probe(uint32_t timeoutMs)
 {
     if (_ser == nullptr) return false;
 
     const uint32_t startPings = _pingsRx;
     const uint32_t startBatches = _batchesOK;
+    const uint32_t startDiag = _diagEventsRx;
 
     while (_ser->available() > 0) {
         poll();   /* no descartar pings pendientes: poll() responde el pong */
     }
-    if (_pingsRx != startPings || _batchesOK != startBatches) {
+    if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {
         return true;
     }
 
@@ -229,7 +264,7 @@ bool PsocUART::probe(uint32_t timeoutMs)
             lastTxMs = now;
         }
         poll();
-        if (_pingsRx != startPings || _batchesOK != startBatches) {
+        if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {
             return true;
         }
         delay(1);
@@ -245,7 +280,7 @@ bool PsocUART::probe(uint32_t timeoutMs)
                               : timeoutMs;
     while ((millis() - t0) < fallbackMs) {
         poll();
-        if (_pingsRx != startPings || _batchesOK != startBatches) {
+        if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {
             got = true;
             break;
         }
@@ -256,7 +291,7 @@ bool PsocUART::probe(uint32_t timeoutMs)
     t0 = millis();
     while ((millis() - t0) < 20u) {
         poll();
-        if (_pingsRx != startPings || _batchesOK != startBatches) {
+        if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {
             got = true;
         }
         delay(1);

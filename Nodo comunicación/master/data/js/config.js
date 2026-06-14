@@ -30,6 +30,7 @@ export const SUBCMD_PGAVDAC = 0xA9;
 export const SUBCMD_VDAC = 0xAA;
 export const SUBCMD_DEBUG = 0xA7;
 export const SUBCMD_VER = 0xB2;
+export const SUBCMD_CALIBRATE = 0xB5;
 export const SUBCMD_LATENCY = 0xAF;
 
 // Acquisition parameters

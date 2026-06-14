@@ -3,7 +3,7 @@
 // are backed by a fixed-capacity RingBuffer (Float64Array) instead of a
 // maxlen-deque, since JS has no built-in bounded queue with O(1) push+evict.
 
-import * as cfg from './config.js?v=field-loop-18';
+import * as cfg from './config.js?v=field-loop-19';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -129,6 +129,7 @@ export class NodeData {
 
     // Pending commands tracking: subCmd -> { param, sendTime, retries }
     this.pending = new Map();
+    this.calibrateAfterPga = false;
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────

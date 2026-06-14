@@ -105,12 +105,15 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
 #ifndef PSOC_CAPTURE_MAX_BATCHES
   #define PSOC_CAPTURE_MAX_BATCHES 512
 #endif
+#ifndef ESPNOW_USE_UNICAST_TO_SLAVES
+  #define ESPNOW_USE_UNICAST_TO_SLAVES 0
+#endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
 static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
-    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01},   /* Esclavo 1 — reemplazar */
-    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02},   /* Esclavo 2 — reemplazar */
-    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x03},   /* Esclavo 3 — reemplazar */
+    {0xC8, 0x2E, 0x18, 0x67, 0x68, 0x6C},   /* Esclavo 1 — GEO actual */
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},   /* Esclavo 2 — broadcast hasta medir MAC */
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},   /* Esclavo 3 — broadcast hasta medir MAC */
 };
 
 /* ── Pin GPIO de scope ────────────────────────────────────────────────────────
@@ -154,6 +157,17 @@ static bool              g_hotWaitQueryInFlight = false;
 static bool              g_hotWaitSettling = false;
 static uint32_t          g_hotWaitQueryMs = 0;
 static uint32_t          g_hotWaitSettleDueMs = 0;
+
+struct StartProbePending {
+    bool active;
+    uint8_t node;
+    uint32_t token;
+    uint32_t txUs;
+};
+
+#define START_PROBE_PENDING_SLOTS 16
+static StartProbePending g_startProbePending[START_PROBE_PENDING_SLOTS] = {};
+static uint8_t g_startProbePendingNext = 0;
 
 /* ── Store-and-forward (dump request/response) ───────────────────────────── */
 static uint16_t g_rec_n_batches   = 0;   /* batches a grabar por slave */
@@ -220,10 +234,15 @@ static bool sameMac(const uint8_t a[6], const uint8_t b[6])
 
 static bool isConfiguredSlaveMac(const uint8_t mac[6])
 {
+#if !ESPNOW_USE_UNICAST_TO_SLAVES
+    (void)mac;
+    return false;
+#else
     static const uint8_t ZERO_MAC[6] = {0, 0, 0, 0, 0, 0};
     if (sameMac(mac, ZERO_MAC) || sameMac(mac, ESPNOW_BROADCAST)) return false;
     return !(mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF &&
              mac[3] == 0xFF && mac[4] == 0xFF);
+#endif
 }
 
 static void addPeerIfNeeded(const uint8_t mac[6])
@@ -293,6 +312,30 @@ static bool hotWaitAcked(uint8_t node)
     return (g_hotWaitAckMask & (1UL << node)) != 0;
 }
 
+static void rememberStartProbe(uint8_t node, uint32_t token, uint32_t txUs)
+{
+    StartProbePending &p = g_startProbePending[g_startProbePendingNext];
+    p.active = true;
+    p.node = node;
+    p.token = token;
+    p.txUs = txUs;
+    g_startProbePendingNext =
+        (uint8_t)((g_startProbePendingNext + 1u) % START_PROBE_PENDING_SLOTS);
+}
+
+static bool takeStartProbe(uint8_t node, uint32_t token, uint32_t &txUs)
+{
+    for (uint8_t i = 0; i < START_PROBE_PENDING_SLOTS; i++) {
+        StartProbePending &p = g_startProbePending[i];
+        if (p.active && p.node == node && p.token == token) {
+            txUs = p.txUs;
+            p.active = false;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void onArmAck(const MsgArmAck &msg)
 {
     if (msg.node_id == 0 || msg.node_id > NUM_SLAVES) return;
@@ -315,6 +358,30 @@ static void onSlaveStatus(const MsgStatus &msg)
 
 static void onCfgAck(const MsgCfgAck &msg)
 {
+    if (msg.sub_cmd == CMD_VIEW) {
+        /* Diagnóstico: registra cada sub-condición de la rama VER-success
+         * para ver cuál falla si "Ver" no avanza a HOTWAIT_QUERY/CMD_START. */
+        LOGM("CFGACK_VIEW", "node=%d,ok=%d,viewDump=%d,viewNode=%d,state=%d",
+             msg.node_id, msg.ok, (int)g_viewDump, g_viewNode, (int)g_state);
+    }
+    /* VER ok=0: el esclavo no pudo completar la captura/dump. Salir de RUNNING
+     * para que la UI no quede esperando muestras que no existen. */
+    if (msg.sub_cmd == CMD_VIEW && msg.ok == 0 &&
+        g_viewDump && msg.node_id == g_viewNode &&
+        (g_state == RUNNING || g_state == PRESTART)) {
+        MASTER_LOG_PRINTF("[MASTER] VIEW failed node=%d -> abort\n", msg.node_id);
+        LOGM("VIEW_FAIL", "node=%d,state=%d", msg.node_id, (int)g_state);
+        syncOutWrite(LOW);
+        g_viewDump = false;
+        g_viewNode = 0;
+        g_streaming = false;
+        g_captureDumpDueMs = 0;
+        g_dumpRetryPaused = false;
+        dumpDeliveryGuardReset();
+        g_state = armedOrIdleState();
+        matlab.sendReady(g_armedCount);
+        matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+    }
     /* VER ok=1: esclavo confirmó HOT_WAIT → iniciar HOTWAIT_QUERY/START igual que START */
     if (msg.sub_cmd == CMD_VIEW && msg.ok == 1 &&
         g_viewDump && msg.node_id == g_viewNode && g_state == RUNNING) {
@@ -375,7 +442,19 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
 
 static void onStartAck(const MsgStartAck &msg)
 {
-    if (msg.node_id == 0 || msg.node_id > NUM_SLAVES || g_startCmdTxUs == 0) return;
+    if (msg.node_id == 0 || msg.node_id > NUM_SLAVES) return;
+
+    uint32_t probeTxUs = 0;
+    if (takeStartProbe(msg.node_id, msg.start_token, probeTxUs)) {
+        uint32_t rttUs = (uint32_t)((uint32_t)micros() - probeTxUs);
+        uint32_t tofUs = rttUs / 2U;
+        matlab.sendStartLatency(msg.node_id, tofUs);
+        MASTER_LOG_PRINTF("[MASTER] START_PROBE_ACK node=%d status=%d rtt=%u us tof~=%u us\n",
+                          msg.node_id, msg.status, (unsigned)rttUs, (unsigned)tofUs);
+        return;
+    }
+
+    if (g_startCmdTxUs == 0) return;
     if (msg.start_token != g_startCmdToken) {
         MASTER_LOG_PRINTF("[MASTER] START_ACK stale node=%d token=%u expected=%u\n",
                           msg.node_id, (unsigned)msg.start_token,
@@ -500,6 +579,7 @@ static void sendStartProbe(uint8_t nodeId)
     g_startProbeNode = nodeId;
     g_startCmdToken  = (uint32_t)t0;
     g_startCmdTxUs   = (uint32_t)micros();
+    rememberStartProbe(nodeId, g_startCmdToken, g_startCmdTxUs);
     esp_err_t err = g_espnowReady
                   ? esp_now_send(dst, (uint8_t *)&msg, sizeof(msg))
                   : ESP_FAIL;

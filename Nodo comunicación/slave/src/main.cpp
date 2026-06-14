@@ -110,10 +110,11 @@ static volatile uint32_t   g_debug_last_us = 0;
 static          uint8_t    g_pga_code    = 0;
 static          uint8_t    g_pgavdac     = 0;
 static          uint8_t    g_vdac_byte   = 128;
-static          bool       g_cfg_waiting = false;
+static volatile bool       g_cfg_waiting = false;
 static          uint8_t    g_cfg_sub_cmd = 0;
 static          uint8_t    g_cfg_param   = 0;
-static          uint32_t   g_cfg_due_ms  = 0;
+static          uint32_t   g_cfg_start_ms = 0;
+static          uint32_t   g_cfg_timeout_ms = 0;
 
 /* ── Store-and-forward ───────────────────────────────────────────────────── */
 static uint16_t    g_rec_n_batches = 0;          /* 0 = modo streaming clásico */
@@ -125,7 +126,16 @@ static uint16_t    g_store_fill    = 0;
 static volatile uint16_t g_view_remaining    = 0; /* legado live deshabilitado */
 static volatile bool     g_view_store_active = false;
 
-#define PSOC_CFG_ACK_TIMEOUT_MS 250u
+#define PSOC_CFG_ACK_TIMEOUT_MS 750u
+#define PSOC_CAL_ACK_TIMEOUT_MS 25000u
+#ifndef PSOC_VIEW_START_FALLBACK_EXTRA_MS
+  #define PSOC_VIEW_START_FALLBACK_EXTRA_MS 350u
+#endif
+
+static uint32_t g_sampling_start_ms = 0;
+static uint32_t g_sampling_start_psoc_bytes = 0;
+static uint32_t g_sampling_start_batches_ok = 0;
+static bool     g_view_start_fallback_sent = false;
 
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static PsocUART       psoc;
@@ -134,6 +144,8 @@ static EspNowTransport transport;
 /* Helpers de pulsos GPIO de osciloscopio (módulo aparte). */
 #include "scope_pulse.h"
 
+static void sendCfgAck(uint8_t sub_cmd, uint8_t ok);
+
 static void logPsocUartDiag(const char *tag)
 {
     const unsigned long bytes = (unsigned long)psoc.bytesRx();
@@ -141,26 +153,105 @@ static void logPsocUartDiag(const char *tag)
     const unsigned long drop  = (unsigned long)psoc.syncDrops();
     const unsigned long badLn = (unsigned long)psoc.badLen();
     const unsigned long ping  = (unsigned long)psoc.pingsRx();
+    const unsigned long diag  = (unsigned long)psoc.diagEventsRx();
     const int rxLevel = digitalRead(PSOC_UART_RX);
 
     if (psoc.hasLastByte()) {
         SLAVE_LOG_PRINTF(
-            "[SLAVE %d] %s bOK=%lu bBad=%lu uartBytes=%lu mark=%lu drop=%lu badLen=%lu ping=%lu rx=%d last=0x%02X age=%lu txOK=%lu txFail=%lu state=%d view=%u\n",
+            "[SLAVE %d] %s bOK=%lu bBad=%lu uartBytes=%lu mark=%lu drop=%lu badLen=%lu ping=%lu diag=%lu rx=%d last=0x%02X age=%lu txOK=%lu txFail=%lu state=%d fill=%u/%u\n",
             NODE_ID, tag,
             (unsigned long)psoc.batchesOK(), (unsigned long)psoc.batchesBad(),
-            bytes, mark, drop, badLn, ping, rxLevel,
+            bytes, mark, drop, badLn, ping, diag, rxLevel,
             psoc.lastByte(), (unsigned long)psoc.lastByteAgeMs(),
             (unsigned long)transport.sentOK(), (unsigned long)transport.sentFail(),
-            (int)g_state, (unsigned)g_view_remaining);
+            (int)g_state, (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
     } else {
         SLAVE_LOG_PRINTF(
-            "[SLAVE %d] %s bOK=%lu bBad=%lu uartBytes=%lu mark=%lu drop=%lu badLen=%lu ping=%lu rx=%d last=none txOK=%lu txFail=%lu state=%d view=%u\n",
+            "[SLAVE %d] %s bOK=%lu bBad=%lu uartBytes=%lu mark=%lu drop=%lu badLen=%lu ping=%lu diag=%lu rx=%d last=none txOK=%lu txFail=%lu state=%d fill=%u/%u\n",
             NODE_ID, tag,
             (unsigned long)psoc.batchesOK(), (unsigned long)psoc.batchesBad(),
-            bytes, mark, drop, badLn, ping, rxLevel,
+            bytes, mark, drop, badLn, ping, diag, rxLevel,
             (unsigned long)transport.sentOK(), (unsigned long)transport.sentFail(),
-            (int)g_state, (unsigned)g_view_remaining);
+            (int)g_state, (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
     }
+}
+
+static const char *psocDiagName(uint8_t event)
+{
+    switch (event) {
+        case PSOC_EVT_BOOT:           return "BOOT";
+        case PSOC_EVT_ANALOG_READY:   return "ANALOG_READY";
+        case PSOC_EVT_CAL_START:      return "CAL_START";
+        case PSOC_EVT_CAL_DONE:       return "CAL_DONE";
+        case PSOC_EVT_CAL_BUSY:       return "CAL_BUSY";
+        case PSOC_EVT_CAL_STAGE_DAC:  return "CAL_STAGE_DAC";
+        case PSOC_EVT_CAL_STAGE_MEAS: return "CAL_STAGE_MEAS";
+        case PSOC_EVT_WAIT_ESP:       return "WAIT_ESP";
+        case PSOC_EVT_ESP_SEEN:       return "ESP_SEEN";
+        case PSOC_EVT_RX_CMD:         return "RX_CMD";
+        case PSOC_EVT_SETN:           return "SETN";
+        case PSOC_EVT_ARMED:          return "ARMED";
+        case PSOC_EVT_SYNC_RISE:      return "SYNC_RISE";
+        case PSOC_EVT_SYNC_FALL:      return "SYNC_FALL";
+        case PSOC_EVT_SAMPLING_START: return "SAMPLING_START";
+        case PSOC_EVT_CAPTURE_DONE:   return "CAPTURE_DONE";
+        case PSOC_EVT_DUMP_START:     return "DUMP_START";
+        case PSOC_EVT_DUMP_DONE:      return "DUMP_DONE";
+        case PSOC_EVT_START_NOW:      return "START_NOW";
+        case PSOC_EVT_DEBUG_MODE:     return "DEBUG_MODE";
+        case PSOC_EVT_STATUS_REQ:     return "STATUS_REQ";
+        default:                      return "UNKNOWN";
+    }
+}
+
+static const char *psocStateName(uint8_t state)
+{
+    switch (state) {
+        case 0:  return "IDLE";
+        case 1:  return "ARMED";
+        case 2:  return "SAMPLING";
+        default: return "UNKNOWN";
+    }
+}
+
+static void onPsocDiag(const PsocDiagEvent &event)
+{
+    const char *eventName = psocDiagName(event.event);
+    const char *stateName = psocStateName(event.psoc_state);
+    g_psocConnected = true;
+
+    if (g_state == SAMPLING && event.event != PSOC_EVT_DUMP_DONE) {
+        return;
+    }
+
+    if (event.event == PSOC_EVT_DUMP_DONE && g_view_store_active &&
+        g_state == SAMPLING && g_store_fill < g_rec_n_batches) {
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        g_view_store_active = false;
+        g_state = STOPPED;
+        sendCfgAck(CMD_VIEW, 0);
+        SLAVE_LOG_PRINTF("[SLAVE] VIEW partial dump fill=%u/%u -> FAIL\n",
+                         (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+        LOGM("VIEW_PARTIAL", "fill=%u,n=%u,bOK=%lu,bBad=%lu,drop=%lu,bytes=%lu",
+             (unsigned)g_store_fill, (unsigned)g_rec_n_batches,
+             (unsigned long)psoc.batchesOK(),
+             (unsigned long)psoc.batchesBad(),
+             (unsigned long)psoc.syncDrops(),
+             (unsigned long)psoc.bytesRx());
+    }
+
+    SLAVE_LOG_PRINTF("[SLAVE] PSOC_EVT %s event=0x%02X val=%u pstate=%u/%s estate=%d bytes=%lu bOK=%lu fill=%u/%u\n",
+                     eventName, event.event, event.value,
+                     event.psoc_state, stateName, (int)g_state,
+                     (unsigned long)psoc.bytesRx(),
+                     (unsigned long)psoc.batchesOK(),
+                     (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+    LOGM("PSOC_EVT", "event=0x%02X,name=%s,val=%u,pstate=%u,pstateName=%s,estate=%d,bytes=%lu,bOK=%lu,fill=%u/%u",
+         event.event, eventName, event.value,
+         event.psoc_state, stateName, (int)g_state,
+         (unsigned long)psoc.bytesRx(),
+         (unsigned long)psoc.batchesOK(),
+         (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
 }
 
 /* ── ISR GPIO hardware sync (IRAM para máxima velocidad) ────────────────── */
@@ -219,10 +310,13 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
 
 static void waitForPsocConfigAck(uint8_t sub_cmd, uint8_t param)
 {
-    g_cfg_waiting = true;
     g_cfg_sub_cmd = sub_cmd;
     g_cfg_param = param;
-    g_cfg_due_ms = millis() + PSOC_CFG_ACK_TIMEOUT_MS;
+    g_cfg_start_ms = millis();
+    g_cfg_timeout_ms = (sub_cmd == PSOC_CMD_CALIBRATE)
+                     ? PSOC_CAL_ACK_TIMEOUT_MS
+                     : PSOC_CFG_ACK_TIMEOUT_MS;
+    g_cfg_waiting = true;
 }
 
 static void servicePsocConfigAck()
@@ -254,11 +348,17 @@ static void servicePsocConfigAck()
         }
     }
 
-    if (g_cfg_waiting && (int32_t)(millis() - g_cfg_due_ms) >= 0) {
+    if (g_cfg_waiting &&
+        (uint32_t)(millis() - g_cfg_start_ms) >= g_cfg_timeout_ms) {
         sendCfgAck(g_cfg_sub_cmd, 0);
-        SLAVE_LOG_PRINTF("[SLAVE] PSoC cfg ack timeout sub=0x%02X expected=%u\n",
-                         g_cfg_sub_cmd, g_cfg_param);
-        LOGM("CFG_TIMEOUT", "sub=0x%02X,expected=%u", g_cfg_sub_cmd, g_cfg_param);
+        SLAVE_LOG_PRINTF("[SLAVE] PSoC cfg ack timeout sub=0x%02X expected=%u elapsed=%lu/%lu\n",
+                         g_cfg_sub_cmd, g_cfg_param,
+                         (unsigned long)(millis() - g_cfg_start_ms),
+                         (unsigned long)g_cfg_timeout_ms);
+        LOGM("CFG_TIMEOUT", "sub=0x%02X,expected=%u,elapsed=%lu,timeout=%lu",
+             g_cfg_sub_cmd, g_cfg_param,
+             (unsigned long)(millis() - g_cfg_start_ms),
+             (unsigned long)g_cfg_timeout_ms);
         g_cfg_waiting = false;
     }
 }
@@ -282,6 +382,14 @@ static uint16_t clampPsocCaptureBatches(uint16_t n)
     return n;
 }
 
+static uint32_t expectedViewCaptureMs(uint16_t n_batches)
+{
+    uint32_t fs = psoc.sampleRate();
+    if (fs == 0) fs = 3000u;
+    uint32_t ms = ((uint32_t)n_batches * (uint32_t)SPI_BATCH_SAMPLES * 1000u + fs - 1u) / fs;
+    return ms + PSOC_VIEW_START_FALLBACK_EXTRA_MS;
+}
+
 static void enterHotWait(uint16_t n_batches)
 {
     n_batches = clampPsocCaptureBatches(n_batches);
@@ -293,13 +401,16 @@ static void enterHotWait(uint16_t n_batches)
     g_view_store_active = false;
     g_debug_count    = 0;
     g_debug_last_us  = (uint32_t)micros();
+    g_view_start_fallback_sent = false;
     g_state = HOT_WAIT;
     /* Armar el PSoC por UART: set N y pre-start (queda esperando flanco SYNC). */
     psoc.setN(n_batches);
     psoc.preStart();
     SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT n=%u ready=%u\n",
                      n_batches, (unsigned)storeReadyForHotWait());
-    LOGM("HOTWAIT", "n=%u,ready=%u", n_batches, (unsigned)storeReadyForHotWait());
+    LOGM("HOTWAIT", "n=%u,ready=%u,sync=%d,bytes=%lu",
+         n_batches, (unsigned)storeReadyForHotWait(),
+         digitalRead(SYNC_TO_PSOC_PIN), (unsigned long)psoc.bytesRx());
 }
 
 static void sendHotWaitAck()
@@ -374,6 +485,10 @@ static void handleSetConfig(const MsgSetConfig *cfg)
             break;
         case 0xAA:                       /* VDAC (calibración) */
             psoc.setVdac(cfg->param);
+            waitAck = true;
+            break;
+        case PSOC_CMD_CALIBRATE:
+            psoc.calibrate();
             waitAck = true;
             break;
         default:
@@ -478,14 +593,29 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
                              (int)g_state, (unsigned)storeReadyForHotWait());
             return;
         }
-        sendStartAck(1, startToken, nowUs);
+        int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
         digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
-        /* START por software: usar como fallback si no hay cable GPIO */
+        int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
+        sendStartAck(1, startToken, nowUs);
         g_t_start_us    = msg->t_start_us;
         g_store_fill    = 0;   /* reset store index para nueva grabación */
         g_debug_count   = 0;
         g_debug_last_us = nowUs;
+        g_sampling_start_ms = millis();
+        g_sampling_start_psoc_bytes = psoc.bytesRx();
+        g_sampling_start_batches_ok = psoc.batchesOK();
+        g_view_start_fallback_sent = false;
         g_state = SAMPLING;
+        SLAVE_LOG_PRINTF("[SLAVE] START_OK target=%u token=%u sync=%d->%d bytes=%lu fill=%u/%u view=%u\n",
+                         (unsigned)targetNode, (unsigned)startToken,
+                         syncBefore, syncAfter,
+                         (unsigned long)g_sampling_start_psoc_bytes,
+                         (unsigned)g_store_fill, (unsigned)g_rec_n_batches,
+                         (unsigned)g_view_store_active);
+        LOGM("START_OK", "token=%u,target=%u,n_batches=%u,store=%d,sync=%d->%d,view=%u",
+             (unsigned)startToken, (unsigned)targetNode,
+             (unsigned)g_rec_n_batches, (int)(g_store_buf != nullptr),
+             syncBefore, syncAfter, (unsigned)g_view_store_active);
     }
     else if (cmd == CMD_STOP) {
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
@@ -721,6 +851,7 @@ void setup()
 
     /* UART → PSoC */
     psoc.begin(onBatch);
+    psoc.onDiag(onPsocDiag);
 
     /* Intentar detectar el PSoC una vez. Si no responde, se reintenta cada 2 s
      * en loop() para no bloquear ESP-NOW ni la generación de batches debug. */
@@ -769,13 +900,42 @@ void loop()
     }
     servicePsocConfigAck();
 
-    /* Mientras "Ver" espera batches, imprimir UART cada 1 s.
-     * Esto separa cable/pin (uartBytes=0) de protocolo/baud (bytes sin frames). */
+    /* Mientras se llena el store (Ver/Test con n_batches>0), imprimir UART cada 1 s.
+     * Esto separa cable/pin (uartBytes=0) de protocolo/baud (bytes sin frames)
+     * de "onBatch no incrementa fill" (psoc.poll() no entrega PsocBatch). */
     static uint32_t lastViewDiagMs = 0;
-    if (g_state == SAMPLING && g_view_remaining > 0 &&
+    if (g_state == SAMPLING && g_rec_n_batches > 0 &&
         (millis() - lastViewDiagMs) >= 1000) {
         lastViewDiagMs = millis();
         logPsocUartDiag("VIEW_UART");
+    }
+
+    if (g_state == SAMPLING && g_view_store_active && g_rec_n_batches > 0 &&
+        g_store_fill == 0 && !g_view_start_fallback_sent) {
+        uint32_t elapsedMs = millis() - g_sampling_start_ms;
+        uint32_t fallbackMs = expectedViewCaptureMs(g_rec_n_batches);
+        uint32_t bytesNow = psoc.bytesRx();
+        uint32_t batchesNow = psoc.batchesOK();
+        if (elapsedMs >= fallbackMs && batchesNow == g_sampling_start_batches_ok) {
+            g_view_start_fallback_sent = true;
+            SLAVE_LOG_PRINTF("[SLAVE] VIEW_SYNC_STALL elapsed=%lu/%lu sync=%d bytes=%lu->%lu bOK=%lu->%lu fill=%u/%u -> START_NOW UART\n",
+                             (unsigned long)elapsedMs, (unsigned long)fallbackMs,
+                             digitalRead(SYNC_TO_PSOC_PIN),
+                             (unsigned long)g_sampling_start_psoc_bytes,
+                             (unsigned long)bytesNow,
+                             (unsigned long)g_sampling_start_batches_ok,
+                             (unsigned long)batchesNow,
+                             (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+            LOGM("VIEW_SYNC_STALL", "ms=%lu/%lu,sync=%d,bytes=%lu->%lu,bOK=%lu->%lu,fill=%u/%u",
+                 (unsigned long)elapsedMs, (unsigned long)fallbackMs,
+                 digitalRead(SYNC_TO_PSOC_PIN),
+                 (unsigned long)g_sampling_start_psoc_bytes,
+                 (unsigned long)bytesNow,
+                 (unsigned long)g_sampling_start_batches_ok,
+                 (unsigned long)batchesNow,
+                 (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+            psoc.startNow();
+        }
     }
 
     /* Volver a esperar ARM después de STOP.

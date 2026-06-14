@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-loop-18';
-import { WsClient } from './ws_client.js?v=field-loop-18';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-18';
-import { DataStore, effectiveFs } from './data_store.js?v=field-loop-18';
-import { PlotArea } from './plot.js?v=field-loop-18';
-import { SpectrumArea } from './spectrum.js?v=field-loop-18';
-import { SlavePanel } from './slave_panel.js?v=field-loop-18';
-import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-18';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-18';
+import * as cfg from './config.js?v=field-loop-19';
+import { WsClient } from './ws_client.js?v=field-loop-19';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-19';
+import { DataStore, effectiveFs } from './data_store.js?v=field-loop-19';
+import { PlotArea } from './plot.js?v=field-loop-19';
+import { SpectrumArea } from './spectrum.js?v=field-loop-19';
+import { SlavePanel } from './slave_panel.js?v=field-loop-19';
+import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-19';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-19';
 
 const $ = (id) => document.getElementById(id);
 
@@ -28,6 +28,8 @@ let activeSlaveCount = 0;
 
 const SETTINGS_PREFIX = 'geophone_scope_web.';
 const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz`;
+const SHOW_RAW_KEY = `${SETTINGS_PREFIX}show_raw`;
+const SHOW_FILT_KEY = `${SETTINGS_PREFIX}show_filt`;
 
 function clamp(value, lo, hi) {
   return Math.max(lo, Math.min(hi, value));
@@ -70,6 +72,20 @@ function loadSlaveBool(chIndex, name, fallback) {
   const raw = loadSetting(settingKey(chIndex, name));
   if (raw === null) return fallback;
   return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+function loadBoolSetting(key, fallback) {
+  const raw = loadSetting(key);
+  if (raw === null) return fallback;
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+function saveSetting(key, value) {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch (_) {
+    // localStorage can be disabled on some phone browser/privacy modes.
+  }
 }
 
 function saveGlobalFs(fsHz) {
@@ -326,7 +342,7 @@ function renderNodeRow(i) {
   row.querySelector('.raw').textContent = (raw === null) ? '--' : `${raw.toFixed(4)} V`;
   row.querySelector('.stats').textContent = `${nd.batchCount} lotes / ${nd.totalSamples} muestras`;
   row.querySelector('.cfg').textContent =
-    `pga=${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode} vdac=${nd.vdacByte}` +
+    `pga=${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}` +
     (nd.psocOk === null ? '' : ` psoc=${nd.psocOk ? 'ok' : 'no'}`);
 }
 
@@ -479,6 +495,10 @@ function schedulePgaLockTimeout(chIndex, expectedCode) {
     nd.pending.delete(cfg.SUBCMD_PGA);
     const panel = panelFor(chIndex);
     if (panel) panel.setPgaLock(2);
+    if (nd.calibrateAfterPga) {
+      nd.calibrateAfterPga = false;
+      appendLog(`S${chIndex} config cancelada: PGA sin confirmacion`);
+    }
     appendLog(`S${chIndex} PGA sin confirmacion: ${cfg.GAIN_NAMES[expectedCode] ?? expectedCode}`);
   }, Math.round(cfg.RETRY_SEC * 1000));
   pgaLockTimers.set(chIndex, timer);
@@ -495,25 +515,6 @@ function prepareNodeCapture(chIndex) {
   return nd;
 }
 
-function onVdacChanged(chIndex, vdacByte) {
-  const nd = data.nodes[chIndex];
-  nd.vdacByte = clamp(vdacByte, cfg.VDAC_MIN, cfg.VDAC_MAX);
-  nd.pending.set(cfg.SUBCMD_VDAC, { param: nd.vdacByte, sendTime: performance.now(), retries: 0 });
-  saveSlaveSetting(chIndex, 'vdac_byte', nd.vdacByte);
-  const panel = panelFor(chIndex);
-  if (panel) panel.setVdacLock(2);
-  sendDirected(chIndex, cfg.SUBCMD_VDAC, nd.vdacByte);
-  appendLog(`S${chIndex} VDAC -> ${nd.vdacByte}`);
-}
-
-function onPgavdacChanged(chIndex, pgaCode) {
-  const nd = data.nodes[chIndex];
-  nd.pgavdac = clamp(pgaCode, 0, cfg.GAIN_CODES.length - 1);
-  saveSlaveSetting(chIndex, 'pgavdac_code', nd.pgavdac);
-  sendDirected(chIndex, cfg.SUBCMD_PGAVDAC, nd.pgavdac);
-  appendLog(`S${chIndex} PGAvdac -> ${cfg.GAIN_NAMES[nd.pgavdac]}`);
-}
-
 function onPgaChanged(chIndex, pgaCode) {
   const nd = data.nodes[chIndex];
   nd.pgaCode = clamp(pgaCode, 0, cfg.GAIN_CODES.length - 1);
@@ -524,6 +525,15 @@ function onPgaChanged(chIndex, pgaCode) {
   sendDirected(chIndex, cfg.SUBCMD_PGA, nd.pgaCode);
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
   appendLog(`S${chIndex} PGA -> ${cfg.GAIN_NAMES[nd.pgaCode]}`);
+}
+
+function onCalibrateRequested(chIndex) {
+  const nd = data.nodes[chIndex];
+  nd.pending.set(cfg.SUBCMD_CALIBRATE, { param: 1, sendTime: performance.now(), retries: 0 });
+  const panel = panelFor(chIndex);
+  if (panel) panel.setCalibrationLock(2);
+  sendDirected(chIndex, cfg.SUBCMD_CALIBRATE, 1);
+  appendLog(`S${chIndex} calibracion solicitada`);
 }
 
 function onVerRequested(chIndex) {
@@ -574,18 +584,15 @@ function onTestRequested(chIndex) {
 
 function onSendAll(chIndex) {
   const nd = data.nodes[chIndex];
-  sendDirected(chIndex, cfg.SUBCMD_PGAVDAC, nd.pgavdac);
-  sendDirected(chIndex, cfg.SUBCMD_VDAC, nd.vdacByte);
+  nd.calibrateAfterPga = true;
   sendDirected(chIndex, cfg.SUBCMD_PGA, nd.pgaCode);
-  nd.pending.set(cfg.SUBCMD_VDAC, { param: nd.vdacByte, sendTime: performance.now(), retries: 0 });
   nd.pending.set(cfg.SUBCMD_PGA, { param: nd.pgaCode, sendTime: performance.now(), retries: 0 });
   const panel = panelFor(chIndex);
   if (panel) {
-    panel.setVdacLock(2);
     panel.setPgaLock(2);
   }
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
-  appendLog(`S${chIndex} enviar todo: pgavdac=${nd.pgavdac} vdac=${nd.vdacByte} pga=${nd.pgaCode}`);
+  appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode} + calibracion`);
 }
 
 function onLatencyRequested(chIndex) {
@@ -680,13 +687,9 @@ function loadSlavePanelState(chIndex, panel) {
     panel.setAlias(alias);
   }
 
-  nd.pgavdac = loadSlaveInt(chIndex, 'pgavdac_code', nd.pgavdac, 0, cfg.GAIN_CODES.length - 1);
-  nd.vdacByte = loadSlaveInt(chIndex, 'vdac_byte', nd.vdacByte, cfg.VDAC_MIN, cfg.VDAC_MAX);
   nd.pgaCode = loadSlaveInt(chIndex, 'pga_code', nd.pgaCode, 0, cfg.GAIN_CODES.length - 1);
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
 
-  panel.setPgavdac(nd.pgavdac);
-  panel.setVdac(nd.vdacByte);
   panel.setPga(nd.pgaCode);
   panel.setDcRemove(nd.dcRemove);
   nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
@@ -720,9 +723,8 @@ function wireSlavePanel(chIndex, panel) {
     refreshSlavePresentationOrder();
     appendLog(`Orden de salida: ${orderedSlaveIndices(true).map((idx) => nodeTitle(idx)).join(', ') || '--'}`);
   });
-  panel.addEventListener('vdac-changed', (ev) => onVdacChanged(chIndex, ev.detail));
-  panel.addEventListener('pgavdac-changed', (ev) => onPgavdacChanged(chIndex, ev.detail));
   panel.addEventListener('pga-changed', (ev) => onPgaChanged(chIndex, ev.detail));
+  panel.addEventListener('calibrate-requested', () => onCalibrateRequested(chIndex));
   panel.addEventListener('fir-apply', (ev) => onFirApply(chIndex, ev.detail.cmd));
   panel.addEventListener('fir-remove', () => onFirRemove(chIndex));
   panel.addEventListener('dc-remove-toggled', (ev) => onDcRemoveToggled(chIndex, !!ev.detail.enabled));
@@ -767,12 +769,27 @@ function handleAck(pkt, idx) {
     }
     const expected = pending ? pending.param : data.nodes[idx].pgaCode;
     appendLog(`S${idx} PGA ${ackVal ? 'confirmado' : 'sin lock'}: ${cfg.GAIN_NAMES[expected] ?? expected}`);
+    if (data.nodes[idx].calibrateAfterPga) {
+      data.nodes[idx].calibrateAfterPga = false;
+      if (ackVal) {
+        onCalibrateRequested(idx);
+      } else {
+        appendLog(`S${idx} calibracion omitida: PGA sin lock`);
+      }
+    }
     return;
   }
 
   if (ackCmd === cfg.SUBCMD_VDAC && idx >= 1 && idx < cfg.MAX_NODES) {
+    appendLog(`ACK legacy VDAC S${idx}: ${ackVal}`);
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_CALIBRATE && idx >= 1 && idx < cfg.MAX_NODES) {
     const panel = panelFor(idx);
-    if (panel) panel.setVdacLock(ackVal ? 1 : 2);
+    if (panel) panel.setCalibrationLock(ackVal ? 1 : 2);
+    appendLog(`S${idx} calibracion ${ackVal ? 'confirmada' : 'fallida'}`);
+    return;
   }
 
   appendLog(`ACK node=${pkt.nodeId} cmd=0x${ackCmd.toString(16).toUpperCase()} val=${ackVal}`);
@@ -921,7 +938,6 @@ ws.addEventListener('packet', (ev) => {
       const panel = panelFor(idx);
       if (panel) {
         panel.setPga(nd.pgaCode);
-        panel.setVdac(nd.vdacByte);
       }
     }
   } else if (pkt.isAck) {
@@ -1012,15 +1028,24 @@ $('btn-spectrum').addEventListener('click', () => {
 });
 
 // Display-only curve visibility — saving/export always keeps raw AND filtered regardless of these.
-function applyCurveVisibility() {
-  plotArea.setCurveVisibility(
-    $('chk-show-raw').checked,
-    $('chk-show-filt').checked,
-  );
+function applyCurveVisibility(persist = true) {
+  const showRaw = $('chk-show-raw').checked;
+  const showFilt = $('chk-show-filt').checked;
+  if (persist) {
+    saveSetting(SHOW_RAW_KEY, showRaw ? 1 : 0);
+    saveSetting(SHOW_FILT_KEY, showFilt ? 1 : 0);
+  }
+  plotArea.setCurveVisibility(showRaw, showFilt);
+}
+
+function initCurveVisibility() {
+  $('chk-show-raw').checked = loadBoolSetting(SHOW_RAW_KEY, $('chk-show-raw').checked);
+  $('chk-show-filt').checked = loadBoolSetting(SHOW_FILT_KEY, $('chk-show-filt').checked);
+  applyCurveVisibility(false);
 }
 $('chk-show-raw').addEventListener('change', applyCurveVisibility);
 $('chk-show-filt').addEventListener('change', applyCurveVisibility);
-applyCurveVisibility();
+initCurveVisibility();
 
 $('disp-secs').addEventListener('change', applyDisplayWindow);
 $('capture-secs').addEventListener('change', () => {

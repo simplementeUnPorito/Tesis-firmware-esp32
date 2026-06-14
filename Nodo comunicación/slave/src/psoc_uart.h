@@ -3,7 +3,7 @@
  * psoc_uart.h — Enlace UART entre el ESP esclavo y el PSoC 5LP.
  *
  * Reemplaza al antiguo psoc_spi. El PSoC envía lotes RAW (sin Filter) y el
- * esclavo le manda comandos (set N, VDAC, pre-start, ver, debug).
+ * esclavo le manda comandos (set N, PGA, calibracion, pre-start, ver, debug).
  *
  * Cableado (ESP32, Serial2 por defecto):
  *   PSOC_UART_RX (GPIO16) ← TX del PSoC (UART.TX)
@@ -30,11 +30,15 @@
 #ifndef PSOC_UART_TX
 #define PSOC_UART_TX 17
 #endif
+#ifndef PSOC_UART_RX_BUFFER_SIZE
+#define PSOC_UART_RX_BUFFER_SIZE 32768
+#endif
 
 #define PSOC_FRAME_MARKER 0xAB
 #define SPI_BATCH_SAMPLES 30                              /* muestras por lote */
 #define PSOC_FRAME_BYTES  (4 + SPI_BATCH_SAMPLES * 3 + 1) /* 95 */
 #define PSOC_CTRL_ACK_BYTES 5
+#define PSOC_CTRL_DIAG_BYTES 6
 
 /* Comandos hacia el PSoC */
 #define PSOC_CMD_PGA       0xA6
@@ -45,12 +49,36 @@
 #define PSOC_CMD_PRESTART  0xB1
 #define PSOC_CMD_DEBUG     0xB3
 #define PSOC_CMD_START_NOW 0xB4
+#define PSOC_CMD_CALIBRATE 0xB5
 
 /* Control PSoC -> ESP */
 #define PSOC_CTRL_PING      0xC0
 #define PSOC_CTRL_PONG      0xC1
 #define PSOC_CTRL_CFG_ACK   0xC2
 #define PSOC_CTRL_FS_REPORT 0xC3  /* PSoC → ESP: frecuencia de muestreo ADC */
+#define PSOC_CTRL_DIAG_EVT  0xC4  /* PSoC → ESP: evento diagnostico */
+
+#define PSOC_EVT_BOOT             0x01
+#define PSOC_EVT_ANALOG_READY     0x02
+#define PSOC_EVT_CAL_START        0x10
+#define PSOC_EVT_CAL_DONE         0x11
+#define PSOC_EVT_CAL_BUSY         0x12
+#define PSOC_EVT_CAL_STAGE_DAC    0x13
+#define PSOC_EVT_CAL_STAGE_MEAS   0x14
+#define PSOC_EVT_WAIT_ESP         0x20
+#define PSOC_EVT_ESP_SEEN         0x21
+#define PSOC_EVT_RX_CMD           0x30
+#define PSOC_EVT_SETN             0x31
+#define PSOC_EVT_ARMED            0x32
+#define PSOC_EVT_SYNC_RISE        0x33
+#define PSOC_EVT_SYNC_FALL        0x34
+#define PSOC_EVT_SAMPLING_START   0x35
+#define PSOC_EVT_CAPTURE_DONE     0x36
+#define PSOC_EVT_DUMP_START       0x37
+#define PSOC_EVT_DUMP_DONE        0x38
+#define PSOC_EVT_START_NOW        0x39
+#define PSOC_EVT_DEBUG_MODE       0x3A
+#define PSOC_EVT_STATUS_REQ       0x3B
 
 struct PsocSample {
     int16_t  raw_input;
@@ -68,11 +96,20 @@ struct PsocBatch {
     uint64_t   timestamp_us;
 };
 
+struct PsocDiagEvent {
+    uint8_t  event;
+    uint8_t  value;
+    uint8_t  psoc_state;
+    uint32_t timestamp_ms;
+};
+
 typedef void (*BatchCallback)(const PsocBatch &batch);
+typedef void (*DiagCallback)(const PsocDiagEvent &event);
 
 class PsocUART {
 public:
     void begin(BatchCallback cb = nullptr, HardwareSerial *serial = nullptr);
+    void onDiag(DiagCallback cb);
     void poll();                 /* drena UART y ensambla frames */
 
     /* Comandos hacia el PSoC. START normal y Ver usan SYNC. */
@@ -82,6 +119,7 @@ public:
     void setVdac(uint8_t v);
     void setPga(uint8_t code);
     void setPgavdac(uint8_t code);
+    void calibrate();
     void debugRamp(bool en);
     void requestStatus();
     void sendPong();
@@ -101,6 +139,7 @@ public:
     uint32_t badLen()     const { return _badLen; }
     uint32_t pingsRx()    const { return _pingsRx; }
     uint32_t configAcksRx() const { return _configAcksRx; }
+    uint32_t diagEventsRx() const { return _diagEventsRx; }
     uint8_t  lastByte()   const { return _lastByte; }
     bool     hasLastByte() const { return _lastByteSeen; }
     uint32_t lastByteAgeMs() const { return _lastByteSeen ? (millis() - _lastByteMs) : 0xFFFFFFFFu; }
@@ -108,6 +147,7 @@ public:
 private:
     HardwareSerial *_ser       = nullptr;
     BatchCallback   _cb        = nullptr;
+    DiagCallback    _diagCb    = nullptr;
     uint8_t         _buf[PSOC_FRAME_BYTES];
     uint16_t        _idx       = 0;
     bool            _lastOK    = false;
@@ -119,6 +159,7 @@ private:
     uint32_t        _badLen    = 0;
     uint32_t        _pingsRx   = 0;
     uint32_t        _configAcksRx = 0;
+    uint32_t        _diagEventsRx = 0;
     uint16_t        _sampleRate = 0;
     bool            _cfgAckPending = false;
     uint8_t         _cfgAckCmd = 0;
@@ -133,6 +174,7 @@ private:
     void _parseFrame();
     void _parseConfigAck();
     void _parseFsReport();
+    void _parseDiagEvent();
     void _noteRxByte(uint8_t b);
     void _sendCmd1(uint8_t cmd, uint8_t p);
     void _sendCmd2(uint8_t cmd, uint8_t p1, uint8_t p2);
