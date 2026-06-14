@@ -55,7 +55,33 @@
 #ifndef PSOC_CAPTURE_MAX_BATCHES
   #define PSOC_CAPTURE_MAX_BATCHES 512
 #endif
-/* Logging (humano + máquina) en debug_log.h, gateado por DBG_ENABLE. */
+/* Logging (humano + máquina) en debug_log.h, gateado por DBG_ENABLE.
+ * Estos defines limpian el monitor USB: por defecto queda solo lo accionable
+ * para diagnosticar calibracion/captura. */
+#ifndef PSOC_DIAG_VERBOSE
+  #define PSOC_DIAG_VERBOSE 0
+#endif
+#ifndef PSOC_CAL_LOG_POINTS
+  #define PSOC_CAL_LOG_POINTS 1
+#endif
+#ifndef PSOC_CAL_LOG_CLAMPED_POINTS
+  #define PSOC_CAL_LOG_CLAMPED_POINTS 0
+#endif
+#ifndef PSOC_CAL_LOG_PROGRESS
+  #define PSOC_CAL_LOG_PROGRESS 0
+#endif
+#ifndef SLAVE_LOG_HELLO_TX
+  #define SLAVE_LOG_HELLO_TX 0
+#endif
+#ifndef SLAVE_LOG_STATUS_PERIODIC
+  #define SLAVE_LOG_STATUS_PERIODIC 0
+#endif
+#ifndef SLAVE_LOG_VIEW_UART
+  #define SLAVE_LOG_VIEW_UART 0
+#endif
+#ifndef SLAVE_USB_CMD_ENABLE
+  #define SLAVE_USB_CMD_ENABLE 1
+#endif
 
 /* MAC del ESP maestro. El valor real debe venir de platformio.ini. */
 #ifndef MASTER_MAC0
@@ -307,8 +333,11 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_CAL_WATCHDOG:   return "CAL_WATCHDOG";
         case PSOC_EVT_CAL_LP_BAD:     return "CAL_LP_BAD";
         case PSOC_EVT_CAL_STAGE_MEAS32: return "CAL_STAGE_MEAS32";
+        case PSOC_EVT_SERVO_STAGE:    return "SERVO_STAGE";
+        case PSOC_EVT_SERVO_STEP:     return "SERVO_STEP";
         case PSOC_EVT_WAIT_ESP:       return "WAIT_ESP";
         case PSOC_EVT_ESP_SEEN:       return "ESP_SEEN";
+        case PSOC_EVT_CAL_LOOP:       return "CAL_LOOP";
         case PSOC_EVT_RX_CMD:         return "RX_CMD";
         case PSOC_EVT_SETN:           return "SETN";
         case PSOC_EVT_ARMED:          return "ARMED";
@@ -347,16 +376,21 @@ static const char *psocCalStageName(uint8_t stage)
     }
 }
 
+static uint32_t absCounts32(int32_t value)
+{
+    return (value < 0) ? (uint32_t)(-value) : (uint32_t)value;
+}
+
 static void onPsocDiag(const PsocDiagEvent &event)
 {
-    const char *eventName = psocDiagName(event.event);
-    const char *stateName = psocStateName(event.psoc_state);
     static uint8_t calStage = 0xFF;
     static uint8_t calDac = 0;
     static int16_t calMeas = 0;
     static bool calMeasHigh = false;
     static uint32_t calMeasRaw = 0;
+    static int32_t calMeasRawSigned = 0;
     static uint8_t calMeasRawByte = 0;
+    static uint16_t calPointIndex = 0;
     g_psocConnected = true;
 
     if (g_state == SAMPLING && event.event != PSOC_EVT_DUMP_DONE) {
@@ -379,19 +413,59 @@ static void onPsocDiag(const PsocDiagEvent &event)
              (unsigned long)psoc.bytesRx());
     }
 
-    if (event.event == PSOC_EVT_CAL_STAGE_BEGIN) {
-        calStage = event.value;
+    if (event.event == PSOC_EVT_CAL_START) {
+        calStage = 0xFF;
+        calDac = 0;
+        calMeas = 0;
         calMeasHigh = false;
+        calMeasRaw = 0;
+        calMeasRawSigned = 0;
         calMeasRawByte = 0;
-        SLAVE_LOG_PRINTF("[SLAVE] CAL begin stage=%u/%s\n",
+        calPointIndex = 0;
+        SLAVE_LOG_PRINTF("[CAL] start\n");
+        LOGM("CAL_START", "pstate=%u", event.psoc_state);
+    } else if (event.event == PSOC_EVT_CAL_DONE) {
+        SLAVE_LOG_PRINTF("[CAL] done ok=%u\n", event.value);
+        LOGM("CAL_DONE", "ok=%u,pstate=%u", event.value, event.psoc_state);
+    } else if (event.event == PSOC_EVT_CAL_BUSY) {
+        SLAVE_LOG_PRINTF("[CAL] busy\n");
+        LOGM("CAL_BUSY", "pstate=%u", event.psoc_state);
+    } else if (event.event == PSOC_EVT_CAL_STAGE_BEGIN) {
+        calStage = event.value;
+        calDac = 0;
+        calMeas = 0;
+        calMeasHigh = false;
+        calMeasRaw = 0;
+        calMeasRawSigned = 0;
+        calMeasRawByte = 0;
+        calPointIndex = 0;
+        SLAVE_LOG_PRINTF("[CAL] begin stage=%u/%s\n",
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_BEGIN", "stage=%u,name=%s", event.value,
              psocCalStageName(event.value));
+    } else if (event.event == PSOC_EVT_SERVO_STAGE) {
+        calStage = event.value;
+        calDac = 0;
+        calMeas = 0;
+        calMeasHigh = false;
+        calMeasRaw = 0;
+        calMeasRawSigned = 0;
+        calMeasRawByte = 0;
+        calPointIndex = 0;
+        SLAVE_LOG_PRINTF("[CAL] servo stage=%u/%s\n",
+                         event.value, psocCalStageName(event.value));
+        LOGM("SERVO_STAGE", "stage=%u,name=%s", event.value,
+             psocCalStageName(event.value));
     } else if (event.event == PSOC_EVT_CAL_VERIFY_BEGIN) {
         calStage = event.value;
+        calDac = 0;
+        calMeas = 0;
         calMeasHigh = false;
+        calMeasRaw = 0;
+        calMeasRawSigned = 0;
         calMeasRawByte = 0;
-        SLAVE_LOG_PRINTF("[SLAVE] CAL verify begin stage=%u/%s\n",
+        calPointIndex = 0;
+        SLAVE_LOG_PRINTF("[CAL] verify begin stage=%u/%s\n",
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_VERIFY_BEGIN", "stage=%u,name=%s", event.value,
              psocCalStageName(event.value));
@@ -404,65 +478,95 @@ static void onPsocDiag(const PsocDiagEvent &event)
         } else {
             calMeas = (int16_t)((uint16_t)calMeas | event.value);
             calMeasHigh = false;
-            SLAVE_LOG_PRINTF("[SLAVE] CAL point stage=%u/%s dac=%u meas=%d\n",
+#if PSOC_CAL_LOG_CLAMPED_POINTS
+            SLAVE_LOG_PRINTF("[CAL] point16 stage=%u/%s dac=%u meas=%d\n",
                              calStage, psocCalStageName(calStage),
                              calDac, (int)calMeas);
-            LOGM("CAL_POINT", "stage=%u,name=%s,dac=%u,meas=%d",
+            LOGM("CAL_POINT16", "stage=%u,name=%s,dac=%u,meas=%d",
                  calStage, psocCalStageName(calStage), calDac, (int)calMeas);
+#endif
         }
     } else if (event.event == PSOC_EVT_CAL_STAGE_MEAS32) {
         calMeasRaw = (calMeasRaw << 8) | event.value;
         calMeasRawByte++;
         if (calMeasRawByte >= 4) {
+            uint32_t absRaw;
             calMeasRawByte = 0;
-            SLAVE_LOG_PRINTF("[SLAVE] CAL point32 stage=%u/%s dac=%u measRaw=%ld\n",
+            calMeasRawSigned = (int32_t)calMeasRaw;
+            absRaw = absCounts32(calMeasRawSigned);
+#if PSOC_CAL_LOG_POINTS
+            SLAVE_LOG_PRINTF("[CAL] point stage=%u/%s i=%u dac=%u raw=%ld abs=%lu\n",
                              calStage, psocCalStageName(calStage),
-                             calDac, (long)(int32_t)calMeasRaw);
-            LOGM("CAL_POINT32", "stage=%u,name=%s,dac=%u,measRaw=%ld",
-                 calStage, psocCalStageName(calStage), calDac,
-                 (long)(int32_t)calMeasRaw);
+                             (unsigned)calPointIndex, calDac,
+                             (long)calMeasRawSigned, (unsigned long)absRaw);
+            LOGM("CAL_POINT32", "stage=%u,name=%s,i=%u,dac=%u,measRaw=%ld,abs=%lu",
+                 calStage, psocCalStageName(calStage),
+                 (unsigned)calPointIndex, calDac, (long)calMeasRawSigned,
+                 (unsigned long)absRaw);
+#endif
+            calPointIndex++;
         }
     } else if (event.event == PSOC_EVT_CAL_STAGE_OK) {
-        SLAVE_LOG_PRINTF("[SLAVE] CAL result stage=%u/%s ok=%u dac=%u meas=%d\n",
+        uint32_t absRaw = absCounts32(calMeasRawSigned);
+        SLAVE_LOG_PRINTF("[CAL] result stage=%u/%s ok=%u dac=%u raw=%ld abs=%lu meas16=%d\n",
                          calStage, psocCalStageName(calStage), event.value,
-                         calDac, (int)calMeas);
-        LOGM("CAL_STAGE", "stage=%u,name=%s,ok=%u,dac=%u,meas=%d",
+                         calDac, (long)calMeasRawSigned,
+                         (unsigned long)absRaw, (int)calMeas);
+        LOGM("CAL_STAGE", "stage=%u,name=%s,ok=%u,dac=%u,measRaw=%ld,abs=%lu,meas16=%d",
              calStage, psocCalStageName(calStage), event.value,
-             calDac, (int)calMeas);
+             calDac, (long)calMeasRawSigned, (unsigned long)absRaw,
+             (int)calMeas);
+    } else if (event.event == PSOC_EVT_SERVO_STEP) {
+        SLAVE_LOG_PRINTF("[CAL] servo step stage=%u/%s dac=%u\n",
+                         calStage, psocCalStageName(calStage), event.value);
+        LOGM("SERVO_STEP", "stage=%u,name=%s,dac=%u",
+             calStage, psocCalStageName(calStage), event.value);
+    } else if (event.event == PSOC_EVT_CAL_LOOP) {
+        SLAVE_LOG_PRINTF("[CAL] loop stage=%u/%s dac=%u -> best candidate\n",
+                         calStage, psocCalStageName(calStage), event.value);
+        LOGM("CAL_LOOP", "stage=%u,name=%s,dac=%u",
+             calStage, psocCalStageName(calStage), event.value);
     } else if (event.event == PSOC_EVT_CAL_VERIFY_OK) {
-        SLAVE_LOG_PRINTF("[SLAVE] CAL verify stage=%u/%s ok=%u dac=%u meas=%d\n",
+        uint32_t absRaw = absCounts32(calMeasRawSigned);
+        SLAVE_LOG_PRINTF("[CAL] verify stage=%u/%s ok=%u dac=%u raw=%ld abs=%lu meas16=%d\n",
                          calStage, psocCalStageName(calStage), event.value,
-                         calDac, (int)calMeas);
-        LOGM("CAL_VERIFY", "stage=%u,name=%s,ok=%u,dac=%u,meas=%d",
+                         calDac, (long)calMeasRawSigned,
+                         (unsigned long)absRaw, (int)calMeas);
+        LOGM("CAL_VERIFY", "stage=%u,name=%s,ok=%u,dac=%u,measRaw=%ld,abs=%lu,meas16=%d",
              calStage, psocCalStageName(calStage), event.value,
-             calDac, (int)calMeas);
+             calDac, (long)calMeasRawSigned, (unsigned long)absRaw,
+             (int)calMeas);
     } else if (event.event == PSOC_EVT_CAL_AMUX_IN) {
-        SLAVE_LOG_PRINTF("[SLAVE] CAL AMux_IN -> %u (%s)\n", event.value,
+        SLAVE_LOG_PRINTF("[CAL] AMux_IN -> %u (%s)\n", event.value,
                          event.value == 0 ? "normal/captura" : "referencia/tierra virtual");
         LOGM("CAL_AMUX_IN", "channel=%u", event.value);
     } else if (event.event == PSOC_EVT_CAL_PROGRESS) {
-        SLAVE_LOG_PRINTF("[SLAVE] CAL progress stage=%u/%s\n",
+#if PSOC_CAL_LOG_PROGRESS
+        SLAVE_LOG_PRINTF("[CAL] progress stage=%u/%s\n",
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_PROGRESS", "stage=%u,name=%s", event.value,
              psocCalStageName(event.value));
+#endif
         /* El "calibrando..." (ok=2) hacia el maestro ya NO depende de este
          * evento: servicePsocConfigAck() lo emite por temporizador propio
          * mientras g_cfg_waiting este activo (ver mas abajo), para que el
          * indicador no dependa de que el stream de diagnostico del PSoC
          * llegue completo. */
     } else if (event.event == PSOC_EVT_CAL_WATCHDOG) {
-        SLAVE_LOG_PRINTF("[SLAVE] CAL WATCHDOG timeout en stage=%u/%s -> abortado, valores seguros restaurados\n",
+        SLAVE_LOG_PRINTF("[CAL] WATCHDOG timeout stage=%u/%s -> aborted\n",
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_WATCHDOG", "stage=%u,name=%s", event.value,
              psocCalStageName(event.value));
     } else if (event.event == PSOC_EVT_CAL_LP_BAD) {
-        SLAVE_LOG_PRINTF("[SLAVE] *** CAL CRITICO *** stage=%u/%s (GEO_LP, etapa de captura) "
-                         "quedo fuera de rango incluso en CAL_DAC_INIT -> la captura va a ser inutil\n",
+        SLAVE_LOG_PRINTF("[CAL] CRITICAL stage=%u/%s LP out of range\n",
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_LP_BAD", "stage=%u,name=%s", event.value,
              psocCalStageName(event.value));
     }
 
+#if PSOC_DIAG_VERBOSE
+    const char *eventName = psocDiagName(event.event);
+    const char *stateName = psocStateName(event.psoc_state);
     SLAVE_LOG_PRINTF("[SLAVE] PSOC_EVT %s event=0x%02X val=%u pstate=%u/%s estate=%d bytes=%lu bOK=%lu fill=%u/%u\n",
                      eventName, event.event, event.value,
                      event.psoc_state, stateName, (int)g_state,
@@ -475,6 +579,7 @@ static void onPsocDiag(const PsocDiagEvent &event)
          (unsigned long)psoc.bytesRx(),
          (unsigned long)psoc.batchesOK(),
          (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+#endif
 }
 
 /* ── ISR GPIO hardware sync (IRAM para máxima velocidad) ────────────────── */
@@ -625,6 +730,88 @@ static void servicePsocConfigAck()
         }
     }
 }
+
+#if SLAVE_USB_CMD_ENABLE
+static bool usbCommandEquals(const char *cmd, const char *word)
+{
+    while (*cmd != '\0' && *word != '\0') {
+        char a = *cmd++;
+        char b = *word++;
+        if (a >= 'A' && a <= 'Z') { a = (char)(a - 'A' + 'a'); }
+        if (b >= 'A' && b <= 'Z') { b = (char)(b - 'A' + 'a'); }
+        if (a != b) { return false; }
+    }
+    return *cmd == '\0' && *word == '\0';
+}
+
+static void requestCalibrationFromUsb()
+{
+    if (g_state == SAMPLING) {
+        SLAVE_LOG_PRINTF("[USB] cal ignored: sampling\n");
+        LOGM("USB_CMD", "cmd=cal,ok=0,reason=sampling");
+        return;
+    }
+
+    servicePsocConfigAck();
+    if (g_cfg_waiting) {
+        SLAVE_LOG_PRINTF("[USB] cal ignored: pending sub=0x%02X\n", g_cfg_sub_cmd);
+        LOGM("USB_CMD", "cmd=cal,ok=0,reason=busy,pending=0x%02X", g_cfg_sub_cmd);
+        return;
+    }
+
+    if (!ensurePsocReadyForConfig()) {
+        SLAVE_LOG_PRINTF("[USB] cal failed: PSoC not ready\n");
+        LOGM("USB_CMD", "cmd=cal,ok=0,reason=psoc_not_ready");
+        return;
+    }
+
+    psoc.calibrate();
+    waitForPsocConfigAck(PSOC_CMD_CALIBRATE, 1);
+    SLAVE_LOG_PRINTF("[USB] cal -> PSoC CMD 0x%02X\n", PSOC_CMD_CALIBRATE);
+    LOGM("USB_CMD", "cmd=cal,ok=1,sub=0x%02X", PSOC_CMD_CALIBRATE);
+}
+
+static void handleUsbCommand(const char *cmd)
+{
+    if (cmd[0] == '\0') {
+        return;
+    }
+    if (usbCommandEquals(cmd, "c") ||
+        usbCommandEquals(cmd, "cal") ||
+        usbCommandEquals(cmd, "calibrate")) {
+        requestCalibrationFromUsb();
+    } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
+        SLAVE_LOG_PRINTF("[USB] commands: cal\n");
+        LOGM("USB_CMD", "cmd=help,ok=1");
+    } else {
+        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: cal)\n", cmd);
+        LOGM("USB_CMD", "cmd=unknown,ok=0,text=%s", cmd);
+    }
+}
+
+static void serviceUsbCommands()
+{
+    static char line[16];
+    static uint8_t pos = 0;
+
+    while (Serial.available() > 0) {
+        char ch = (char)Serial.read();
+        if (ch == '\r' || ch == '\n') {
+            line[pos] = '\0';
+            handleUsbCommand(line);
+            pos = 0;
+        } else if (ch == 8 || ch == 127) {
+            if (pos > 0) { pos--; }
+        } else if (ch >= 32 && ch <= 126) {
+            if (pos < sizeof(line) - 1) {
+                line[pos++] = ch;
+            }
+        }
+    }
+}
+#else
+static void serviceUsbCommands() {}
+#endif
 
 static void sendStartAck(uint8_t status, uint32_t startToken, uint32_t rxUs)
 {
@@ -1191,16 +1378,19 @@ void loop()
         psoc.poll();
     }
     servicePsocConfigAck();
+    serviceUsbCommands();
 
     /* Mientras se llena el store (Ver/Test con n_batches>0), imprimir UART cada 1 s.
      * Esto separa cable/pin (uartBytes=0) de protocolo/baud (bytes sin frames)
      * de "onBatch no incrementa fill" (psoc.poll() no entrega PsocBatch). */
+#if SLAVE_LOG_VIEW_UART
     static uint32_t lastViewDiagMs = 0;
     if (g_state == SAMPLING && g_rec_n_batches > 0 &&
         (millis() - lastViewDiagMs) >= 1000) {
         lastViewDiagMs = millis();
         logPsocUartDiag("VIEW_UART");
     }
+#endif
 
     if (g_state == SAMPLING && g_view_store_active && g_rec_n_batches > 0 &&
         g_store_fill == 0 && !g_view_start_fallback_sent) {
@@ -1264,8 +1454,12 @@ void loop()
         lastHelloMs = millis();
         MsgHello h = { CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected, psoc.sampleRate() };
         esp_err_t err = espnowSend(MASTER_MAC, (const uint8_t *)&h, sizeof(h));
+#if SLAVE_LOG_HELLO_TX
         SLAVE_LOG_PRINTF("[SLAVE] HELLO tx err=%d txOK=%u txFail=%u\n",
                          (int)err, transport.sentOK(), transport.sentFail());
+#else
+        (void)err;
+#endif
     }
 
     /* Informe de estado cada 10 s */
@@ -1280,9 +1474,11 @@ void loop()
             (uint8_t)g_psocConnected
         };
         espnowSend(MASTER_MAC, (const uint8_t *)&st, sizeof(st));
+#if SLAVE_LOG_STATUS_PERIODIC
         logPsocUartDiag("STATUS");
 #if PSOC_RX_SCAN_ENABLE
         logPsocRxScan();
+#endif
 #endif
     }
 }
