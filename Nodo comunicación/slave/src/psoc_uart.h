@@ -65,6 +65,15 @@
 #define PSOC_EVT_CAL_BUSY         0x12
 #define PSOC_EVT_CAL_STAGE_DAC    0x13
 #define PSOC_EVT_CAL_STAGE_MEAS   0x14
+#define PSOC_EVT_CAL_STAGE_BEGIN  0x15
+#define PSOC_EVT_CAL_STAGE_OK     0x16
+#define PSOC_EVT_CAL_VERIFY_BEGIN 0x17
+#define PSOC_EVT_CAL_VERIFY_OK    0x18
+#define PSOC_EVT_CAL_AMUX_IN      0x19
+#define PSOC_EVT_CAL_PROGRESS     0x1A
+#define PSOC_EVT_CAL_WATCHDOG     0x1B
+#define PSOC_EVT_CAL_LP_BAD       0x1C
+#define PSOC_EVT_CAL_STAGE_MEAS32 0x1D
 #define PSOC_EVT_WAIT_ESP         0x20
 #define PSOC_EVT_ESP_SEEN         0x21
 #define PSOC_EVT_RX_CMD           0x30

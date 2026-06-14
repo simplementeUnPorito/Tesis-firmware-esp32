@@ -32,10 +32,11 @@ function dot(tooltip) {
   return d;
 }
 
-function setDot(d, state, okTip, badTip, unkTip) {
-  d.classList.remove('ok', 'bad');
+function setDot(d, state, okTip, badTip, unkTip, busyTip) {
+  d.classList.remove('ok', 'bad', 'busy');
   if (state === 1) { d.classList.add('ok'); d.title = okTip; }
   else if (state === 2) { d.classList.add('bad'); d.title = badTip; }
+  else if (state === 3) { d.classList.add('busy'); d.title = busyTip ?? 'Calibrando...'; }
   else { d.title = unkTip; }
 }
 
@@ -94,7 +95,7 @@ export class SlavePanel extends EventTarget {
     root.appendChild(row(labeled('PGA', this._ddPga), this._dotPga, this._lblPgaActual));
 
     this._btnCalibrate = el('button', null, 'Calibrar');
-    this._btnCalibrate.title = 'Ejecuta la calibracion bloqueante en el PSoC';
+    this._btnCalibrate.title = 'Ejecuta la calibracion no bloqueante en el PSoC';
     this._btnCalibrate.addEventListener('click', () => this._dispatch('calibrate-requested'));
     this._dotCal = dot('Calibracion sin ejecutar');
     root.appendChild(row(this._btnCalibrate, this._dotCal));
@@ -270,9 +271,10 @@ export class SlavePanel extends EventTarget {
     setDot(this._dotPga, state, 'PGA confirmado por PSoC', 'PGA pendiente o sin confirmacion', 'PGA sin confirmar');
   }
 
-  /** state: 0=unknown, 1=ok, 2=pending/fail. */
+  /** state: 0=unknown, 1=ok, 2=pending/fail, 3=calibrando (en curso). */
   setCalibrationLock(state) {
-    setDot(this._dotCal, state, 'Calibracion confirmada por PSoC', 'Calibracion pendiente o fallida', 'Calibracion sin ejecutar');
+    setDot(this._dotCal, state, 'Calibracion confirmada por PSoC', 'Calibracion pendiente o fallida',
+           'Calibracion sin ejecutar', 'Calibrando... (puede tardar hasta ~3 min)');
   }
 
   updateStats(batchCount, totalSamples, lastVal, driftStr, latencyStr, psocOk) {

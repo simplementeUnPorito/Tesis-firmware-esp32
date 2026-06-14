@@ -130,6 +130,9 @@ export class NodeData {
     // Pending commands tracking: subCmd -> { param, sendTime, retries }
     this.pending = new Map();
     this.calibrateAfterPga = false;
+
+    // Throttle del log "calibrando..." (heartbeat ok=2 de SUBCMD_CALIBRATE)
+    this.calProgressLogMs = 0;
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────

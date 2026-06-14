@@ -7,7 +7,8 @@
  *   - MÁQUINA : "#M,<t_us>,<ROLE>,<evento>,<...>" -> log máquina (todos los datos)
  *
  * Gate de compilación (definir en platformio.ini):
- *   -DDBG_ENABLE=1   habilita el logging  (0 = TODO compila a do{}while(0), 0 CPU)
+ *   -DSLAVE_LOGS_ENABLE=1 habilita el logging del esclavo
+ *   -DDBG_ENABLE=1        alias interno; 0 = TODO compila a do{}while(0), 0 CPU
  *   -DDBG_HUMAN=1    (opcional) flujo humano   (1 por defecto)
  *   -DDBG_MACHINE=1  (opcional) flujo máquina  (1 por defecto)
  *   -DDBG_STREAM=Serial1   stream destino (maestro=Serial1; esclavo=Serial)
@@ -21,7 +22,11 @@
 #include <Arduino.h>
 
 #ifndef DBG_ENABLE
-#define DBG_ENABLE 0
+  #ifdef SLAVE_LOGS_ENABLE
+    #define DBG_ENABLE SLAVE_LOGS_ENABLE
+  #else
+    #define DBG_ENABLE 0
+  #endif
 #endif
 #ifndef DBG_HUMAN
 #define DBG_HUMAN 1

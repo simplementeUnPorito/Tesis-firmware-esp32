@@ -531,7 +531,7 @@ function onCalibrateRequested(chIndex) {
   const nd = data.nodes[chIndex];
   nd.pending.set(cfg.SUBCMD_CALIBRATE, { param: 1, sendTime: performance.now(), retries: 0 });
   const panel = panelFor(chIndex);
-  if (panel) panel.setCalibrationLock(2);
+  if (panel) panel.setCalibrationLock(3);
   sendDirected(chIndex, cfg.SUBCMD_CALIBRATE, 1);
   appendLog(`S${chIndex} calibracion solicitada`);
 }
@@ -753,6 +753,21 @@ function buildSlavePanels() {
 function handleAck(pkt, idx) {
   const ackCmd = pkt.ackCmd;
   const ackVal = pkt.ackVal;
+
+  // Heartbeat "sigue calibrando" (ok=2): no consume el pending de la
+  // confirmacion final, solo refleja progreso en la UI cada pocos segundos.
+  if (ackCmd === cfg.SUBCMD_CALIBRATE && ackVal === 2 && idx >= 1 && idx < cfg.MAX_NODES) {
+    const nd = data.nodes[idx];
+    const panel = panelFor(idx);
+    if (panel) panel.setCalibrationLock(3);
+    const now = performance.now();
+    if (now - nd.calProgressLogMs >= 15000) {
+      nd.calProgressLogMs = now;
+      appendLog(`S${idx} calibrando...`);
+    }
+    return;
+  }
+
   let pending = null;
   if (idx >= 0 && idx < cfg.MAX_NODES) {
     const nd = data.nodes[idx];

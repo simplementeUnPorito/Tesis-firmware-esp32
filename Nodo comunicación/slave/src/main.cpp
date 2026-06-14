@@ -115,6 +115,7 @@ static          uint8_t    g_cfg_sub_cmd = 0;
 static          uint8_t    g_cfg_param   = 0;
 static          uint32_t   g_cfg_start_ms = 0;
 static          uint32_t   g_cfg_timeout_ms = 0;
+static          uint32_t   g_cal_progress_ack_ms = 0; /* ultimo "calibrando..." (ok=2) enviado al maestro */
 
 /* ── Store-and-forward ───────────────────────────────────────────────────── */
 static uint16_t    g_rec_n_batches = 0;          /* 0 = modo streaming clásico */
@@ -127,7 +128,9 @@ static volatile uint16_t g_view_remaining    = 0; /* legado live deshabilitado *
 static volatile bool     g_view_store_active = false;
 
 #define PSOC_CFG_ACK_TIMEOUT_MS 750u
-#define PSOC_CAL_ACK_TIMEOUT_MS 25000u
+#define PSOC_CAL_ACK_TIMEOUT_MS 240000u
+#define PSOC_CAL_PROGRESS_ACK_PERIOD_MS 3000u /* "sigue calibrando" (ok=2) hacia el maestro */
+#define PSOC_CFG_READY_STALE_MS 5000u
 #ifndef PSOC_VIEW_START_FALLBACK_EXTRA_MS
   #define PSOC_VIEW_START_FALLBACK_EXTRA_MS 350u
 #endif
@@ -136,6 +139,100 @@ static uint32_t g_sampling_start_ms = 0;
 static uint32_t g_sampling_start_psoc_bytes = 0;
 static uint32_t g_sampling_start_batches_ok = 0;
 static bool     g_view_start_fallback_sent = false;
+
+static volatile uint32_t g_psoc_rx_edges = 0;
+static volatile uint8_t  g_psoc_rx_last_level = 0;
+
+#ifndef PSOC_RX_SCAN_ENABLE
+  #define PSOC_RX_SCAN_ENABLE 0
+#endif
+
+#if PSOC_RX_SCAN_ENABLE
+struct GpioScanSlot {
+    uint8_t pin;
+    volatile uint32_t edges;
+    volatile uint8_t level;
+};
+
+static GpioScanSlot g_rx_scan[] = {
+    {4, 0, 0}, {5, 0, 0}, {12, 0, 0}, {13, 0, 0}, {14, 0, 0},
+    {18, 0, 0}, {19, 0, 0}, {21, 0, 0}, {22, 0, 0},
+    {25, 0, 0}, {27, 0, 0}, {32, 0, 0}, {33, 0, 0},
+};
+
+static void IRAM_ATTR onRxScan0()  { g_rx_scan[0].edges++;  g_rx_scan[0].level  = (uint8_t)digitalRead(g_rx_scan[0].pin); }
+static void IRAM_ATTR onRxScan1()  { g_rx_scan[1].edges++;  g_rx_scan[1].level  = (uint8_t)digitalRead(g_rx_scan[1].pin); }
+static void IRAM_ATTR onRxScan2()  { g_rx_scan[2].edges++;  g_rx_scan[2].level  = (uint8_t)digitalRead(g_rx_scan[2].pin); }
+static void IRAM_ATTR onRxScan3()  { g_rx_scan[3].edges++;  g_rx_scan[3].level  = (uint8_t)digitalRead(g_rx_scan[3].pin); }
+static void IRAM_ATTR onRxScan4()  { g_rx_scan[4].edges++;  g_rx_scan[4].level  = (uint8_t)digitalRead(g_rx_scan[4].pin); }
+static void IRAM_ATTR onRxScan5()  { g_rx_scan[5].edges++;  g_rx_scan[5].level  = (uint8_t)digitalRead(g_rx_scan[5].pin); }
+static void IRAM_ATTR onRxScan6()  { g_rx_scan[6].edges++;  g_rx_scan[6].level  = (uint8_t)digitalRead(g_rx_scan[6].pin); }
+static void IRAM_ATTR onRxScan7()  { g_rx_scan[7].edges++;  g_rx_scan[7].level  = (uint8_t)digitalRead(g_rx_scan[7].pin); }
+static void IRAM_ATTR onRxScan8()  { g_rx_scan[8].edges++;  g_rx_scan[8].level  = (uint8_t)digitalRead(g_rx_scan[8].pin); }
+static void IRAM_ATTR onRxScan9()  { g_rx_scan[9].edges++;  g_rx_scan[9].level  = (uint8_t)digitalRead(g_rx_scan[9].pin); }
+static void IRAM_ATTR onRxScan10() { g_rx_scan[10].edges++; g_rx_scan[10].level = (uint8_t)digitalRead(g_rx_scan[10].pin); }
+static void IRAM_ATTR onRxScan11() { g_rx_scan[11].edges++; g_rx_scan[11].level = (uint8_t)digitalRead(g_rx_scan[11].pin); }
+static void IRAM_ATTR onRxScan12() { g_rx_scan[12].edges++; g_rx_scan[12].level = (uint8_t)digitalRead(g_rx_scan[12].pin); }
+
+static void (* const g_rx_scan_isr[])(void) = {
+    onRxScan0, onRxScan1, onRxScan2, onRxScan3, onRxScan4,
+    onRxScan5, onRxScan6, onRxScan7, onRxScan8, onRxScan9,
+    onRxScan10, onRxScan11, onRxScan12,
+};
+
+static bool rxScanIsReservedPin(uint8_t pin)
+{
+    return pin == (uint8_t)PSOC_UART_RX ||
+           pin == (uint8_t)PSOC_UART_TX ||
+           pin == (uint8_t)SYNC_TO_PSOC_PIN ||
+           pin == (uint8_t)SYNC_IN_PIN ||
+           pin == (uint8_t)DEBUG_HW_START_PIN;
+}
+
+static void beginPsocRxScan()
+{
+    for (size_t i = 0; i < (sizeof(g_rx_scan) / sizeof(g_rx_scan[0])); i++) {
+        const uint8_t pin = g_rx_scan[i].pin;
+        if (rxScanIsReservedPin(pin)) {
+            continue;
+        }
+        pinMode(pin, INPUT_PULLUP);
+        g_rx_scan[i].level = (uint8_t)digitalRead(pin);
+        attachInterrupt(digitalPinToInterrupt(pin), g_rx_scan_isr[i], CHANGE);
+    }
+    SLAVE_LOG_PRINTLN("[SLAVE] RX_SCAN enabled");
+}
+
+static void logPsocRxScan()
+{
+    uint32_t edges[sizeof(g_rx_scan) / sizeof(g_rx_scan[0])];
+    uint8_t levels[sizeof(g_rx_scan) / sizeof(g_rx_scan[0])];
+
+    noInterrupts();
+    for (size_t i = 0; i < (sizeof(g_rx_scan) / sizeof(g_rx_scan[0])); i++) {
+        edges[i] = g_rx_scan[i].edges;
+        levels[i] = g_rx_scan[i].level;
+    }
+    interrupts();
+
+    SLAVE_LOG_PRINTF(
+        "[SLAVE] RX_SCAN p4=%lu/%u p5=%lu/%u p12=%lu/%u p13=%lu/%u p14=%lu/%u "
+        "p18=%lu/%u p19=%lu/%u p21=%lu/%u p22=%lu/%u p25=%lu/%u p27=%lu/%u p32=%lu/%u p33=%lu/%u\n",
+        (unsigned long)edges[0], (unsigned)levels[0],
+        (unsigned long)edges[1], (unsigned)levels[1],
+        (unsigned long)edges[2], (unsigned)levels[2],
+        (unsigned long)edges[3], (unsigned)levels[3],
+        (unsigned long)edges[4], (unsigned)levels[4],
+        (unsigned long)edges[5], (unsigned)levels[5],
+        (unsigned long)edges[6], (unsigned)levels[6],
+        (unsigned long)edges[7], (unsigned)levels[7],
+        (unsigned long)edges[8], (unsigned)levels[8],
+        (unsigned long)edges[9], (unsigned)levels[9],
+        (unsigned long)edges[10], (unsigned)levels[10],
+        (unsigned long)edges[11], (unsigned)levels[11],
+        (unsigned long)edges[12], (unsigned)levels[12]);
+}
+#endif
 
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static PsocUART       psoc;
@@ -146,6 +243,12 @@ static EspNowTransport transport;
 
 static void sendCfgAck(uint8_t sub_cmd, uint8_t ok);
 
+static void IRAM_ATTR onPsocRxEdge()
+{
+    g_psoc_rx_edges++;
+    g_psoc_rx_last_level = (uint8_t)digitalRead(PSOC_UART_RX);
+}
+
 static void logPsocUartDiag(const char *tag)
 {
     const unsigned long bytes = (unsigned long)psoc.bytesRx();
@@ -155,22 +258,31 @@ static void logPsocUartDiag(const char *tag)
     const unsigned long ping  = (unsigned long)psoc.pingsRx();
     const unsigned long diag  = (unsigned long)psoc.diagEventsRx();
     const int rxLevel = digitalRead(PSOC_UART_RX);
+    uint32_t rxEdges;
+    uint8_t rxEdgeLevel;
+
+    noInterrupts();
+    rxEdges = g_psoc_rx_edges;
+    rxEdgeLevel = g_psoc_rx_last_level;
+    interrupts();
 
     if (psoc.hasLastByte()) {
         SLAVE_LOG_PRINTF(
-            "[SLAVE %d] %s bOK=%lu bBad=%lu uartBytes=%lu mark=%lu drop=%lu badLen=%lu ping=%lu diag=%lu rx=%d last=0x%02X age=%lu txOK=%lu txFail=%lu state=%d fill=%u/%u\n",
+            "[SLAVE %d] %s bOK=%lu bBad=%lu uartBytes=%lu mark=%lu drop=%lu badLen=%lu ping=%lu diag=%lu rx=%d edge=%lu/%u last=0x%02X age=%lu txOK=%lu txFail=%lu state=%d fill=%u/%u\n",
             NODE_ID, tag,
             (unsigned long)psoc.batchesOK(), (unsigned long)psoc.batchesBad(),
             bytes, mark, drop, badLn, ping, diag, rxLevel,
+            (unsigned long)rxEdges, (unsigned)rxEdgeLevel,
             psoc.lastByte(), (unsigned long)psoc.lastByteAgeMs(),
             (unsigned long)transport.sentOK(), (unsigned long)transport.sentFail(),
             (int)g_state, (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
     } else {
         SLAVE_LOG_PRINTF(
-            "[SLAVE %d] %s bOK=%lu bBad=%lu uartBytes=%lu mark=%lu drop=%lu badLen=%lu ping=%lu diag=%lu rx=%d last=none txOK=%lu txFail=%lu state=%d fill=%u/%u\n",
+            "[SLAVE %d] %s bOK=%lu bBad=%lu uartBytes=%lu mark=%lu drop=%lu badLen=%lu ping=%lu diag=%lu rx=%d edge=%lu/%u last=none txOK=%lu txFail=%lu state=%d fill=%u/%u\n",
             NODE_ID, tag,
             (unsigned long)psoc.batchesOK(), (unsigned long)psoc.batchesBad(),
             bytes, mark, drop, badLn, ping, diag, rxLevel,
+            (unsigned long)rxEdges, (unsigned)rxEdgeLevel,
             (unsigned long)transport.sentOK(), (unsigned long)transport.sentFail(),
             (int)g_state, (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
     }
@@ -186,6 +298,15 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_CAL_BUSY:       return "CAL_BUSY";
         case PSOC_EVT_CAL_STAGE_DAC:  return "CAL_STAGE_DAC";
         case PSOC_EVT_CAL_STAGE_MEAS: return "CAL_STAGE_MEAS";
+        case PSOC_EVT_CAL_STAGE_BEGIN:return "CAL_STAGE_BEGIN";
+        case PSOC_EVT_CAL_STAGE_OK:   return "CAL_STAGE_OK";
+        case PSOC_EVT_CAL_VERIFY_BEGIN:return "CAL_VERIFY_BEGIN";
+        case PSOC_EVT_CAL_VERIFY_OK:  return "CAL_VERIFY_OK";
+        case PSOC_EVT_CAL_AMUX_IN:    return "CAL_AMUX_IN";
+        case PSOC_EVT_CAL_PROGRESS:   return "CAL_PROGRESS";
+        case PSOC_EVT_CAL_WATCHDOG:   return "CAL_WATCHDOG";
+        case PSOC_EVT_CAL_LP_BAD:     return "CAL_LP_BAD";
+        case PSOC_EVT_CAL_STAGE_MEAS32: return "CAL_STAGE_MEAS32";
         case PSOC_EVT_WAIT_ESP:       return "WAIT_ESP";
         case PSOC_EVT_ESP_SEEN:       return "ESP_SEEN";
         case PSOC_EVT_RX_CMD:         return "RX_CMD";
@@ -210,6 +331,18 @@ static const char *psocStateName(uint8_t state)
         case 0:  return "IDLE";
         case 1:  return "ARMED";
         case 2:  return "SAMPLING";
+        case 3:  return "CALIBRATING";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *psocCalStageName(uint8_t stage)
+{
+    switch (stage) {
+        case 0:  return "GEO_PGA";
+        case 1:  return "GEO_BP";
+        case 2:  return "GEO_ADDER";
+        case 3:  return "GEO_LP";
         default: return "UNKNOWN";
     }
 }
@@ -218,6 +351,12 @@ static void onPsocDiag(const PsocDiagEvent &event)
 {
     const char *eventName = psocDiagName(event.event);
     const char *stateName = psocStateName(event.psoc_state);
+    static uint8_t calStage = 0xFF;
+    static uint8_t calDac = 0;
+    static int16_t calMeas = 0;
+    static bool calMeasHigh = false;
+    static uint32_t calMeasRaw = 0;
+    static uint8_t calMeasRawByte = 0;
     g_psocConnected = true;
 
     if (g_state == SAMPLING && event.event != PSOC_EVT_DUMP_DONE) {
@@ -238,6 +377,90 @@ static void onPsocDiag(const PsocDiagEvent &event)
              (unsigned long)psoc.batchesBad(),
              (unsigned long)psoc.syncDrops(),
              (unsigned long)psoc.bytesRx());
+    }
+
+    if (event.event == PSOC_EVT_CAL_STAGE_BEGIN) {
+        calStage = event.value;
+        calMeasHigh = false;
+        calMeasRawByte = 0;
+        SLAVE_LOG_PRINTF("[SLAVE] CAL begin stage=%u/%s\n",
+                         event.value, psocCalStageName(event.value));
+        LOGM("CAL_BEGIN", "stage=%u,name=%s", event.value,
+             psocCalStageName(event.value));
+    } else if (event.event == PSOC_EVT_CAL_VERIFY_BEGIN) {
+        calStage = event.value;
+        calMeasHigh = false;
+        calMeasRawByte = 0;
+        SLAVE_LOG_PRINTF("[SLAVE] CAL verify begin stage=%u/%s\n",
+                         event.value, psocCalStageName(event.value));
+        LOGM("CAL_VERIFY_BEGIN", "stage=%u,name=%s", event.value,
+             psocCalStageName(event.value));
+    } else if (event.event == PSOC_EVT_CAL_STAGE_DAC) {
+        calDac = event.value;
+    } else if (event.event == PSOC_EVT_CAL_STAGE_MEAS) {
+        if (!calMeasHigh) {
+            calMeas = (int16_t)((uint16_t)event.value << 8);
+            calMeasHigh = true;
+        } else {
+            calMeas = (int16_t)((uint16_t)calMeas | event.value);
+            calMeasHigh = false;
+            SLAVE_LOG_PRINTF("[SLAVE] CAL point stage=%u/%s dac=%u meas=%d\n",
+                             calStage, psocCalStageName(calStage),
+                             calDac, (int)calMeas);
+            LOGM("CAL_POINT", "stage=%u,name=%s,dac=%u,meas=%d",
+                 calStage, psocCalStageName(calStage), calDac, (int)calMeas);
+        }
+    } else if (event.event == PSOC_EVT_CAL_STAGE_MEAS32) {
+        calMeasRaw = (calMeasRaw << 8) | event.value;
+        calMeasRawByte++;
+        if (calMeasRawByte >= 4) {
+            calMeasRawByte = 0;
+            SLAVE_LOG_PRINTF("[SLAVE] CAL point32 stage=%u/%s dac=%u measRaw=%ld\n",
+                             calStage, psocCalStageName(calStage),
+                             calDac, (long)(int32_t)calMeasRaw);
+            LOGM("CAL_POINT32", "stage=%u,name=%s,dac=%u,measRaw=%ld",
+                 calStage, psocCalStageName(calStage), calDac,
+                 (long)(int32_t)calMeasRaw);
+        }
+    } else if (event.event == PSOC_EVT_CAL_STAGE_OK) {
+        SLAVE_LOG_PRINTF("[SLAVE] CAL result stage=%u/%s ok=%u dac=%u meas=%d\n",
+                         calStage, psocCalStageName(calStage), event.value,
+                         calDac, (int)calMeas);
+        LOGM("CAL_STAGE", "stage=%u,name=%s,ok=%u,dac=%u,meas=%d",
+             calStage, psocCalStageName(calStage), event.value,
+             calDac, (int)calMeas);
+    } else if (event.event == PSOC_EVT_CAL_VERIFY_OK) {
+        SLAVE_LOG_PRINTF("[SLAVE] CAL verify stage=%u/%s ok=%u dac=%u meas=%d\n",
+                         calStage, psocCalStageName(calStage), event.value,
+                         calDac, (int)calMeas);
+        LOGM("CAL_VERIFY", "stage=%u,name=%s,ok=%u,dac=%u,meas=%d",
+             calStage, psocCalStageName(calStage), event.value,
+             calDac, (int)calMeas);
+    } else if (event.event == PSOC_EVT_CAL_AMUX_IN) {
+        SLAVE_LOG_PRINTF("[SLAVE] CAL AMux_IN -> %u (%s)\n", event.value,
+                         event.value == 0 ? "normal/captura" : "referencia/tierra virtual");
+        LOGM("CAL_AMUX_IN", "channel=%u", event.value);
+    } else if (event.event == PSOC_EVT_CAL_PROGRESS) {
+        SLAVE_LOG_PRINTF("[SLAVE] CAL progress stage=%u/%s\n",
+                         event.value, psocCalStageName(event.value));
+        LOGM("CAL_PROGRESS", "stage=%u,name=%s", event.value,
+             psocCalStageName(event.value));
+        /* El "calibrando..." (ok=2) hacia el maestro ya NO depende de este
+         * evento: servicePsocConfigAck() lo emite por temporizador propio
+         * mientras g_cfg_waiting este activo (ver mas abajo), para que el
+         * indicador no dependa de que el stream de diagnostico del PSoC
+         * llegue completo. */
+    } else if (event.event == PSOC_EVT_CAL_WATCHDOG) {
+        SLAVE_LOG_PRINTF("[SLAVE] CAL WATCHDOG timeout en stage=%u/%s -> abortado, valores seguros restaurados\n",
+                         event.value, psocCalStageName(event.value));
+        LOGM("CAL_WATCHDOG", "stage=%u,name=%s", event.value,
+             psocCalStageName(event.value));
+    } else if (event.event == PSOC_EVT_CAL_LP_BAD) {
+        SLAVE_LOG_PRINTF("[SLAVE] *** CAL CRITICO *** stage=%u/%s (GEO_LP, etapa de captura) "
+                         "quedo fuera de rango incluso en CAL_DAC_INIT -> la captura va a ser inutil\n",
+                         event.value, psocCalStageName(event.value));
+        LOGM("CAL_LP_BAD", "stage=%u,name=%s", event.value,
+             psocCalStageName(event.value));
     }
 
     SLAVE_LOG_PRINTF("[SLAVE] PSOC_EVT %s event=0x%02X val=%u pstate=%u/%s estate=%d bytes=%lu bOK=%lu fill=%u/%u\n",
@@ -317,6 +540,32 @@ static void waitForPsocConfigAck(uint8_t sub_cmd, uint8_t param)
                      ? PSOC_CAL_ACK_TIMEOUT_MS
                      : PSOC_CFG_ACK_TIMEOUT_MS;
     g_cfg_waiting = true;
+    if (sub_cmd == PSOC_CMD_CALIBRATE) {
+        /* Que el primer "calibrando..." salga ya en el proximo loop(),
+         * sin esperar PSOC_CAL_PROGRESS_ACK_PERIOD_MS. */
+        g_cal_progress_ack_ms = g_cfg_start_ms - PSOC_CAL_PROGRESS_ACK_PERIOD_MS;
+    }
+}
+
+static bool ensurePsocReadyForConfig()
+{
+    psoc.poll();
+    if (g_psocConnected && psoc.hasLastByte() &&
+        psoc.lastByteAgeMs() <= PSOC_CFG_READY_STALE_MS) {
+        return true;
+    }
+
+    const bool ready = psoc.probe(250);
+    g_psocConnected = ready;
+    if (!ready) {
+        SLAVE_LOG_PRINTF("[SLAVE] PSoC cfg probe failed age=%lu bytes=%lu\n",
+                         (unsigned long)psoc.lastByteAgeMs(),
+                         (unsigned long)psoc.bytesRx());
+        LOGM("CFG_PSOC_MISS", "age=%lu,bytes=%lu",
+             (unsigned long)psoc.lastByteAgeMs(),
+             (unsigned long)psoc.bytesRx());
+    }
+    return ready;
 }
 
 static void servicePsocConfigAck()
@@ -360,6 +609,20 @@ static void servicePsocConfigAck()
              (unsigned long)(millis() - g_cfg_start_ms),
              (unsigned long)g_cfg_timeout_ms);
         g_cfg_waiting = false;
+    }
+
+    /* "Calibrando..." (ok=2) hacia el maestro: por temporizador propio del
+     * ESP, independiente de que el stream de diagnostico del PSoC llegue.
+     * Mientras g_cfg_waiting este activo para CALIBRATE (hasta
+     * PSOC_CAL_ACK_TIMEOUT_MS=240s o el ack final), repetir cada
+     * PSOC_CAL_PROGRESS_ACK_PERIOD_MS para que el panel muestre el estado
+     * "Calibrando..." de forma confiable. */
+    if (g_cfg_waiting && g_cfg_sub_cmd == PSOC_CMD_CALIBRATE) {
+        uint32_t now = millis();
+        if ((uint32_t)(now - g_cal_progress_ack_ms) >= PSOC_CAL_PROGRESS_ACK_PERIOD_MS) {
+            g_cal_progress_ack_ms = now;
+            sendCfgAck(PSOC_CMD_CALIBRATE, 2);
+        }
     }
 }
 
@@ -464,31 +727,29 @@ static void handleSetConfig(const MsgSetConfig *cfg)
         return;
     }
 
+    const uint8_t subCmd = cfg->sub_cmd;
+    const uint8_t param = cfg->param;
     uint8_t ok = 1;
     bool waitAck = false;
     switch (cfg->sub_cmd) {
         case 0xA6:                       /* PGA */
-            if (!isGainCode(cfg->param)) {
+            if (!isGainCode(param)) {
                 ok = 0;
             } else {
-                psoc.setPga(cfg->param);
                 waitAck = true;
             }
             break;
         case 0xA9:                       /* PGAvdac */
-            if (!isGainCode(cfg->param)) {
+            if (!isGainCode(param)) {
                 ok = 0;
             } else {
-                psoc.setPgavdac(cfg->param);
                 waitAck = true;
             }
             break;
         case 0xAA:                       /* VDAC (calibración) */
-            psoc.setVdac(cfg->param);
             waitAck = true;
             break;
         case PSOC_CMD_CALIBRATE:
-            psoc.calibrate();
             waitAck = true;
             break;
         default:
@@ -496,14 +757,40 @@ static void handleSetConfig(const MsgSetConfig *cfg)
             break;
     }
     if (ok && waitAck) {
-        waitForPsocConfigAck(cfg->sub_cmd, cfg->param);
+        if (!ensurePsocReadyForConfig()) {
+            ok = 0;
+            sendCfgAck(subCmd, ok);
+        } else {
+            switch (subCmd) {
+                case 0xA6:
+                    psoc.setPga(param);
+                    break;
+                case 0xA9:
+                    psoc.setPgavdac(param);
+                    break;
+                case 0xAA:
+                    psoc.setVdac(param);
+                    break;
+                case PSOC_CMD_CALIBRATE:
+                    psoc.calibrate();
+                    break;
+                default:
+                    ok = 0;
+                    break;
+            }
+            if (ok) {
+                waitForPsocConfigAck(subCmd, param);
+            } else {
+                sendCfgAck(subCmd, ok);
+            }
+        }
     } else {
-        sendCfgAck(cfg->sub_cmd, ok);
+        sendCfgAck(subCmd, ok);
     }
     SLAVE_LOG_PRINTF("[SLAVE] cfg sub=0x%02X p=%u ok=%u\n",
-                     cfg->sub_cmd, cfg->param, ok);
+                     subCmd, param, ok);
     LOGM("CFG", "sub=0x%02X,p=%u,ok=%u,wait=%u",
-         cfg->sub_cmd, cfg->param, ok, (unsigned)waitAck);
+         subCmd, param, ok, (unsigned)waitAck);
 }
 
 static void handleDebugNode(const MsgDebugNode *dbg)
@@ -852,6 +1139,11 @@ void setup()
     /* UART → PSoC */
     psoc.begin(onBatch);
     psoc.onDiag(onPsocDiag);
+    g_psoc_rx_last_level = (uint8_t)digitalRead(PSOC_UART_RX);
+    attachInterrupt(digitalPinToInterrupt(PSOC_UART_RX), onPsocRxEdge, CHANGE);
+#if PSOC_RX_SCAN_ENABLE
+    beginPsocRxScan();
+#endif
 
     /* Intentar detectar el PSoC una vez. Si no responde, se reintenta cada 2 s
      * en loop() para no bloquear ESP-NOW ni la generación de batches debug. */
@@ -989,5 +1281,8 @@ void loop()
         };
         espnowSend(MASTER_MAC, (const uint8_t *)&st, sizeof(st));
         logPsocUartDiag("STATUS");
+#if PSOC_RX_SCAN_ENABLE
+        logPsocRxScan();
+#endif
     }
 }

@@ -272,6 +272,15 @@ button:active { background: var(--input-active); }
 
 .dot.ok { background: #21a33a; }
 .dot.bad { background: #d71920; }
+.dot.busy {
+  background: #e0a300;
+  animation: dot-pulse 1s ease-in-out infinite;
+}
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
 
 .mac-label {
   color: var(--muted);
