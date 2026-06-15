@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-loop-19';
-import { WsClient } from './ws_client.js?v=field-loop-19';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-19';
-import { DataStore, effectiveFs } from './data_store.js?v=field-loop-19';
-import { PlotArea } from './plot.js?v=field-loop-19';
-import { SpectrumArea } from './spectrum.js?v=field-loop-19';
-import { SlavePanel } from './slave_panel.js?v=field-loop-19';
-import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-19';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-19';
+import * as cfg from './config.js?v=field-loop-20';
+import { WsClient } from './ws_client.js?v=field-loop-20';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-20';
+import { DataStore, effectiveFs } from './data_store.js?v=field-loop-20';
+import { PlotArea } from './plot.js?v=field-loop-20';
+import { SpectrumArea } from './spectrum.js?v=field-loop-20';
+import { SlavePanel } from './slave_panel.js?v=field-loop-20';
+import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-20';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-20';
 
 const $ = (id) => document.getElementById(id);
 
@@ -495,10 +495,6 @@ function schedulePgaLockTimeout(chIndex, expectedCode) {
     nd.pending.delete(cfg.SUBCMD_PGA);
     const panel = panelFor(chIndex);
     if (panel) panel.setPgaLock(2);
-    if (nd.calibrateAfterPga) {
-      nd.calibrateAfterPga = false;
-      appendLog(`S${chIndex} config cancelada: PGA sin confirmacion`);
-    }
     appendLog(`S${chIndex} PGA sin confirmacion: ${cfg.GAIN_NAMES[expectedCode] ?? expectedCode}`);
   }, Math.round(cfg.RETRY_SEC * 1000));
   pgaLockTimers.set(chIndex, timer);
@@ -525,15 +521,6 @@ function onPgaChanged(chIndex, pgaCode) {
   sendDirected(chIndex, cfg.SUBCMD_PGA, nd.pgaCode);
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
   appendLog(`S${chIndex} PGA -> ${cfg.GAIN_NAMES[nd.pgaCode]}`);
-}
-
-function onCalibrateRequested(chIndex) {
-  const nd = data.nodes[chIndex];
-  nd.pending.set(cfg.SUBCMD_CALIBRATE, { param: 1, sendTime: performance.now(), retries: 0 });
-  const panel = panelFor(chIndex);
-  if (panel) panel.setCalibrationLock(3);
-  sendDirected(chIndex, cfg.SUBCMD_CALIBRATE, 1);
-  appendLog(`S${chIndex} calibracion solicitada`);
 }
 
 function onVerRequested(chIndex) {
@@ -584,7 +571,6 @@ function onTestRequested(chIndex) {
 
 function onSendAll(chIndex) {
   const nd = data.nodes[chIndex];
-  nd.calibrateAfterPga = true;
   sendDirected(chIndex, cfg.SUBCMD_PGA, nd.pgaCode);
   nd.pending.set(cfg.SUBCMD_PGA, { param: nd.pgaCode, sendTime: performance.now(), retries: 0 });
   const panel = panelFor(chIndex);
@@ -592,7 +578,7 @@ function onSendAll(chIndex) {
     panel.setPgaLock(2);
   }
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
-  appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode} + calibracion`);
+  appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}`);
 }
 
 function onLatencyRequested(chIndex) {
@@ -724,7 +710,6 @@ function wireSlavePanel(chIndex, panel) {
     appendLog(`Orden de salida: ${orderedSlaveIndices(true).map((idx) => nodeTitle(idx)).join(', ') || '--'}`);
   });
   panel.addEventListener('pga-changed', (ev) => onPgaChanged(chIndex, ev.detail));
-  panel.addEventListener('calibrate-requested', () => onCalibrateRequested(chIndex));
   panel.addEventListener('fir-apply', (ev) => onFirApply(chIndex, ev.detail.cmd));
   panel.addEventListener('fir-remove', () => onFirRemove(chIndex));
   panel.addEventListener('dc-remove-toggled', (ev) => onDcRemoveToggled(chIndex, !!ev.detail.enabled));
@@ -784,14 +769,6 @@ function handleAck(pkt, idx) {
     }
     const expected = pending ? pending.param : data.nodes[idx].pgaCode;
     appendLog(`S${idx} PGA ${ackVal ? 'confirmado' : 'sin lock'}: ${cfg.GAIN_NAMES[expected] ?? expected}`);
-    if (data.nodes[idx].calibrateAfterPga) {
-      data.nodes[idx].calibrateAfterPga = false;
-      if (ackVal) {
-        onCalibrateRequested(idx);
-      } else {
-        appendLog(`S${idx} calibracion omitida: PGA sin lock`);
-      }
-    }
     return;
   }
 

@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-loop-19';
+import * as cfg from './config.js?v=field-loop-20';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -44,7 +44,7 @@ function setDot(d, state, okTip, badTip, unkTip, busyTip) {
  * Controls for one slave node (channels 1-3, displayed as Esclavo 1-3).
  *
  * Events: 'alias-changed' {alias}, 'pga-changed' {code},
- *         'calibrate-requested', 'fir-apply' {cmd}, 'fir-remove',
+ *         'fir-apply' {cmd}, 'fir-remove',
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
  *         'send-all-requested', 'latency-requested', 'offset-changed' {offset}
  */
@@ -94,11 +94,7 @@ export class SlavePanel extends EventTarget {
     this._lblPgaActual = el('span', null, 'Current: 1x');
     root.appendChild(row(labeled('PGA', this._ddPga), this._dotPga, this._lblPgaActual));
 
-    this._btnCalibrate = el('button', null, 'Calibrar');
-    this._btnCalibrate.title = 'Ejecuta la calibracion no bloqueante en el PSoC';
-    this._btnCalibrate.addEventListener('click', () => this._dispatch('calibrate-requested'));
-    this._dotCal = dot('Calibracion sin ejecutar');
-    root.appendChild(row(this._btnCalibrate, this._dotCal));
+    this._dotCal = null;
 
     const firBox = el('div', 'filter-box');
     firBox.appendChild(el('div', 'subhead', 'FIR Filter'));
@@ -160,7 +156,7 @@ export class SlavePanel extends EventTarget {
     root.appendChild(row(this._btnTest, this._btnVer, this._btnLatency));
 
     this._btnSendAll = el('button', null, 'Enviar Config');
-    this._btnSendAll.title = 'Envia PGA y fuerza calibracion';
+    this._btnSendAll.title = 'Envia la configuracion de PGA al PSoC';
     this._btnSendAll.addEventListener('click', () => this._dispatch('send-all-requested'));
     root.appendChild(row(this._btnSendAll));
 
@@ -231,7 +227,6 @@ export class SlavePanel extends EventTarget {
     this._btnVer.disabled = !connected;
     this._btnLatency.disabled = !connected;
     this._btnSendAll.disabled = !connected;
-    this._btnCalibrate.disabled = !connected;
     if (!connected) {
       this.setPgaLock(0);
       this.setCalibrationLock(0);
@@ -273,6 +268,7 @@ export class SlavePanel extends EventTarget {
 
   /** state: 0=unknown, 1=ok, 2=pending/fail, 3=calibrando (en curso). */
   setCalibrationLock(state) {
+    if (!this._dotCal) return;
     setDot(this._dotCal, state, 'Calibracion confirmada por PSoC', 'Calibracion pendiente o fallida',
            'Calibracion sin ejecutar', 'Calibrando... (puede tardar hasta ~3 min)');
   }

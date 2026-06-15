@@ -82,6 +82,15 @@
 #ifndef SLAVE_USB_CMD_ENABLE
   #define SLAVE_USB_CMD_ENABLE 1
 #endif
+#ifndef PSOC_AUTO_CAL_ON_READY
+  #define PSOC_AUTO_CAL_ON_READY 1
+#endif
+#ifndef PSOC_AUTO_CAL_DELAY_MS
+  #define PSOC_AUTO_CAL_DELAY_MS 500u
+#endif
+#ifndef PSOC_AUTO_CAL_RETRY_MS
+  #define PSOC_AUTO_CAL_RETRY_MS 3000u
+#endif
 
 /* MAC del ESP maestro. El valor real debe venir de platformio.ini. */
 #ifndef MASTER_MAC0
@@ -142,6 +151,8 @@ static          uint8_t    g_cfg_param   = 0;
 static          uint32_t   g_cfg_start_ms = 0;
 static          uint32_t   g_cfg_timeout_ms = 0;
 static          uint32_t   g_cal_progress_ack_ms = 0; /* ultimo "calibrando..." (ok=2) enviado al maestro */
+static          bool       g_auto_cal_requested = false;
+static          uint32_t   g_auto_cal_due_ms = 0;
 
 /* ── Store-and-forward ───────────────────────────────────────────────────── */
 static uint16_t    g_rec_n_batches = 0;          /* 0 = modo streaming clásico */
@@ -731,6 +742,77 @@ static void servicePsocConfigAck()
     }
 }
 
+static bool captureOrDumpBusy()
+{
+    return (g_state == SAMPLING || g_state == HOT_WAIT ||
+            g_view_remaining != 0 ||
+            (g_state == STOPPED && g_rec_n_batches > 0));
+}
+
+static bool requestPsocCalibration(const char *source)
+{
+    if (captureOrDumpBusy()) {
+        SLAVE_LOG_PRINTF("[%s] cal ignored: capture/dump busy state=%d\n",
+                         source, (int)g_state);
+        LOGM("CAL_REQ", "source=%s,ok=0,reason=capture_busy,state=%d",
+             source, (int)g_state);
+        return false;
+    }
+
+    servicePsocConfigAck();
+    if (g_cfg_waiting) {
+        SLAVE_LOG_PRINTF("[%s] cal ignored: pending sub=0x%02X\n",
+                         source, g_cfg_sub_cmd);
+        LOGM("CAL_REQ", "source=%s,ok=0,reason=cfg_busy,pending=0x%02X",
+             source, g_cfg_sub_cmd);
+        return false;
+    }
+
+    if (!ensurePsocReadyForConfig()) {
+        SLAVE_LOG_PRINTF("[%s] cal failed: PSoC not ready\n", source);
+        LOGM("CAL_REQ", "source=%s,ok=0,reason=psoc_not_ready", source);
+        return false;
+    }
+
+    psoc.calibrate();
+    waitForPsocConfigAck(PSOC_CMD_CALIBRATE, 1);
+    SLAVE_LOG_PRINTF("[%s] cal -> PSoC CMD 0x%02X\n", source, PSOC_CMD_CALIBRATE);
+    LOGM("CAL_REQ", "source=%s,ok=1,sub=0x%02X", source, PSOC_CMD_CALIBRATE);
+    return true;
+}
+
+#if PSOC_AUTO_CAL_ON_READY
+static void scheduleAutoCalibration(uint32_t delayMs)
+{
+    if (!g_auto_cal_requested) {
+        g_auto_cal_due_ms = millis() + delayMs;
+    }
+}
+
+static void serviceAutoCalibration()
+{
+    if (g_auto_cal_requested || g_auto_cal_due_ms == 0u) {
+        return;
+    }
+    if ((int32_t)(millis() - g_auto_cal_due_ms) < 0) {
+        return;
+    }
+    if (!g_psocConnected || captureOrDumpBusy() || g_cfg_waiting) {
+        g_auto_cal_due_ms = millis() + PSOC_AUTO_CAL_RETRY_MS;
+        return;
+    }
+    if (requestPsocCalibration("AUTO")) {
+        g_auto_cal_requested = true;
+        g_auto_cal_due_ms = 0u;
+    } else {
+        g_auto_cal_due_ms = millis() + PSOC_AUTO_CAL_RETRY_MS;
+    }
+}
+#else
+static void scheduleAutoCalibration(uint32_t) {}
+static void serviceAutoCalibration() {}
+#endif
+
 #if SLAVE_USB_CMD_ENABLE
 static bool usbCommandEquals(const char *cmd, const char *word)
 {
@@ -746,29 +828,13 @@ static bool usbCommandEquals(const char *cmd, const char *word)
 
 static void requestCalibrationFromUsb()
 {
-    if (g_state == SAMPLING) {
-        SLAVE_LOG_PRINTF("[USB] cal ignored: sampling\n");
-        LOGM("USB_CMD", "cmd=cal,ok=0,reason=sampling");
-        return;
+    const bool sent = requestPsocCalibration("USB");
+    if (sent) {
+        g_auto_cal_requested = true;
+        g_auto_cal_due_ms = 0u;
     }
-
-    servicePsocConfigAck();
-    if (g_cfg_waiting) {
-        SLAVE_LOG_PRINTF("[USB] cal ignored: pending sub=0x%02X\n", g_cfg_sub_cmd);
-        LOGM("USB_CMD", "cmd=cal,ok=0,reason=busy,pending=0x%02X", g_cfg_sub_cmd);
-        return;
-    }
-
-    if (!ensurePsocReadyForConfig()) {
-        SLAVE_LOG_PRINTF("[USB] cal failed: PSoC not ready\n");
-        LOGM("USB_CMD", "cmd=cal,ok=0,reason=psoc_not_ready");
-        return;
-    }
-
-    psoc.calibrate();
-    waitForPsocConfigAck(PSOC_CMD_CALIBRATE, 1);
-    SLAVE_LOG_PRINTF("[USB] cal -> PSoC CMD 0x%02X\n", PSOC_CMD_CALIBRATE);
-    LOGM("USB_CMD", "cmd=cal,ok=1,sub=0x%02X", PSOC_CMD_CALIBRATE);
+    LOGM("USB_CMD", "cmd=cal,ok=%u,sub=0x%02X",
+         (unsigned)sent, PSOC_CMD_CALIBRATE);
 }
 
 static void handleUsbCommand(const char *cmd)
@@ -1014,12 +1080,26 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
          g_state == STOPPED || g_state == SAMPLING)) {
         g_debug_mode = false;   /* detener debug stream si estaba activo */
         g_state = ARMED;
+        scheduleAutoCalibration(0u);
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, 0 };
         espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
         SLAVE_LOG_PRINTLN("[SLAVE] ARMED");
     }
     else if (cmd == CMD_PRESTART && len >= (int)sizeof(MsgPrestart) &&
              g_state != SAMPLING) {
+        if (!g_auto_cal_requested && g_auto_cal_due_ms != 0u) {
+            serviceAutoCalibration();
+        }
+        if (g_cfg_waiting && g_cfg_sub_cmd == PSOC_CMD_CALIBRATE) {
+            SLAVE_LOG_PRINTLN("[SLAVE] PRESTART deferred: calibration busy");
+            LOGM("PRESTART_DEFER", "reason=cal_busy,state=%d", (int)g_state);
+            return;
+        }
+        if (!g_auto_cal_requested && g_auto_cal_due_ms != 0u) {
+            SLAVE_LOG_PRINTLN("[SLAVE] PRESTART deferred: auto calibration pending");
+            LOGM("PRESTART_DEFER", "reason=auto_cal_pending,state=%d", (int)g_state);
+            return;
+        }
         const MsgPrestart *msg = (const MsgPrestart *)data;
         enterHotWait(msg->n_batches);
     }
@@ -1339,6 +1419,7 @@ void setup()
     if (g_psocConnected) {
         SLAVE_LOG_PRINTF("[SLAVE %d] PSoC: DETECTADO\n", NODE_ID);
         LOGM("PSOC", "detected=1");
+        scheduleAutoCalibration(PSOC_AUTO_CAL_DELAY_MS);
     } else {
         SLAVE_LOG_PRINTF("[SLAVE %d] PSoC sin respuesta — reintentando en loop\n", NODE_ID);
         LOGM("PSOC", "detected=0,retry=loop");
@@ -1379,6 +1460,7 @@ void loop()
     }
     servicePsocConfigAck();
     serviceUsbCommands();
+    serviceAutoCalibration();
 
     /* Mientras se llena el store (Ver/Test con n_batches>0), imprimir UART cada 1 s.
      * Esto separa cable/pin (uartBytes=0) de protocolo/baud (bytes sin frames)
@@ -1439,6 +1521,7 @@ void loop()
         if (g_psocConnected) {
             SLAVE_LOG_PRINTF("[SLAVE %d] PSoC: DETECTADO\n", NODE_ID);
             LOGM("PSOC", "detected=1");
+            scheduleAutoCalibration(PSOC_AUTO_CAL_DELAY_MS);
         }
     }
 

@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-loop-19';
+import * as cfg from './config.js?v=field-loop-20';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-loop-19';
+import { effectiveFs } from './data_store.js?v=field-loop-20';
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
