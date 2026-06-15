@@ -79,6 +79,13 @@
 #define PSOC_EVT_WAIT_ESP         0x20
 #define PSOC_EVT_ESP_SEEN         0x21
 #define PSOC_EVT_CAL_LOOP         0x22
+#define PSOC_EVT_CAL_STAGE_SAT    0x23
+#define PSOC_EVT_CAL_STAGE_SAT_ALL 0x24
+#define PSOC_EVT_CAL_REALCHECK_BEGIN 0x25
+#define PSOC_EVT_CAL_REALCHECK_DAC   0x26
+#define PSOC_EVT_CAL_REALCHECK_MEAS32 0x27
+#define PSOC_EVT_CAL_REALCHECK_NUDGE 0x28
+#define PSOC_EVT_CAL_REALCHECK_OK    0x29
 #define PSOC_EVT_RX_CMD           0x30
 #define PSOC_EVT_SETN             0x31
 #define PSOC_EVT_ARMED            0x32

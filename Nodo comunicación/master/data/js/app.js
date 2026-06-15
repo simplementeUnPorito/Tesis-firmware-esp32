@@ -735,20 +735,29 @@ function buildSlavePanels() {
   }
 }
 
+function calibrationProgressLabel(v) {
+  const stages = ['GEO_PGA', 'GEO_BP', 'GEO_ADDER', 'GEO_LP'];
+  if (v >= 3 && v <= 6) return `biseccion ${stages[v - 3]}`;
+  if (v >= 7 && v <= 10) return `verify ${stages[v - 7]}`;
+  if (v >= 11 && v <= 14) return `realcheck ${stages[v - 11]}`;
+  return 'en curso';
+}
+
 function handleAck(pkt, idx) {
   const ackCmd = pkt.ackCmd;
   const ackVal = pkt.ackVal;
 
-  // Heartbeat "sigue calibrando" (ok=2): no consume el pending de la
-  // confirmacion final, solo refleja progreso en la UI cada pocos segundos.
-  if (ackCmd === cfg.SUBCMD_CALIBRATE && ackVal === 2 && idx >= 1 && idx < cfg.MAX_NODES) {
+  // Progreso de calibracion (ok>=2): no consume el pending de la confirmacion
+  // final, solo refleja fase/etapa en la UI.
+  if (ackCmd === cfg.SUBCMD_CALIBRATE && ackVal >= 2 && idx >= 1 && idx < cfg.MAX_NODES) {
     const nd = data.nodes[idx];
     const panel = panelFor(idx);
-    if (panel) panel.setCalibrationLock(3);
+    const progress = calibrationProgressLabel(ackVal);
+    if (panel) panel.setCalibrationLock(3, progress);
     const now = performance.now();
     if (now - nd.calProgressLogMs >= 15000) {
       nd.calProgressLogMs = now;
-      appendLog(`S${idx} calibrando...`);
+      appendLog(`S${idx} calibrando... ${progress}`);
     }
     return;
   }

@@ -94,7 +94,8 @@ export class SlavePanel extends EventTarget {
     this._lblPgaActual = el('span', null, 'Current: 1x');
     root.appendChild(row(labeled('PGA', this._ddPga), this._dotPga, this._lblPgaActual));
 
-    this._dotCal = null;
+    this._dotCal = dot('Calibracion sin ejecutar');
+    root.appendChild(row(el('span', null, 'Calibracion'), this._dotCal));
 
     const firBox = el('div', 'filter-box');
     firBox.appendChild(el('div', 'subhead', 'FIR Filter'));
@@ -267,10 +268,11 @@ export class SlavePanel extends EventTarget {
   }
 
   /** state: 0=unknown, 1=ok, 2=pending/fail, 3=calibrando (en curso). */
-  setCalibrationLock(state) {
+  setCalibrationLock(state, detail) {
     if (!this._dotCal) return;
+    const busyTip = detail ? `Calibrando... ${detail}` : 'Calibrando... (puede tardar hasta ~4 min)';
     setDot(this._dotCal, state, 'Calibracion confirmada por PSoC', 'Calibracion pendiente o fallida',
-           'Calibracion sin ejecutar', 'Calibrando... (puede tardar hasta ~3 min)');
+           'Calibracion sin ejecutar', busyTip);
   }
 
   updateStats(batchCount, totalSamples, lastVal, driftStr, latencyStr, psocOk) {

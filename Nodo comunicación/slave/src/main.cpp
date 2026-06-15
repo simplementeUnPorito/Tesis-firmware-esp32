@@ -83,7 +83,7 @@
   #define SLAVE_USB_CMD_ENABLE 1
 #endif
 #ifndef PSOC_AUTO_CAL_ON_READY
-  #define PSOC_AUTO_CAL_ON_READY 1
+  #define PSOC_AUTO_CAL_ON_READY 0
 #endif
 #ifndef PSOC_AUTO_CAL_DELAY_MS
   #define PSOC_AUTO_CAL_DELAY_MS 500u
@@ -165,7 +165,7 @@ static volatile uint16_t g_view_remaining    = 0; /* legado live deshabilitado *
 static volatile bool     g_view_store_active = false;
 
 #define PSOC_CFG_ACK_TIMEOUT_MS 750u
-#define PSOC_CAL_ACK_TIMEOUT_MS 240000u
+#define PSOC_CAL_ACK_TIMEOUT_MS 450000u
 #define PSOC_CAL_PROGRESS_ACK_PERIOD_MS 3000u /* "sigue calibrando" (ok=2) hacia el maestro */
 #define PSOC_CFG_READY_STALE_MS 5000u
 #ifndef PSOC_VIEW_START_FALLBACK_EXTRA_MS
@@ -349,6 +349,13 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_WAIT_ESP:       return "WAIT_ESP";
         case PSOC_EVT_ESP_SEEN:       return "ESP_SEEN";
         case PSOC_EVT_CAL_LOOP:       return "CAL_LOOP";
+        case PSOC_EVT_CAL_STAGE_SAT:  return "CAL_STAGE_SAT";
+        case PSOC_EVT_CAL_STAGE_SAT_ALL: return "CAL_STAGE_SAT_ALL";
+        case PSOC_EVT_CAL_REALCHECK_BEGIN: return "CAL_REALCHECK_BEGIN";
+        case PSOC_EVT_CAL_REALCHECK_DAC: return "CAL_REALCHECK_DAC";
+        case PSOC_EVT_CAL_REALCHECK_MEAS32: return "CAL_REALCHECK_MEAS32";
+        case PSOC_EVT_CAL_REALCHECK_NUDGE: return "CAL_REALCHECK_NUDGE";
+        case PSOC_EVT_CAL_REALCHECK_OK: return "CAL_REALCHECK_OK";
         case PSOC_EVT_RX_CMD:         return "RX_CMD";
         case PSOC_EVT_SETN:           return "SETN";
         case PSOC_EVT_ARMED:          return "ARMED";
@@ -433,9 +440,14 @@ static void onPsocDiag(const PsocDiagEvent &event)
         calMeasRawSigned = 0;
         calMeasRawByte = 0;
         calPointIndex = 0;
+        g_cal_progress_ack_ms = millis();
+        sendCfgAck(PSOC_CMD_CALIBRATE, 2);
         SLAVE_LOG_PRINTF("[CAL] start\n");
         LOGM("CAL_START", "pstate=%u", event.psoc_state);
     } else if (event.event == PSOC_EVT_CAL_DONE) {
+        if (!(g_cfg_waiting && g_cfg_sub_cmd == PSOC_CMD_CALIBRATE)) {
+            sendCfgAck(PSOC_CMD_CALIBRATE, event.value ? 1 : 0);
+        }
         SLAVE_LOG_PRINTF("[CAL] done ok=%u\n", event.value);
         LOGM("CAL_DONE", "ok=%u,pstate=%u", event.value, event.psoc_state);
     } else if (event.event == PSOC_EVT_CAL_BUSY) {
@@ -450,6 +462,8 @@ static void onPsocDiag(const PsocDiagEvent &event)
         calMeasRawSigned = 0;
         calMeasRawByte = 0;
         calPointIndex = 0;
+        g_cal_progress_ack_ms = millis();
+        sendCfgAck(PSOC_CMD_CALIBRATE, (uint8_t)(3u + (event.value & 0x03u)));
         SLAVE_LOG_PRINTF("[CAL] begin stage=%u/%s\n",
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_BEGIN", "stage=%u,name=%s", event.value,
@@ -476,9 +490,26 @@ static void onPsocDiag(const PsocDiagEvent &event)
         calMeasRawSigned = 0;
         calMeasRawByte = 0;
         calPointIndex = 0;
+        g_cal_progress_ack_ms = millis();
+        sendCfgAck(PSOC_CMD_CALIBRATE, (uint8_t)(7u + (event.value & 0x03u)));
         SLAVE_LOG_PRINTF("[CAL] verify begin stage=%u/%s\n",
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_VERIFY_BEGIN", "stage=%u,name=%s", event.value,
+             psocCalStageName(event.value));
+    } else if (event.event == PSOC_EVT_CAL_REALCHECK_BEGIN) {
+        calStage = event.value;
+        calDac = 0;
+        calMeas = 0;
+        calMeasHigh = false;
+        calMeasRaw = 0;
+        calMeasRawSigned = 0;
+        calMeasRawByte = 0;
+        calPointIndex = 0;
+        g_cal_progress_ack_ms = millis();
+        sendCfgAck(PSOC_CMD_CALIBRATE, (uint8_t)(11u + (event.value & 0x03u)));
+        SLAVE_LOG_PRINTF("[CAL] realcheck begin stage=%u/%s\n",
+                         event.value, psocCalStageName(event.value));
+        LOGM("CAL_REALCHECK_BEGIN", "stage=%u,name=%s", event.value,
              psocCalStageName(event.value));
     } else if (event.event == PSOC_EVT_CAL_STAGE_DAC) {
         calDac = event.value;
@@ -517,6 +548,30 @@ static void onPsocDiag(const PsocDiagEvent &event)
 #endif
             calPointIndex++;
         }
+    } else if (event.event == PSOC_EVT_CAL_REALCHECK_DAC) {
+        calDac = event.value;
+        calMeasRaw = 0;
+        calMeasRawByte = 0;
+    } else if (event.event == PSOC_EVT_CAL_REALCHECK_MEAS32) {
+        calMeasRaw = (calMeasRaw << 8) | event.value;
+        calMeasRawByte++;
+        if (calMeasRawByte >= 4) {
+            uint32_t absRaw;
+            calMeasRawByte = 0;
+            calMeasRawSigned = (int32_t)calMeasRaw;
+            absRaw = absCounts32(calMeasRawSigned);
+#if PSOC_CAL_LOG_POINTS
+            SLAVE_LOG_PRINTF("[CAL] realcheck point stage=%u/%s i=%u dac=%u raw=%ld abs=%lu\n",
+                             calStage, psocCalStageName(calStage),
+                             (unsigned)calPointIndex, calDac,
+                             (long)calMeasRawSigned, (unsigned long)absRaw);
+            LOGM("CAL_REALCHECK_POINT32", "stage=%u,name=%s,i=%u,dac=%u,measRaw=%ld,abs=%lu",
+                 calStage, psocCalStageName(calStage),
+                 (unsigned)calPointIndex, calDac, (long)calMeasRawSigned,
+                 (unsigned long)absRaw);
+#endif
+            calPointIndex++;
+        }
     } else if (event.event == PSOC_EVT_CAL_STAGE_OK) {
         uint32_t absRaw = absCounts32(calMeasRawSigned);
         SLAVE_LOG_PRINTF("[CAL] result stage=%u/%s ok=%u dac=%u raw=%ld abs=%lu meas16=%d\n",
@@ -537,6 +592,34 @@ static void onPsocDiag(const PsocDiagEvent &event)
                          calStage, psocCalStageName(calStage), event.value);
         LOGM("CAL_LOOP", "stage=%u,name=%s,dac=%u",
              calStage, psocCalStageName(calStage), event.value);
+    } else if (event.event == PSOC_EVT_CAL_STAGE_SAT) {
+        if (event.value) {
+            SLAVE_LOG_PRINTF("[CAL] saturation stage=%u/%s dac=%u\n",
+                             calStage, psocCalStageName(calStage), calDac);
+            LOGM("CAL_SAT", "stage=%u,name=%s,dac=%u",
+                 calStage, psocCalStageName(calStage), calDac);
+        }
+    } else if (event.event == PSOC_EVT_CAL_STAGE_SAT_ALL) {
+        SLAVE_LOG_PRINTF("[CAL] all candidates saturated stage=%u/%s\n",
+                         event.value, psocCalStageName(event.value));
+        LOGM("CAL_SAT_ALL", "stage=%u,name=%s", event.value,
+             psocCalStageName(event.value));
+    } else if (event.event == PSOC_EVT_CAL_REALCHECK_NUDGE) {
+        int8_t nudge = (int8_t)event.value;
+        SLAVE_LOG_PRINTF("[CAL] realcheck nudge stage=%u/%s dac=%u step=%d\n",
+                         calStage, psocCalStageName(calStage), calDac,
+                         (int)nudge);
+        LOGM("CAL_REALCHECK_NUDGE", "stage=%u,name=%s,dac=%u,step=%d",
+             calStage, psocCalStageName(calStage), calDac, (int)nudge);
+    } else if (event.event == PSOC_EVT_CAL_REALCHECK_OK) {
+        uint32_t absRaw = absCounts32(calMeasRawSigned);
+        SLAVE_LOG_PRINTF("[CAL] realcheck result stage=%u/%s ok=%u dac=%u raw=%ld abs=%lu\n",
+                         calStage, psocCalStageName(calStage), event.value,
+                         calDac, (long)calMeasRawSigned,
+                         (unsigned long)absRaw);
+        LOGM("CAL_REALCHECK", "stage=%u,name=%s,ok=%u,dac=%u,measRaw=%ld,abs=%lu",
+             calStage, psocCalStageName(calStage), event.value,
+             calDac, (long)calMeasRawSigned, (unsigned long)absRaw);
     } else if (event.event == PSOC_EVT_CAL_VERIFY_OK) {
         uint32_t absRaw = absCounts32(calMeasRawSigned);
         SLAVE_LOG_PRINTF("[CAL] verify stage=%u/%s ok=%u dac=%u raw=%ld abs=%lu meas16=%d\n",
@@ -552,17 +635,23 @@ static void onPsocDiag(const PsocDiagEvent &event)
                          event.value == 0 ? "normal/captura" : "referencia/tierra virtual");
         LOGM("CAL_AMUX_IN", "channel=%u", event.value);
     } else if (event.event == PSOC_EVT_CAL_PROGRESS) {
+        if (!(g_cfg_waiting && g_cfg_sub_cmd == PSOC_CMD_CALIBRATE)) {
+            uint32_t now = millis();
+            if ((uint32_t)(now - g_cal_progress_ack_ms) >=
+                PSOC_CAL_PROGRESS_ACK_PERIOD_MS) {
+                g_cal_progress_ack_ms = now;
+                sendCfgAck(PSOC_CMD_CALIBRATE, 2);
+            }
+        }
 #if PSOC_CAL_LOG_PROGRESS
         SLAVE_LOG_PRINTF("[CAL] progress stage=%u/%s\n",
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_PROGRESS", "stage=%u,name=%s", event.value,
              psocCalStageName(event.value));
 #endif
-        /* El "calibrando..." (ok=2) hacia el maestro ya NO depende de este
-         * evento: servicePsocConfigAck() lo emite por temporizador propio
-         * mientras g_cfg_waiting este activo (ver mas abajo), para que el
-         * indicador no dependa de que el stream de diagnostico del PSoC
-         * llegue completo. */
+        /* Para calibracion manual, servicePsocConfigAck() emite el heartbeat
+         * mientras g_cfg_waiting este activo. Para boot-cal autonoma no hay
+         * pending ACK, asi que este evento mantiene vivo el estado del maestro. */
     } else if (event.event == PSOC_EVT_CAL_WATCHDOG) {
         SLAVE_LOG_PRINTF("[CAL] WATCHDOG timeout stage=%u/%s -> aborted\n",
                          event.value, psocCalStageName(event.value));
@@ -730,7 +819,7 @@ static void servicePsocConfigAck()
     /* "Calibrando..." (ok=2) hacia el maestro: por temporizador propio del
      * ESP, independiente de que el stream de diagnostico del PSoC llegue.
      * Mientras g_cfg_waiting este activo para CALIBRATE (hasta
-     * PSOC_CAL_ACK_TIMEOUT_MS=240s o el ack final), repetir cada
+     * PSOC_CAL_ACK_TIMEOUT_MS=450s o el ack final), repetir cada
      * PSOC_CAL_PROGRESS_ACK_PERIOD_MS para que el panel muestre el estado
      * "Calibrando..." de forma confiable. */
     if (g_cfg_waiting && g_cfg_sub_cmd == PSOC_CMD_CALIBRATE) {
@@ -786,6 +875,9 @@ static void scheduleAutoCalibration(uint32_t delayMs)
 {
     if (!g_auto_cal_requested) {
         g_auto_cal_due_ms = millis() + delayMs;
+        SLAVE_LOG_PRINTF("[AUTO_CAL] scheduled in %lu ms (due=%lu)\n",
+                         (unsigned long)delayMs, (unsigned long)g_auto_cal_due_ms);
+        LOGM("AUTO_CAL", "ev=scheduled,delay_ms=%lu", (unsigned long)delayMs);
     }
 }
 
@@ -798,13 +890,23 @@ static void serviceAutoCalibration()
         return;
     }
     if (!g_psocConnected || captureOrDumpBusy() || g_cfg_waiting) {
+        SLAVE_LOG_PRINTF("[AUTO_CAL] deferred (psocConnected=%d busy=%d cfg_waiting=%d) retry in %lu ms\n",
+                         (int)g_psocConnected, (int)captureOrDumpBusy(), (int)g_cfg_waiting,
+                         (unsigned long)PSOC_AUTO_CAL_RETRY_MS);
+        LOGM("AUTO_CAL", "ev=deferred,psoc=%d,busy=%d,cfg_waiting=%d",
+             (int)g_psocConnected, (int)captureOrDumpBusy(), (int)g_cfg_waiting);
         g_auto_cal_due_ms = millis() + PSOC_AUTO_CAL_RETRY_MS;
         return;
     }
+    SLAVE_LOG_PRINTF("[AUTO_CAL] due -> requesting calibration\n");
     if (requestPsocCalibration("AUTO")) {
         g_auto_cal_requested = true;
         g_auto_cal_due_ms = 0u;
+        LOGM("AUTO_CAL", "ev=requested,ok=1");
     } else {
+        SLAVE_LOG_PRINTF("[AUTO_CAL] request failed, retry in %lu ms\n",
+                         (unsigned long)PSOC_AUTO_CAL_RETRY_MS);
+        LOGM("AUTO_CAL", "ev=requested,ok=0");
         g_auto_cal_due_ms = millis() + PSOC_AUTO_CAL_RETRY_MS;
     }
 }
