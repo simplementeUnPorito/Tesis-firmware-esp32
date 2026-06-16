@@ -83,6 +83,26 @@ inline bool webServerBegin()
         request->send(404, "text/plain", "Not found. Try /health");
     });
 
+    /* Respuestas a probes de conectividad — evita que Windows/Android/iOS
+     * marquen la red como "sin internet" e intenten hacer auto-switch. */
+    webServer.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft Connect Test");
+    });
+    webServer.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft NCSI");
+    });
+    webServer.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(204, "text/plain", "");
+    });
+    webServer.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/html",
+            "<!DOCTYPE html><html><head><title>Success</title></head>"
+            "<body>Success</body></html>");
+    });
+    webServer.on("/redirect", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->redirect("/");
+    });
+
     webRelayBegin(webServer);
 
     webServer.begin();

@@ -30,9 +30,41 @@ const SETTINGS_PREFIX = 'geophone_scope_web.';
 const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz`;
 const SHOW_RAW_KEY = `${SETTINGS_PREFIX}show_raw`;
 const SHOW_FILT_KEY = `${SETTINGS_PREFIX}show_filt`;
+const WS_TOKEN_KEY  = `${SETTINGS_PREFIX}ws_token`;
 
 function clamp(value, lo, hi) {
   return Math.max(lo, Math.min(hi, value));
+}
+
+// ── Auth modal ───────────────────────────────────────────────────────────────
+
+function showAuthModal(showError = false) {
+  const modal = $('auth-modal');
+  if (!modal) return;
+  const firstShow = modal.hidden;
+  modal.hidden = false;
+  const err = $('auth-error');
+  if (err) {
+    if (showError) err.hidden = false;      // siempre mostrar si hay error
+    else if (firstShow) err.hidden = true;  // solo ocultar en primera apertura
+  }
+  if (firstShow) {
+    const inp = $('auth-password');
+    if (inp) { inp.value = ''; inp.focus(); }
+  }
+}
+
+function hideAuthModal() {
+  const modal = $('auth-modal');
+  if (modal) modal.hidden = true;
+}
+
+function applyAuthToken(token) {
+  ws.authToken = token || null;
+  try {
+    if (token) localStorage.setItem(WS_TOKEN_KEY, token);
+    else localStorage.removeItem(WS_TOKEN_KEY);
+  } catch (_) {}
 }
 
 function settingKey(chIndex, name) {
@@ -914,7 +946,30 @@ setActiveSlaveCount(activeSlaveCount);
 updateGlobalFsDisplay();
 setInterval(renderTick, cfg.RENDER_PERIOD_MS);
 
+// Cargar token guardado y conectar
+const _savedToken = loadSetting(WS_TOKEN_KEY);
+if (_savedToken) applyAuthToken(_savedToken);
+
+ws.addEventListener('auth-required', (ev) => {
+  const wrongPassword = ev.detail?.reason === 'wrong_password';
+  showAuthModal(wrongPassword);
+});
+
+$('btn-auth-connect').addEventListener('click', async () => {
+  const token = $('auth-password')?.value?.trim() || '';
+  applyAuthToken(token);
+  hideAuthModal();
+  ws.stop();
+  await resetWsLock();   // libera el WS lock del servidor antes de reconectar
+  ws.start();
+});
+
+$('auth-password').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') $('btn-auth-connect').click();
+});
+
 ws.addEventListener('connection', (ev) => {
+  if (ev.detail) hideAuthModal();
   setConnIndicator(ev.detail);
   if (ev.detail) {
     // Ask for cached READY/HELLO immediately and once more if Fs is still
@@ -1015,6 +1070,14 @@ $('btn-stop').addEventListener('click', () => {
 
 $('btn-status').addEventListener('click', () => {
   sendStd(cfg.CMD_STATUS, 0);
+});
+
+$('btn-cal-all').addEventListener('click', () => {
+  if (!ws.connected) return;
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (data.nodes[i].psocOk !== null) onCalibrateRequested(i);
+  }
+  appendLog('Calibracion solicitada a todos los esclavos');
 });
 
 $('btn-export').addEventListener('click', onExportRequested);

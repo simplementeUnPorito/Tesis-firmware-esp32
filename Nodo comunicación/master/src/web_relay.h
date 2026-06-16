@@ -27,6 +27,16 @@ static AsyncWebSocket ws("/ws");
 typedef void (*WebRelayClientHook)();
 static WebRelayClientHook g_webRelayClientHook = nullptr;
 
+/* ── Autenticación de aplicación (WS_AUTH_TOKEN) ───────────────────────────
+ * Definir en platformio.ini: -DWS_AUTH_TOKEN='"tu_password"'
+ * Sin la macro (o vacío) → sin autenticación (modo legacy).               */
+#ifndef WS_AUTH_TOKEN
+  #define WS_AUTH_TOKEN ""
+#endif
+static const bool WS_AUTH_ENABLED = (WS_AUTH_TOKEN[0] != '\0');
+static bool     g_wsAuthOk     = false;   /* true: cliente autenticado */
+static uint32_t g_wsAuthDeadMs = 0;       /* deadline de auth (0 = inactivo) */
+
 static constexpr size_t WEB_RELAY_PKT_LEN = 6;
 static constexpr size_t WEB_RELAY_TX_PKTS = 300;
 static constexpr size_t WEB_RELAY_TX_BYTES = WEB_RELAY_TX_PKTS * WEB_RELAY_PKT_LEN;
@@ -229,6 +239,15 @@ static void webRelayService()
     webRelayTxUnlock();
     if (due) webRelayFlush();
 
+    /* Timeout de auth: si el cliente no autenticó en 5 s → expulsar */
+    if (WS_AUTH_ENABLED && !g_wsAuthOk && g_wsAuthDeadMs != 0 &&
+        ws.count() > 0 &&
+        (int32_t)(millis() - g_wsAuthDeadMs) >= 0) {
+        MASTER_LOG_PRINTLN("[WEB] auth timeout — cerrando cliente");
+        ws.closeAll(4401, "auth timeout");
+        g_wsAuthDeadMs = 0;
+    }
+
     /* Ping periódico para detectar conexiones muertas y limpiarlas.
      * Sin ping, un cliente con TCP zombi sigue en WS_CONNECTED para siempre
      * y bloquea reconexiones del mismo dispositivo. */
@@ -303,11 +322,7 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
 {
     switch (type) {
         case WS_EVT_CONNECT: {
-            /* Un cliente a la vez: el primero que entra queda como dueño.
-             * No expulsamos al dueño, ni siquiera si el nuevo viene de la
-             * misma IP. En navegadores, dos sockets del mismo tab/equipo
-             * pueden solaparse durante una recarga o reconexión y terminar
-             * pateándose en bucle. */
+            /* Un cliente a la vez: el primero que entra queda como dueño. */
             bool rejected = false;
             for (auto &c : server->getClients()) {
                 if (c.id() == client->id() || c.status() != WS_CONNECTED) continue;
@@ -322,22 +337,54 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
             if (!rejected) {
                 MASTER_LOG_PRINTF("[WEB] WS #%u conectado (%s)\n",
                                   client->id(), client->remoteIP().toString().c_str());
-                if (g_webRelayClientHook) g_webRelayClientHook();
+                if (WS_AUTH_ENABLED) {
+                    g_wsAuthOk     = false;
+                    g_wsAuthDeadMs = millis() + 5000u;
+                    client->text("{\"type\":\"auth_required\"}");
+                    MASTER_LOG_PRINTLN("[WEB] auth requerida — 5 s para autenticar");
+                } else {
+                    g_wsAuthOk = true;
+                    if (g_webRelayClientHook) g_webRelayClientHook();
+                }
             }
             break;
         }
         case WS_EVT_DISCONNECT:
             MASTER_LOG_PRINTF("[WEB] WS cliente #%u desconectado\n", client->id());
+            g_wsAuthOk     = !WS_AUTH_ENABLED;   /* reset para próximo cliente */
+            g_wsAuthDeadMs = 0;
             break;
         case WS_EVT_DATA: {
             AwsFrameInfo *info = (AwsFrameInfo *)arg;
-            if (info->final && info->index == 0 && info->len == len &&
-                info->opcode == WS_TEXT) {
-                String msg;
-                msg.reserve(len + 1);
-                for (size_t i = 0; i < len; i++) msg += (char)data[i];
-                webRelayDecodeCmd(msg);
+            if (!(info->final && info->index == 0 && info->len == len &&
+                  info->opcode == WS_TEXT)) break;
+
+            String msg;
+            msg.reserve(len + 1);
+            for (size_t i = 0; i < len; i++) msg += (char)data[i];
+
+            /* Validar auth antes de aceptar cualquier comando */
+            if (WS_AUTH_ENABLED && !g_wsAuthOk) {
+                String cmdStr;
+                if (webRelayJsonStr(msg, "cmd", cmdStr) && cmdStr == "AUTH") {
+                    String tok;
+                    webRelayJsonStr(msg, "token", tok);
+                    if (tok == WS_AUTH_TOKEN) {
+                        g_wsAuthOk     = true;
+                        g_wsAuthDeadMs = 0;
+                        client->text("{\"type\":\"auth\",\"ok\":true}");
+                        MASTER_LOG_PRINTF("[WEB] auth ok #%u\n", client->id());
+                        if (g_webRelayClientHook) g_webRelayClientHook();
+                    } else {
+                        client->text("{\"type\":\"auth\",\"ok\":false}");
+                        client->close(4401, "unauthorized");
+                        MASTER_LOG_PRINTF("[WEB] auth fail #%u\n", client->id());
+                    }
+                }
+                break;   /* descartar cualquier otro comando hasta auth */
             }
+
+            webRelayDecodeCmd(msg);
             break;
         }
         default:

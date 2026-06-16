@@ -69,6 +69,9 @@
             <button id="btn-stop">STOP</button>
             <button id="btn-status">STATUS</button>
           </div>
+          <div class="row">
+            <button id="btn-cal-all">Calibrar todos</button>
+          </div>
         </section>
 
         <section id="tab-nodes" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-nodes">
@@ -115,6 +118,19 @@
       </div>
     </aside>
   </main>
+
+  <!-- Modal de autenticación — solo visible cuando el servidor lo requiere -->
+  <div id="auth-modal" class="auth-overlay" hidden>
+    <div class="auth-box">
+      <h2>Acceso protegido</h2>
+      <p>Ingresá la contraseña para conectarte al maestro.</p>
+      <input id="auth-password" type="password" placeholder="Contraseña" autocomplete="current-password">
+      <div class="auth-actions">
+        <button id="btn-auth-connect">Conectar</button>
+      </div>
+      <p id="auth-error" class="auth-error" hidden>Contraseña incorrecta. Intentá de nuevo.</p>
+    </div>
+  </div>
 
   <script type="module" src="/js/app.js?v=field-loop-21"></script>
 </body>

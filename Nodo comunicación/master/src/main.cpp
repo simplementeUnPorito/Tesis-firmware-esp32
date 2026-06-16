@@ -24,6 +24,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <DNSServer.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "sync_protocol.h"
@@ -37,6 +38,7 @@
 /* ── Configuración ────────────────────────────────────────────────────────── */
 static const char *AP_SSID = "GeoNetwork";
 static const char *AP_PASS = "geophone2026";
+static DNSServer dnsServer;
 static const uint8_t ESPNOW_BROADCAST[6] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 };
@@ -1052,6 +1054,10 @@ void setup()
                       IPAddress(255, 255, 255, 0));
     bool apOk = WiFi.softAP(AP_SSID, AP_PASS, 1);   /* canal 1 fijo */
     MASTER_LOG_PRINTF("[MASTER] softAP %s\n", apOk ? "OK" : "FAIL");
+    if (apOk) {
+        dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+        MASTER_LOG_PRINTLN("[MASTER] DNS catchall :53 -> 192.168.4.1");
+    }
     /* Aumentar intervalo de beacon para reducir interferencia RF en el ADC.
      * El default (100 TU ≈ 100 ms) genera spikes de 10 Hz visibles en el geófono.
      * ESP-NOW no depende de beacons, así que 1000 ms no afecta la comunicación. */
@@ -1106,6 +1112,7 @@ void setup()
 void loop()
 {
     debugEspHardwareService();
+    dnsServer.processNextRequest();
 
     /* Gestionar conexión TCP de MATLAB */
     matlab.loop();

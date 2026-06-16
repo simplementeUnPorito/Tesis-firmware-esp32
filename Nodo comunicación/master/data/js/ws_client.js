@@ -9,10 +9,11 @@ import { PKT_LEN, PKT_HEADER } from './config.js?v=field-loop-21';
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
-const SHORT_CLOSE_MS = 1500;
-const SHORT_CLOSE_LIMIT = 3;
-const STABLE_OPEN_MS = 3000;
+const SHORT_CLOSE_MS = 2000;
+const SHORT_CLOSE_LIMIT = 5;
+const STABLE_OPEN_MS = 5000;
 const WS_CLOSE_POLICY = 1008;
+const WS_CLOSE_UNAUTH = 4401;
 
 export class WsClient extends EventTarget {
   constructor(url) {
@@ -26,6 +27,7 @@ export class WsClient extends EventTarget {
     this._stableTimer = null;
     this._shortCloseCount = 0;
     this._blocked = false;
+    this.authToken = null;  // set from outside if auth is required
   }
 
   /** Start connecting (and keep reconnecting until stop() is called). */
@@ -88,6 +90,9 @@ export class WsClient extends EventTarget {
     ws.onopen = () => {
       this._openMs = Date.now();
       this._log('WS: connected');
+      if (this.authToken) {
+        ws.send(JSON.stringify({ cmd: 'AUTH', token: this.authToken }));
+      }
       this._emitConnection(true);
       if (this._stableTimer) clearTimeout(this._stableTimer);
       this._stableTimer = setTimeout(() => {
@@ -106,6 +111,7 @@ export class WsClient extends EventTarget {
       const closedFast = ageMs === 0 || ageMs < SHORT_CLOSE_MS;
       const reason = `${ev?.reason || ''}`.toLowerCase();
       const busy = ev?.code === WS_CLOSE_POLICY || reason.includes('busy') || reason.includes('ws_lock');
+      const unauth = ev?.code === WS_CLOSE_UNAUTH || reason.includes('unauthorized') || reason.includes('auth');
 
       if (busy) {
         this._blocked = true;
@@ -113,6 +119,19 @@ export class WsClient extends EventTarget {
         this._openMs = null;
         this._emitConnection(false);
         this._log('WS: ocupado por otra pagina/cliente; reconexion automatica detenida');
+        return;
+      }
+
+      if (unauth) {
+        const wrongPassword = `${ev?.reason || ''}`.toLowerCase().includes('unauthorized');
+        this._blocked = true;
+        this._wantConnected = false;
+        this._openMs = null;
+        this._emitConnection(false);
+        this._log('WS: autenticacion rechazada; ingresa la contraseña');
+        this.dispatchEvent(new CustomEvent('auth-required', {
+          detail: { reason: wrongPassword ? 'wrong_password' : 'rejected' },
+        }));
         return;
       }
 
@@ -126,10 +145,9 @@ export class WsClient extends EventTarget {
       this._emitConnection(false);
 
       if (this._shortCloseCount >= SHORT_CLOSE_LIMIT) {
-        this._blocked = true;
-        this._wantConnected = false;
-        this._log('WS: cierres rapidos repetidos; reconexion automatica detenida');
-        return;
+        this._reconnectMs = RECONNECT_MAX_MS;
+        this._shortCloseCount = 0;
+        this._log('WS: cierres rapidos repetidos; reintentando en 15 s…');
       }
 
       if (this._wantConnected) this._scheduleReconnect();
@@ -147,6 +165,15 @@ export class WsClient extends EventTarget {
           if (msg?.type === 'busy') {
             this._blocked = true;
             this._wantConnected = false;
+          } else if (msg?.type === 'auth_required') {
+            if (!this.authToken) {
+              this.dispatchEvent(new CustomEvent('auth-required', { detail: { reason: 'prompt' } }));
+            }
+          } else if (msg?.type === 'auth') {
+            if (!msg.ok) {
+              this._log('WS: contraseña incorrecta');
+              this.dispatchEvent(new CustomEvent('auth-required', { detail: { reason: 'wrong_password' } }));
+            }
           }
         } catch (_) {}
         return;
