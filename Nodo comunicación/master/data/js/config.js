@@ -60,7 +60,7 @@ export const GAIN_CODES = [1, 2, 4, 8, 16, 24, 32, 48, 50];
 export const GAIN_NAMES = ['1x', '2x', '4x', '8x', '16x', '24x', '32x', '48x', '50x'];
 
 // VDAC
-export const VDAC_STEP = 0.004;
+export const VDAC_STEP = 0.016;
 export const VDAC_MIN = 0;
 export const VDAC_MAX = 255;
 export const VDAC_FULL_SCALE_V = VDAC_MAX * VDAC_STEP;

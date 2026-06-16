@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-loop-20';
+import * as cfg from './config.js?v=field-loop-21';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -46,7 +46,8 @@ function setDot(d, state, okTip, badTip, unkTip, busyTip) {
  * Events: 'alias-changed' {alias}, 'pga-changed' {code},
  *         'fir-apply' {cmd}, 'fir-remove',
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
- *         'send-all-requested', 'latency-requested', 'offset-changed' {offset}
+ *         'send-all-requested', 'calibrate-requested', 'latency-requested',
+ *         'offset-changed' {offset}
  */
 export class SlavePanel extends EventTarget {
   constructor(chIndex) {
@@ -95,7 +96,10 @@ export class SlavePanel extends EventTarget {
     root.appendChild(row(labeled('PGA', this._ddPga), this._dotPga, this._lblPgaActual));
 
     this._dotCal = dot('Calibracion sin ejecutar');
-    root.appendChild(row(el('span', null, 'Calibracion'), this._dotCal));
+    this._btnCalibrate = el('button', null, 'Calibrar');
+    this._btnCalibrate.title = 'Calibrar PSoC';
+    this._btnCalibrate.addEventListener('click', () => this._dispatch('calibrate-requested'));
+    root.appendChild(row(el('span', null, 'Calibracion'), this._dotCal, this._btnCalibrate));
 
     const firBox = el('div', 'filter-box');
     firBox.appendChild(el('div', 'subhead', 'FIR Filter'));
@@ -228,6 +232,7 @@ export class SlavePanel extends EventTarget {
     this._btnVer.disabled = !connected;
     this._btnLatency.disabled = !connected;
     this._btnSendAll.disabled = !connected;
+    this._btnCalibrate.disabled = !connected;
     if (!connected) {
       this.setPgaLock(0);
       this.setCalibrationLock(0);

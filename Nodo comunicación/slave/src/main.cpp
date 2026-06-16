@@ -368,6 +368,8 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_START_NOW:      return "START_NOW";
         case PSOC_EVT_DEBUG_MODE:     return "DEBUG_MODE";
         case PSOC_EVT_STATUS_REQ:     return "STATUS_REQ";
+        case PSOC_EVT_BUTTON:         return "BUTTON";
+        case PSOC_EVT_BUTTON_IGNORED: return "BUTTON_IGNORED";
         default:                      return "UNKNOWN";
     }
 }
@@ -432,7 +434,7 @@ static void onPsocDiag(const PsocDiagEvent &event)
     }
 
     if (event.event == PSOC_EVT_CAL_START) {
-        calStage = 0xFF;
+        calStage = 0;
         calDac = 0;
         calMeas = 0;
         calMeasHigh = false;
@@ -662,6 +664,16 @@ static void onPsocDiag(const PsocDiagEvent &event)
                          event.value, psocCalStageName(event.value));
         LOGM("CAL_LP_BAD", "stage=%u,name=%s", event.value,
              psocCalStageName(event.value));
+    } else if (event.event == PSOC_EVT_BUTTON) {
+        SLAVE_LOG_PRINTF("[BUTTON] pressed pstate=%u/%s\n",
+                         event.value, psocStateName(event.value));
+        LOGM("BUTTON", "pstate=%u,pstateName=%s",
+             event.value, psocStateName(event.value));
+    } else if (event.event == PSOC_EVT_BUTTON_IGNORED) {
+        SLAVE_LOG_PRINTF("[BUTTON] ignored pstate=%u/%s\n",
+                         event.value, psocStateName(event.value));
+        LOGM("BUTTON_IGNORED", "pstate=%u,pstateName=%s",
+             event.value, psocStateName(event.value));
     }
 
 #if PSOC_DIAG_VERBOSE

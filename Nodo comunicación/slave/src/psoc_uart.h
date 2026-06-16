@@ -98,6 +98,8 @@
 #define PSOC_EVT_START_NOW        0x39
 #define PSOC_EVT_DEBUG_MODE       0x3A
 #define PSOC_EVT_STATUS_REQ       0x3B
+#define PSOC_EVT_BUTTON           0x3C
+#define PSOC_EVT_BUTTON_IGNORED   0x3D
 
 struct PsocSample {
     int16_t  raw_input;

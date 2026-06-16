@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-loop-20';
-import { WsClient } from './ws_client.js?v=field-loop-20';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-20';
-import { DataStore, effectiveFs } from './data_store.js?v=field-loop-20';
-import { PlotArea } from './plot.js?v=field-loop-20';
-import { SpectrumArea } from './spectrum.js?v=field-loop-20';
-import { SlavePanel } from './slave_panel.js?v=field-loop-20';
-import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-20';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-20';
+import * as cfg from './config.js?v=field-loop-21';
+import { WsClient } from './ws_client.js?v=field-loop-21';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-21';
+import { DataStore, effectiveFs } from './data_store.js?v=field-loop-21';
+import { PlotArea } from './plot.js?v=field-loop-21';
+import { SpectrumArea } from './spectrum.js?v=field-loop-21';
+import { SlavePanel } from './slave_panel.js?v=field-loop-21';
+import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-21';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-21';
 
 const $ = (id) => document.getElementById(id);
 
@@ -581,6 +581,16 @@ function onSendAll(chIndex) {
   appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}`);
 }
 
+function onCalibrateRequested(chIndex) {
+  const nd = data.nodes[chIndex];
+  sendDirected(chIndex, cfg.SUBCMD_CALIBRATE, 1);
+  nd.pending.set(cfg.SUBCMD_CALIBRATE, { param: 1, sendTime: performance.now(), retries: 0 });
+  nd.calProgressLogMs = 0;
+  const panel = panelFor(chIndex);
+  if (panel) panel.setCalibrationLock(3, 'solicitada');
+  appendLog(`S${chIndex} calibracion solicitada`);
+}
+
 function onLatencyRequested(chIndex) {
   const nd = data.nodes[chIndex];
   nd.latencyHist = [];
@@ -716,6 +726,7 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('test-requested', () => onTestRequested(chIndex));
   panel.addEventListener('ver-requested', () => onVerRequested(chIndex));
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
+  panel.addEventListener('calibrate-requested', () => onCalibrateRequested(chIndex));
   panel.addEventListener('latency-requested', () => onLatencyRequested(chIndex));
   panel.addEventListener('offset-changed', (ev) => {
     data.nodes[chIndex].hammerOffset = ev.detail;
