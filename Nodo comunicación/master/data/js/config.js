@@ -31,8 +31,8 @@ export const SUBCMD_VDAC = 0xAA;
 export const SUBCMD_DEBUG = 0xA7;
 export const SUBCMD_VER = 0xB2;
 export const SUBCMD_CALIBRATE     = 0xB5;
-export const SUBCMD_SAVE_EEPROM   = 0x71;
-export const SUBCMD_SELECT_STREAM = 0x72;
+export const SUBCMD_SAVE_EEPROM   = 0xB6;   /* mismo código que PSOC_CMD_SAVE_EEPROM */
+export const SUBCMD_SELECT_STREAM = 0xB7;   /* mismo código que PSOC_CMD_SELECT_STREAM */
 export const SUBCMD_BLINK_LED     = 0x70;
 export const SUBCMD_LATENCY       = 0xAF;
 

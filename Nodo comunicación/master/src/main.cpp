@@ -641,18 +641,12 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
         LOGM("DBGPSOC", "node=%d,en=%d", node_id, param);
     } else if (sub_cmd == CMD_BLINK_LED) {
+        /* LED blink: no pasa por PSoC, mensaje propio */
         MsgBlinkLed msg = { CMD_BLINK_LED, node_id };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
         LOGM("BLINK_LED", "node=%d", node_id);
-    } else if (sub_cmd == CMD_SAVE_EEPROM) {
-        MsgSaveEeprom msg = { CMD_SAVE_EEPROM, node_id };
-        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
-        LOGM("SAVE_EEPROM", "node=%d", node_id);
-    } else if (sub_cmd == CMD_SELECT_STREAM) {
-        MsgSelectStream msg = { CMD_SELECT_STREAM, node_id, param };
-        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
-        LOGM("SELECT_STREAM", "node=%d,mode=%d", node_id, param);
     } else {
+        /* SaveEEPROM (0xB6) y SelectStream (0xB7) van por MsgSetConfig igual que calibrate */
         MsgSetConfig msg = { CMD_SET_CONFIG, node_id, sub_cmd, param };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
     }

@@ -1128,6 +1128,12 @@ static void handleSetConfig(const MsgSetConfig *cfg)
         case PSOC_CMD_CALIBRATE:
             waitAck = true;
             break;
+        case PSOC_CMD_SAVE_EEPROM:          /* 0xB6: guardar calibración en EEPROM */
+            waitAck = true;
+            break;
+        case PSOC_CMD_SELECT_STREAM:        /* 0xB7: 0=crudo, 1=FIR hardware */
+            waitAck = true;
+            break;
         default:
             ok = 0;
             break;
@@ -1149,6 +1155,12 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                     break;
                 case PSOC_CMD_CALIBRATE:
                     psoc.calibrate();
+                    break;
+                case PSOC_CMD_SAVE_EEPROM:
+                    psoc.saveEeprom();
+                    break;
+                case PSOC_CMD_SELECT_STREAM:
+                    psoc.selectStream(param);
                     break;
                 default:
                     ok = 0;
@@ -1375,31 +1387,8 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         SLAVE_LOG_PRINTF("[SLAVE] BLINK_LED node=%u\n", NODE_ID);
         LOGM("BLINK_LED", "node=%u", NODE_ID);
     }
-    else if (cmd == CMD_SAVE_EEPROM && len >= (int)sizeof(MsgSaveEeprom)) {
-        const MsgSaveEeprom *msg = (const MsgSaveEeprom *)data;
-        if (msg->node_id != NODE_ID) return;
-        if (!ensurePsocReadyForConfig()) {
-            sendCfgAck(CMD_SAVE_EEPROM, 0);
-            return;
-        }
-        psoc.saveEeprom();
-        waitForPsocConfigAck(PSOC_CMD_SAVE_EEPROM, 1);
-        SLAVE_LOG_PRINTF("[SLAVE] SAVE_EEPROM requested\n");
-        LOGM("SAVE_EEPROM", "node=%u", NODE_ID);
-    }
-    else if (cmd == CMD_SELECT_STREAM && len >= (int)sizeof(MsgSelectStream)) {
-        const MsgSelectStream *msg = (const MsgSelectStream *)data;
-        if (msg->node_id != NODE_ID) return;
-        if (!ensurePsocReadyForConfig()) {
-            sendCfgAck(CMD_SELECT_STREAM, 0);
-            return;
-        }
-        psoc.selectStream(msg->mode);
-        waitForPsocConfigAck(PSOC_CMD_SELECT_STREAM, msg->mode);
-        SLAVE_LOG_PRINTF("[SLAVE] SELECT_STREAM mode=%u\n", msg->mode);
-        LOGM("SELECT_STREAM", "mode=%u,node=%u", msg->mode, NODE_ID);
-    }
 }
+/* SaveEEPROM (0xB6) y SelectStream (0xB7) llegan por CMD_SET_CONFIG → handleSetConfig */
 
 /* ── Store-and-forward helpers ───────────────────────────────────────────── */
 
