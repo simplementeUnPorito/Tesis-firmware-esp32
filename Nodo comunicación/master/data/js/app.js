@@ -623,6 +623,23 @@ function onCalibrateRequested(chIndex) {
   appendLog(`S${chIndex} calibracion solicitada`);
 }
 
+function onBlinkLedRequested(chIndex) {
+  sendDirected(chIndex, cfg.SUBCMD_BLINK_LED, 0);
+  appendLog(`S${chIndex} titular LED`);
+}
+
+function onSaveEepromRequested(chIndex) {
+  sendDirected(chIndex, cfg.SUBCMD_SAVE_EEPROM, 0);
+  const panel = panelFor(chIndex);
+  if (panel) panel.setEepromLock(0);
+  appendLog(`S${chIndex} guardar EEPROM solicitado`);
+}
+
+function onFirHwToggled(chIndex, mode) {
+  sendDirected(chIndex, cfg.SUBCMD_SELECT_STREAM, mode);
+  appendLog(`S${chIndex} stream: ${mode ? 'FIR hardware' : 'ADC crudo'}`);
+}
+
 function onLatencyRequested(chIndex) {
   const nd = data.nodes[chIndex];
   nd.latencyHist = [];
@@ -760,6 +777,9 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
   panel.addEventListener('calibrate-requested', () => onCalibrateRequested(chIndex));
   panel.addEventListener('latency-requested', () => onLatencyRequested(chIndex));
+  panel.addEventListener('blink-led-requested', () => onBlinkLedRequested(chIndex));
+  panel.addEventListener('save-eeprom-requested', () => onSaveEepromRequested(chIndex));
+  panel.addEventListener('fir-hw-toggled', (ev) => onFirHwToggled(chIndex, ev.detail.mode));
   panel.addEventListener('offset-changed', (ev) => {
     data.nodes[chIndex].hammerOffset = ev.detail;
     saveSlaveSetting(chIndex, 'hammer_offset_m', ev.detail);
@@ -833,6 +853,23 @@ function handleAck(pkt, idx) {
     const panel = panelFor(idx);
     if (panel) panel.setCalibrationLock(ackVal ? 1 : 2);
     appendLog(`S${idx} calibracion ${ackVal ? 'confirmada' : 'fallida'}`);
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_SAVE_EEPROM && idx >= 1 && idx < cfg.MAX_NODES) {
+    const panel = panelFor(idx);
+    if (panel) panel.setEepromLock(ackVal ? 1 : 2);
+    appendLog(`S${idx} EEPROM ${ackVal ? 'guardada OK' : 'error al guardar'}`);
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_BLINK_LED && idx >= 1 && idx < cfg.MAX_NODES) {
+    appendLog(`S${idx} LED titilando`);
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_SELECT_STREAM && idx >= 1 && idx < cfg.MAX_NODES) {
+    appendLog(`S${idx} stream: ${ackVal ? 'FIR hardware' : 'ADC crudo'}`);
     return;
   }
 

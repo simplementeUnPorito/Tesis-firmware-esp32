@@ -26,6 +26,9 @@
 #define CMD_PRESTART    0x61  /* master → todos: entrar en HOT_WAIT con n_batches listo */
 #define CMD_HOTWAIT_QUERY 0x62 /* master → esclavo: consultar si está en HOT_WAIT */
 #define CMD_HOTWAIT_ACK 0x63  /* esclavo → master: confirma HOT_WAIT */
+#define CMD_BLINK_LED   0x70  /* master → esclavo unicast: titilar LED para identificación */
+#define CMD_SAVE_EEPROM 0x71  /* master → esclavo unicast: guardar config PSoC en EEPROM */
+#define CMD_SELECT_STREAM 0x72 /* master → esclavo unicast: 0=crudo, 1=FIR hardware */
 
 #pragma pack(push, 1)
 
@@ -145,6 +148,22 @@ struct MsgHotWaitAck {
     uint8_t  ok;        /* 1=HOT_WAIT listo, 0=no listo */
     uint8_t  state;
     uint16_t n_batches;
+};
+
+struct MsgBlinkLed {
+    uint8_t cmd;      /* CMD_BLINK_LED */
+    uint8_t node_id;
+};
+
+struct MsgSaveEeprom {
+    uint8_t cmd;      /* CMD_SAVE_EEPROM */
+    uint8_t node_id;
+};
+
+struct MsgSelectStream {
+    uint8_t cmd;      /* CMD_SELECT_STREAM */
+    uint8_t node_id;
+    uint8_t mode;     /* 0=crudo ADC, 1=filtrado FIR hardware */
 };
 
 #pragma pack(pop)

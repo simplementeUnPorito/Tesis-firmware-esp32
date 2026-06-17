@@ -165,6 +165,32 @@ export class SlavePanel extends EventTarget {
     this._btnSendAll.addEventListener('click', () => this._dispatch('send-all-requested'));
     root.appendChild(row(this._btnSendAll));
 
+    /* ── Controles hardware FIR / EEPROM / identificación ──────────────────── */
+    const hwBox = el('div', 'filter-box');
+    hwBox.appendChild(el('div', 'subhead', 'Hardware PSoC'));
+
+    this._cbFirHw = el('input');
+    this._cbFirHw.type = 'checkbox';
+    this._cbFirHw.title = 'Enviar señal filtrada por el FIR hardware del PSoC en vez del ADC crudo';
+    this._cbFirHw.addEventListener('change', () => {
+      this._dispatch('fir-hw-toggled', { mode: this._cbFirHw.checked ? 1 : 0 });
+    });
+    this._lblFirHw = el('span', null, 'FIR hardware');
+    hwBox.appendChild(row(labeled('', this._cbFirHw), this._lblFirHw));
+
+    this._btnSaveEeprom = el('button', null, 'Guardar EEPROM');
+    this._btnSaveEeprom.title = 'Guarda los valores VDAC de calibración actuales en la EEPROM del PSoC';
+    this._btnSaveEeprom.addEventListener('click', () => this._dispatch('save-eeprom-requested'));
+    this._dotEeprom = dot('EEPROM sin guardar');
+
+    this._btnBlinkLed = el('button', null, 'Titular LED');
+    this._btnBlinkLed.title = 'Hace titilar el LED del ESP esclavo para identificarlo físicamente';
+    this._btnBlinkLed.addEventListener('click', () => this._dispatch('blink-led-requested'));
+
+    hwBox.appendChild(row(this._btnSaveEeprom, this._dotEeprom));
+    hwBox.appendChild(row(this._btnBlinkLed));
+    root.appendChild(hwBox);
+
     const stats = el('div', 'slave-stats');
     this._lblStats = el('div', 'stat-line', 'Batches: 0  Samples: 0');
     this._lblLastVal = el('div', 'stat-line', 'Last: --');
@@ -233,10 +259,18 @@ export class SlavePanel extends EventTarget {
     this._btnLatency.disabled = !connected;
     this._btnSendAll.disabled = !connected;
     this._btnCalibrate.disabled = !connected;
+    this._btnSaveEeprom.disabled = !connected;
+    this._btnBlinkLed.disabled = !connected;
+    this._cbFirHw.disabled = !connected;
     if (!connected) {
       this.setPgaLock(0);
       this.setCalibrationLock(0);
     }
+  }
+
+  /** state: 0=unknown, 1=ok (guardado), 2=fail. */
+  setEepromLock(state) {
+    setDot(this._dotEeprom, state, 'EEPROM guardada', 'Error al guardar EEPROM', 'EEPROM sin guardar');
   }
 
   setFirPreset(type, f1, f2, taps) {

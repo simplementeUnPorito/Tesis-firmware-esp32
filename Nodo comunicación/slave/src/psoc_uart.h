@@ -49,7 +49,9 @@
 #define PSOC_CMD_PRESTART  0xB1
 #define PSOC_CMD_DEBUG     0xB3
 #define PSOC_CMD_START_NOW 0xB4
-#define PSOC_CMD_CALIBRATE 0xB5
+#define PSOC_CMD_CALIBRATE    0xB5
+#define PSOC_CMD_SAVE_EEPROM  0xB6
+#define PSOC_CMD_SELECT_STREAM 0xB7
 
 /* Control PSoC -> ESP */
 #define PSOC_CTRL_PING      0xC0
@@ -141,6 +143,8 @@ public:
     void setPga(uint8_t code);
     void setPgavdac(uint8_t code);
     void calibrate();
+    void saveEeprom();
+    void selectStream(uint8_t mode);
     void debugRamp(bool en);
     void requestStatus();
     void sendPong();

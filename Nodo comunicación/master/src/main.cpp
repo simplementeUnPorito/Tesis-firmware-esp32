@@ -637,10 +637,21 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
         g_captureDumpDueMs = 0;      /* el dump arranca solo con VIEW_DONE del esclavo */
         LOGM("VIEW", "node=%d,n=%u,store=1,wait_done=1", node_id, msg.n);
     } else if (sub_cmd == 0xB3) {
-        /* Debug PSoC: rampa on/off en el PSoC del nodo. */
         MsgDebugPsoc msg = { CMD_DEBUG_PSOC, node_id, param };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
         LOGM("DBGPSOC", "node=%d,en=%d", node_id, param);
+    } else if (sub_cmd == CMD_BLINK_LED) {
+        MsgBlinkLed msg = { CMD_BLINK_LED, node_id };
+        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        LOGM("BLINK_LED", "node=%d", node_id);
+    } else if (sub_cmd == CMD_SAVE_EEPROM) {
+        MsgSaveEeprom msg = { CMD_SAVE_EEPROM, node_id };
+        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        LOGM("SAVE_EEPROM", "node=%d", node_id);
+    } else if (sub_cmd == CMD_SELECT_STREAM) {
+        MsgSelectStream msg = { CMD_SELECT_STREAM, node_id, param };
+        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        LOGM("SELECT_STREAM", "node=%d,mode=%d", node_id, param);
     } else {
         MsgSetConfig msg = { CMD_SET_CONFIG, node_id, sub_cmd, param };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));

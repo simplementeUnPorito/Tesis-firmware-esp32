@@ -154,6 +154,15 @@ static          uint32_t   g_cal_progress_ack_ms = 0; /* ultimo "calibrando..." 
 static          bool       g_auto_cal_requested = false;
 static          uint32_t   g_auto_cal_due_ms = 0;
 
+/* ── LED blink para identificación (CMD_BLINK_LED) ──────────────────────── */
+#ifndef BLINK_LED_PIN
+  #define BLINK_LED_PIN LED_BUILTIN
+#endif
+#define BLINK_TIMES       10u     /* flashes totales (on+off = 1 flash) */
+#define BLINK_INTERVAL_MS 150u
+static uint8_t   g_blink_count    = 0;
+static uint32_t  g_blink_last_ms  = 0;
+
 /* ── Store-and-forward ───────────────────────────────────────────────────── */
 static uint16_t    g_rec_n_batches = 0;          /* 0 = modo streaming clásico */
 static SampleBytes *g_store_buf    = nullptr;    /* n_batches × 30 SampleBytes */
@@ -1357,6 +1366,39 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     else if (cmd == CMD_REQ_BATCH && len >= (int)sizeof(MsgReqBatch)) {
         handleReqBatch((const MsgReqBatch *)data);
     }
+    else if (cmd == CMD_BLINK_LED && len >= (int)sizeof(MsgBlinkLed)) {
+        const MsgBlinkLed *msg = (const MsgBlinkLed *)data;
+        if (msg->node_id != NODE_ID) return;
+        g_blink_count   = BLINK_TIMES * 2u;  /* flashes × (on + off) */
+        g_blink_last_ms = millis();
+        sendCfgAck(CMD_BLINK_LED, 1);
+        SLAVE_LOG_PRINTF("[SLAVE] BLINK_LED node=%u\n", NODE_ID);
+        LOGM("BLINK_LED", "node=%u", NODE_ID);
+    }
+    else if (cmd == CMD_SAVE_EEPROM && len >= (int)sizeof(MsgSaveEeprom)) {
+        const MsgSaveEeprom *msg = (const MsgSaveEeprom *)data;
+        if (msg->node_id != NODE_ID) return;
+        if (!ensurePsocReadyForConfig()) {
+            sendCfgAck(CMD_SAVE_EEPROM, 0);
+            return;
+        }
+        psoc.saveEeprom();
+        waitForPsocConfigAck(PSOC_CMD_SAVE_EEPROM, 1);
+        SLAVE_LOG_PRINTF("[SLAVE] SAVE_EEPROM requested\n");
+        LOGM("SAVE_EEPROM", "node=%u", NODE_ID);
+    }
+    else if (cmd == CMD_SELECT_STREAM && len >= (int)sizeof(MsgSelectStream)) {
+        const MsgSelectStream *msg = (const MsgSelectStream *)data;
+        if (msg->node_id != NODE_ID) return;
+        if (!ensurePsocReadyForConfig()) {
+            sendCfgAck(CMD_SELECT_STREAM, 0);
+            return;
+        }
+        psoc.selectStream(msg->mode);
+        waitForPsocConfigAck(PSOC_CMD_SELECT_STREAM, msg->mode);
+        SLAVE_LOG_PRINTF("[SLAVE] SELECT_STREAM mode=%u\n", msg->mode);
+        LOGM("SELECT_STREAM", "mode=%u,node=%u", msg->mode, NODE_ID);
+    }
 }
 
 /* ── Store-and-forward helpers ───────────────────────────────────────────── */
@@ -1511,6 +1553,10 @@ void setup()
     }
     esp_now_register_recv_cb(onDataRecv);
 
+    /* LED de identificación */
+    pinMode(BLINK_LED_PIN, OUTPUT);
+    digitalWrite(BLINK_LED_PIN, HIGH);   /* LED off (activo-bajo) */
+
     /* GPIO hardware sync — pull-down para evitar ISR espurias cuando no hay cable */
     pinMode(SYNC_IN_PIN,      INPUT_PULLDOWN);
     pinMode(SYNC_TO_PSOC_PIN, OUTPUT);
@@ -1575,6 +1621,16 @@ void loop()
     servicePsocConfigAck();
     serviceUsbCommands();
     serviceAutoCalibration();
+
+    /* LED blink para identificación: g_blink_count > 0 → toggle cada BLINK_INTERVAL_MS */
+    if (g_blink_count > 0 && (millis() - g_blink_last_ms) >= BLINK_INTERVAL_MS) {
+        g_blink_last_ms = millis();
+        digitalWrite(BLINK_LED_PIN, g_blink_count % 2u == 0 ? HIGH : LOW);
+        g_blink_count--;
+        if (g_blink_count == 0) {
+            digitalWrite(BLINK_LED_PIN, HIGH);  /* LED off (activo-bajo en la mayoría) */
+        }
+    }
 
     /* Mientras se llena el store (Ver/Test con n_batches>0), imprimir UART cada 1 s.
      * Esto separa cable/pin (uartBytes=0) de protocolo/baud (bytes sin frames)
