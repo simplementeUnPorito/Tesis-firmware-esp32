@@ -156,7 +156,11 @@ static          uint32_t   g_auto_cal_due_ms = 0;
 
 /* ── LED blink para identificación (CMD_BLINK_LED) ──────────────────────── */
 #ifndef BLINK_LED_PIN
-  #define BLINK_LED_PIN LED_BUILTIN
+  #ifdef LED_BUILTIN
+    #define BLINK_LED_PIN LED_BUILTIN
+  #else
+    #define BLINK_LED_PIN 2
+  #endif
 #endif
 #define BLINK_TIMES       10u     /* flashes totales (on+off = 1 flash) */
 #define BLINK_INTERVAL_MS 150u
@@ -379,6 +383,7 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_STATUS_REQ:     return "STATUS_REQ";
         case PSOC_EVT_BUTTON:         return "BUTTON";
         case PSOC_EVT_BUTTON_IGNORED: return "BUTTON_IGNORED";
+        case PSOC_EVT_CAPTURE_CLAMPED:return "CAPTURE_CLAMPED";
         default:                      return "UNKNOWN";
     }
 }
@@ -683,6 +688,11 @@ static void onPsocDiag(const PsocDiagEvent &event)
                          event.value, psocStateName(event.value));
         LOGM("BUTTON_IGNORED", "pstate=%u,pstateName=%s",
              event.value, psocStateName(event.value));
+    } else if (event.event == PSOC_EVT_CAPTURE_CLAMPED) {
+        SLAVE_LOG_PRINTF("[CAPTURE] clamped requested_sat=%u max=%u\n",
+                         event.value, PSOC_CAPTURE_MAX_BATCHES);
+        LOGM("CAPTURE_CLAMPED", "requested_sat=%u,max=%u",
+             event.value, PSOC_CAPTURE_MAX_BATCHES);
     }
 
 #if PSOC_DIAG_VERBOSE

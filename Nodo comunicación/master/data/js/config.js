@@ -22,11 +22,9 @@ export const CMD_STOP = 0xA4;
 export const CMD_STATUS = 0xA5;
 export const CMD_DEBUG = 0xA7;
 export const CMD_SET_RECLEN = 0xAE;
-export const CMD_SCOPE_MULTI = 0xB0;
 
 // Sub-commands (directed to slave)
 export const SUBCMD_PGA = 0xA6;
-export const SUBCMD_PGAVDAC = 0xA9;
 export const SUBCMD_VDAC = 0xAA;
 export const SUBCMD_DEBUG = 0xA7;
 export const SUBCMD_VER = 0xB2;

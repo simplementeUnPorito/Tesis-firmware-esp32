@@ -236,6 +236,14 @@ button:active { background: var(--input-active); }
   font-size: 0.78rem;
 }
 
+.stat-line {
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .filter-box {
   border-top: 1px solid var(--filter-border);
   padding-top: 0.55rem;
@@ -382,7 +390,7 @@ button:active { background: var(--input-active); }
   }
 
   .plot-wrap {
-    height: 12rem;
+    height: clamp(14rem, 42vh, 24rem);
   }
 }
 

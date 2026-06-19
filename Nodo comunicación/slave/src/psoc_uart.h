@@ -102,6 +102,7 @@
 #define PSOC_EVT_STATUS_REQ       0x3B
 #define PSOC_EVT_BUTTON           0x3C
 #define PSOC_EVT_BUTTON_IGNORED   0x3D
+#define PSOC_EVT_CAPTURE_CLAMPED  0x3E
 
 struct PsocSample {
     int16_t  raw_input;

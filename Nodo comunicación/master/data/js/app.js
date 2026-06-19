@@ -159,6 +159,18 @@ function batchesForSeconds(seconds) {
   return clamp(Math.max(1, batches), 1, cfg.PSOC_CAPTURE_MAX_BATCHES);
 }
 
+function captureLimitInfo(seconds) {
+  const fs = currentFsHz();
+  if (!fs) return { n: 0, actualSecs: 0, capped: false };
+  const requested = Math.max(1, Math.ceil((seconds * fs) / cfg.SAMPLES_PER_BATCH));
+  const n = clamp(requested, 1, cfg.PSOC_CAPTURE_MAX_BATCHES);
+  return {
+    n,
+    actualSecs: secondsForBatches(n),
+    capped: requested > n,
+  };
+}
+
 function captureBatches() {
   return batchesForSeconds(captureSeconds());
 }
@@ -177,10 +189,9 @@ function updateCapturePreview() {
     return;
   }
   const secs = captureSeconds();
-  const n = batchesForSeconds(secs);
-  const actualSecs = secondsForBatches(n);
-  const capped = secs > actualSecs + 0.01 ? ' max' : '';
-  el.textContent = `${n} lotes / real ${actualSecs.toFixed(2)} s${capped}`;
+  const info = captureLimitInfo(secs);
+  const capped = info.capped ? ` (max; pedido ${secs.toFixed(2)} s)` : '';
+  el.textContent = `${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}`;
 }
 
 function updateGlobalFsDisplay() {
@@ -1091,13 +1102,15 @@ $('btn-start').addEventListener('click', () => {
     appendLog('START cancelado: esperando Fs real del esclavo (HELLO no recibido aun)');
     return;
   }
-  const n = captureBatches();
-  const secs = secondsForBatches(n);
+  const requestedSecs = captureSeconds();
+  const info = captureLimitInfo(requestedSecs);
+  const n = info.n;
   data.clearAll();
   plotArea.clearAll();
   spectrumArea.clearAll();
   sendStd16(cfg.CMD_START, n);
-  appendLog(`START: ${n} lotes (~${secs.toFixed(2)} s real)`);
+  const capped = info.capped ? `, max; pedido ${requestedSecs.toFixed(2)} s` : '';
+  appendLog(`START: ${n} lotes (~${info.actualSecs.toFixed(2)} s real${capped})`);
 });
 
 $('btn-stop').addEventListener('click', () => {

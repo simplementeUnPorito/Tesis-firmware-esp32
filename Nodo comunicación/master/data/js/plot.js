@@ -82,10 +82,14 @@ class ChannelPlot {
     this._dragLastX = null;
     this._cursorMode = null;
     this._cursorSamps = [null, null];
+    this._activePointers = new Map();
+    this._pinching = false;
+    this._pinchLastDist = null;
 
     this.wrap = document.createElement('div');
     this.wrap.className = 'plot-wrap';
     this.canvas = document.createElement('canvas');
+    this.canvas.style.touchAction = 'none';
     this.wrap.appendChild(this.canvas);
     container.appendChild(this.wrap);
 
@@ -158,6 +162,20 @@ class ChannelPlot {
   }
 
   _wirePointerControls() {
+    const pointerPair = () => Array.from(this._activePointers.values()).slice(0, 2);
+    const pointerDistance = () => {
+      const pts = pointerPair();
+      if (pts.length < 2) return 0;
+      return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    };
+    const pointerCenterFrac = () => {
+      const pts = pointerPair();
+      const rect = this.canvas.getBoundingClientRect();
+      if (pts.length < 2) return 0.5;
+      const centerX = (pts[0].x + pts[1].x) / 2;
+      return clamp((centerX - rect.left) / Math.max(1, rect.width), 0, 1);
+    };
+
     this.canvas.addEventListener('wheel', (ev) => {
       if (!this._handlers.onZoom) return;
       ev.preventDefault();
@@ -175,14 +193,37 @@ class ChannelPlot {
     // double-click and fight each other.
     const CLICK_SLOP = 4;
     this.canvas.addEventListener('pointerdown', (ev) => {
+      this._activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      this.canvas.setPointerCapture(ev.pointerId);
+      if (this._activePointers.size >= 2) {
+        this._pinching = true;
+        this._pinchLastDist = pointerDistance();
+        this._dragLastX = null;
+        ev.preventDefault();
+        return;
+      }
       this._dragLastX = ev.clientX;
       this._downX = ev.clientX;
       this._downY = ev.clientY;
       this._downButton = ev.button;
       this._dragMoved = false;
-      this.canvas.setPointerCapture(ev.pointerId);
     });
     this.canvas.addEventListener('pointermove', (ev) => {
+      if (this._activePointers.has(ev.pointerId)) {
+        this._activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      }
+      if (this._activePointers.size >= 2) {
+        const dist = pointerDistance();
+        if (this._handlers.onZoom && this._pinchLastDist > 0 && dist > 0) {
+          const factor = dist / this._pinchLastDist;
+          if (Math.abs(factor - 1) > 0.005) {
+            this._handlers.onZoom(factor, pointerCenterFrac());
+          }
+        }
+        this._pinchLastDist = dist;
+        ev.preventDefault();
+        return;
+      }
       if (this._dragLastX === null) return;
       if (!this._dragMoved
           && (Math.abs(ev.clientX - this._downX) > CLICK_SLOP
@@ -195,7 +236,20 @@ class ChannelPlot {
       const rect = this.canvas.getBoundingClientRect();
       this._handlers.onPan(-dx / Math.max(1, rect.width));
     });
-    const endDrag = (ev) => {
+    const endPointer = (ev) => {
+      const wasPinching = this._pinching;
+      this._activePointers.delete(ev.pointerId);
+      if (this.canvas.hasPointerCapture(ev.pointerId)) {
+        this.canvas.releasePointerCapture(ev.pointerId);
+      }
+      if (wasPinching) {
+        if (this._activePointers.size < 2) {
+          this._pinching = false;
+          this._pinchLastDist = null;
+          this._dragLastX = null;
+        }
+        return;
+      }
       if (this._dragLastX !== null && !this._dragMoved) {
         const rect = this.canvas.getBoundingClientRect();
         const frac = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
@@ -208,8 +262,8 @@ class ChannelPlot {
       }
       this._dragLastX = null;
     };
-    this.canvas.addEventListener('pointerup', endDrag);
-    this.canvas.addEventListener('pointercancel', () => { this._dragLastX = null; });
+    this.canvas.addEventListener('pointerup', endPointer);
+    this.canvas.addEventListener('pointercancel', endPointer);
     // Right-click drives zoom-out (above) instead of opening a context menu.
     this.canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
   }
