@@ -52,6 +52,7 @@
 #define PSOC_CMD_CALIBRATE    0xB5
 #define PSOC_CMD_SAVE_EEPROM  0xB6
 #define PSOC_CMD_SELECT_STREAM 0xB7
+#define PSOC_CMD_ADC_SNAPSHOT 0xB8
 
 /* Control PSoC -> ESP */
 #define PSOC_CTRL_PING      0xC0
@@ -88,6 +89,12 @@
 #define PSOC_EVT_CAL_REALCHECK_MEAS32 0x27
 #define PSOC_EVT_CAL_REALCHECK_NUDGE 0x28
 #define PSOC_EVT_CAL_REALCHECK_OK    0x29
+#define PSOC_EVT_CAL_STAGE_TARGET32 0x2A
+#define PSOC_EVT_CAL_SWEEP_DAC      0x2B
+#define PSOC_EVT_CAL_SWEEP_MEAS32   0x2C
+#define PSOC_EVT_ADC_SNAPSHOT_BEGIN 0x2D
+#define PSOC_EVT_ADC_RAW32          0x2E
+#define PSOC_EVT_ADC_FILT32         0x2F
 #define PSOC_EVT_RX_CMD           0x30
 #define PSOC_EVT_SETN             0x31
 #define PSOC_EVT_ARMED            0x32
@@ -146,6 +153,7 @@ public:
     void calibrate();
     void saveEeprom();
     void selectStream(uint8_t mode);
+    void adcSnapshot();
     void debugRamp(bool en);
     void requestStatus();
     void sendPong();

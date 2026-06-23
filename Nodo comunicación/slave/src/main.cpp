@@ -179,6 +179,7 @@ static volatile bool     g_view_store_active = false;
 
 #define PSOC_CFG_ACK_TIMEOUT_MS 750u
 #define PSOC_CAL_ACK_TIMEOUT_MS 450000u
+#define PSOC_ADC_SNAPSHOT_ACK_TIMEOUT_MS 5000u
 #define PSOC_CAL_PROGRESS_ACK_PERIOD_MS 3000u /* "sigue calibrando" (ok=2) hacia el maestro */
 #define PSOC_CFG_READY_STALE_MS 5000u
 #ifndef PSOC_VIEW_START_FALLBACK_EXTRA_MS
@@ -369,6 +370,12 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_CAL_REALCHECK_MEAS32: return "CAL_REALCHECK_MEAS32";
         case PSOC_EVT_CAL_REALCHECK_NUDGE: return "CAL_REALCHECK_NUDGE";
         case PSOC_EVT_CAL_REALCHECK_OK: return "CAL_REALCHECK_OK";
+        case PSOC_EVT_CAL_STAGE_TARGET32: return "CAL_STAGE_TARGET32";
+        case PSOC_EVT_CAL_SWEEP_DAC: return "CAL_SWEEP_DAC";
+        case PSOC_EVT_CAL_SWEEP_MEAS32: return "CAL_SWEEP_MEAS32";
+        case PSOC_EVT_ADC_SNAPSHOT_BEGIN: return "ADC_SNAPSHOT_BEGIN";
+        case PSOC_EVT_ADC_RAW32: return "ADC_RAW32";
+        case PSOC_EVT_ADC_FILT32: return "ADC_FILT32";
         case PSOC_EVT_RX_CMD:         return "RX_CMD";
         case PSOC_EVT_SETN:           return "SETN";
         case PSOC_EVT_ARMED:          return "ARMED";
@@ -399,20 +406,53 @@ static const char *psocStateName(uint8_t state)
     }
 }
 
+static uint8_t g_psoc_hw_class = 0xFFu;
+
+static const char *psocHwName(uint8_t hwClass)
+{
+    switch (hwClass) {
+        case 0:  return "GEO";
+        case 1:  return "HAMMER";
+        default: return "UNKNOWN";
+    }
+}
+
 static const char *psocCalStageName(uint8_t stage)
 {
-    switch (stage) {
-        case 0:  return "GEO_PGA";
-        case 1:  return "GEO_BP";
-        case 2:  return "GEO_ADDER";
-        case 3:  return "GEO_LP";
-        default: return "UNKNOWN";
+    if (g_psoc_hw_class == 1u) {
+        switch (stage) {
+            case 0:  return "HAMMER_PGA";
+            case 1:  return "HAMMER_LP";
+            default: return "UNKNOWN";
+        }
+    } else {
+        switch (stage) {
+            case 0:  return "GEO_PGA";
+            case 1:  return "GEO_BP";
+            case 2:  return "GEO_ADDER";
+            case 3:  return "GEO_LP";
+            default: return "UNKNOWN";
+        }
     }
 }
 
 static uint32_t absCounts32(int32_t value)
 {
     return (value < 0) ? (uint32_t)(-value) : (uint32_t)value;
+}
+
+static int32_t psocCalCompareCounts(int32_t raw)
+{
+    return (g_psoc_hw_class == 1u) ? (int32_t)absCounts32(raw) : raw;
+}
+
+static int32_t adcCountsToMv(int32_t counts)
+{
+    const int64_t scaled = (int64_t)counts * 1000LL;
+    if (scaled >= 0) {
+        return (int32_t)((scaled + 26214LL) / 52429LL);
+    }
+    return (int32_t)((scaled - 26214LL) / 52429LL);
 }
 
 static void onPsocDiag(const PsocDiagEvent &event)
@@ -424,6 +464,14 @@ static void onPsocDiag(const PsocDiagEvent &event)
     static uint32_t calMeasRaw = 0;
     static int32_t calMeasRawSigned = 0;
     static uint8_t calMeasRawByte = 0;
+    static uint32_t calTargetRaw = 0;
+    static int32_t calTargetSigned = 0;
+    static uint8_t calTargetRawByte = 0;
+    static bool calTargetValid = false;
+    static uint32_t calSweepRaw = 0;
+    static uint8_t calSweepRawByte = 0;
+    static uint32_t adcSnapshotRaw = 0;
+    static uint8_t adcSnapshotRawByte = 0;
     static uint16_t calPointIndex = 0;
     g_psocConnected = true;
 
@@ -447,6 +495,16 @@ static void onPsocDiag(const PsocDiagEvent &event)
              (unsigned long)psoc.bytesRx());
     }
 
+    if (event.event == PSOC_EVT_BOOT) {
+        g_psoc_hw_class = event.value;
+        SLAVE_LOG_PRINTF("[PSoC] boot hw=%u/%s pstate=%u/%s\n",
+                         event.value, psocHwName(event.value),
+                         event.psoc_state, psocStateName(event.psoc_state));
+        LOGM("PSOC_BOOT", "hw=%u,hwName=%s,pstate=%u,pstateName=%s",
+             event.value, psocHwName(event.value),
+             event.psoc_state, psocStateName(event.psoc_state));
+    }
+
     if (event.event == PSOC_EVT_CAL_START) {
         calStage = 0;
         calDac = 0;
@@ -455,6 +513,12 @@ static void onPsocDiag(const PsocDiagEvent &event)
         calMeasRaw = 0;
         calMeasRawSigned = 0;
         calMeasRawByte = 0;
+        calTargetRaw = 0;
+        calTargetSigned = 0;
+        calTargetRawByte = 0;
+        calTargetValid = false;
+        adcSnapshotRaw = 0;
+        adcSnapshotRawByte = 0;
         calPointIndex = 0;
         g_cal_progress_ack_ms = millis();
         sendCfgAck(PSOC_CMD_CALIBRATE, 2);
@@ -477,6 +541,12 @@ static void onPsocDiag(const PsocDiagEvent &event)
         calMeasRaw = 0;
         calMeasRawSigned = 0;
         calMeasRawByte = 0;
+        calTargetRaw = 0;
+        calTargetSigned = 0;
+        calTargetRawByte = 0;
+        calTargetValid = false;
+        adcSnapshotRaw = 0;
+        adcSnapshotRawByte = 0;
         calPointIndex = 0;
         g_cal_progress_ack_ms = millis();
         sendCfgAck(PSOC_CMD_CALIBRATE, (uint8_t)(3u + (event.value & 0x03u)));
@@ -529,6 +599,104 @@ static void onPsocDiag(const PsocDiagEvent &event)
              psocCalStageName(event.value));
     } else if (event.event == PSOC_EVT_CAL_STAGE_DAC) {
         calDac = event.value;
+    } else if (event.event == PSOC_EVT_CAL_SWEEP_DAC) {
+        calDac = event.value;
+        calSweepRaw = 0;
+        calSweepRawByte = 0;
+    } else if (event.event == PSOC_EVT_ADC_SNAPSHOT_BEGIN) {
+        calStage = event.value;
+        calDac = 0;
+        calMeasRaw = 0;
+        calMeasRawByte = 0;
+        calTargetRaw = 0;
+        calTargetRawByte = 0;
+        calTargetValid = false;
+        calSweepRaw = 0;
+        calSweepRawByte = 0;
+        adcSnapshotRaw = 0;
+        adcSnapshotRawByte = 0;
+        calPointIndex = 0;
+        SLAVE_LOG_PRINTF("[ADC] snapshot begin stage=%u/%s\n",
+                         calStage, psocCalStageName(calStage));
+        LOGM("ADC_SNAPSHOT_BEGIN", "stage=%u,name=%s",
+             calStage, psocCalStageName(calStage));
+    } else if (event.event == PSOC_EVT_CAL_STAGE_TARGET32) {
+        calTargetRaw = (calTargetRaw << 8) | event.value;
+        calTargetRawByte++;
+        if (calTargetRawByte >= 4) {
+            calTargetRawByte = 0;
+            calTargetSigned = (int32_t)calTargetRaw;
+            calTargetRaw = 0;
+            calTargetValid = true;
+            SLAVE_LOG_PRINTF("[CAL] target stage=%u/%s counts=%ld mV=%ld\n",
+                             calStage, psocCalStageName(calStage),
+                             (long)calTargetSigned,
+                             (long)adcCountsToMv(calTargetSigned));
+            LOGM("CAL_TARGET", "stage=%u,name=%s,target=%ld,target_mV=%ld",
+                 calStage, psocCalStageName(calStage),
+                 (long)calTargetSigned, (long)adcCountsToMv(calTargetSigned));
+        }
+    } else if (event.event == PSOC_EVT_CAL_SWEEP_MEAS32) {
+        calSweepRaw = (calSweepRaw << 8) | event.value;
+        calSweepRawByte++;
+        if (calSweepRawByte >= 4) {
+            int32_t sweepSigned;
+            uint32_t absRaw;
+            int32_t cmpRaw;
+            int32_t errRaw;
+            calSweepRawByte = 0;
+            sweepSigned = (int32_t)calSweepRaw;
+            calSweepRaw = 0;
+            absRaw = absCounts32(sweepSigned);
+            cmpRaw = psocCalCompareCounts(sweepSigned);
+            errRaw = calTargetValid ? (calTargetSigned - cmpRaw) : 0;
+            SLAVE_LOG_PRINTF("[CAL] sweep stage=%u/%s dac=%u raw=%ld raw_mV=%ld abs=%lu cmp=%ld cmp_mV=%ld target=%ld target_mV=%ld err=%ld err_mV=%ld\n",
+                             calStage, psocCalStageName(calStage), calDac,
+                             (long)sweepSigned, (long)adcCountsToMv(sweepSigned),
+                             (unsigned long)absRaw,
+                             (long)cmpRaw, (long)adcCountsToMv(cmpRaw),
+                             calTargetValid ? (long)calTargetSigned : 0L,
+                             calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
+                             (long)errRaw, (long)adcCountsToMv(errRaw));
+            LOGM("CAL_SWEEP", "stage=%u,name=%s,dac=%u,measRaw=%ld,raw_mV=%ld,abs=%lu,cmp=%ld,cmp_mV=%ld,target=%ld,target_mV=%ld,err=%ld,err_mV=%ld",
+                 calStage, psocCalStageName(calStage), calDac,
+                 (long)sweepSigned, (long)adcCountsToMv(sweepSigned),
+                 (unsigned long)absRaw, (long)cmpRaw, (long)adcCountsToMv(cmpRaw),
+                 calTargetValid ? (long)calTargetSigned : 0L,
+                 calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
+                 (long)errRaw, (long)adcCountsToMv(errRaw));
+        }
+    } else if (event.event == PSOC_EVT_ADC_RAW32) {
+        adcSnapshotRaw = (adcSnapshotRaw << 8) | event.value;
+        adcSnapshotRawByte++;
+        if (adcSnapshotRawByte >= 4) {
+            int32_t adcSigned;
+            uint32_t absRaw;
+            int32_t cmpRaw;
+            int32_t errRaw;
+            adcSnapshotRawByte = 0;
+            adcSigned = (int32_t)adcSnapshotRaw;
+            adcSnapshotRaw = 0;
+            absRaw = absCounts32(adcSigned);
+            cmpRaw = psocCalCompareCounts(adcSigned);
+            errRaw = calTargetValid ? (calTargetSigned - cmpRaw) : 0;
+            SLAVE_LOG_PRINTF("[ADC] snapshot stage=%u/%s dac=%u raw=%ld raw_mV=%ld abs=%lu cmp=%ld cmp_mV=%ld target=%ld target_mV=%ld err=%ld err_mV=%ld\n",
+                             calStage, psocCalStageName(calStage), calDac,
+                             (long)adcSigned, (long)adcCountsToMv(adcSigned),
+                             (unsigned long)absRaw, (long)cmpRaw,
+                             (long)adcCountsToMv(cmpRaw),
+                             calTargetValid ? (long)calTargetSigned : 0L,
+                             calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
+                             (long)errRaw, (long)adcCountsToMv(errRaw));
+            LOGM("ADC_SNAPSHOT", "stage=%u,name=%s,dac=%u,raw=%ld,raw_mV=%ld,abs=%lu,cmp=%ld,cmp_mV=%ld,target=%ld,target_mV=%ld,err=%ld,err_mV=%ld",
+                 calStage, psocCalStageName(calStage), calDac,
+                 (long)adcSigned, (long)adcCountsToMv(adcSigned),
+                 (unsigned long)absRaw, (long)cmpRaw,
+                 (long)adcCountsToMv(cmpRaw),
+                 calTargetValid ? (long)calTargetSigned : 0L,
+                 calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
+                 (long)errRaw, (long)adcCountsToMv(errRaw));
+        }
     } else if (event.event == PSOC_EVT_CAL_STAGE_MEAS) {
         if (!calMeasHigh) {
             calMeas = (int16_t)((uint16_t)event.value << 8);
@@ -549,18 +717,32 @@ static void onPsocDiag(const PsocDiagEvent &event)
         calMeasRawByte++;
         if (calMeasRawByte >= 4) {
             uint32_t absRaw;
+            int32_t cmpRaw;
+            int32_t errRaw;
             calMeasRawByte = 0;
             calMeasRawSigned = (int32_t)calMeasRaw;
+            calMeasRaw = 0;
             absRaw = absCounts32(calMeasRawSigned);
+            cmpRaw = psocCalCompareCounts(calMeasRawSigned);
+            errRaw = calTargetValid ? (calTargetSigned - cmpRaw) : 0;
 #if PSOC_CAL_LOG_POINTS
-            SLAVE_LOG_PRINTF("[CAL] point stage=%u/%s i=%u dac=%u raw=%ld abs=%lu\n",
+            SLAVE_LOG_PRINTF("[CAL] point stage=%u/%s i=%u dac=%u raw=%ld raw_mV=%ld abs=%lu cmp=%ld cmp_mV=%ld target=%ld target_mV=%ld err=%ld err_mV=%ld\n",
                              calStage, psocCalStageName(calStage),
                              (unsigned)calPointIndex, calDac,
-                             (long)calMeasRawSigned, (unsigned long)absRaw);
-            LOGM("CAL_POINT32", "stage=%u,name=%s,i=%u,dac=%u,measRaw=%ld,abs=%lu",
+                             (long)calMeasRawSigned, (long)adcCountsToMv(calMeasRawSigned),
+                             (unsigned long)absRaw,
+                             (long)cmpRaw, (long)adcCountsToMv(cmpRaw),
+                             calTargetValid ? (long)calTargetSigned : 0L,
+                             calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
+                             (long)errRaw, (long)adcCountsToMv(errRaw));
+            LOGM("CAL_POINT32", "stage=%u,name=%s,i=%u,dac=%u,measRaw=%ld,raw_mV=%ld,abs=%lu,cmp=%ld,cmp_mV=%ld,target=%ld,target_mV=%ld,err=%ld,err_mV=%ld",
                  calStage, psocCalStageName(calStage),
                  (unsigned)calPointIndex, calDac, (long)calMeasRawSigned,
-                 (unsigned long)absRaw);
+                 (long)adcCountsToMv(calMeasRawSigned),
+                 (unsigned long)absRaw, (long)cmpRaw, (long)adcCountsToMv(cmpRaw),
+                 calTargetValid ? (long)calTargetSigned : 0L,
+                 calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
+                 (long)errRaw, (long)adcCountsToMv(errRaw));
 #endif
             calPointIndex++;
         }
@@ -590,13 +772,26 @@ static void onPsocDiag(const PsocDiagEvent &event)
         }
     } else if (event.event == PSOC_EVT_CAL_STAGE_OK) {
         uint32_t absRaw = absCounts32(calMeasRawSigned);
-        SLAVE_LOG_PRINTF("[CAL] result stage=%u/%s ok=%u dac=%u raw=%ld abs=%lu meas16=%d\n",
+        int32_t cmpRaw = psocCalCompareCounts(calMeasRawSigned);
+        int32_t errRaw = calTargetValid ? (calTargetSigned - cmpRaw) : 0;
+        SLAVE_LOG_PRINTF("[CAL] result stage=%u/%s ok=%u dac=%u raw=%ld raw_mV=%ld abs=%lu cmp=%ld cmp_mV=%ld target=%ld target_mV=%ld err=%ld err_mV=%ld meas16=%d\n",
                          calStage, psocCalStageName(calStage), event.value,
                          calDac, (long)calMeasRawSigned,
-                         (unsigned long)absRaw, (int)calMeas);
-        LOGM("CAL_STAGE", "stage=%u,name=%s,ok=%u,dac=%u,measRaw=%ld,abs=%lu,meas16=%d",
+                         (long)adcCountsToMv(calMeasRawSigned),
+                         (unsigned long)absRaw, (long)cmpRaw,
+                         (long)adcCountsToMv(cmpRaw),
+                         calTargetValid ? (long)calTargetSigned : 0L,
+                         calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
+                         (long)errRaw, (long)adcCountsToMv(errRaw), (int)calMeas);
+        LOGM("CAL_STAGE", "stage=%u,name=%s,ok=%u,dac=%u,measRaw=%ld,raw_mV=%ld,abs=%lu,cmp=%ld,cmp_mV=%ld,target=%ld,target_mV=%ld,err=%ld,err_mV=%ld,meas16=%d",
              calStage, psocCalStageName(calStage), event.value,
-             calDac, (long)calMeasRawSigned, (unsigned long)absRaw,
+             calDac, (long)calMeasRawSigned,
+             (long)adcCountsToMv(calMeasRawSigned),
+             (unsigned long)absRaw,
+             (long)cmpRaw, (long)adcCountsToMv(cmpRaw),
+             calTargetValid ? (long)calTargetSigned : 0L,
+             calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
+             (long)errRaw, (long)adcCountsToMv(errRaw),
              (int)calMeas);
     } else if (event.event == PSOC_EVT_SERVO_STEP) {
         SLAVE_LOG_PRINTF("[CAL] servo step stage=%u/%s dac=%u\n",
@@ -774,7 +969,9 @@ static void waitForPsocConfigAck(uint8_t sub_cmd, uint8_t param)
     g_cfg_start_ms = millis();
     g_cfg_timeout_ms = (sub_cmd == PSOC_CMD_CALIBRATE)
                      ? PSOC_CAL_ACK_TIMEOUT_MS
-                     : PSOC_CFG_ACK_TIMEOUT_MS;
+                     : ((sub_cmd == PSOC_CMD_ADC_SNAPSHOT)
+                        ? PSOC_ADC_SNAPSHOT_ACK_TIMEOUT_MS
+                        : PSOC_CFG_ACK_TIMEOUT_MS);
     g_cfg_waiting = true;
     if (sub_cmd == PSOC_CMD_CALIBRATE) {
         /* Que el primer "calibrando..." salga ya en el proximo loop(),
@@ -901,6 +1098,38 @@ static bool requestPsocCalibration(const char *source)
     return true;
 }
 
+static bool requestPsocAdcSnapshot(const char *source)
+{
+    if (captureOrDumpBusy()) {
+        SLAVE_LOG_PRINTF("[%s] adc ignored: capture/dump busy state=%d\n",
+                         source, (int)g_state);
+        LOGM("ADC_REQ", "source=%s,ok=0,reason=capture_busy,state=%d",
+             source, (int)g_state);
+        return false;
+    }
+
+    servicePsocConfigAck();
+    if (g_cfg_waiting) {
+        SLAVE_LOG_PRINTF("[%s] adc ignored: pending sub=0x%02X\n",
+                         source, g_cfg_sub_cmd);
+        LOGM("ADC_REQ", "source=%s,ok=0,reason=cfg_busy,pending=0x%02X",
+             source, g_cfg_sub_cmd);
+        return false;
+    }
+
+    if (!ensurePsocReadyForConfig()) {
+        SLAVE_LOG_PRINTF("[%s] adc failed: PSoC not ready\n", source);
+        LOGM("ADC_REQ", "source=%s,ok=0,reason=psoc_not_ready", source);
+        return false;
+    }
+
+    psoc.adcSnapshot();
+    waitForPsocConfigAck(PSOC_CMD_ADC_SNAPSHOT, 1);
+    SLAVE_LOG_PRINTF("[%s] adc -> PSoC CMD 0x%02X\n", source, PSOC_CMD_ADC_SNAPSHOT);
+    LOGM("ADC_REQ", "source=%s,ok=1,sub=0x%02X", source, PSOC_CMD_ADC_SNAPSHOT);
+    return true;
+}
+
 #if PSOC_AUTO_CAL_ON_READY
 static void scheduleAutoCalibration(uint32_t delayMs)
 {
@@ -970,6 +1199,13 @@ static void requestCalibrationFromUsb()
          (unsigned)sent, PSOC_CMD_CALIBRATE);
 }
 
+static void requestAdcSnapshotFromUsb()
+{
+    const bool sent = requestPsocAdcSnapshot("USB");
+    LOGM("USB_CMD", "cmd=adc,ok=%u,sub=0x%02X",
+         (unsigned)sent, PSOC_CMD_ADC_SNAPSHOT);
+}
+
 static void handleUsbCommand(const char *cmd)
 {
     if (cmd[0] == '\0') {
@@ -979,11 +1215,15 @@ static void handleUsbCommand(const char *cmd)
         usbCommandEquals(cmd, "cal") ||
         usbCommandEquals(cmd, "calibrate")) {
         requestCalibrationFromUsb();
+    } else if (usbCommandEquals(cmd, "a") ||
+               usbCommandEquals(cmd, "adc") ||
+               usbCommandEquals(cmd, "snapshot")) {
+        requestAdcSnapshotFromUsb();
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
-        SLAVE_LOG_PRINTF("[USB] commands: cal\n");
+        SLAVE_LOG_PRINTF("[USB] commands: cal, adc\n");
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
-        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: cal)\n", cmd);
+        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: cal, adc)\n", cmd);
         LOGM("USB_CMD", "cmd=unknown,ok=0,text=%s", cmd);
     }
 }
