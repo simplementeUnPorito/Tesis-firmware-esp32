@@ -1188,6 +1188,40 @@ static bool usbCommandEquals(const char *cmd, const char *word)
     return *cmd == '\0' && *word == '\0';
 }
 
+static bool usbCommandStartsWithWord(const char *cmd, const char *word)
+{
+    while (*cmd != '\0' && *word != '\0') {
+        char a = *cmd++;
+        char b = *word++;
+        if (a >= 'A' && a <= 'Z') { a = (char)(a - 'A' + 'a'); }
+        if (b >= 'A' && b <= 'Z') { b = (char)(b - 'A' + 'a'); }
+        if (a != b) { return false; }
+    }
+    return *word == '\0' && (*cmd == ' ' || *cmd == '=' || *cmd == ':');
+}
+
+static bool usbParseGainParam(const char *cmd, const char *word, uint8_t &value)
+{
+    if (!usbCommandStartsWithWord(cmd, word)) {
+        return false;
+    }
+    while (*cmd != '\0' && *cmd != ' ' && *cmd != '=' && *cmd != ':') {
+        cmd++;
+    }
+    while (*cmd == ' ' || *cmd == '=' || *cmd == ':') {
+        cmd++;
+    }
+    if (*cmd < '0' || *cmd > '8') {
+        return false;
+    }
+    value = (uint8_t)(*cmd - '0');
+    cmd++;
+    while (*cmd == ' ') {
+        cmd++;
+    }
+    return *cmd == '\0';
+}
+
 static void requestCalibrationFromUsb()
 {
     const bool sent = requestPsocCalibration("USB");
@@ -1206,8 +1240,38 @@ static void requestAdcSnapshotFromUsb()
          (unsigned)sent, PSOC_CMD_ADC_SNAPSHOT);
 }
 
+static bool requestPsocGainFromUsb(uint8_t subCmd, uint8_t param, const char *name)
+{
+    bool sent = false;
+    if (!isGainCode(param)) {
+        LOGM("USB_CMD", "cmd=%s,ok=0,reason=bad_gain,value=%u", name, (unsigned)param);
+        return false;
+    }
+    servicePsocConfigAck();
+    if (g_cfg_waiting) {
+        LOGM("USB_CMD", "cmd=%s,ok=0,reason=cfg_busy,pending=0x%02X",
+             name, g_cfg_sub_cmd);
+        return false;
+    }
+    if (ensurePsocReadyForConfig()) {
+        if (subCmd == PSOC_CMD_PGA) {
+            psoc.setPga(param);
+        } else {
+            psoc.setPgavdac(param);
+        }
+        waitForPsocConfigAck(subCmd, param);
+        sent = true;
+    }
+    SLAVE_LOG_PRINTF("[USB] %s %u -> PSoC CMD 0x%02X\n",
+                     name, (unsigned)param, subCmd);
+    LOGM("USB_CMD", "cmd=%s,ok=%u,sub=0x%02X,value=%u",
+         name, (unsigned)sent, subCmd, (unsigned)param);
+    return sent;
+}
+
 static void handleUsbCommand(const char *cmd)
 {
+    uint8_t value = 0u;
     if (cmd[0] == '\0') {
         return;
     }
@@ -1219,11 +1283,15 @@ static void handleUsbCommand(const char *cmd)
                usbCommandEquals(cmd, "adc") ||
                usbCommandEquals(cmd, "snapshot")) {
         requestAdcSnapshotFromUsb();
+    } else if (usbParseGainParam(cmd, "pga", value)) {
+        (void)requestPsocGainFromUsb(PSOC_CMD_PGA, value, "pga");
+    } else if (usbParseGainParam(cmd, "pgavdac", value)) {
+        (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
-        SLAVE_LOG_PRINTF("[USB] commands: cal, adc\n");
+        SLAVE_LOG_PRINTF("[USB] commands: cal, adc, pga N, pgavdac N\n");
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
-        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: cal, adc)\n", cmd);
+        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: cal, adc, pga N, pgavdac N)\n", cmd);
         LOGM("USB_CMD", "cmd=unknown,ok=0,text=%s", cmd);
     }
 }
