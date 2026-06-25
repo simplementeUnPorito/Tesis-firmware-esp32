@@ -391,6 +391,12 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_BUTTON:         return "BUTTON";
         case PSOC_EVT_BUTTON_IGNORED: return "BUTTON_IGNORED";
         case PSOC_EVT_CAPTURE_CLAMPED:return "CAPTURE_CLAMPED";
+        case PSOC_EVT_CAL_PI_GAIN32:  return "CAL_PI_GAIN32";
+        case PSOC_EVT_CAL_PI_DEADBAND:return "CAL_PI_DEADBAND";
+        case PSOC_EVT_CAL_PI_ERROR32: return "CAL_PI_ERROR32";
+        case PSOC_EVT_CAL_PI_BUCKET32:return "CAL_PI_BUCKET32";
+        case PSOC_EVT_CAL_PI_STABLE:  return "CAL_PI_STABLE";
+        case PSOC_EVT_CAL_AMUX_CAP:   return "CAL_AMUX_CAP";
         default:                      return "UNKNOWN";
     }
 }
@@ -472,6 +478,9 @@ static void onPsocDiag(const PsocDiagEvent &event)
     static uint8_t calSweepRawByte = 0;
     static uint32_t adcSnapshotRaw = 0;
     static uint8_t adcSnapshotRawByte = 0;
+    static uint32_t calPiRaw = 0;
+    static uint8_t calPiRawByte = 0;
+    static uint8_t calPiRawEvent = 0;
     static uint16_t calPointIndex = 0;
     g_psocConnected = true;
 
@@ -519,6 +528,9 @@ static void onPsocDiag(const PsocDiagEvent &event)
         calTargetValid = false;
         adcSnapshotRaw = 0;
         adcSnapshotRawByte = 0;
+        calPiRaw = 0;
+        calPiRawByte = 0;
+        calPiRawEvent = 0;
         calPointIndex = 0;
         g_cal_progress_ack_ms = millis();
         sendCfgAck(PSOC_CMD_CALIBRATE, 2);
@@ -547,6 +559,9 @@ static void onPsocDiag(const PsocDiagEvent &event)
         calTargetValid = false;
         adcSnapshotRaw = 0;
         adcSnapshotRawByte = 0;
+        calPiRaw = 0;
+        calPiRawByte = 0;
+        calPiRawEvent = 0;
         calPointIndex = 0;
         g_cal_progress_ack_ms = millis();
         sendCfgAck(PSOC_CMD_CALIBRATE, (uint8_t)(3u + (event.value & 0x03u)));
@@ -697,6 +712,42 @@ static void onPsocDiag(const PsocDiagEvent &event)
                  calTargetValid ? (long)adcCountsToMv(calTargetSigned) : 0L,
                  (long)errRaw, (long)adcCountsToMv(errRaw));
         }
+    } else if (event.event == PSOC_EVT_CAL_PI_GAIN32 ||
+               event.event == PSOC_EVT_CAL_PI_ERROR32 ||
+               event.event == PSOC_EVT_CAL_PI_BUCKET32) {
+        if (calPiRawByte == 0 || calPiRawEvent != event.event) {
+            calPiRaw = 0;
+            calPiRawByte = 0;
+            calPiRawEvent = event.event;
+        }
+        calPiRaw = (calPiRaw << 8) | event.value;
+        calPiRawByte++;
+        if (calPiRawByte >= 4) {
+            int32_t piSigned = (int32_t)calPiRaw;
+            const char *kind =
+                (event.event == PSOC_EVT_CAL_PI_GAIN32) ? "gain_x1000" :
+                (event.event == PSOC_EVT_CAL_PI_ERROR32) ? "error_dac" :
+                                                           "bucket";
+            calPiRaw = 0;
+            calPiRawByte = 0;
+            calPiRawEvent = 0;
+            SLAVE_LOG_PRINTF("[CAL] pi stage=%u/%s %s=%ld\n",
+                             calStage, psocCalStageName(calStage),
+                             kind, (long)piSigned);
+            LOGM("CAL_PI", "stage=%u,name=%s,%s=%ld",
+                 calStage, psocCalStageName(calStage),
+                 kind, (long)piSigned);
+        }
+    } else if (event.event == PSOC_EVT_CAL_PI_DEADBAND) {
+        SLAVE_LOG_PRINTF("[CAL] pi stage=%u/%s deadband_dac=%u\n",
+                         calStage, psocCalStageName(calStage), event.value);
+        LOGM("CAL_PI", "stage=%u,name=%s,deadband_dac=%u",
+             calStage, psocCalStageName(calStage), event.value);
+    } else if (event.event == PSOC_EVT_CAL_PI_STABLE) {
+        SLAVE_LOG_PRINTF("[CAL] pi stage=%u/%s stable=%u\n",
+                         calStage, psocCalStageName(calStage), event.value);
+        LOGM("CAL_PI", "stage=%u,name=%s,stable=%u",
+             calStage, psocCalStageName(calStage), event.value);
     } else if (event.event == PSOC_EVT_CAL_STAGE_MEAS) {
         if (!calMeasHigh) {
             calMeas = (int16_t)((uint16_t)event.value << 8);
@@ -842,9 +893,11 @@ static void onPsocDiag(const PsocDiagEvent &event)
              calDac, (long)calMeasRawSigned, (unsigned long)absRaw,
              (int)calMeas);
     } else if (event.event == PSOC_EVT_CAL_AMUX_IN) {
-        SLAVE_LOG_PRINTF("[CAL] AMux_IN -> %u (%s)\n", event.value,
-                         event.value == 0 ? "normal/captura" : "referencia/tierra virtual");
+        SLAVE_LOG_PRINTF("[CAL] AMux signal channel=%u\n", event.value);
         LOGM("CAL_AMUX_IN", "channel=%u", event.value);
+    } else if (event.event == PSOC_EVT_CAL_AMUX_CAP) {
+        SLAVE_LOG_PRINTF("[CAL] AMux cap channel=%u\n", event.value);
+        LOGM("CAL_AMUX_CAP", "channel=%u", event.value);
     } else if (event.event == PSOC_EVT_CAL_PROGRESS) {
         if (!(g_cfg_waiting && g_cfg_sub_cmd == PSOC_CMD_CALIBRATE)) {
             uint32_t now = millis();

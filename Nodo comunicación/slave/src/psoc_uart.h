@@ -110,6 +110,12 @@
 #define PSOC_EVT_BUTTON           0x3C
 #define PSOC_EVT_BUTTON_IGNORED   0x3D
 #define PSOC_EVT_CAPTURE_CLAMPED  0x3E
+#define PSOC_EVT_CAL_PI_GAIN32    0x3F
+#define PSOC_EVT_CAL_PI_DEADBAND  0x40
+#define PSOC_EVT_CAL_PI_ERROR32   0x41
+#define PSOC_EVT_CAL_PI_BUCKET32  0x42
+#define PSOC_EVT_CAL_PI_STABLE    0x43
+#define PSOC_EVT_CAL_AMUX_CAP     0x44
 
 struct PsocSample {
     int16_t  raw_input;
