@@ -83,7 +83,7 @@
   #define SLAVE_USB_CMD_ENABLE 1
 #endif
 #ifndef PSOC_AUTO_CAL_ON_READY
-  #define PSOC_AUTO_CAL_ON_READY 0
+  #define PSOC_AUTO_CAL_ON_READY 1
 #endif
 #ifndef PSOC_AUTO_CAL_DELAY_MS
   #define PSOC_AUTO_CAL_DELAY_MS 500u
