@@ -4,7 +4,8 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-loop-21';
+import * as cfg from './config.js?v=field-loop-22';
+import { hilbertEnvelope } from './signal_proc.js?v=field-loop-22';
 
 const RAW_COLOR = 'rgb(80, 140, 255)';
 const FILT_COLOR = 'rgb(255, 80, 80)';
@@ -78,6 +79,7 @@ class ChannelPlot {
     this._visible = true;
     this._showRaw = true;
     this._showFilt = true;
+    this._showEnvelope = false;
     this._handlers = handlers;
     this._dragLastX = null;
     this._cursorMode = null;
@@ -116,6 +118,10 @@ class ChannelPlot {
   setCurveVisibility(showRaw, showFilt) {
     this._showRaw = showRaw !== false;
     this._showFilt = showFilt !== false;
+  }
+
+  setEnvelopeMode(enabled) {
+    this._showEnvelope = enabled === true;
   }
 
   /** raw/filt: Float64Array|null, already windowed. fs: Hz, for the time axis.
@@ -293,8 +299,8 @@ class ChannelPlot {
     ctx.fillStyle = colors.bg;
     ctx.fillRect(0, 0, W, H);
 
-    const raw = this._raw;
-    const filt = this._filt;
+    const raw = (this._showEnvelope && this._raw) ? hilbertEnvelope(this._raw) : this._raw;
+    const filt = (this._showEnvelope && this._filt) ? hilbertEnvelope(this._filt) : this._filt;
     const xLo = this._xStartSamp / this._fs;
     const xHi = (this._xStartSamp + this._xSpanSamp) / this._fs;
     const xSpan = Math.max(1 / this._fs, xHi - xLo);
@@ -421,11 +427,11 @@ class ChannelPlot {
       const relIdx = cursorSamp - this._xStartSamp;
       const tMs = cursorT * 1000;
       const lines = [`${style.label} t: ${tMs.toFixed(2)} ms`];
-      if (this._raw && relIdx >= 0 && relIdx < this._raw.length)
-        lines.push(`raw: ${fmtVolt(this._raw[relIdx])} V`);
+      if (raw && relIdx >= 0 && relIdx < raw.length)
+        lines.push(`${this._showEnvelope ? 'env raw' : 'raw'}: ${fmtVolt(raw[relIdx])} V`);
       const filtIdx = relIdx + (this._filtTrimSamp || 0);
-      if (this._filt && filtIdx >= 0 && filtIdx < this._filt.length)
-        lines.push(`filt: ${fmtVolt(this._filt[filtIdx])} V`);
+      if (filt && filtIdx >= 0 && filtIdx < filt.length)
+        lines.push(`${this._showEnvelope ? 'env filt' : 'filt'}: ${fmtVolt(filt[filtIdx])} V`);
       if (ci === 1 && deltaMs !== null) lines.push(`dt: ${deltaMs.toFixed(2)} ms`);
 
       const lineH = 13 * dpr;
@@ -474,10 +480,10 @@ class ChannelPlot {
     };
     ctx.textAlign = 'right';
     if (filt && this._showFilt) {
-      drawLegendItem('Filtrada', FILT_COLOR);
+      drawLegendItem(this._showEnvelope ? 'Env filtrada' : 'Filtrada', FILT_COLOR);
     }
     if (this._showRaw) {
-      drawLegendItem('Cruda', RAW_COLOR);
+      drawLegendItem(this._showEnvelope ? 'Env cruda' : 'Cruda', RAW_COLOR);
     }
 
     // Y-axis unit label (rotated)
@@ -511,6 +517,7 @@ export class PlotArea {
     this._followTail = true;
     this._showRaw = true;
     this._showFilt = true;
+    this._showEnvelope = false;
     this._lastMaxLen = 0;
     this._cursorMode = null;
     this._cursorSamps = [null, null];
@@ -538,6 +545,14 @@ export class PlotArea {
     this._showFilt = showFilt !== false;
     for (const p of this._plots) {
       p.setCurveVisibility(this._showRaw, this._showFilt);
+      if (p.visible) p.draw();
+    }
+  }
+
+  setEnvelopeMode(enabled) {
+    this._showEnvelope = enabled === true;
+    for (const p of this._plots) {
+      p.setEnvelopeMode(this._showEnvelope);
       if (p.visible) p.draw();
     }
   }

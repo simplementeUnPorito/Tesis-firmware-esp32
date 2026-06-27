@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-loop-21';
-import { WsClient } from './ws_client.js?v=field-loop-21';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-21';
-import { DataStore, effectiveFs } from './data_store.js?v=field-loop-21';
-import { PlotArea } from './plot.js?v=field-loop-21';
-import { SpectrumArea } from './spectrum.js?v=field-loop-21';
-import { SlavePanel } from './slave_panel.js?v=field-loop-21';
-import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-21';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-21';
+import * as cfg from './config.js?v=field-loop-22';
+import { WsClient } from './ws_client.js?v=field-loop-22';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-22';
+import { DataStore, effectiveFs } from './data_store.js?v=field-loop-22';
+import { PlotArea } from './plot.js?v=field-loop-22';
+import { SpectrumArea } from './spectrum.js?v=field-loop-22';
+import { SlavePanel } from './slave_panel.js?v=field-loop-22';
+import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-22';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-22';
 
 const $ = (id) => document.getElementById(id);
 
@@ -30,6 +30,7 @@ const SETTINGS_PREFIX = 'geophone_scope_web.';
 const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz`;
 const SHOW_RAW_KEY = `${SETTINGS_PREFIX}show_raw`;
 const SHOW_FILT_KEY = `${SETTINGS_PREFIX}show_filt`;
+const SHOW_HILBERT_KEY = `${SETTINGS_PREFIX}show_hilbert`;
 const WS_TOKEN_KEY  = `${SETTINGS_PREFIX}ws_token`;
 
 function clamp(value, lo, hi) {
@@ -1156,20 +1157,25 @@ $('btn-spectrum').addEventListener('click', () => {
 function applyCurveVisibility(persist = true) {
   const showRaw = $('chk-show-raw').checked;
   const showFilt = $('chk-show-filt').checked;
+  const showHilbert = $('chk-show-hilbert').checked;
   if (persist) {
     saveSetting(SHOW_RAW_KEY, showRaw ? 1 : 0);
     saveSetting(SHOW_FILT_KEY, showFilt ? 1 : 0);
+    saveSetting(SHOW_HILBERT_KEY, showHilbert ? 1 : 0);
   }
   plotArea.setCurveVisibility(showRaw, showFilt);
+  plotArea.setEnvelopeMode(showHilbert);
 }
 
 function initCurveVisibility() {
   $('chk-show-raw').checked = loadBoolSetting(SHOW_RAW_KEY, $('chk-show-raw').checked);
   $('chk-show-filt').checked = loadBoolSetting(SHOW_FILT_KEY, $('chk-show-filt').checked);
+  $('chk-show-hilbert').checked = loadBoolSetting(SHOW_HILBERT_KEY, $('chk-show-hilbert').checked);
   applyCurveVisibility(false);
 }
 $('chk-show-raw').addEventListener('change', applyCurveVisibility);
 $('chk-show-filt').addEventListener('change', applyCurveVisibility);
+$('chk-show-hilbert').addEventListener('change', applyCurveVisibility);
 initCurveVisibility();
 
 $('disp-secs').addEventListener('change', applyDisplayWindow);

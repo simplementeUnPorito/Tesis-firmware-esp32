@@ -164,6 +164,11 @@ static          uint32_t   g_auto_cal_due_ms = 0;
 #endif
 #define BLINK_TIMES       10u     /* flashes totales (on+off = 1 flash) */
 #define BLINK_INTERVAL_MS 150u
+#ifndef BLINK_LED_ACTIVE_LOW
+#define BLINK_LED_ACTIVE_LOW 1u
+#endif
+#define BLINK_LED_ON_LEVEL  ((BLINK_LED_ACTIVE_LOW) ? LOW : HIGH)
+#define BLINK_LED_OFF_LEVEL ((BLINK_LED_ACTIVE_LOW) ? HIGH : LOW)
 static uint8_t   g_blink_count    = 0;
 static uint32_t  g_blink_last_ms  = 0;
 
@@ -1751,9 +1756,10 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     }
     else if (cmd == CMD_BLINK_LED && len >= (int)sizeof(MsgBlinkLed)) {
         const MsgBlinkLed *msg = (const MsgBlinkLed *)data;
-        if (msg->node_id != NODE_ID) return;
-        g_blink_count   = BLINK_TIMES * 2u;  /* flashes × (on + off) */
+        if (msg->node_id != 0u && msg->node_id != NODE_ID) return;
+        g_blink_count   = (BLINK_TIMES * 2u) - 1u;  /* ya queda prendido ahora */
         g_blink_last_ms = millis();
+        digitalWrite(BLINK_LED_PIN, BLINK_LED_ON_LEVEL);
         sendCfgAck(CMD_BLINK_LED, 1);
         SLAVE_LOG_PRINTF("[SLAVE] BLINK_LED node=%u\n", NODE_ID);
         LOGM("BLINK_LED", "node=%u", NODE_ID);
@@ -1915,7 +1921,7 @@ void setup()
 
     /* LED de identificación */
     pinMode(BLINK_LED_PIN, OUTPUT);
-    digitalWrite(BLINK_LED_PIN, HIGH);   /* LED off (activo-bajo) */
+    digitalWrite(BLINK_LED_PIN, BLINK_LED_OFF_LEVEL);
 
     /* GPIO hardware sync — pull-down para evitar ISR espurias cuando no hay cable */
     pinMode(SYNC_IN_PIN,      INPUT_PULLDOWN);
@@ -1985,10 +1991,10 @@ void loop()
     /* LED blink para identificación: g_blink_count > 0 → toggle cada BLINK_INTERVAL_MS */
     if (g_blink_count > 0 && (millis() - g_blink_last_ms) >= BLINK_INTERVAL_MS) {
         g_blink_last_ms = millis();
-        digitalWrite(BLINK_LED_PIN, g_blink_count % 2u == 0 ? HIGH : LOW);
+        digitalWrite(BLINK_LED_PIN, (g_blink_count % 2u) ? BLINK_LED_OFF_LEVEL : BLINK_LED_ON_LEVEL);
         g_blink_count--;
         if (g_blink_count == 0) {
-            digitalWrite(BLINK_LED_PIN, HIGH);  /* LED off (activo-bajo en la mayoría) */
+            digitalWrite(BLINK_LED_PIN, BLINK_LED_OFF_LEVEL);
         }
     }
 
