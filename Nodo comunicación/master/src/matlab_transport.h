@@ -201,6 +201,18 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
     uint8_t fs_code = (fs >= 100u) ? (uint8_t)(fs / 100u) : 0u;
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x01, psoc_ok, fs_code };
     _emit(pkt);
+    if (fs > 0u) {
+        /* b2=0x05: Fs exacta uint16 big-endian para la UI web/Python nueva. */
+        uint8_t fsExact[6] = {
+            MATLAB_PKT_HEADER,
+            nodeId,
+            0xFD,
+            0x05,
+            (uint8_t)((fs >> 8) & 0xFFu),
+            (uint8_t)(fs & 0xFFu),
+        };
+        _emit(fsExact);
+    }
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */
         uint8_t m0[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x02, mac[0], mac[1] };

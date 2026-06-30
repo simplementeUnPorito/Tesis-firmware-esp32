@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-loop-22';
-import { WsClient } from './ws_client.js?v=field-loop-22';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-22';
-import { DataStore, effectiveFs } from './data_store.js?v=field-loop-22';
-import { PlotArea } from './plot.js?v=field-loop-22';
-import { SpectrumArea } from './spectrum.js?v=field-loop-22';
-import { SlavePanel } from './slave_panel.js?v=field-loop-22';
-import { compileFirCmd, firFilter, lastFirError } from './signal_proc.js?v=field-loop-22';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-22';
+import * as cfg from './config.js?v=field-loop-33';
+import { WsClient } from './ws_client.js?v=field-loop-33';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-33';
+import { DataStore, effectiveFs } from './data_store.js?v=field-loop-33';
+import { PlotArea } from './plot.js?v=field-loop-33';
+import { SpectrumArea } from './spectrum.js?v=field-loop-33';
+import { SlavePanel } from './slave_panel.js?v=field-loop-33';
+import { compileFirCmd, dcRemove, filtFilt, firFilter, lastFirError } from './signal_proc.js?v=field-loop-33';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-33';
 
 const $ = (id) => document.getElementById(id);
 
@@ -22,14 +22,26 @@ const slavePanels = new Array(cfg.MAX_NODES).fill(null);
 const macPartial = new Map();
 const pgaLockTimers = new Map();
 const testTimers = new Map();
+const preservedCaptures = [];
+const PRESERVE_COLORS = [
+  'rgba(20, 184, 166, 0.72)',
+  'rgba(245, 158, 11, 0.72)',
+  'rgba(168, 85, 247, 0.72)',
+  'rgba(34, 197, 94, 0.72)',
+  'rgba(236, 72, 153, 0.72)',
+  'rgba(14, 165, 233, 0.72)',
+];
 
 let masterState = 0;
 let activeSlaveCount = 0;
+let preserveSeq = 0;
 
 const SETTINGS_PREFIX = 'geophone_scope_web.';
-const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz`;
+const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz_v2`;
 const SHOW_RAW_KEY = `${SETTINGS_PREFIX}show_raw`;
 const SHOW_FILT_KEY = `${SETTINGS_PREFIX}show_filt`;
+const SHOW_ENV_RAW_KEY = `${SETTINGS_PREFIX}show_env_raw`;
+const SHOW_ENV_FILT_KEY = `${SETTINGS_PREFIX}show_env_filt`;
 const SHOW_HILBERT_KEY = `${SETTINGS_PREFIX}show_hilbert`;
 const WS_TOKEN_KEY  = `${SETTINGS_PREFIX}ws_token`;
 
@@ -137,17 +149,268 @@ function anySlaveFsKnown() {
   return false;
 }
 
-// Returns the Fs reported by the hardware (Hz), or 0 if no slave has sent its
-// HELLO yet. NEVER substitute a guessed/nominal value here — the PSoC is the
-// only source of truth for its own configured sample rate, and it can change.
-function currentFsHz() {
+function hardwareFsHz() {
   return effectiveFs(data);
+}
+
+// Returns the hardware Fs when available, otherwise the measured default rate.
+// HELLO exact (sub-packet 0x05) replaces this fallback as soon as it arrives.
+function currentFsHz() {
+  return hardwareFsHz() || cfg.DEFAULT_SAMPLE_RATE_HZ;
+}
+
+function displayFsHz() {
+  const liveFs = hardwareFsHz();
+  if (liveFs) return liveFs;
+  for (const capture of selectedPreservedCaptures()) {
+    if (capture.fs > 0) return capture.fs;
+  }
+  for (const capture of preservedCaptures) {
+    if (capture.fs > 0) return capture.fs;
+  }
+  return cfg.DEFAULT_SAMPLE_RATE_HZ;
+}
+
+function compactTimestamp(date) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_` +
+         `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function humanTimestamp(date) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function gainValue(code) {
+  return (code >= 0 && code < cfg.GAIN_CODES.length) ? cfg.GAIN_CODES[code] : null;
+}
+
+function nodeConnectedForCapture(nd, index) {
+  return index > 0
+    && (nd.visible || nd.rawBuf.length > 0 || nd.filtBuf.length > 0)
+    && (nd.fsKnown || !!nd.mac || nd.rawBuf.length > 0 || nd.filtBuf.length > 0);
+}
+
+function nodeSnapshot(nd, index) {
+  const raw = nd.rawBuf.toArray();
+  const filt = filteredArrayForNode(nd, raw);
+  return {
+    index,
+    name: cfg.NODE_NAMES[index] || `Node ${index}`,
+    type: nd.alias || cfg.NODE_NAMES[index] || `Node ${index}`,
+    slave_id: nd.slaveId,
+    fs: nd.fs,
+    fs_known: !!nd.fsKnown,
+    connected: nodeConnectedForCapture(nd, index),
+    raw,
+    filt,
+    raw_count: raw.length,
+    filt_count: filt.length,
+    batch_count: nd.batchCount,
+    total_samples: nd.totalSamples,
+    pga_code: nd.pgaCode,
+    pga_gain: gainValue(nd.pgaCode),
+    vdac_byte: nd.vdacByte,
+    pgavdac_code: nd.pgavdac,
+    pgavdac_gain: gainValue(nd.pgavdac),
+    psoc_ok: nd.psocOk,
+    hammer_offset_m: nd.hammerOffset ?? 0,
+    sample_offset: 0,
+    mac: nd.mac || '',
+    visible: !!nd.visible,
+    fir_cmd: nd.filtCmd || '',
+    filt_trim_samples: 0,
+    dc_remove: !!nd.dcRemove,
+    drift_hist: nd.driftHist.slice(),
+    latency_hist: nd.latencyHist.slice(),
+    health: nd.health,
+    units: 'V',
+    dtype: 'float32',
+    endian: 'little',
+  };
+}
+
+function captureSampleCount(capture, signal = 'raw') {
+  if (!capture || !Array.isArray(capture.nodes)) return 0;
+  return capture.nodes.reduce((sum, node) => {
+    const values = node ? node[signal] : null;
+    return sum + (values && values.length ? values.length : 0);
+  }, 0);
+}
+
+function captureHasSamples(capture) {
+  return captureSampleCount(capture, 'raw') > 0 || captureSampleCount(capture, 'filt') > 0;
+}
+
+function captureSignature(nodes) {
+  return nodes.map((node) => {
+    const raw = node.raw || [];
+    const filt = node.filt || [];
+    const rawLast = raw.length ? raw[raw.length - 1].toPrecision(8) : '';
+    const filtLast = filt.length ? filt[filt.length - 1].toPrecision(8) : '';
+    return `${node.index}:${raw.length}:${filt.length}:${node.total_samples}:${rawLast}:${filtLast}:${node.fs}`;
+  }).join('|');
+}
+
+function captureSampleOffset(capture) {
+  return Number.isFinite(capture?.sample_offset) ? Math.round(capture.sample_offset) : 0;
+}
+
+function makeCaptureSnapshot(label, options = {}) {
+  const now = new Date();
+  const source = options.source || 'preserved';
+  const order = Number.isFinite(options.order) ? options.order : 0;
+  const nodes = data.nodes.map((nd, index) => nodeSnapshot(nd, index));
+  const fs = currentFsHz() || nodes.find((node) => node.fs > 0)?.fs || 0;
+  const capture = {
+    id: options.id || `${source}_${now.getTime()}_${order || preserveSeq + 1}`,
+    order,
+    label: label || (source === 'live' ? 'Actual' : `Start ${order}`),
+    source,
+    created_at: now.toISOString(),
+    save_time: compactTimestamp(now),
+    display_time: humanTimestamp(now),
+    visible: options.visible !== false,
+    sample_offset: Number.isFinite(options.sampleOffset) ? Math.round(options.sampleOffset) : 0,
+    color: options.color || PRESERVE_COLORS[Math.max(0, order - 1) % PRESERVE_COLORS.length],
+    fs,
+    n_slaves: activeSlaveCount,
+    n_batches: captureBatches(),
+    samples_per_batch: cfg.SAMPLES_PER_BATCH,
+    display_secs: parseInt($('disp-secs').value, 10) || null,
+    max_buf_secs: cfg.MAX_BUF_S,
+    active_node_indices: orderedSlaveIndices(true),
+    nodes,
+  };
+  capture.raw_count = captureSampleCount(capture, 'raw');
+  capture.filt_count = captureSampleCount(capture, 'filt');
+  capture.signature = captureSignature(nodes);
+  return capture;
+}
+
+function selectedPreservedCaptures() {
+  return preservedCaptures.filter((capture) => capture.visible);
+}
+
+function selectedPreservedNodeIndices() {
+  const indices = new Set();
+  for (const capture of selectedPreservedCaptures()) {
+    for (const node of capture.nodes) {
+      if (node && node.index > 0 && (node.raw_count > 0 || node.filt_count > 0)) {
+        indices.add(node.index);
+      }
+    }
+  }
+  return indices;
+}
+
+function refreshPreservedStatus() {
+  const el = $('preserve-status');
+  if (!el) return;
+  const selected = selectedPreservedCaptures().length;
+  const rawCount = preservedCaptures.reduce((sum, cap) => sum + cap.raw_count, 0);
+  el.textContent = `${preservedCaptures.length} preservados / ${selected} visibles / ${rawCount} muestras raw`;
+}
+
+function renderPreservedList() {
+  const list = $('preserve-list');
+  if (!list) return;
+  list.textContent = '';
+  const captures = preservedCaptures.slice().sort((a, b) => b.order - a.order);
+  for (const capture of captures) {
+    const row = document.createElement('div');
+    row.className = 'preserve-row';
+
+    const chk = document.createElement('input');
+    chk.type = 'checkbox';
+    chk.checked = !!capture.visible;
+    chk.addEventListener('change', () => {
+      capture.visible = chk.checked;
+      refreshPreservedStatus();
+      refreshSlavePresentationOrder();
+    });
+
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    swatch.style.background = capture.color;
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const title = document.createElement('div');
+    title.className = 'title';
+    title.textContent = capture.label;
+    const sub = document.createElement('div');
+    sub.className = 'sub';
+    sub.textContent = `${capture.display_time} · ${capture.raw_count} raw · Fs ${capture.fs ? capture.fs.toFixed(0) : '?'} Hz · offset ${captureSampleOffset(capture)} muestras`;
+    meta.append(title, sub);
+
+    const offsetWrap = document.createElement('label');
+    offsetWrap.className = 'preserve-offset';
+    offsetWrap.appendChild(document.createTextNode('Offset '));
+    const offsetInput = document.createElement('input');
+    offsetInput.type = 'number';
+    offsetInput.step = '1';
+    offsetInput.value = String(captureSampleOffset(capture));
+    offsetInput.title = 'Mueve esta captura en el eje X, en muestras. Acepta valores positivos o negativos.';
+    offsetInput.addEventListener('change', () => {
+      const parsed = parseInt(offsetInput.value, 10);
+      capture.sample_offset = Number.isFinite(parsed) ? parsed : 0;
+      renderPreservedList();
+      refreshSlavePresentationOrder();
+    });
+    offsetWrap.appendChild(offsetInput);
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.textContent = 'Quitar';
+    del.addEventListener('click', () => {
+      const idx = preservedCaptures.findIndex((item) => item.id === capture.id);
+      if (idx >= 0) preservedCaptures.splice(idx, 1);
+      renderPreservedList();
+      refreshSlavePresentationOrder();
+    });
+
+    row.append(chk, swatch, meta, offsetWrap, del);
+    list.appendChild(row);
+  }
+  refreshPreservedStatus();
+}
+
+function setAllPreservedVisible(visible) {
+  for (const capture of preservedCaptures) capture.visible = !!visible;
+  renderPreservedList();
+  refreshSlavePresentationOrder();
+}
+
+function clearPreservedCaptures() {
+  preservedCaptures.length = 0;
+  renderPreservedList();
+  refreshSlavePresentationOrder();
+}
+
+function onPreserveRequested() {
+  const nextOrder = preserveSeq + 1;
+  const capture = makeCaptureSnapshot(`Start ${nextOrder}`, {
+    source: 'preserved',
+    order: nextOrder,
+    visible: true,
+  });
+  if (!captureHasSamples(capture)) {
+    appendLog('Preservar cancelado: no hay muestras en el buffer actual');
+    return;
+  }
+  preserveSeq = nextOrder;
+  preservedCaptures.push(capture);
+  renderPreservedList();
+  refreshSlavePresentationOrder();
+  appendLog(`Preservado ${capture.label}: ${capture.raw_count} muestras raw`);
 }
 
 function captureSeconds() {
   const el = $('capture-secs');
   const parsed = el ? parseFloat(el.value) : NaN;
-  const secs = Number.isFinite(parsed) ? parsed : 1.0;
+  const secs = Number.isFinite(parsed) ? parsed : 3.0;
   return clamp(secs, 0.1, 120);
 }
 
@@ -193,6 +456,14 @@ function updateCapturePreview() {
   const info = captureLimitInfo(secs);
   const capped = info.capped ? ` (max; pedido ${secs.toFixed(2)} s)` : '';
   el.textContent = `${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}`;
+}
+
+function syncDisplayWindowToCaptureDuration() {
+  const displayEl = $('disp-secs');
+  if (!displayEl) return;
+  const secs = captureSeconds();
+  displayEl.value = secs.toFixed(secs % 1 === 0 ? 0 : 1);
+  applyDisplayWindow();
 }
 
 function updateGlobalFsDisplay() {
@@ -284,7 +555,10 @@ function refreshSlavePresentationOrder() {
   plotArea.setNodeTitles(titles);
   spectrumArea.setNodeTitles(titles);
 
-  const visibleNodes = orderedSlaveIndices(true);
+  const preservedNodes = selectedPreservedNodeIndices();
+  const visibleNodeSet = new Set(orderedSlaveIndices(true));
+  for (const idx of preservedNodes) visibleNodeSet.add(idx);
+  const visibleNodes = orderedSlaveIndices(false).filter((idx) => visibleNodeSet.has(idx));
   plotArea.setActiveNodes(visibleNodes);
   spectrumArea.setActiveNodes(visibleNodes);
 
@@ -357,8 +631,13 @@ function setActiveSlaveCount(nSlaves, zeroMeansAll = false) {
   updateCapturePreview();
 }
 
+function ensureSlaveVisible(chIndex) {
+  if (chIndex <= 0 || chIndex >= cfg.MAX_NODES) return;
+  if (chIndex > activeSlaveCount) setActiveSlaveCount(chIndex);
+}
+
 function applyDisplayWindow() {
-  const fs = currentFsHz();
+  const fs = displayFsHz();
   if (!fs) return;   // nothing sensible to size the window to yet
   const secs = parseInt($('disp-secs').value, 10) || 1;
   plotArea.setDisplaySamples(Math.round(secs * fs));
@@ -439,6 +718,21 @@ function fillRingBuffer(ring, arr) {
   for (let i = 0; i < arr.length; i++) ring.push(arr[i]);
 }
 
+function filteredArrayForNode(nd, rawArray = null) {
+  const raw = rawArray || nd.rawBuf.toArray();
+  if (!raw.length) return new Float64Array(0);
+  let arr = nd.filtB ? filtFilt(nd.filtB, raw) : new Float64Array(raw);
+  if (nd.dcRemove && arr.length > 1) arr = dcRemove(arr);
+  return arr;
+}
+
+function syncZeroPhaseFiltBuffers() {
+  for (const nd of data.nodes) {
+    fillRingBuffer(nd.filtBuf, filteredArrayForNode(nd));
+    nd.filtZi = null;
+  }
+}
+
 function reprocessFiltBuf(chIndex) {
   const nd = data.nodes[chIndex];
   const raw = nd.rawBuf.toArray();
@@ -448,25 +742,8 @@ function reprocessFiltBuf(chIndex) {
     return;
   }
 
-  let arr;
-  if (nd.filtB) {
-    const result = firFilter(nd.filtB, raw, null);
-    arr = result.y;
-    nd.filtZi = result.zi;
-  } else {
-    arr = new Float64Array(raw);
-    nd.filtZi = null;
-  }
-
-  if (nd.dcRemove && arr.length > 1) {
-    let mean = 0;
-    for (let i = 0; i < arr.length; i++) mean += arr[i];
-    mean /= arr.length;
-    const out = new Float64Array(arr.length);
-    for (let i = 0; i < arr.length; i++) out[i] = arr[i] - mean;
-    arr = out;
-  }
-
+  const arr = filteredArrayForNode(nd, raw);
+  nd.filtZi = null;
   fillRingBuffer(nd.filtBuf, arr);
 }
 
@@ -504,6 +781,8 @@ function applyGlobalFs(fsHz, logMessage = '') {
       changed = true;
     }
   }
+  const manualInput = $('manual-fs-hz');
+  if (manualInput) manualInput.value = String(Math.round(fsHz));
   if (!changed && wasKnown) return;
 
   syncDataBufferForFs();
@@ -513,8 +792,25 @@ function applyGlobalFs(fsHz, logMessage = '') {
   if (logMessage) appendLog(logMessage);
 }
 
+function hasExactFsReport() {
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (data.nodes[i].fsExactKnown) return true;
+  }
+  return false;
+}
+
 function updateNodeFsFromHello(chIndex, fsHz) {
   if (!(fsHz > 0)) return;
+  if (hasExactFsReport()) return;
+  saveSlaveSetting(chIndex, 'fs_hz', Math.round(fsHz));
+  saveGlobalFs(fsHz);
+  applyGlobalFs(fsHz, `Fs global actualizado por S${chIndex}: ${fsHz} Hz`);
+}
+
+function updateNodeExactFsFromHello(chIndex, fsHz) {
+  if (!(fsHz > 0)) return;
+  const nd = data.nodes[chIndex];
+  if (nd) nd.fsExactKnown = true;
   saveSlaveSetting(chIndex, 'fs_hz', Math.round(fsHz));
   saveGlobalFs(fsHz);
   applyGlobalFs(fsHz, `Fs global actualizado por S${chIndex}: ${fsHz} Hz`);
@@ -637,7 +933,7 @@ function onCalibrateRequested(chIndex) {
 
 function onBlinkLedRequested(chIndex) {
   sendDirected(chIndex, cfg.SUBCMD_BLINK_LED, 0);
-  appendLog(`S${chIndex} titular LED`);
+  appendLog(`S${chIndex} titilar LED`);
 }
 
 function onSaveEepromRequested(chIndex) {
@@ -670,16 +966,22 @@ function onExportRequested() {
     const displaySecs = parseInt($('disp-secs').value, 10) || null;
     const nBatches = captureBatches();
     const baseName = ($('export-name').value || cfg.DEFAULT_SAVE_NAME).trim() || cfg.DEFAULT_SAVE_NAME;
+    syncZeroPhaseFiltBuffers();
+    const liveCapture = makeCaptureSnapshot('Actual', { source: 'live', visible: false });
     const { blob, filename, metadata } = buildCaptureZip(data, {
       baseName,
       nSlaves: activeSlaveCount,
       nBatches,
       displaySecs,
+      preservedCaptures: preservedCaptures.slice(),
+      liveCapture: captureHasSamples(liveCapture) ? liveCapture : null,
     });
     downloadBlob(blob, filename);
+    const captureCount = metadata.capture_count ?? 1;
+    const combined = metadata.combined_csv_file ? ` · ${metadata.combined_csv_file}` : '';
     $('export-status').textContent =
-      `ZIP: ${filename} (${metadata.nodes.reduce((s, n) => s + n.raw_count, 0)} muestras raw)`;
-    appendLog(`Export ZIP ${filename}`);
+      `ZIP: ${filename} (${captureCount} capturas${combined})`;
+    appendLog(`Export ZIP ${filename}: ${captureCount} capturas`);
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     $('export-status').textContent = `Error: ${msg}`;
@@ -921,6 +1223,14 @@ function handleStatus(pkt, idx) {
     return;
   }
 
+  if (pkt.helloMacSub === 0x05) {
+    updateNodeExactFsFromHello(idx, pkt.helloFsExactHz);
+    updateSlavePanelStats(idx);
+    renderNodeRow(idx);
+    appendLog(`HELLO slave=${idx} fs_exact=${pkt.helloFsExactHz}Hz`);
+    return;
+  }
+
   if (pkt.helloMacSub === 0x01) {
     const nd = data.nodes[idx];
     nd.psocOk = pkt.helloPsocOk;
@@ -932,23 +1242,36 @@ function handleStatus(pkt, idx) {
 }
 
 function renderTick() {
-  const fs = effectiveFs(data);
+  const fs = displayFsHz();
   const rawBufs = data.nodes.map((nd) => (nd.rawBuf.length ? nd.rawBuf.toArray() : null));
-  const filtBufs = data.nodes.map((nd) => (nd.filtBuf.length ? nd.filtBuf.toArray() : null));
-  // Linear-phase FIR of length N has constant group delay (N-1)/2: its first
-  // (N-1)/2 outputs are pure startup transient. PlotArea discards that many
-  // leading samples so the transient never appears and the rest aligns
-  // index-for-index with raw.
-  const filtTrims = data.nodes.map((nd) => (nd.filtB ? (nd.filtB.length - 1) / 2 : 0));
+  const filtBufs = data.nodes.map((nd, i) => (rawBufs[i] ? filteredArrayForNode(nd, rawBufs[i]) : null));
+  // filtFilt is zero-phase already: no group-delay trim is needed for display/export.
+  const filtTrims = data.nodes.map(() => 0);
   updateWaveVelocityLabel(fs);
-  plotArea.update(rawBufs, filtBufs, fs, filtTrims);
-  if (!$('spectra').hidden) spectrumArea.update(rawBufs, fs);
+  const overlays = selectedPreservedCaptures();
+  plotArea.update(rawBufs, filtBufs, fs, filtTrims, overlays);
+  if (!$('spectra').hidden) spectrumArea.update(rawBufs, fs, overlays);
 
   updateGlobalFsDisplay();
   for (let i = 1; i <= activeSlaveCount; i++) {
     renderNodeRow(i);
     updateSlavePanelStats(i);
   }
+}
+
+function spectrumActive() {
+  const el = $('spectra');
+  return !!el && !el.hidden;
+}
+
+function zoomPlotControls(factor, anchor = 0.5) {
+  plotArea.zoomBy(factor, anchor);
+  if (spectrumActive()) spectrumArea.zoomBy(factor, anchor);
+}
+
+function resetPlotControls() {
+  plotArea.resetView();
+  spectrumArea.resetView();
 }
 
 function applyTheme(light) {
@@ -988,6 +1311,7 @@ $('btn-theme').addEventListener('click', () => {
 initTheme();
 initTabs();
 buildSlavePanels();
+renderPreservedList();
 restoreFsFromLocalCache();
 setConnIndicator(false);
 setMasterState(masterState);
@@ -1041,6 +1365,7 @@ ws.addEventListener('packet', (ev) => {
   const idx = pkt.nodeId === cfg.MASTER_NODE_ID ? 0 : pkt.nodeId;
   if (idx < 0 || idx >= cfg.MAX_NODES) return;
   const nd = data.nodes[idx];
+  if (idx > 0) ensureSlaveVisible(idx);
 
   if (pkt.isData) {
     handleData(nd, pkt);
@@ -1114,6 +1439,8 @@ $('btn-start').addEventListener('click', () => {
   appendLog(`START: ${n} lotes (~${info.actualSecs.toFixed(2)} s real${capped})`);
 });
 
+$('btn-preserve').addEventListener('click', onPreserveRequested);
+
 $('btn-stop').addEventListener('click', () => {
   sendStd(cfg.CMD_STOP, 0);
   sendStd(cfg.CMD_STREAM, 0);
@@ -1132,10 +1459,13 @@ $('btn-cal-all').addEventListener('click', () => {
 });
 
 $('btn-export').addEventListener('click', onExportRequested);
+$('btn-preserved-all').addEventListener('click', () => setAllPreservedVisible(true));
+$('btn-preserved-none').addEventListener('click', () => setAllPreservedVisible(false));
+$('btn-preserved-clear').addEventListener('click', clearPreservedCaptures);
 
-$('btn-plot-zoom-in').addEventListener('click', () => plotArea.zoomBy(1.5, 0.5));
-$('btn-plot-zoom-out').addEventListener('click', () => plotArea.zoomBy(1 / 1.5, 0.5));
-$('btn-plot-reset').addEventListener('click', () => plotArea.resetView());
+$('btn-plot-zoom-in').addEventListener('click', () => zoomPlotControls(1.5, 0.5));
+$('btn-plot-zoom-out').addEventListener('click', () => zoomPlotControls(1 / 1.5, 0.5));
+$('btn-plot-reset').addEventListener('click', resetPlotControls);
 
 function setCursorEditMode(mode) {
   const buttons = [$('btn-cursor-1'), $('btn-cursor-2')];
@@ -1151,38 +1481,48 @@ $('btn-cursor-2').addEventListener('click', () => setCursorEditMode(1));
 $('btn-spectrum').addEventListener('click', () => {
   const active = $('btn-spectrum').classList.toggle('active');
   $('spectra').hidden = !active;
+  if (active) spectrumArea.resetView();
 });
 
 // Display-only curve visibility — saving/export always keeps raw AND filtered regardless of these.
 function applyCurveVisibility(persist = true) {
   const showRaw = $('chk-show-raw').checked;
   const showFilt = $('chk-show-filt').checked;
-  const showHilbert = $('chk-show-hilbert').checked;
+  const showEnvRaw = $('chk-show-env-raw').checked;
+  const showEnvFilt = $('chk-show-env-filt').checked;
   if (persist) {
     saveSetting(SHOW_RAW_KEY, showRaw ? 1 : 0);
     saveSetting(SHOW_FILT_KEY, showFilt ? 1 : 0);
-    saveSetting(SHOW_HILBERT_KEY, showHilbert ? 1 : 0);
+    saveSetting(SHOW_ENV_RAW_KEY, showEnvRaw ? 1 : 0);
+    saveSetting(SHOW_ENV_FILT_KEY, showEnvFilt ? 1 : 0);
   }
   plotArea.setCurveVisibility(showRaw, showFilt);
-  plotArea.setEnvelopeMode(showHilbert);
+  plotArea.setEnvelopeMode(showEnvRaw, showEnvFilt);
 }
 
 function initCurveVisibility() {
   $('chk-show-raw').checked = loadBoolSetting(SHOW_RAW_KEY, $('chk-show-raw').checked);
   $('chk-show-filt').checked = loadBoolSetting(SHOW_FILT_KEY, $('chk-show-filt').checked);
-  $('chk-show-hilbert').checked = loadBoolSetting(SHOW_HILBERT_KEY, $('chk-show-hilbert').checked);
+  const oldEnvelope = loadBoolSetting(SHOW_HILBERT_KEY, false);
+  $('chk-show-env-raw').checked = loadBoolSetting(SHOW_ENV_RAW_KEY, oldEnvelope);
+  $('chk-show-env-filt').checked = loadBoolSetting(SHOW_ENV_FILT_KEY, oldEnvelope);
   applyCurveVisibility(false);
 }
 $('chk-show-raw').addEventListener('change', applyCurveVisibility);
 $('chk-show-filt').addEventListener('change', applyCurveVisibility);
-$('chk-show-hilbert').addEventListener('change', applyCurveVisibility);
+$('chk-show-env-raw').addEventListener('change', applyCurveVisibility);
+$('chk-show-env-filt').addEventListener('change', applyCurveVisibility);
 initCurveVisibility();
 
-$('disp-secs').addEventListener('change', applyDisplayWindow);
-$('capture-secs').addEventListener('change', () => {
+function onCaptureDurationEdited() {
   updateCapturePreview();
-  applyDisplayWindow();
-});
-applyDisplayWindow();
+  syncDisplayWindowToCaptureDuration();
+}
+
+$('disp-secs').addEventListener('input', applyDisplayWindow);
+$('disp-secs').addEventListener('change', applyDisplayWindow);
+$('capture-secs').addEventListener('input', onCaptureDurationEdited);
+$('capture-secs').addEventListener('change', onCaptureDurationEdited);
+syncDisplayWindowToCaptureDuration();
 
 ws.start();

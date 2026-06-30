@@ -2,7 +2,7 @@
 // commands as the flat JSON the firmware's web_relay.h expects.
 // Mirrors python/geophone_scope/protocol.py — keep field names/semantics in sync.
 
-import * as cfg from './config.js?v=field-loop-22';
+import * as cfg from './config.js?v=field-loop-33';
 
 /** Parsed 6-byte packet from the master (0x56 header). Mirrors protocol.Packet. */
 export class Packet {
@@ -43,8 +43,9 @@ export class Packet {
   get statusEspnowOk() { return this.b2; }
   get statusApCh() { return this.b1; }
   get helloPsocOk() { return !!this.b1; }
-  /** Sample rate reported in a slave HELLO (b0 = fs/100 Hz, 0 = unknown). */
+  /** Legacy sample rate reported in a slave HELLO (b0 = fs/100 Hz, 0 = unknown). */
   get helloFsHz() { return this.b0 * 100; }
+  get helloFsExactHz() { return ((this.b1 << 8) | this.b0) >>> 0; }
   get helloMacSub() { return this.b2; }
   get helloMacHi() { return this.b1; }
   get helloMacLo() { return this.b0; }

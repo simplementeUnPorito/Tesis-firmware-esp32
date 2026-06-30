@@ -93,7 +93,7 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
   #define ARM_TIMEOUT_MS 3000
 #endif
 #ifndef ADC_SAMPLE_RATE_HZ
-  #define ADC_SAMPLE_RATE_HZ 3000
+  #define ADC_SAMPLE_RATE_HZ 2929
 #endif
 #ifndef STORE_CAPTURE_MARGIN_MS
   #define STORE_CAPTURE_MARGIN_MS 750

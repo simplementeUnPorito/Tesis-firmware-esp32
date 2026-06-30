@@ -91,6 +91,12 @@
 #ifndef PSOC_AUTO_CAL_RETRY_MS
   #define PSOC_AUTO_CAL_RETRY_MS 3000u
 #endif
+#ifndef PSOC_NOMINAL_SAMPLE_RATE_HZ
+  #define PSOC_NOMINAL_SAMPLE_RATE_HZ 3000u
+#endif
+#ifndef PSOC_EFFECTIVE_SAMPLE_RATE_HZ
+  #define PSOC_EFFECTIVE_SAMPLE_RATE_HZ 2929u
+#endif
 
 /* MAC del ESP maestro. El valor real debe venir de platformio.ini. */
 #ifndef MASTER_MAC0
@@ -1020,6 +1026,12 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
     }
 }
 
+static uint8_t expectedPsocAckValue(uint8_t sub_cmd, uint8_t param)
+{
+    /* SAVE_EEPROM se envia con parametro 0, pero el PSoC responde 1 si grabo bien. */
+    return (sub_cmd == PSOC_CMD_SAVE_EEPROM) ? 1u : param;
+}
+
 static void waitForPsocConfigAck(uint8_t sub_cmd, uint8_t param)
 {
     g_cfg_sub_cmd = sub_cmd;
@@ -1070,15 +1082,16 @@ static void servicePsocConfigAck()
     while (psoc.takeConfigAck(ackCmd, ackVal)) {
         g_psocConnected = true;
         if (g_cfg_waiting && ackCmd == g_cfg_sub_cmd) {
-            const uint8_t ok = (ackVal == g_cfg_param) ? 1u : 0u;
+            const uint8_t expected = expectedPsocAckValue(g_cfg_sub_cmd, g_cfg_param);
+            const uint8_t ok = (ackVal == expected) ? 1u : 0u;
             if (ok) {
                 applyConfirmedConfig(ackCmd, ackVal);
             }
             sendCfgAck(g_cfg_sub_cmd, ok);
             SLAVE_LOG_PRINTF("[SLAVE] PSoC cfg ack sub=0x%02X val=%u expected=%u ok=%u\n",
-                             ackCmd, ackVal, g_cfg_param, ok);
+                             ackCmd, ackVal, expected, ok);
             LOGM("CFG_ACK", "sub=0x%02X,val=%u,expected=%u,ok=%u",
-                 ackCmd, ackVal, g_cfg_param, ok);
+                 ackCmd, ackVal, expected, ok);
             g_cfg_waiting = false;
         } else {
             applyConfirmedConfig(ackCmd, ackVal);
@@ -1090,13 +1103,14 @@ static void servicePsocConfigAck()
 
     if (g_cfg_waiting &&
         (uint32_t)(millis() - g_cfg_start_ms) >= g_cfg_timeout_ms) {
+        const uint8_t expected = expectedPsocAckValue(g_cfg_sub_cmd, g_cfg_param);
         sendCfgAck(g_cfg_sub_cmd, 0);
         SLAVE_LOG_PRINTF("[SLAVE] PSoC cfg ack timeout sub=0x%02X expected=%u elapsed=%lu/%lu\n",
-                         g_cfg_sub_cmd, g_cfg_param,
+                         g_cfg_sub_cmd, expected,
                          (unsigned long)(millis() - g_cfg_start_ms),
                          (unsigned long)g_cfg_timeout_ms);
         LOGM("CFG_TIMEOUT", "sub=0x%02X,expected=%u,elapsed=%lu,timeout=%lu",
-             g_cfg_sub_cmd, g_cfg_param,
+             g_cfg_sub_cmd, expected,
              (unsigned long)(millis() - g_cfg_start_ms),
              (unsigned long)g_cfg_timeout_ms);
         g_cfg_waiting = false;
@@ -1389,6 +1403,15 @@ static bool storeReadyForHotWait()
     return (g_rec_n_batches == 0) || (g_store_buf != nullptr && g_store_ts_us != nullptr);
 }
 
+static uint16_t effectivePsocSampleRateHz()
+{
+    uint16_t fs = psoc.sampleRate();
+    if (fs == (uint16_t)PSOC_NOMINAL_SAMPLE_RATE_HZ) {
+        return (uint16_t)PSOC_EFFECTIVE_SAMPLE_RATE_HZ;
+    }
+    return fs;
+}
+
 static uint16_t clampPsocCaptureBatches(uint16_t n)
 {
     if (n > PSOC_CAPTURE_MAX_BATCHES) {
@@ -1399,8 +1422,8 @@ static uint16_t clampPsocCaptureBatches(uint16_t n)
 
 static uint32_t expectedViewCaptureMs(uint16_t n_batches)
 {
-    uint32_t fs = psoc.sampleRate();
-    if (fs == 0) fs = 3000u;
+    uint32_t fs = effectivePsocSampleRateHz();
+    if (fs == 0) fs = 2929u;
     uint32_t ms = ((uint32_t)n_batches * (uint32_t)SPI_BATCH_SAMPLES * 1000u + fs - 1u) / fs;
     return ms + PSOC_VIEW_START_FALLBACK_EXTRA_MS;
 }
@@ -1922,6 +1945,9 @@ void setup()
     /* LED de identificación */
     pinMode(BLINK_LED_PIN, OUTPUT);
     digitalWrite(BLINK_LED_PIN, BLINK_LED_OFF_LEVEL);
+    SLAVE_LOG_PRINTF("[SLAVE] blink LED pin=%d active_low=%u on=%d off=%d\n",
+                     BLINK_LED_PIN, (unsigned)BLINK_LED_ACTIVE_LOW,
+                     BLINK_LED_ON_LEVEL, BLINK_LED_OFF_LEVEL);
 
     /* GPIO hardware sync — pull-down para evitar ISR espurias cuando no hay cable */
     pinMode(SYNC_IN_PIN,      INPUT_PULLDOWN);
@@ -2071,7 +2097,7 @@ void loop()
         !(g_state == STOPPED && g_rec_n_batches > 0) &&
         millis() - lastHelloMs >= 2000) {
         lastHelloMs = millis();
-        MsgHello h = { CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected, psoc.sampleRate() };
+        MsgHello h = { CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected, effectivePsocSampleRateHz() };
         esp_err_t err = espnowSend(MASTER_MAC, (const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX
         SLAVE_LOG_PRINTF("[SLAVE] HELLO tx err=%d txOK=%u txFail=%u\n",

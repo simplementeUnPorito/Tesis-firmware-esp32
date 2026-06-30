@@ -4,11 +4,13 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-loop-22';
-import { hilbertEnvelope } from './signal_proc.js?v=field-loop-22';
+import * as cfg from './config.js?v=field-loop-33';
+import { hilbertEnvelope } from './signal_proc.js?v=field-loop-33';
 
 const RAW_COLOR = 'rgb(80, 140, 255)';
 const FILT_COLOR = 'rgb(255, 80, 80)';
+const ENV_RAW_COLOR  = 'rgba(242, 130, 13, 0.86)';
+const ENV_FILT_COLOR = 'rgba(255, 190, 80, 0.86)';
 const CURSOR_STYLES = [
   { label: 'C1', line: 'rgba(255,230,80,0.9)', stroke: 'rgba(255,230,80,0.65)', text: '#ffe980' },
   { label: 'C2', line: 'rgba(80,220,255,0.9)', stroke: 'rgba(80,220,255,0.65)', text: '#80eaff' },
@@ -67,6 +69,33 @@ function clamp(value, lo, hi) {
   return Math.max(lo, Math.min(hi, value));
 }
 
+function withAlpha(color, alpha) {
+  const a = clamp(alpha, 0, 1);
+  const rgba = color.match(/^rgba?\(([^,]+),\s*([^,]+),\s*([^,\)]+)(?:,\s*([^\)]+))?\)$/i);
+  if (!rgba) return color;
+  return `rgba(${rgba[1]}, ${rgba[2]}, ${rgba[3]}, ${a})`;
+}
+
+function sampleOffset(value) {
+  return Number.isFinite(value) ? Math.round(value) : 0;
+}
+
+function envelopeNoDc(src, trim = 0) {
+  if (!src || src.length <= trim) return null;
+  const start = Math.max(0, trim | 0);
+  const n = src.length - start;
+  if (n < 2) return null;
+  let mean = 0;
+  for (let i = start; i < src.length; i++) mean += src[i];
+  mean /= n;
+  const centered = new Float64Array(n);
+  for (let i = 0; i < n; i++) centered[i] = src[start + i] - mean;
+  const values = hilbertEnvelope(centered);
+  let peak = 0;
+  for (let i = 0; i < values.length; i++) if (values[i] > peak) peak = values[i];
+  return { values, peak };
+}
+
 /** One stacked channel: canvas + raw/filtered curves, grid, title, legend. */
 class ChannelPlot {
   constructor(container, title, handlers = {}) {
@@ -79,7 +108,9 @@ class ChannelPlot {
     this._visible = true;
     this._showRaw = true;
     this._showFilt = true;
-    this._showEnvelope = false;
+    this._showRawEnvelope = false;
+    this._showFiltEnvelope = false;
+    this._overlays = [];
     this._handlers = handlers;
     this._dragLastX = null;
     this._cursorMode = null;
@@ -120,14 +151,15 @@ class ChannelPlot {
     this._showFilt = showFilt !== false;
   }
 
-  setEnvelopeMode(enabled) {
-    this._showEnvelope = enabled === true;
+  setEnvelopeMode(rawEnabled, filtEnabled) {
+    this._showRawEnvelope = rawEnabled === true;
+    this._showFiltEnvelope = filtEnabled === true;
   }
 
   /** raw/filt: Float64Array|null, already windowed. fs: Hz, for the time axis.
    *  filtTrimSamp: count of leading filtered samples to discard before
    *  drawing (0 → keep all). See PlotArea.update for why. */
-  setData(raw, filt, fs, xStartSamp, xSpanSamp, filtTrimSamp = 0) {
+  setData(raw, filt, fs, xStartSamp, xSpanSamp, filtTrimSamp = 0, overlays = []) {
     this._raw = (raw && raw.length) ? raw : null;
     this._filt = (filt && filt.length) ? filt : null;
     // No nominal fallback: Fs comes only from the hardware HELLO. 0 = unknown.
@@ -135,6 +167,7 @@ class ChannelPlot {
     this._xStartSamp = Math.max(0, xStartSamp | 0);
     this._xSpanSamp = Math.max(1, xSpanSamp | 0);
     this._filtTrimSamp = filtTrimSamp || 0;
+    this._overlays = Array.isArray(overlays) ? overlays : [];
   }
 
   setCursors(samps) {
@@ -154,6 +187,7 @@ class ChannelPlot {
   clear() {
     this._raw = null;
     this._filt = null;
+    this._overlays = [];
   }
 
   _fitCanvas() {
@@ -299,31 +333,62 @@ class ChannelPlot {
     ctx.fillStyle = colors.bg;
     ctx.fillRect(0, 0, W, H);
 
-    const raw = (this._showEnvelope && this._raw) ? hilbertEnvelope(this._raw) : this._raw;
-    const filt = (this._showEnvelope && this._filt) ? hilbertEnvelope(this._filt) : this._filt;
+    const raw = this._raw;
+    const filt = this._filt;
+    const envRaw  = this._showRawEnvelope ? envelopeNoDc(raw, 0) : null;
+    const envFilt = this._showFiltEnvelope ? envelopeNoDc(filt, this._filtTrimSamp) : null;
+    const overlays = (this._overlays || []).map((overlay) => {
+      const rawOverlay = overlay.raw && overlay.raw.length ? overlay.raw : null;
+      const filtOverlay = overlay.filt && overlay.filt.length ? overlay.filt : null;
+      const trim = overlay.filtTrimSamp || 0;
+      return {
+        ...overlay,
+        raw: rawOverlay,
+        filt: filtOverlay,
+        filtTrimSamp: trim,
+        envRaw: this._showRawEnvelope ? envelopeNoDc(rawOverlay, 0) : null,
+        envFilt: this._showFiltEnvelope ? envelopeNoDc(filtOverlay, trim) : null,
+      };
+    });
     const xLo = this._xStartSamp / this._fs;
     const xHi = (this._xStartSamp + this._xSpanSamp) / this._fs;
     const xSpan = Math.max(1 / this._fs, xHi - xLo);
 
     const showRaw = this._showRaw && raw;
     const showFilt = this._showFilt && filt;
+    const showEnvRaw = this._showRawEnvelope && envRaw;
+    const showEnvFilt = this._showFiltEnvelope && envFilt;
     let yLo = -1, yHi = 1;
-    if (showRaw || showFilt) {
-      let lo = Infinity, hi = -Infinity;
-      if (showRaw) {
-        const r = minMax(raw);
-        if (r) { lo = Math.min(lo, r.lo); hi = Math.max(hi, r.hi); }
-      }
-      if (showFilt) {
-        const r = minMax(filt, this._filtTrimSamp);
-        if (r) { lo = Math.min(lo, r.lo); hi = Math.max(hi, r.hi); }
-      }
-      if (Number.isFinite(lo) && Number.isFinite(hi)) {
-        if (lo === hi) { lo -= 1; hi += 1; }
-        const pad = (hi - lo) * 0.08;
-        yLo = lo - pad;
-        yHi = hi + pad;
-      }
+    let lo = Infinity, hi = -Infinity;
+    const includeRange = (range) => {
+      if (!range) return;
+      lo = Math.min(lo, range.lo);
+      hi = Math.max(hi, range.hi);
+    };
+    const includeEnvelope = (env) => {
+      if (!env || !(env.peak > 0)) return;
+      lo = Math.min(lo, -env.peak);
+      hi = Math.max(hi, env.peak);
+    };
+    if (showRaw) {
+      includeRange(minMax(raw));
+    }
+    if (showFilt) {
+      includeRange(minMax(filt, this._filtTrimSamp));
+    }
+    if (showEnvRaw) includeEnvelope(envRaw);
+    if (showEnvFilt) includeEnvelope(envFilt);
+    for (const overlay of overlays) {
+      if (this._showRaw && overlay.raw) includeRange(minMax(overlay.raw));
+      if (this._showFilt && overlay.filt) includeRange(minMax(overlay.filt, overlay.filtTrimSamp));
+      if (this._showRawEnvelope) includeEnvelope(overlay.envRaw);
+      if (this._showFiltEnvelope) includeEnvelope(overlay.envFilt);
+    }
+    if (Number.isFinite(lo) && Number.isFinite(hi)) {
+      if (lo === hi) { lo -= 1; hi += 1; }
+      const pad = Math.max((hi - lo) * 0.08, 1e-6);
+      yLo = lo - pad;
+      yHi = hi + pad;
     }
 
     const xTo = (t) => m.left + ((t - xLo) / xSpan) * plotW;
@@ -369,10 +434,11 @@ class ChannelPlot {
     ctx.beginPath();
     ctx.rect(m.left, m.top, plotW, plotH);
     ctx.clip();
-    const drawCurve = (data, color, trimSamp) => {
+    const drawCurve = (data, color, trimSamp, dash = null, xStartSamp = this._xStartSamp) => {
       if (!data || data.length < 2 + trimSamp) return;
       ctx.strokeStyle = color;
       ctx.lineWidth = Math.max(1, dpr);
+      ctx.setLineDash(dash || []);
       ctx.beginPath();
       const len = data.length;
       let started = false;
@@ -381,18 +447,56 @@ class ChannelPlot {
         // up with raw[k] (k = i - trimSamp); plot it at raw[k]'s x-position,
         // not at its own raw index, or the curve ends up shifted right by an
         // extra trimSamp samples on top of the filter's own group delay.
-        const px = xTo((this._xStartSamp + i - trimSamp) / this._fs);
+        const px = xTo((xStartSamp + i - trimSamp) / this._fs);
         const py = yTo(data[i]);
         if (!started) { ctx.moveTo(px, py); started = true; }
         else ctx.lineTo(px, py);
       }
       ctx.stroke();
+      ctx.setLineDash([]);
     };
+    const drawEnvBilateral = (env, color, xStartSamp = this._xStartSamp) => {
+      if (!env || !env.values || env.values.length < 2) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = Math.max(1, dpr);
+      ctx.setLineDash([]);
+      for (const sign of [1, -1]) {
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < env.values.length; i++) {
+          const px = xTo((xStartSamp + i) / this._fs);
+          const py = yTo(sign * env.values[i]);
+          if (!started) { ctx.moveTo(px, py); started = true; }
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+      }
+    };
+
+    for (const overlay of overlays) {
+      const color = overlay.color || 'rgba(20, 184, 166, 0.65)';
+      const xStart = Number.isFinite(overlay.xStartSamp) ? overlay.xStartSamp : this._xStartSamp;
+      if (this._showRaw) drawCurve(overlay.raw, withAlpha(color, 0.35), 0, null, xStart);
+      if (this._showFilt) {
+        drawCurve(
+          overlay.filt,
+          withAlpha(color, 0.72),
+          overlay.filtTrimSamp,
+          [6 * dpr, 3 * dpr],
+          xStart,
+        );
+      }
+      if (this._showRawEnvelope) drawEnvBilateral(overlay.envRaw, withAlpha(color, 0.38), xStart);
+      if (this._showFiltEnvelope) drawEnvBilateral(overlay.envFilt, withAlpha(color, 0.58), xStart);
+    }
+
     if (this._showRaw) drawCurve(raw, RAW_COLOR, 0);
     // Linear-phase FIR of length N has constant group delay (N-1)/2: its
     // first (N-1)/2 outputs are pure startup transient. Discard them so the
     // rest aligns index-for-index with raw, and the transient never appears.
     if (this._showFilt) drawCurve(filt, FILT_COLOR, this._filtTrimSamp);
+    if (this._showRawEnvelope) drawEnvBilateral(envRaw, ENV_RAW_COLOR);
+    if (this._showFiltEnvelope) drawEnvBilateral(envFilt, ENV_FILT_COLOR);
     ctx.restore();
 
     // Cursors - vertical dashed lines + readout boxes.
@@ -428,10 +532,14 @@ class ChannelPlot {
       const tMs = cursorT * 1000;
       const lines = [`${style.label} t: ${tMs.toFixed(2)} ms`];
       if (raw && relIdx >= 0 && relIdx < raw.length)
-        lines.push(`${this._showEnvelope ? 'env raw' : 'raw'}: ${fmtVolt(raw[relIdx])} V`);
+        lines.push(`raw: ${fmtVolt(raw[relIdx])} V`);
+      if (envRaw && relIdx >= 0 && relIdx < envRaw.values.length)
+        lines.push(`env raw: ${fmtVolt(envRaw.values[relIdx])} V`);
       const filtIdx = relIdx + (this._filtTrimSamp || 0);
       if (filt && filtIdx >= 0 && filtIdx < filt.length)
-        lines.push(`${this._showEnvelope ? 'env filt' : 'filt'}: ${fmtVolt(filt[filtIdx])} V`);
+        lines.push(`filt: ${fmtVolt(filt[filtIdx])} V`);
+      if (envFilt && relIdx >= 0 && relIdx < envFilt.values.length)
+        lines.push(`env filt: ${fmtVolt(envFilt.values[relIdx])} V`);
       if (ci === 1 && deltaMs !== null) lines.push(`dt: ${deltaMs.toFixed(2)} ms`);
 
       const lineH = 13 * dpr;
@@ -479,11 +587,20 @@ class ChannelPlot {
       return true;
     };
     ctx.textAlign = 'right';
+    if (overlays.length) {
+      drawLegendItem('Preservados', withAlpha(overlays[0].color || 'rgba(20,184,166,0.7)', 0.86));
+    }
+    if (this._showFiltEnvelope && envFilt) {
+      drawLegendItem('Env filtrada', ENV_FILT_COLOR);
+    }
+    if (this._showRawEnvelope && envRaw) {
+      drawLegendItem('Env cruda', ENV_RAW_COLOR);
+    }
     if (filt && this._showFilt) {
-      drawLegendItem(this._showEnvelope ? 'Env filtrada' : 'Filtrada', FILT_COLOR);
+      drawLegendItem('Filtrada', FILT_COLOR);
     }
     if (this._showRaw) {
-      drawLegendItem(this._showEnvelope ? 'Env cruda' : 'Cruda', RAW_COLOR);
+      drawLegendItem('Cruda', RAW_COLOR);
     }
 
     // Y-axis unit label (rotated)
@@ -517,7 +634,8 @@ export class PlotArea {
     this._followTail = true;
     this._showRaw = true;
     this._showFilt = true;
-    this._showEnvelope = false;
+    this._showRawEnvelope = false;
+    this._showFiltEnvelope = false;
     this._lastMaxLen = 0;
     this._cursorMode = null;
     this._cursorSamps = [null, null];
@@ -549,10 +667,11 @@ export class PlotArea {
     }
   }
 
-  setEnvelopeMode(enabled) {
-    this._showEnvelope = enabled === true;
+  setEnvelopeMode(rawEnabled, filtEnabled) {
+    this._showRawEnvelope = rawEnabled === true;
+    this._showFiltEnvelope = filtEnabled === true;
     for (const p of this._plots) {
-      p.setEnvelopeMode(this._showEnvelope);
+      p.setEnvelopeMode(this._showRawEnvelope, this._showFiltEnvelope);
       if (p.visible) p.draw();
     }
   }
@@ -639,12 +758,20 @@ export class PlotArea {
    *                       transient; dropping them both hides that transient and
    *                       re-aligns what's left with raw at the same x positions.
    */
-  update(rawBufs, filtBufs, fs, filtTrims) {
+  update(rawBufs, filtBufs, fs, filtTrims, overlayCaptures = []) {
     this._lastMaxLen = 0;
     for (let i = 0; i < this._plots.length; i++) {
       const rawLen = rawBufs[i] ? rawBufs[i].length : 0;
       const filtLen = filtBufs[i] ? filtBufs[i].length : 0;
       this._lastMaxLen = Math.max(this._lastMaxLen, rawLen, filtLen);
+      for (const capture of overlayCaptures || []) {
+        const node = capture.nodes && capture.nodes[i];
+        if (!node) continue;
+        const oRawLen = node.raw && node.raw.length ? node.raw.length : 0;
+        const oFiltLen = node.filt && node.filt.length ? node.filt.length : 0;
+        const offset = sampleOffset(capture.sample_offset);
+        this._lastMaxLen = Math.max(this._lastMaxLen, oRawLen + offset, oFiltLen + offset);
+      }
     }
     const viewSamples = this._viewSamples();
     if (this._followTail) this._panSamp = Math.max(0, this._lastMaxLen - viewSamples);
@@ -666,9 +793,32 @@ export class PlotArea {
       // still reaches rawTail's right edge after drawCurve discards the lead-in.
       const filtEnd = end + filtTrim;
       const filtTail = (filt && filt.length) ? filt.subarray(Math.min(start, filt.length), Math.min(filtEnd, filt.length)) : null;
+      const overlays = [];
+      for (const capture of overlayCaptures || []) {
+        const node = capture.nodes && capture.nodes[i];
+        if (!node) continue;
+        const nodeRaw = node.raw && node.raw.length ? node.raw : null;
+        const nodeFilt = node.filt && node.filt.length ? node.filt : null;
+        if (!nodeRaw && !nodeFilt) continue;
+        const oTrim = node.filt_trim_samples || 0;
+        const offset = sampleOffset(capture.sample_offset);
+        const rawSrcStart = Math.max(0, start - offset);
+        const rawSrcEnd = Math.max(rawSrcStart, end - offset);
+        const filtSrcStart = Math.max(0, start - offset);
+        const filtSrcEnd = Math.max(filtSrcStart, end + oTrim - offset);
+        const xStartSamp = rawSrcStart + offset;
+        overlays.push({
+          label: capture.label,
+          color: capture.color,
+          raw: nodeRaw ? nodeRaw.subarray(Math.min(rawSrcStart, nodeRaw.length), Math.min(rawSrcEnd, nodeRaw.length)) : null,
+          filt: nodeFilt ? nodeFilt.subarray(Math.min(filtSrcStart, nodeFilt.length), Math.min(filtSrcEnd, nodeFilt.length)) : null,
+          filtTrimSamp: oTrim,
+          xStartSamp,
+        });
+      }
       // No nominal fallback: fs is 0 until the hardware reports it, and
       // setData/draw treat 0 as "don't draw a time axis yet".
-      p.setData(rawTail, filtTail, fs || 0, start, viewSamples, filtTrim);
+      p.setData(rawTail, filtTail, fs || 0, start, viewSamples, filtTrim, overlays);
       p.setCursors(this._cursorSamps);
       p.draw();
     }

@@ -90,12 +90,13 @@ header {
 
 .app-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(18rem, 340px);
+  grid-template-columns: minmax(18rem, 360px) minmax(0, 1fr);
   gap: 0.75rem;
   align-items: start;
 }
 
 .control-sidebar {
+  order: -1;
   min-width: 0;
   max-height: calc(100vh - 5rem);
   position: sticky;
@@ -212,6 +213,10 @@ button:active { background: var(--input-active); }
 .node-row .stats { color: var(--muted); }
 .node-row .cfg   { color: var(--muted-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.capture-subhead {
+  margin-top: 0.75rem;
+}
+
 .slave-panel .row {
   align-items: center;
 }
@@ -310,6 +315,7 @@ button:active { background: var(--input-active); }
 
 .plot-tools {
   display: inline-flex;
+  flex-wrap: wrap;
   gap: 0.35rem;
   align-items: center;
 }
@@ -364,6 +370,70 @@ button:active { background: var(--input-active); }
   gap: 0.75rem;
 }
 
+.preserve-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+}
+
+.preserve-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  gap: 0.45rem;
+  align-items: center;
+  padding: 0.35rem 0.4rem;
+  background: var(--node-row-bg);
+  border-radius: 6px;
+  font-size: 0.82rem;
+}
+
+.preserve-row .swatch {
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 50%;
+  border: 1px solid var(--plot-border);
+}
+
+.preserve-row .meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.08rem;
+}
+
+.preserve-row .title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.preserve-row .sub {
+  color: var(--muted-2);
+  font-family: ui-monospace, monospace;
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+
+.preserve-offset {
+  display: inline-flex;
+  gap: 0.25rem;
+  align-items: center;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.preserve-offset input {
+  width: 5.5rem;
+}
+
+.preserve-row button {
+  padding: 0.22rem 0.45rem;
+  font-size: 0.8rem;
+}
+
 .slave-panels .panel:last-child,
 .control-sidebar .panel:last-child {
   margin-bottom: 0;
@@ -389,6 +459,15 @@ button:active { background: var(--input-active); }
     min-height: auto;
   }
 
+  .plot-toolbar {
+    gap: 0.4rem;
+  }
+
+  .plot-tools {
+    display: flex;
+    width: 100%;
+  }
+
   .plot-wrap {
     height: clamp(14rem, 42vh, 24rem);
   }
@@ -407,12 +486,38 @@ button:active { background: var(--input-active); }
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .preserve-row {
+    grid-template-columns: auto auto minmax(0, 1fr);
+  }
+
+  .preserve-offset {
+    grid-column: 3 / -1;
+  }
+
+  .preserve-row button {
+    grid-column: 3 / -1;
+    justify-self: start;
+  }
+
+  .tab-btn {
+    font-size: 0.74rem;
+    padding-inline: 0.18rem;
+  }
+
   .node-row .cfg {
     grid-column: 1 / -1;
   }
 
   button, select, input {
     min-height: 2.35rem;
+  }
+
+  .row {
+    gap: 0.4rem;
+  }
+
+  .plot-tools button {
+    flex: 1 1 auto;
   }
 
   input[type="text"] {

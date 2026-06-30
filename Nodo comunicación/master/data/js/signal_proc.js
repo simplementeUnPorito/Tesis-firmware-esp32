@@ -180,6 +180,46 @@ export function firFilter(b, x, zi = null) {
   return { y, zi: state };
 }
 
+function reverseCopy(input) {
+  const out = new Float64Array(input.length);
+  for (let i = 0; i < input.length; i++) out[i] = input[input.length - 1 - i];
+  return out;
+}
+
+/**
+ * Zero-phase FIR filtering, equivalent in spirit to scipy.signal.filtfilt(b, 1, x).
+ * Uses odd reflection padding so edge transients fall mostly outside the returned
+ * capture. This is for full-buffer display/export, not real-time hardware FIR.
+ */
+export function filtFilt(b, x) {
+  const coeff = ArrayBuffer.isView(b) ? b : new Float64Array(b);
+  const input = ArrayBuffer.isView(x) ? x : new Float64Array(x);
+  const n = input.length;
+  if (!n) return new Float64Array(0);
+  if (coeff.length === 0) return new Float64Array(input);
+  if (coeff.length === 1) {
+    const gain = coeff[0] * coeff[0];
+    const out = new Float64Array(n);
+    for (let i = 0; i < n; i++) out[i] = input[i] * gain;
+    return out;
+  }
+
+  const padLen = Math.min(n - 1, Math.max(0, 3 * (coeff.length - 1)));
+  const ext = new Float64Array(n + 2 * padLen);
+  for (let i = 0; i < padLen; i++) {
+    ext[i] = 2 * input[0] - input[padLen - i];
+  }
+  ext.set(input, padLen);
+  for (let i = 0; i < padLen; i++) {
+    ext[padLen + n + i] = 2 * input[n - 1] - input[n - 2 - i];
+  }
+
+  const forward = firFilter(coeff, ext, null).y;
+  const backward = firFilter(coeff, reverseCopy(forward), null).y;
+  const zeroPhase = reverseCopy(backward);
+  return zeroPhase.slice(padLen, padLen + n);
+}
+
 export function dcRemove(buf) {
   const x = ArrayBuffer.isView(buf) ? buf : new Float64Array(buf);
   if (!x.length) return new Float64Array(0);

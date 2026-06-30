@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-loop-22';
+import * as cfg from './config.js?v=field-loop-33';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -183,7 +183,7 @@ export class SlavePanel extends EventTarget {
     this._btnSaveEeprom.addEventListener('click', () => this._dispatch('save-eeprom-requested'));
     this._dotEeprom = dot('EEPROM sin guardar');
 
-    this._btnBlinkLed = el('button', null, 'Titular LED');
+    this._btnBlinkLed = el('button', null, 'Titilar LED');
     this._btnBlinkLed.title = 'Hace titilar el LED del ESP esclavo para identificarlo físicamente';
     this._btnBlinkLed.addEventListener('click', () => this._dispatch('blink-led-requested'));
 

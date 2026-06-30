@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-loop-22">
+  <link rel="stylesheet" href="/css/style.css?v=field-loop-33">
 </head>
 <body>
   <header>
@@ -34,7 +34,8 @@
         <span class="plot-tools">
           <label><input id="chk-show-raw" type="checkbox" checked> Cruda</label>
           <label><input id="chk-show-filt" type="checkbox" checked> Filtrada <span id="wave-velocity" class="velocity-readout"></span></label>
-          <label><input id="chk-show-hilbert" type="checkbox"> Envolvente</label>
+          <label><input id="chk-show-env-raw" type="checkbox"> Env cruda</label>
+          <label><input id="chk-show-env-filt" type="checkbox"> Env filtrada</label>
         </span>
       </div>
       <div id="plots" class="plot-area"></div>
@@ -44,8 +45,8 @@
     <aside class="control-sidebar">
       <nav class="tab-bar" role="tablist" aria-label="Configuración">
         <button id="tab-btn-capture" class="tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="tab-capture" data-tab-target="tab-capture">Captura</button>
-        <button id="tab-btn-nodes" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-nodes" data-tab-target="tab-nodes">Nodos</button>
         <button id="tab-btn-slaves" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-slaves" data-tab-target="tab-slaves">Esclavos</button>
+        <button id="tab-btn-preserved" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-preserved" data-tab-target="tab-preserved">Preservados</button>
         <button id="tab-btn-export" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-export" data-tab-target="tab-export">Export</button>
         <button id="tab-btn-log" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-log" data-tab-target="tab-log">Log</button>
       </nav>
@@ -58,12 +59,13 @@
             <button id="btn-arm">ARM</button>
           </div>
           <div class="row">
-            <label>Fs manual <input id="manual-fs-hz" type="number" min="1" step="1" placeholder="Hz, si no llega por HELLO"></label>
+            <label>Fs manual <input id="manual-fs-hz" type="number" min="1" step="1" value="2929" placeholder="Hz, si no llega por HELLO"></label>
             <button id="btn-manual-fs">Aplicar Fs</button>
           </div>
           <div class="row">
-            <label>Duración <input id="capture-secs" type="number" min="0.1" max="120" step="0.1" value="1.0"> s</label>
+            <label>Duración <input id="capture-secs" type="number" min="0.1" max="120" step="0.1" value="3.0"> s</label>
             <button id="btn-start">START</button>
+            <button id="btn-preserve">Preservar</button>
             <span id="capture-batches" class="status-text">--</span>
           </div>
           <div class="row">
@@ -73,10 +75,7 @@
           <div class="row">
             <button id="btn-cal-all">Calibrar todos</button>
           </div>
-        </section>
-
-        <section id="tab-nodes" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-nodes">
-          <h2>Nodos</h2>
+          <div class="subhead capture-subhead">Nodos</div>
           <div class="node-list">
             <div class="node-row" id="node-1">
               <span class="name">Esclavo 1</span>
@@ -103,11 +102,22 @@
           <div id="slave-panels" class="slave-panels"></div>
         </div>
 
+        <section id="tab-preserved" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-preserved">
+          <h2>Preservados</h2>
+          <div class="row">
+            <button id="btn-preserved-all">Todos</button>
+            <button id="btn-preserved-none">Ninguno</button>
+            <button id="btn-preserved-clear">Vaciar</button>
+          </div>
+          <div id="preserve-status" class="status-text">0 preservados</div>
+          <div id="preserve-list" class="preserve-list"></div>
+        </section>
+
         <section id="tab-export" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-export">
           <h2>Exportar</h2>
           <div class="row">
             <label>Nombre <input id="export-name" type="text" value="muestra"></label>
-            <button id="btn-export">Descargar ZIP</button>
+            <button id="btn-export">Guardar CSV/ZIP</button>
           </div>
           <div id="export-status" class="status-text">--</div>
         </section>
@@ -133,6 +143,6 @@
     </div>
   </div>
 
-  <script type="module" src="/js/app.js?v=field-loop-22"></script>
+  <script type="module" src="/js/app.js?v=field-loop-33"></script>
 </body>
 </html>

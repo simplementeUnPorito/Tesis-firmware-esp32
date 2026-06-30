@@ -131,8 +131,8 @@ def parse_args():
     parser.add_argument(
         "--fs",
         type=float,
-        default=3000.0,
-        help="Sample rate for --seconds conversion (default: 3000 Hz)",
+        default=2929.0,
+        help="Sample rate for --seconds conversion (default: 2929 Hz)",
     )
     parser.add_argument(
         "--allow-long",

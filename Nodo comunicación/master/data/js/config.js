@@ -45,10 +45,12 @@ export const TEST_DEFAULT_SECONDS = 0.2;
 // Placeholder sample counts for buffer/display sizing before any slave's
 // HELLO reports the real Fs — syncDataBufferForFs()/applyDisplayWindow()
 // (app.js) resize these for real the moment Fs becomes known, so the exact
-// values here only need to be "reasonable", not tied to any real rate.
-export const DISP_SAMP = 3000;
+// values here only seed startup sizing before HELLO. Use the measured real
+// rate so the initial 3 s / 10 s windows are close even before the first HELLO.
+export const DEFAULT_SAMPLE_RATE_HZ = 2929;
+export const DISP_SAMP = DEFAULT_SAMPLE_RATE_HZ * 3;
 export const MAX_BUF_S = 10;
-export const MAX_BUF = 30000;
+export const MAX_BUF = DEFAULT_SAMPLE_RATE_HZ * MAX_BUF_S;
 
 // Nodes
 export const MAX_NODES = 4;
