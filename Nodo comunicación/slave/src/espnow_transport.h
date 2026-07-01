@@ -19,6 +19,7 @@ class EspNowTransport {
 public:
     /* masterMac: dirección MAC del ESP maestro (6 bytes) */
     bool begin(const uint8_t *masterMac);
+    bool setMasterMac(const uint8_t *masterMac);
 
     /* Envía un batch completo en 2 paquetes ESP-NOW (tiempo real). */
     void sendBatch(const PsocBatch &batch, uint64_t t_start_us, uint8_t nodeId);
@@ -70,8 +71,6 @@ inline void EspNowTransport::onSendCb(const uint8_t *, esp_now_send_status_t sta
 
 inline bool EspNowTransport::begin(const uint8_t *masterMac)
 {
-    memcpy(_masterMac, masterMac, 6);
-
     if (!espnowInitOk()) {
         ESPNOW_LOG_PRINTLN("[ESPNOW] init failed");
         return false;
@@ -79,11 +78,18 @@ inline bool EspNowTransport::begin(const uint8_t *masterMac)
     espnowSetRole();
     esp_now_register_send_cb(onSendCb);
 
-    if (!espnowAddPeer(masterMac)) {
+    if (!setMasterMac(masterMac)) {
         ESPNOW_LOG_PRINTLN("[ESPNOW] add_peer failed");
         return false;
     }
     ESPNOW_LOG_PRINTF("[ESPNOW] ready ch=%u\n", espnowCurrentChannel());
+    return true;
+}
+
+inline bool EspNowTransport::setMasterMac(const uint8_t *masterMac)
+{
+    if (!espnowAddPeer(masterMac)) return false;
+    memcpy(_masterMac, masterMac, 6);
     return true;
 }
 

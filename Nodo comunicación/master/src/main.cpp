@@ -113,6 +113,18 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
 #ifndef ESPNOW_USE_UNICAST_TO_SLAVES
   #define ESPNOW_USE_UNICAST_TO_SLAVES 0
 #endif
+#ifndef AP_BEACON_INTERVAL_TU
+  #define AP_BEACON_INTERVAL_TU 100
+#endif
+#ifndef AP_BEACON_CAPTURE_INTERVAL_TU
+  #define AP_BEACON_CAPTURE_INTERVAL_TU 1000
+#endif
+#ifndef AP_KEEP_BEACON_DURING_CAPTURE
+  #define AP_KEEP_BEACON_DURING_CAPTURE 0
+#endif
+#ifndef WIFI_TX_POWER_QDBM
+  #define WIFI_TX_POWER_QDBM 78
+#endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
 static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
@@ -188,6 +200,8 @@ static bool     g_dumpRetryPaused = false;
 static uint32_t g_dumpRetryDueMs  = 0;
 static uint32_t g_captureDumpDueMs = 0;
 static uint32_t g_captureDoneMask = 0;
+static bool     g_dumpRequiresWebClient = false;
+static bool     g_dumpWaitingForWeb = false;
 #define DUMP_MAX_RETRIES  30
 #define DUMP_BATCH_TIMEOUT_MS 300
 
@@ -239,16 +253,21 @@ static bool sameMac(const uint8_t a[6], const uint8_t b[6])
     return memcmp(a, b, 6) == 0;
 }
 
+static bool isUsableUnicastMac(const uint8_t mac[6])
+{
+    static const uint8_t ZERO_MAC[6] = {0, 0, 0, 0, 0, 0};
+    if (sameMac(mac, ZERO_MAC) || sameMac(mac, ESPNOW_BROADCAST)) return false;
+    return !(mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF &&
+             mac[3] == 0xFF && mac[4] == 0xFF);
+}
+
 static bool isConfiguredSlaveMac(const uint8_t mac[6])
 {
 #if !ESPNOW_USE_UNICAST_TO_SLAVES
     (void)mac;
     return false;
 #else
-    static const uint8_t ZERO_MAC[6] = {0, 0, 0, 0, 0, 0};
-    if (sameMac(mac, ZERO_MAC) || sameMac(mac, ESPNOW_BROADCAST)) return false;
-    return !(mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF &&
-             mac[3] == 0xFF && mac[4] == 0xFF);
+    return isUsableUnicastMac(mac);
 #endif
 }
 
@@ -260,6 +279,24 @@ static void addPeerIfNeeded(const uint8_t mac[6])
     peer.channel = 0;
     peer.encrypt = false;
     esp_now_add_peer(&peer);
+}
+
+static const uint8_t *espnowDstForSlave(uint8_t nodeId)
+{
+    if (nodeId == 0 || nodeId > NUM_SLAVES) return ESPNOW_BROADCAST;
+
+    CachedHello &h = g_cachedHello[nodeId];
+    if (h.valid && isUsableUnicastMac(h.mac)) {
+        addPeerIfNeeded(h.mac);
+        return h.mac;
+    }
+
+    const uint8_t *configured = SLAVE_MACS[nodeId - 1];
+    if (isConfiguredSlaveMac(configured)) {
+        addPeerIfNeeded(configured);
+        return configured;
+    }
+    return ESPNOW_BROADCAST;
 }
 
 static uint8_t countArmAcks(uint32_t mask)
@@ -391,6 +428,8 @@ static void onCfgAck(const MsgCfgAck &msg)
         g_captureDumpDueMs = 0;
         g_captureDoneMask = 0;
         g_dumpRetryPaused = false;
+        g_dumpRequiresWebClient = false;
+        g_dumpWaitingForWeb = false;
         dumpDeliveryGuardReset();
         g_state = armedOrIdleState();
         matlab.sendReady(g_armedCount);
@@ -491,6 +530,7 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
         h.sample_rate = msg.sample_rate;
         h.hw_class = msg.hw_class;
         memcpy(h.mac, senderMac, 6);
+        if (isUsableUnicastMac(h.mac)) addPeerIfNeeded(h.mac);
     }
     matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate, msg.hw_class);
 }
@@ -538,9 +578,7 @@ static void onHotWaitAck(const MsgHotWaitAck &msg)
 
 static void requestBatch(uint8_t nodeId, uint16_t seq)
 {
-    const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[nodeId - 1])
-                       ? SLAVE_MACS[nodeId - 1]
-                       : ESPNOW_BROADCAST;
+    const uint8_t *dst = espnowDstForSlave(nodeId);
     MsgReqBatch msg = { CMD_REQ_BATCH, nodeId, seq };
     if (g_espnowReady) { esp_now_send(dst, (uint8_t *)&msg, sizeof(msg)); }
     MASTER_LOG_PRINTF("[MASTER] REQ_BATCH node=%d seq=%d\n", nodeId, seq);
@@ -562,18 +600,40 @@ static uint32_t captureDurationMs(uint16_t nBatches)
     return (samples * 1000UL + (fs - 1)) / fs;
 }
 
+static void setApBeaconInterval(uint16_t intervalTu, const char *reason)
+{
+    wifi_config_t ap_cfg = {};
+    if (esp_wifi_get_config(WIFI_IF_AP, &ap_cfg) != ESP_OK) {
+        MASTER_LOG_PRINTF("[MASTER] beacon cfg read fail (%s)\n", reason);
+        return;
+    }
+    if (ap_cfg.ap.beacon_interval == intervalTu) return;
+    ap_cfg.ap.beacon_interval = intervalTu;
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    MASTER_LOG_PRINTF("[MASTER] beacon=%u TU (%s) err=%d\n",
+                      intervalTu, reason, (int)err);
+}
+
 /* ── Beacon pause/resume — sin RF durante captura ─────────────────────────── */
 static void beacon_pause(void)
 {
-    /* El beacon ya está en 1000 TU desde setup(). No llamamos
-     * esp_wifi_set_config() aquí porque reinicializar la config del AP
-     * puede desconectar brevemente a los clientes WiFi activos. */
-    MASTER_LOG_PRINTLN("[MASTER] beacon lento (captura activa, AP visible)");
+#if AP_KEEP_BEACON_DURING_CAPTURE
+    MASTER_LOG_PRINTLN("[MASTER] beacon sin cambios durante captura");
+#else
+    /* El SoftAP del maestro no puede estar conectado a telefonos sin beacon.
+     * Durante captura lo dejamos lento para no volver al spike de ~10 Hz. */
+    setApBeaconInterval(AP_BEACON_CAPTURE_INTERVAL_TU, "captura");
+#endif
 }
 
 static void beacon_resume(void)
 {
-    MASTER_LOG_PRINTLN("[MASTER] beacon resumido (inicio dump)");
+#if AP_KEEP_BEACON_DURING_CAPTURE
+    /* Si no tocamos el beacon al entrar en captura, tampoco lo tocamos al salir:
+     * evita reconfigurar el AP con clientes conectados. */
+#else
+    setApBeaconInterval(AP_BEACON_INTERVAL_TU, "dump/idle");
+#endif
 }
 
 static void scheduleStoreDump(uint16_t nBatches)
@@ -599,6 +659,7 @@ static void beginDump(const char *reason)
     g_captureDoneMask = 0;
     g_dumpRetryPaused = false;
     g_dumpRetryDueMs = 0;
+    g_dumpWaitingForWeb = false;
     /* VIEW dump: un solo nodo; normal dump: todos los esclavos armados */
     /* Primer nodo armado (por mask) para no iterar nodos inexistentes */
     uint8_t firstArmedNode = 1;
@@ -629,6 +690,8 @@ static void beginDump(const char *reason)
     } else {
         g_state = armedOrIdleState();
         g_streaming = false;
+        g_dumpRequiresWebClient = false;
+        g_dumpWaitingForWeb = false;
         matlab.sendReady(g_armedCount);
         matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         MASTER_LOG_PRINTF("[MASTER] %s\n", g_state == ARMED ? "ARMED" : "IDLE");
@@ -637,9 +700,7 @@ static void beginDump(const char *reason)
 
 static void sendStartProbe(uint8_t nodeId)
 {
-    const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[nodeId - 1])
-                       ? SLAVE_MACS[nodeId - 1]
-                       : ESPNOW_BROADCAST;
+    const uint8_t *dst = espnowDstForSlave(nodeId);
     uint64_t t0 = (uint64_t)micros();
     MsgStart msg = { CMD_START, t0, (uint8_t)(0x80u | nodeId) };
     g_startProbeNode = nodeId;
@@ -656,7 +717,7 @@ static void sendStartProbe(uint8_t nodeId)
 
 /* ── Comando dirigido a un esclavo específico ────────────────────────────── */
 
-static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
+static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param, bool fromWeb)
 {
     if (node_id == 0 || node_id > NUM_SLAVES) {
         matlab.sendAck(node_id, sub_cmd, 0);
@@ -676,9 +737,7 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
         return;
     }
 
-    const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[node_id - 1])
-                       ? SLAVE_MACS[node_id - 1]
-                       : ESPNOW_BROADCAST;
+    const uint8_t *dst = espnowDstForSlave(node_id);
     esp_err_t err;
     if (sub_cmd == 0xA7) {
         MsgDebugNode msg = { CMD_DEBUG_NODE, node_id, param };
@@ -695,6 +754,8 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
         g_dumpSlaveIdx = 0;
         g_dumpBatchSeq = 0;
         g_dumpBatchRx = false;
+        g_dumpRequiresWebClient = fromWeb;
+        g_dumpWaitingForWeb = false;
         dumpDeliveryGuardReset();
         MsgView msg = { CMD_VIEW, node_id, n };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
@@ -744,9 +805,7 @@ static void broadcastPrestart(uint16_t nBatches)
 
 static void sendHotWaitQuery(uint8_t nodeId)
 {
-    const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[nodeId - 1])
-                       ? SLAVE_MACS[nodeId - 1]
-                       : ESPNOW_BROADCAST;
+    const uint8_t *dst = espnowDstForSlave(nodeId);
     MsgHotWaitQuery msg = { CMD_HOTWAIT_QUERY, nodeId };
     if (g_espnowReady) {
         esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
@@ -848,6 +907,8 @@ static void abortPrestart(const char *reason)
     g_captureDumpDueMs = 0;
     g_captureDoneMask = 0;
     g_dumpRetryPaused = false;
+    g_dumpRequiresWebClient = false;
+    g_dumpWaitingForWeb = false;
     syncOutWrite(LOW);
     g_state = armedOrIdleState();
     matlab.sendReady(g_armedCount);
@@ -886,9 +947,7 @@ static void finishPrestartAction()
         syncOutWrite(HIGH);
         debugEspHardwareStartPulse();
         {
-            const uint8_t *dst = isConfiguredSlaveMac(SLAVE_MACS[g_viewNode - 1])
-                               ? SLAVE_MACS[g_viewNode - 1]
-                               : ESPNOW_BROADCAST;
+            const uint8_t *dst = espnowDstForSlave(g_viewNode);
             MsgStart msg = { CMD_START, g_t_start_us, g_viewNode };
             if (g_espnowReady) {
                 g_startCmdTxUs = (uint32_t)micros();
@@ -930,6 +989,15 @@ static void finishPrestartAction()
 static void onBatchReady(const ReassembledBatch &batch)
 {
     if (g_state == DUMPING) {
+        if (g_dumpRequiresWebClient && !webRelayHasActiveClient()) {
+            if (!g_dumpWaitingForWeb) {
+                MASTER_LOG_PRINTF("[MASTER] DUMP pause: esperando reconexion WS node=%d seq=%d\n",
+                                  g_dumpSlaveIdx, g_dumpBatchSeq);
+                LOGM("DUMP_WAIT_WS", "node=%u,seq=%u", g_dumpSlaveIdx, g_dumpBatchSeq);
+            }
+            g_dumpWaitingForWeb = true;
+            return;
+        }
         if (batch.node_id != g_dumpSlaveIdx || batch.seq != g_dumpBatchSeq) {
             MASTER_LOG_PRINTF("[MASTER] DUMP ignore node=%d seq=%d expected node=%d seq=%d\n",
                               batch.node_id, batch.seq,
@@ -970,6 +1038,7 @@ static void onBatchReady(const ReassembledBatch &batch)
     /* Durante dump: marcar batch como recibido si es el que esperábamos */
     if (g_state == DUMPING) {
         g_dumpBatchRx = true;
+        g_dumpWaitingForWeb = false;
     } else if (g_viewNode != 0 && batch.node_id == g_viewNode &&
                g_viewBatchesRemaining > 0) {
         g_viewBatchesRemaining--;
@@ -987,7 +1056,7 @@ static void onBatchReady(const ReassembledBatch &batch)
 
 /* ── Procesar comandos de MATLAB ─────────────────────────────────────────── */
 
-static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
+static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = false)
 {
     uint8_t cmd   = rxCmd.cmd;
     uint8_t param = rxCmd.param;
@@ -1014,6 +1083,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
                     g_captureDumpDueMs = 0;
                     g_captureDoneMask = 0;
                     g_dumpRetryPaused  = false;
+                    g_dumpRequiresWebClient = false;
+                    g_dumpWaitingForWeb = false;
                 } else {
                     g_armedCount = countArmAcks(g_armAckMask);
                 }
@@ -1050,6 +1121,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             g_captureDumpDueMs = 0;
             g_debugRamp = 0;
             g_streaming = true;
+            g_dumpRequiresWebClient = fromWeb;
+            g_dumpWaitingForWeb = false;
             beginPrestart(PRESTART_ACTION_START);
             matlab.sendAck(0xFF, cmd, 1);
             break;
@@ -1061,6 +1134,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             g_captureDumpDueMs = 0;
             g_captureDoneMask = 0;
             g_dumpRetryPaused = false;
+            if (fromWeb) g_dumpRequiresWebClient = true;
+            g_dumpWaitingForWeb = false;
             broadcastStop();
             g_state = STOPPING;
             matlab.sendAck(0xFF, cmd, 0);
@@ -1087,7 +1162,7 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             break;
 
         case 0xBD:   /* comando dirigido a esclavo específico */
-            handleDirectedCmd(rxCmd.node_id, rxCmd.sub_cmd, rxCmd.param);
+            handleDirectedCmd(rxCmd.node_id, rxCmd.sub_cmd, rxCmd.param, fromWeb);
             break;
 
         case 0xA7: {  /* debug mode on/off — maestro y esclavos */
@@ -1110,6 +1185,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
                 g_captureDumpDueMs = 0;
                 g_captureDoneMask = 0;
                 g_dumpRetryPaused = false;
+                g_dumpRequiresWebClient = false;
+                g_dumpWaitingForWeb = false;
                 g_state     = armedOrIdleState();
                 syncOutWrite(LOW);
             }
@@ -1155,24 +1232,28 @@ void setup()
      * El modo puro WIFI_AP lleva el AP MAC como BSSID en el action frame,
      * que el ESP8266 puede descartar si no reconoce ese BSSID. */
     WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
     WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
                       IPAddress(192, 168, 4, 1),
                       IPAddress(255, 255, 255, 0));
     bool apOk = WiFi.softAP(AP_SSID, AP_PASS, 1);   /* canal 1 fijo */
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
     MASTER_LOG_PRINTF("[MASTER] softAP %s\n", apOk ? "OK" : "FAIL");
     if (apOk) {
         dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
         MASTER_LOG_PRINTLN("[MASTER] DNS catchall :53 -> 192.168.4.1");
     }
-    /* Aumentar intervalo de beacon para reducir interferencia RF en el ADC.
-     * El default (100 TU ≈ 100 ms) genera spikes de 10 Hz visibles en el geófono.
-     * ESP-NOW no depende de beacons, así que 1000 ms no afecta la comunicación. */
+    /* Beacon intermedio fuera de captura.
+     * 100 TU (default) mete energia a ~10 Hz cerca del ADC; 1000 TU estabiliza
+     * menos los telefonos. Usamos 100 TU en idle/dump y 1000 TU durante captura. */
     {
-        wifi_config_t ap_cfg = {};
-        esp_wifi_get_config(WIFI_IF_AP, &ap_cfg);
-        ap_cfg.ap.beacon_interval = 1000;   /* 1000 TU ≈ 1024 ms */
-        esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+        setApBeaconInterval(AP_BEACON_INTERVAL_TU, "setup");
     }
+    MASTER_LOG_PRINTF("[MASTER] WiFi ps=off tx=%d qdBm beacon idle=%d TU capture=%d TU keep=%d\n",
+                      WIFI_TX_POWER_QDBM, AP_BEACON_INTERVAL_TU,
+                      AP_BEACON_CAPTURE_INTERVAL_TU,
+                      AP_KEEP_BEACON_DURING_CAPTURE);
     MASTER_LOG_PRINTF("[MASTER] AP IP:     %s\n", WiFi.softAPIP().toString().c_str());
     MASTER_LOG_PRINTF("[MASTER] STA MAC:   %s\n", WiFi.macAddress().c_str());
     MASTER_LOG_PRINTF("[MASTER] AP MAC:    %s  ch=%d\n",
@@ -1225,13 +1306,13 @@ void loop()
 
     /* Procesar TODOS los comandos encolados (evita pérdida de A1+A3 back-to-back) */
     while (matlab.hasCmd()) {
-        handleMatlabCmd(matlab.lastCmd());
+        handleMatlabCmd(matlab.lastCmd(), false);
     }
 
     /* Comandos llegados por la interfaz web (mismo despachador — ver
      * web_relay.h: se decodifican a RxCmd para no duplicar lógica). */
     while (webRelayHasCmd()) {
-        handleMatlabCmd(webRelayPopCmd());
+        handleMatlabCmd(webRelayPopCmd(), true);
     }
     webRelayService();
 
@@ -1405,19 +1486,42 @@ void loop()
     /* DUMPING — stop-and-wait con retry por batch */
     if (g_state == DUMPING) {
         bool advance = false;
+        bool waitingForWeb = g_dumpRequiresWebClient && !webRelayHasActiveClient();
 
-        if (g_dumpBatchRx && webRelayReadyForDumpRequest()) {
+        if (waitingForWeb) {
+            webRelayService();
+            if (!g_dumpWaitingForWeb) {
+                MASTER_LOG_PRINTF("[MASTER] DUMP pause: sin WS node=%d seq=%d\n",
+                                  g_dumpSlaveIdx, g_dumpBatchSeq);
+                LOGM("DUMP_PAUSE_WS", "node=%u,seq=%u", g_dumpSlaveIdx, g_dumpBatchSeq);
+            }
+            g_dumpWaitingForWeb = true;
+            g_dumpReqMs = millis();
+        } else if (g_dumpWaitingForWeb) {
+            MASTER_LOG_PRINTF("[MASTER] DUMP resume WS node=%d seq=%d\n",
+                              g_dumpSlaveIdx, g_dumpBatchSeq);
+            LOGM("DUMP_RESUME_WS", "node=%u,seq=%u", g_dumpSlaveIdx, g_dumpBatchSeq);
+            g_dumpWaitingForWeb = false;
+            g_dumpRetries = 0;
+            if (!g_dumpBatchRx) {
+                requestBatch(g_dumpSlaveIdx, g_dumpBatchSeq);
+                g_dumpReqMs = millis();
+            }
+        }
+
+        if (!waitingForWeb && g_dumpBatchRx &&
+            webRelayReadyForDumpRequest(g_dumpRequiresWebClient)) {
             g_dumpBatchRx = false;
             g_dumpRetries = 0;
             g_dumpRetryPaused = false;
             advance = true;
-        } else if (g_dumpRetryPaused) {
+        } else if (!waitingForWeb && g_dumpRetryPaused) {
             if ((int32_t)(millis() - g_dumpRetryDueMs) >= 0) {
                 g_dumpRetryPaused = false;
                 requestBatch(g_dumpSlaveIdx, g_dumpBatchSeq);
                 g_dumpReqMs = millis();
             }
-        } else if (millis() - g_dumpReqMs > DUMP_BATCH_TIMEOUT_MS) {
+        } else if (!waitingForWeb && millis() - g_dumpReqMs > DUMP_BATCH_TIMEOUT_MS) {
             g_dumpRetries++;
             if (g_dumpRetries >= DUMP_MAX_RETRIES) {
                 MASTER_LOG_PRINTF("[MASTER] DUMP skip node=%d seq=%d\n",
@@ -1461,6 +1565,8 @@ void loop()
                     g_captureDumpDueMs = 0;
                     g_captureDoneMask = 0;
                     g_dumpRetryPaused = false;
+                    g_dumpRequiresWebClient = false;
+                    g_dumpWaitingForWeb = false;
                     dumpDeliveryGuardReset();
                     matlab.sendReady(g_armedCount);
                     matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);

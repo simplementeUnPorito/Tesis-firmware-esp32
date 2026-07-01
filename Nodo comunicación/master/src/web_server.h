@@ -38,6 +38,16 @@ static uint8_t webServerSimHwClass(const String &type)
     return SLAVE_HW_UNKNOWN;
 }
 
+static void webServerSendNoContent(AsyncWebServerRequest *r)
+{
+    r->send(204, "text/plain", "");
+}
+
+static void webServerSendAndroidOk(AsyncWebServerRequest *r)
+{
+    r->send(200, "text/plain", "OK");
+}
+
 inline bool webServerBegin()
 {
     bool fsOk = LittleFS.begin(true);   /* true = formatear si el mount falla */
@@ -169,9 +179,12 @@ inline bool webServerBegin()
     webServer.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
         r->send(200, "text/plain", "Microsoft NCSI");
     });
-    webServer.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *r) {
-        r->send(204, "text/plain", "");
-    });
+    webServer.on("/generate_204", HTTP_GET, webServerSendNoContent);
+    webServer.on("/gen_204", HTTP_GET, webServerSendNoContent);
+    webServer.on("/gstatic/generate_204", HTTP_GET, webServerSendNoContent);
+    webServer.on("/connectivity-check/generate_204", HTTP_GET, webServerSendNoContent);
+    webServer.on("/canonical.html", HTTP_GET, webServerSendAndroidOk);
+    webServer.on("/success.txt", HTTP_GET, webServerSendAndroidOk);
     webServer.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *r) {
         r->send(200, "text/html",
             "<!DOCTYPE html><html><head><title>Success</title></head>"

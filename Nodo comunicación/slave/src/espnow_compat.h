@@ -37,6 +37,7 @@
 
   static inline bool espnowAddPeer(const uint8_t *mac)
   {
+      if (esp_now_is_peer_exist((uint8_t *)mac)) return true;
       return esp_now_add_peer((uint8_t *)mac, ESP_NOW_ROLE_COMBO,
                               espnowCurrentChannel(), nullptr, 0) == ESP_OK;
   }
@@ -65,6 +66,7 @@
 
   static inline bool espnowAddPeer(const uint8_t *mac)
   {
+      if (esp_now_is_peer_exist(mac)) return true;
       esp_now_peer_info_t peer = {};
       memcpy(peer.peer_addr, mac, 6);
       peer.channel = 0;

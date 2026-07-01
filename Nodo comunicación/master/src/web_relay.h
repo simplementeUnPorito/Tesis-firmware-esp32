@@ -36,6 +36,8 @@ static WebRelayClientHook g_webRelayClientHook = nullptr;
 static const bool WS_AUTH_ENABLED = (WS_AUTH_TOKEN[0] != '\0');
 static bool     g_wsAuthOk     = false;   /* true: cliente autenticado */
 static uint32_t g_wsAuthDeadMs = 0;       /* deadline de auth (0 = inactivo) */
+static uint32_t g_wsOwnerId    = 0;       /* cliente aceptado actual */
+static uint32_t g_wsAliveMs    = 0;       /* ultima actividad del dueño */
 
 static constexpr size_t WEB_RELAY_PKT_LEN = 6;
 static constexpr size_t WEB_RELAY_TX_PKTS = 300;
@@ -43,6 +45,8 @@ static constexpr size_t WEB_RELAY_TX_BYTES = WEB_RELAY_TX_PKTS * WEB_RELAY_PKT_L
 static constexpr size_t WEB_RELAY_DUMP_BATCH_BYTES = 30 * WEB_RELAY_PKT_LEN;
 static constexpr size_t WEB_RELAY_QUEUE_SOFT_MAX = 12;
 static constexpr uint32_t WEB_RELAY_FLUSH_MS = 8u;
+static constexpr uint32_t WEB_RELAY_PING_MS = 1000u;
+static constexpr uint32_t WEB_RELAY_ALIVE_MS = 2500u;
 static uint8_t  g_webRelayTxBuf[WEB_RELAY_TX_BYTES];
 static size_t   g_webRelayTxLen = 0;
 static uint32_t g_webRelayTxFirstMs = 0;
@@ -70,6 +74,13 @@ static void webRelayFlush();
 inline void webRelaySetClientHook(WebRelayClientHook hook)
 {
     g_webRelayClientHook = hook;
+}
+
+inline bool webRelayHasActiveClient()
+{
+    if (ws.count() == 0 || (WS_AUTH_ENABLED && !g_wsAuthOk)) return false;
+    if (g_wsAliveMs == 0) return true;
+    return (uint32_t)(millis() - g_wsAliveMs) <= WEB_RELAY_ALIVE_MS;
 }
 
 /* Cerrar el cliente WS activo a propósito (p. ej. justo antes de
@@ -204,7 +215,16 @@ static void webRelayFlush()
     webRelayTxUnlock();
 
     if (len == 0) return;
-    if (ws.count() == 0) return;
+    if (!webRelayHasActiveClient()) {
+        webRelayTxLock();
+        if (g_webRelayTxLen == 0 && len <= WEB_RELAY_TX_BYTES) {
+            memcpy(g_webRelayTxBuf, out, len);
+            g_webRelayTxLen = len;
+            if (g_webRelayTxFirstMs == 0) g_webRelayTxFirstMs = millis();
+        }
+        webRelayTxUnlock();
+        return;
+    }
 
     if (!ws.availableForWriteAll()) {
         webRelayTxLock();
@@ -231,6 +251,8 @@ static void webRelayFlush()
 
 static void webRelayService()
 {
+    ws.cleanupClients(1);
+
     bool due = false;
     webRelayTxLock();
     due = (g_webRelayTxLen > 0 &&
@@ -252,16 +274,16 @@ static void webRelayService()
      * Sin ping, un cliente con TCP zombi sigue en WS_CONNECTED para siempre
      * y bloquea reconexiones del mismo dispositivo. */
     static uint32_t g_wsPingMs = 0;
-    if (ws.count() > 0 && (uint32_t)(millis() - g_wsPingMs) > 10000u) {
+    if (ws.count() > 0 && (uint32_t)(millis() - g_wsPingMs) > WEB_RELAY_PING_MS) {
         ws.pingAll();
         g_wsPingMs = millis();
     }
 }
 
-inline bool webRelayReadyForDumpRequest()
+inline bool webRelayReadyForDumpRequest(bool requireClient = false)
 {
     webRelayService();
-    if (ws.count() == 0) return true;
+    if (!webRelayHasActiveClient()) return !requireClient;
 
     size_t pending = 0;
     webRelayTxLock();
@@ -284,7 +306,7 @@ inline bool webRelayReadyForDumpRequest()
 
 static void webRelayPacket(const uint8_t pkt[6])
 {
-    if (ws.count() == 0) {
+    if (!webRelayHasActiveClient()) {
         webRelayTxLock();
         g_webRelayTxLen = 0;
         g_webRelayTxFirstMs = 0;
@@ -326,6 +348,13 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
             bool rejected = false;
             for (auto &c : server->getClients()) {
                 if (c.id() == client->id() || c.status() != WS_CONNECTED) continue;
+                if (c.remoteIP() == client->remoteIP()) {
+                    MASTER_LOG_PRINTF("[WEB] WS takeover #%u reemplaza #%u (%s)\n",
+                                      client->id(), c.id(),
+                                      client->remoteIP().toString().c_str());
+                    c.close(1001, "takeover");
+                    continue;
+                }
                 MASTER_LOG_PRINTF("[WEB] WS rechazado #%u (lock: dueño #%u %s)\n",
                                   client->id(), c.id(),
                                   c.remoteIP().toString().c_str());
@@ -337,6 +366,8 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
             if (!rejected) {
                 MASTER_LOG_PRINTF("[WEB] WS #%u conectado (%s)\n",
                                   client->id(), client->remoteIP().toString().c_str());
+                g_wsOwnerId = client->id();
+                g_wsAliveMs = millis();
                 if (WS_AUTH_ENABLED) {
                     g_wsAuthOk     = false;
                     g_wsAuthDeadMs = millis() + 5000u;
@@ -351,10 +382,19 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
         }
         case WS_EVT_DISCONNECT:
             MASTER_LOG_PRINTF("[WEB] WS cliente #%u desconectado\n", client->id());
-            g_wsAuthOk     = !WS_AUTH_ENABLED;   /* reset para próximo cliente */
-            g_wsAuthDeadMs = 0;
+            if (client->id() == g_wsOwnerId) {
+                g_wsOwnerId    = 0;
+                g_wsAliveMs    = 0;
+                g_wsAuthOk     = !WS_AUTH_ENABLED;   /* reset para próximo cliente */
+                g_wsAuthDeadMs = 0;
+            }
+            break;
+        case WS_EVT_PING:
+        case WS_EVT_PONG:
+            if (client->id() == g_wsOwnerId) g_wsAliveMs = millis();
             break;
         case WS_EVT_DATA: {
+            if (client->id() == g_wsOwnerId) g_wsAliveMs = millis();
             AwsFrameInfo *info = (AwsFrameInfo *)arg;
             if (!(info->final && info->index == 0 && info->len == len &&
                   info->opcode == WS_TEXT)) break;

@@ -97,6 +97,9 @@
 #ifndef PSOC_EFFECTIVE_SAMPLE_RATE_HZ
   #define PSOC_EFFECTIVE_SAMPLE_RATE_HZ 2929u
 #endif
+#ifndef WIFI_TX_POWER_QDBM
+  #define WIFI_TX_POWER_QDBM 78
+#endif
 
 /* MAC del ESP maestro. El valor real debe venir de platformio.ini. */
 #ifndef MASTER_MAC0
@@ -117,7 +120,11 @@
 #ifndef MASTER_MAC5
   #define MASTER_MAC5 0xFF
 #endif
-static const uint8_t MASTER_MAC[6] = {
+static const uint8_t MASTER_MAC_DEFAULT[6] = {
+    MASTER_MAC0, MASTER_MAC1, MASTER_MAC2,
+    MASTER_MAC3, MASTER_MAC4, MASTER_MAC5
+};
+static uint8_t g_masterTxMac[6] = {
     MASTER_MAC0, MASTER_MAC1, MASTER_MAC2,
     MASTER_MAC3, MASTER_MAC4, MASTER_MAC5
 };
@@ -294,6 +301,42 @@ static EspNowTransport transport;
 
 /* Helpers de pulsos GPIO de osciloscopio (módulo aparte). */
 #include "scope_pulse.h"
+
+static bool sameMac(const uint8_t a[6], const uint8_t b[6])
+{
+    return memcmp(a, b, 6) == 0;
+}
+
+static bool usableUnicastMac(const uint8_t mac[6])
+{
+    static const uint8_t zero[6] = {0, 0, 0, 0, 0, 0};
+    static const uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    return !sameMac(mac, zero) && !sameMac(mac, broadcast);
+}
+
+static bool masterMacIsDefaultBroadcast()
+{
+    return !usableUnicastMac(MASTER_MAC_DEFAULT);
+}
+
+static void learnMasterMac(const uint8_t mac[6])
+{
+    if (!usableUnicastMac(mac) || sameMac(g_masterTxMac, mac)) return;
+    if (!transport.setMasterMac(mac)) {
+        SLAVE_LOG_PRINTLN("[SLAVE] master MAC learn failed");
+        return;
+    }
+    memcpy(g_masterTxMac, mac, 6);
+    SLAVE_LOG_PRINTF("[SLAVE] master MAC learned %02X:%02X:%02X:%02X:%02X:%02X%s\n",
+                     g_masterTxMac[0], g_masterTxMac[1], g_masterTxMac[2],
+                     g_masterTxMac[3], g_masterTxMac[4], g_masterTxMac[5],
+                     masterMacIsDefaultBroadcast() ? " (auto)" : "");
+}
+
+static esp_err_t sendToMaster(const uint8_t *data, size_t len)
+{
+    return espnowSend(g_masterTxMac, data, len);
+}
 
 static void sendCfgAck(uint8_t sub_cmd, uint8_t ok);
 
@@ -1020,7 +1063,7 @@ static void handleReqBatch(const MsgReqBatch *msg);
 static void sendCfgAck(uint8_t sub_cmd, uint8_t ok)
 {
     MsgCfgAck ack = { CMD_CFG_ACK, NODE_ID, sub_cmd, ok };
-    espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+    sendToMaster((const uint8_t *)&ack, sizeof(ack));
 }
 
 static bool isGainCode(uint8_t code)
@@ -1426,7 +1469,7 @@ static void serviceUsbCommands() {}
 static void sendStartAck(uint8_t status, uint32_t startToken, uint32_t rxUs)
 {
     MsgStartAck ack = { CMD_START_ACK, NODE_ID, status, startToken, rxUs };
-    espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+    sendToMaster((const uint8_t *)&ack, sizeof(ack));
 }
 
 static bool storeReadyForHotWait()
@@ -1489,7 +1532,7 @@ static void sendHotWaitAck()
     MsgHotWaitAck ack = {
         CMD_HOTWAIT_ACK, NODE_ID, ok, (uint8_t)g_state, g_rec_n_batches
     };
-    espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+    sendToMaster((const uint8_t *)&ack, sizeof(ack));
     SLAVE_LOG_PRINTF("[SLAVE] HOTWAIT_ACK ok=%u state=%u n=%u\n",
                      ok, (unsigned)g_state, g_rec_n_batches);
 }
@@ -1627,8 +1670,8 @@ static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len)
 static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 #endif
 {
-    (void)mac;
     if (len < 1) return;
+    learnMasterMac(mac);
     uint8_t cmd = data[0];
     if (g_state == SAMPLING && cmd != CMD_STOP) {
         /* En debug/test, VER puede interrumpir para evitar race condition */
@@ -1648,7 +1691,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_state = ARMED;
         scheduleAutoCalibration(0u);
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, 0 };
-        espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+        sendToMaster((const uint8_t *)&ack, sizeof(ack));
         SLAVE_LOG_PRINTLN("[SLAVE] ARMED");
     }
     else if (cmd == CMD_PRESTART && len >= (int)sizeof(MsgPrestart) &&
@@ -1759,7 +1802,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         bool enable = (d->enable != 0);
         debugEspSetRamp(enable);
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, (uint8_t)(g_debug_mode ? 0xDD : 0x00) };
-        espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+        sendToMaster((const uint8_t *)&ack, sizeof(ack));
         SLAVE_LOG_PRINTF("[SLAVE] debug=%d\n", (int)g_debug_mode);
     }
     else if (cmd == CMD_SET_CONFIG && len >= (int)sizeof(MsgSetConfig)) {
@@ -1812,7 +1855,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         /* Confirmar al maestro que el buffer está listo */
         MsgCfgAck ack = { CMD_CFG_ACK, NODE_ID, CMD_SET_RECLEN,
                           (uint8_t)((msg->n_batches == 0 || storeReadyForHotWait()) ? 1 : 0) };
-        espnowSend(MASTER_MAC, (const uint8_t *)&ack, sizeof(ack));
+        sendToMaster((const uint8_t *)&ack, sizeof(ack));
     }
     else if (cmd == CMD_REQ_BATCH && len >= (int)sizeof(MsgReqBatch)) {
         handleReqBatch((const MsgReqBatch *)data);
@@ -1869,7 +1912,7 @@ static void handleReqBatch(const MsgReqBatch *msg)
     if (seq >= g_store_fill || !g_store_buf) {
         /* Batch fuera de rango: notificar al master para que avance sin esperar timeout */
         MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
-        espnowSend(MASTER_MAC, (const uint8_t *)&nack, sizeof(nack));
+        sendToMaster((const uint8_t *)&nack, sizeof(nack));
         SLAVE_LOG_PRINTF("[SLAVE] REQ_BATCH NACK seq=%u fill=%u\n", seq, g_store_fill);
         return;
     }
@@ -1966,12 +2009,17 @@ void setup()
      * ESP8266 en modo STA desconectado (recorre ch1-13 buscando APs y pierde
      * paquetes ESP-NOW del canal 1 a distancia real). */
     WiFi.mode(WIFI_AP);
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+    WiFi.setOutputPower(20.5f);
     WiFi.softAP("GeoSlave", "", 1, 1);   /* ssid, pass vacío, canal 1, oculto */
     delay(100);
     SLAVE_LOG_PRINTF("[SLAVE] MAC: %s  ch=%d (AP-fixed)\n",
                      WiFi.macAddress().c_str(), wifi_get_channel());
 #else
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
     WiFi.disconnect();
     delay(100);
     /* Fijar canal 1 explícitamente para coincidir con el AP del maestro.
@@ -1980,10 +2028,11 @@ void setup()
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     SLAVE_LOG_PRINTF("[SLAVE] MAC: %s  ch=%d\n",
                      WiFi.macAddress().c_str(), WiFi.channel());
+    SLAVE_LOG_PRINTF("[SLAVE] WiFi ps=off tx=%d qdBm\n", WIFI_TX_POWER_QDBM);
 #endif
 
     /* ESP-NOW */
-    if (!transport.begin(MASTER_MAC)) {
+    if (!transport.begin(g_masterTxMac)) {
         SLAVE_LOG_PRINTLN("[SLAVE] ESP-NOW FAIL - halt");
         while (true) { delay(1000); }
     }
@@ -2140,7 +2189,7 @@ void loop()
             CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected,
             effectivePsocSampleRateHz(), g_psoc_hw_class
         };
-        esp_err_t err = espnowSend(MASTER_MAC, (const uint8_t *)&h, sizeof(h));
+        esp_err_t err = sendToMaster((const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX
         SLAVE_LOG_PRINTF("[SLAVE] HELLO tx err=%d txOK=%u txFail=%u\n",
                          (int)err, transport.sentOK(), transport.sentFail());
@@ -2160,7 +2209,7 @@ void loop()
             transport.sentOK(), transport.sentFail(),
             (uint8_t)g_psocConnected
         };
-        espnowSend(MASTER_MAC, (const uint8_t *)&st, sizeof(st));
+        sendToMaster((const uint8_t *)&st, sizeof(st));
 #if SLAVE_LOG_STATUS_PERIODIC
         logPsocUartDiag("STATUS");
 #if PSOC_RX_SCAN_ENABLE

@@ -9,6 +9,7 @@ import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-10';
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
+const BUSY_RETRY_MS = 2500;
 const SHORT_CLOSE_MS = 2000;
 const SHORT_CLOSE_LIMIT = 5;
 const STABLE_OPEN_MS = 5000;
@@ -114,11 +115,11 @@ export class WsClient extends EventTarget {
       const unauth = ev?.code === WS_CLOSE_UNAUTH || reason.includes('unauthorized') || reason.includes('auth');
 
       if (busy) {
-        this._blocked = true;
-        this._wantConnected = false;
         this._openMs = null;
         this._emitConnection(false);
-        this._log('WS: ocupado por otra pagina/cliente; reconexion automatica detenida');
+        this._reconnectMs = Math.max(this._reconnectMs, BUSY_RETRY_MS);
+        this._log('WS: ocupado por otra pagina/cliente; reintentando');
+        if (this._wantConnected) this._scheduleReconnect();
         return;
       }
 
@@ -163,8 +164,9 @@ export class WsClient extends EventTarget {
         try {
           const msg = JSON.parse(ev.data);
           if (msg?.type === 'busy') {
-            this._blocked = true;
-            this._wantConnected = false;
+            this._log('WS: maestro ocupado; reintentando');
+            this._reconnectMs = Math.max(this._reconnectMs, BUSY_RETRY_MS);
+            try { ws.close(); } catch (_) {}
           } else if (msg?.type === 'auth_required') {
             if (!this.authToken) {
               this.dispatchEvent(new CustomEvent('auth-required', { detail: { reason: 'prompt' } }));
