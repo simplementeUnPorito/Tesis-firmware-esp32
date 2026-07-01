@@ -1,48 +1,115 @@
 # ESP32 Maestro — Gateway geófono
 
-Pasarela entre **MATLAB** (USB serie, datos binarios) y los **esclavos** (ESP-NOW).
-El maestro **no muestrea ningún sensor**: coordina ARM/PRESTART/START/STOP, recibe
-los lotes de los esclavos y los reenvía a MATLAB. El martillo es un esclavo más.
+Pasarela entre **MATLAB/Web** y los **esclavos** (ESP-NOW). No muestrea ningún
+sensor; coordina ARM/PRESTART/START/STOP, recibe lotes de los esclavos y los
+reenvía a MATLAB. La UI web es una SPA embebida servida desde LittleFS.
 
-## Flujo
+## Flujo de datos
+
 ```
-MATLAB ─USB(0x56)─> Maestro ─ESP-NOW─> Esclavos ─UART─> PSoC
+MATLAB ──USB 921600──> Maestro ──ESP-NOW──> Esclavos ──UART──> PSoC
+Web/Celular ──WiFi──>  |      <───lotes──────────────────────────
+                       └──LittleFS──> SPA (192.168.4.1)
 ```
-1. `0xA2` ARM → broadcast `CMD_ARM`; esclavos responden `CMD_ARM_ACK`.
-2. `0xA3` START (N 16 bits) → `CMD_PRESTART(N)` + handshake HOT_WAIT, luego
-   `CMD_START` por **ESP-NOW** (el START real). Cada esclavo levanta el flanco a su PSoC.
-3. Esclavos graban N lotes y el maestro hace **dump** (`CMD_REQ_BATCH`) a MATLAB.
-4. `0xBD … 0xB2` = **Ver** (captura única de un nodo en vivo).
 
-> `SYNC_OUT_PIN` (GPIO25) es **solo marcador de osciloscopio**, NO llega a los
-> esclavos. Se compila a nada con `DEBUG_HARDWARE=0`.
+1. `A2` ARM → broadcast `CMD_ARM`; esclavos responden `CMD_ARM_ACK`.
+2. `A3` START (N lotes) → `CMD_PRESTART(N)` + handshake HOT_WAIT, luego
+   `CMD_START` por **ESP-NOW broadcast**. Cada esclavo levanta SYNC_TO_PSOC.
+3. Esclavos capturan N lotes y el maestro hace dump (`CMD_REQ_BATCH`).
+4. `BD … B2` = **Ver** (captura en vivo de un solo nodo).
 
-## Protocolo con MATLAB (USB, `matlab_transport.h`)
-- RX 4 bytes: `[0xAB][cmd][param][cmd^param]` (`0xA1` stream, `0xA2` arm, `0xA4` stop, `0xA5` status, `0xA7` debug, `0xB0` scope-multi).
-- RX 5 bytes (N 16 bits): `[0xAB][cmd][n_lo][n_hi][cs]` (`0xA3` start, `0xAE` set-reclen).
-- RX 6 bytes dirigido: `[0xAB][0xBD][node][sub][param][cs]` (`0xA6/0xA9/0xAA` cfg, `0xA7` debug ESP, `0xB2` Ver, `0xB3` debug PSoC).
-- TX 6 bytes: `[0x56][node][type][b2][b1][b0]` (type 0 dato, 1 HB, 7 ACK, 0xFC latencia, 0xFD diag, 0xFE ready).
+`SYNC_OUT_PIN` (GPIO15) es **solo marcador de osciloscopio**; NO llega a los
+esclavos ni dispara ningún PSoC.
 
-## Mensajes ESP-NOW (`sync_protocol.h`, compartido con el esclavo)
-`CMD_ARM/START/STOP/PRESTART/HOTWAIT_QUERY/REQ_BATCH/SET_CONFIG/DEBUG_NODE`,
-y nuevos **`CMD_VIEW (0x24)`** y **`CMD_DEBUG_PSOC (0x25)`**.
+## Máquina de estados
+
+`IDLE → ARMING → ARMED → PRESTART → RUNNING → STOPPING → DUMPING`
+
+Modo adicional: `SCOPE_MULTI` (múltiples starts para caracterizar jitter).
+
+## Protocolo con MATLAB/Web (6 bytes TX)
+
+`[0x56][node][type][b2][b1][b0]`
+
+| type | Significado |
+|------|-------------|
+| `0x00` | Muestra ADC raw |
+| `0x01` | Heartbeat (estado maestro, PGA, VDAC) |
+| `0x07` | ACK (b2=cmd, b1:b0=valor) |
+| `0xFC` | Latencia START µs |
+| `0xFD` | Status/HELLO multiframe |
+| `0xFE` | READY (n_slaves) |
+
+## Comandos recibidos
+
+| Bytes | Cmd | Descripción |
+|-------|-----|-------------|
+| 4 | `0xA4` | STOP |
+| 4 | `0xA5` | STATUS |
+| 4 | `0xA7` | DEBUG |
+| 4 | `0xB0` | SCOPE_MULTI |
+| 5 | `0xA2` | ARM (n esclavos) |
+| 5 | `0xA3` | START (N lotes, 16 bits) |
+| 5 | `0xAE` | SET_RECLEN |
+| 6 | `0xBD … 0xA6` | PGA por esclavo |
+| 6 | `0xBD … 0xA9` | PGAvdac por esclavo |
+| 6 | `0xBD … 0xAA` | VDAC por esclavo |
+| 6 | `0xBD … 0xB2` | Ver (captura en vivo) |
+| 6 | `0xBD … 0xB5` | Calibrar PSoC |
+| 6 | `0xBD … 0xB6` | Guardar EEPROM |
+| 6 | `0xBD … 0xB7` | Seleccionar stream crudo/FIR |
+| 6 | `0xBD … 0xB9` | Titilar LED del PSoC |
+| 6 | `0xBD … 0xAF` | Latency probe |
+
+Equivalentes JSON para WebSocket: `{"cmd":"A2","param":1}`,
+`{"cmd":"BD","node":2,"sub":"B5","param":1}`, etc.
+
+## Interfaz web
+
+Servida desde LittleFS en `data/` (SPA versión `field-study-10`).
+
+- **WebSocket** `/ws`: paquetes binarios hacia cliente + comandos JSON desde cliente.
+- **`/health`**: estado del servidor y LittleFS.
+- **`/sim/hello`**: dummy esclavo para validar UI sin hardware real.
+- **Auth opcional**: `WS_AUTH_TOKEN` en platformio.ini exige password por WS.
 
 ## Archivos
+
 | Archivo | Rol |
-|---|---|
-| `src/main.cpp` | setup/loop, estados (IDLE…DUMPING), handlers de comandos MATLAB |
-| `src/matlab_transport.h` | serie USB ↔ MATLAB (parser + envíos) |
-| `src/espnow_rx.h` | recepción y reensamblado de lotes de los esclavos |
-| `src/sync_protocol.h` | structs/IDs ESP-NOW (mantener en sync con el esclavo) |
-| `src/debug_log.h` | logging unificado humano+máquina (ver abajo) |
-| `src/master_log.h` | shim que incluye `debug_log.h` |
+|---------|-----|
+| `src/main.cpp` | setup/loop, estados, handlers MATLAB/WS, beacon_pause |
+| `src/web_server.h` | HTTP/LittleFS, rutas, endpoint /sim/hello |
+| `src/web_relay.h` | Espejo WS: binario→cliente, JSON→cmd, `webRelayCloseAll()` |
+| `src/matlab_transport.h` | Serie USB ↔ MATLAB (parser + TX) |
+| `src/espnow_rx.h` | Recepción y reensamblado de lotes ESP-NOW |
+| `src/sync_protocol.h` | Structs/IDs ESP-NOW (mantener sync con esclavo) |
+| `data/index.html` | UI principal |
+| `data/js/app.js` | Orquestación JS (~1600 líneas) |
+| `data/js/plot.js` | Canvas tiempo |
+| `data/js/signal_proc.js` | FIR, filtFilt, dcRemove, Hilbert |
+| `data/js/slave_panel.js` | Panel por esclavo |
+| `data/js/export.js` | ZIP/CSV export |
 
 ## Build (`platformio.ini`)
-- `NUM_SLAVES`, `DEBUG_HARDWARE`/`DEBUG_HW_START_PIN` (pulso de scope), HOT_WAIT timings.
-- **Logging**: `DBG_ENABLE` (0 = compila a cero), `DBG_STREAM=Serial1`,
-  `DBG_LOG_RX/TX/BAUD`. El log va por **Serial1** (no por el USB de datos).
-- Actualizar `SLAVE_MACS[]` con las MAC reales.
 
-## Logging
-- `Serial` (USB) = binario 0x56 hacia MATLAB. `Serial1` = log (humano + `#M,…` máquina).
-- En MATLAB, abrir “Debug COM Maestro” para ver el log en el tab Log.
+```ini
+[env:esp32dev]
+upload_port = COM8
+NUM_SLAVES  = 8
+DEBUG_HARDWARE = 1       ; pulso de osciloscopio en GPIO15 al emitir START
+DBG_ENABLE = 0           ; logging por Serial1 (0 = silenciado en campo)
+```
+
+Logging cuando se necesite diagnóstico:
+```ini
+-DDBG_ENABLE=1 -DDBG_HUMAN=1 -DDBG_MACHINE=1
+```
+
+## Notas de campo
+
+- **Límite `PSOC_CAPTURE_MAX_BATCHES = 512`**: `SET_RECLEN` se silencia
+  por encima de 512. Si el master queda en `DUMPING`, enviar STOP + `SET_RECLEN=0`.
+- **beacon_pause**: durante captura el beacon AP sube a 60000 TU (~61 s).
+  El PC puede desconectarse del AP pero los datos están seguros en el ESP.
+- **No abrir COM8 con pySerial en Windows**: el DTR/RTS del CP210x hace reset
+  al ESP32. Usar solo diagnóstico por WebSocket.

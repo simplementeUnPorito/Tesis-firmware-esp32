@@ -1,45 +1,96 @@
-# ESP32 Esclavo — Nodo geófono
+# ESP32 Esclavo — Nodo geófono/martillo
 
-Lee las muestras **raw** del PSoC por **UART**, las acumula y las envía al maestro
-por **ESP-NOW**. Reenvía al PSoC la configuración (N, VDAC, PGA) y dispara el
-muestreo levantando el pin `SYNC_TO_PSOC`. Un esclavo puede ser un geófono o el
-martillo (mismo firmware; cambia solo el hardware del PSoC).
-
-## Enlace con el PSoC (`psoc_uart.*`)
-- **Serial2** (ESP32): `PSOC_UART_RX=16`, `PSOC_UART_TX=17`, `PSOC_UART_BAUD=115200`.
-- Recibe frames de 95 B (raw 24-bit → `PsocBatch`); envía comandos
-  `setN / preStart / setVdac / setPga / setPgavdac / debugRamp`.
-- El **arranque del PSoC es siempre por el pin** `SYNC_TO_PSOC` (flanco), no por UART.
+Lee muestras del PSoC por **UART** y las envía al maestro por **ESP-NOW**.
+Un esclavo puede ser geófono (GEO) o martillo (HAMMER) — mismo firmware,
+distinto PSoC y `PSOC_HW_CLASS` detectado por el PSoC al arrancar.
 
 ## Estados
-`WAIT_ARM → ARMED → HOT_WAIT → SAMPLING → STOPPED`
-- `CMD_PRESTART(N)`: `enterHotWait` reserva buffer y arma el PSoC (`setN`+`preStart`).
-- `CMD_START`: levanta `SYNC_TO_PSOC` → el PSoC arranca; el esclavo acumula N lotes
-  (store-and-forward) y queda esperando el dump (`CMD_REQ_BATCH`).
-- `CMD_VIEW(N)` (**Ver**): arma el PSoC, levanta el flanco (con pequeño retardo) y
-  transmite los N lotes **en vivo** al maestro (disparo único, sin store).
-- `CMD_DEBUG_PSOC`: rampa de debug en el PSoC.
 
-## Sincronización
-El flanco del maestro (`SYNC_OUT`) **no** está cableado a los esclavos; el START
-llega por **ESP-NOW** y cada esclavo levanta su propio pin hacia el PSoC.
+```
+WAIT_ARM → ARMED → HOT_WAIT → SAMPLING → STOPPED
+```
+
+- **WAIT_ARM**: espera `CMD_ARM` del maestro (broadcast).
+- **ARMED**: envía `CMD_ARM_ACK`, espera `CMD_PRESTART`.
+- **HOT_WAIT**: `CMD_PRESTART(N)` recibido → reserva buffer, arma PSoC
+  (`setN` + `preStart`). Solo espera `CMD_START` o queries de maestro.
+- **SAMPLING**: recibe `CMD_START` → levanta `SYNC_TO_PSOC` (GPIO23) → PSoC
+  arranca. Acumula N lotes del PSoC y espera dump (`CMD_REQ_BATCH`).
+- **STOPPED**: vuelve a WAIT_ARM al recibir `CMD_STOP`.
+
+### Modo VER
+
+`CMD_VIEW(N)`: arma el PSoC, levanta SYNC_TO_PSOC con un pequeño retardo, y
+transmite N lotes **en tiempo real** al maestro (sin store-and-forward).
+
+## Enlace con el PSoC (`psoc_uart.*`)
+
+- **Serial2** (ESP32): `PSOC_UART_RX=17`, `PSOC_UART_TX=16`, baud=115200.
+- Wiring: ESP GPIO17 → PSoC P1[2] (RX); ESP GPIO16 ← PSoC P1[5] (TX).
+- **Arranque siempre por pin**: GPIO23 (`SYNC_TO_PSOC`) → PSoC `SYNC_IN` (P12[6]).
+  El PSoC nunca arranca por comando UART.
+
+## Auto-calibración
+
+Al detectar el PSoC al arrancar, el esclavo programa una auto-calibración
+500 ms después (`PSOC_AUTO_CAL_ON_READY=1`, `PSOC_AUTO_CAL_DELAY_MS=500`).
+Si el maestro envía `CMD_PRESTART` mientras hay auto-cal pendiente, se cancela
+y el esclavo entra en HOT_WAIT normalmente.
+
+## Tipo de hardware (GEO/HAMMER)
+
+El PSoC reporta `PSOC_HW_CLASS` en `PSOC_EVT_BOOT`. El esclavo lo reenvía en
+`MsgHello.hw_class`. El maestro lo relaya a la web como status subtype `0x06`:
+`0 = GEO`, `1 = HAMMER`, `0xFF = desconocido`.
+
+## LED de identificación
+
+`CMD_BLINK_LED` → esclavo envía `PSOC_CMD_BLINK_LED (0xB9)` al PSoC por UART.
+El PSoC titila ~8 s a 2.5 Hz (no bloqueante). El LED físico es el del PSoC.
 
 ## Archivos
+
 | Archivo | Rol |
-|---|---|
-| `src/main.cpp` | setup/loop, estados, handlers ESP-NOW, store-and-forward, Ver |
-| `src/psoc_uart.h/.cpp` | enlace UART con el PSoC (parser + comandos) |
-| `src/espnow_transport.h` | envío de lotes al maestro (fragmenta en 2× MsgData) |
-| `src/espnow_compat.h` | compatibilidad ESP-NOW ESP32/ESP8266 |
-| `src/sync_protocol.h` | structs/IDs ESP-NOW (igual que el maestro) |
-| `src/debug_log.h` | logging humano + máquina |
+|---------|-----|
+| `src/main.cpp` | Firmware completo: estados, handlers ESP-NOW, store-forward, VER |
+| `src/psoc_uart.h/.cpp` | Enlace UART con PSoC: parser de frames + envío de cmds |
+| `src/espnow_transport.h` | Envío de lotes al maestro (fragmenta en 2× MsgData) |
+| `src/sync_protocol.h` | Structs/IDs ESP-NOW (mismo que maestro) |
+| `src/debug_log.h` | Logging humano + máquina (gateado por `DBG_ENABLE`) |
 
 ## Build (`platformio.ini`)
-- Un `env` por nodo (`slave1/2/3`) con `-DNODE_ID=n`.
-- **Logging**: `DBG_ENABLE` (0 = compila a cero). El log va por el **USB** del esclavo
-  (115200); en MATLAB se ve con “Debug COM Esclavo”.
-- UART al PSoC: `PSOC_UART_BAUD/RX/TX`. Actualizar `MASTER_MAC[]`.
 
-## Logging
-Líneas humanas `[t_us][Sn] …` → tab Log; líneas máquina `#M,t_us,Sn,evt,…` → log máquina.
-Se registran: ESP-NOW recibidos, comandos al PSoC, lotes, cambios de estado, flancos.
+```ini
+[env:slave2]  ; GEO físico
+upload_port = COM12
+NODE_ID     = 2
+BLINK_LED_PIN = 2
+BLINK_LED_ACTIVE_LOW = 0   ; GPIO2 en ESP32-DevKitC es activo-ALTO
+```
+
+Habilitar logging para diagnóstico:
+```ini
+-DSLAVE_LOGS_ENABLE=1 -DDBG_HUMAN=1
+```
+
+Auto-calibración al arrancar:
+```ini
+-DPSOC_AUTO_CAL_ON_READY=1
+-DPSOC_AUTO_CAL_DELAY_MS=500
+-DPSOC_AUTO_CAL_RETRY_MS=3000
+```
+
+## Logging típico de boot normal
+
+```
+[SLAVE 2] boot
+MAC: C8:2E:18:68:5F:6C  ch=1
+[ESPNOW] ready ch=1
+[SLAVE 2] Buscando PSoC...
+[PSoC] boot hw=0/GEO pstate=0/IDLE
+[SLAVE 2] PSoC: DETECTADO
+[AUTO_CAL] scheduled in 500 ms
+[SLAVE 2] listo, esperando ARM
+[AUTO_CAL] -> requesting calibration
+[CAL] done ok=1
+```
