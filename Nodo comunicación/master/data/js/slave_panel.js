@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-study-3';
+import * as cfg from './config.js?v=field-study-8';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -76,7 +76,7 @@ export class SlavePanel extends EventTarget {
       this._syncTypeLayout();
     });
     this._lblMac = el('span', 'mac-label', 'MAC: --');
-    root.appendChild(row(labeled('Tipo', this._ddType), this._lblMac));
+    root.appendChild(row(this._lblMac));
 
     this._inpOffset = el('input');
     this._inpOffset.type = 'number';
@@ -93,17 +93,6 @@ export class SlavePanel extends EventTarget {
     this._rowOffset = row(labeled('Offset m', this._inpOffset));
     root.appendChild(this._rowOffset);
 
-    this._inpYOffset = el('input');
-    this._inpYOffset.type = 'number';
-    this._inpYOffset.step = '100';
-    this._inpYOffset.value = '0';
-    this._inpYOffset.placeholder = 'mV';
-    this._inpYOffset.title = 'Desplazamiento vertical de display [mV] — no afecta export ni análisis';
-    this._inpYOffset.addEventListener('change', () => {
-      this._dispatch('y-offset-changed', parseFloat(this._inpYOffset.value) || 0);
-    });
-    root.appendChild(row(labeled('Offset Y (mV)', this._inpYOffset)));
-
     this._cbInvert = el('input');
     this._cbInvert.type = 'checkbox';
     this._cbInvert.title = 'Invertir señal (×−1) para display y export';
@@ -117,7 +106,10 @@ export class SlavePanel extends EventTarget {
     this._ddPga.addEventListener('change', () => this._onPgaChanged());
     this._dotPga = dot('PGA sin confirmar');
     this._lblPgaActual = el('span', null, 'Current: 1x');
-    root.appendChild(row(labeled('PGA', this._ddPga), this._dotPga, this._lblPgaActual));
+    this._btnSendAll = el('button', null, 'resend');
+    this._btnSendAll.title = 'Reenvia la configuracion de PGA al PSoC';
+    this._btnSendAll.addEventListener('click', () => this._dispatch('send-all-requested'));
+    root.appendChild(row(labeled('PGA', this._ddPga), this._btnSendAll, this._dotPga, this._lblPgaActual));
 
     this._dotCal = dot('Calibracion sin ejecutar');
     this._btnCalibrate = el('button', null, 'Calibrar');
@@ -158,20 +150,14 @@ export class SlavePanel extends EventTarget {
     this._btnApplyFir.addEventListener('click', () => this._onFirToggle());
     this._lblFirStatus = el('span', 'filter-status', 'No filter');
     firBox.appendChild(row(
-      labeled('Tipo', this._ddFirType),
+      labeled('Filtro', this._ddFirType),
       labeled('F1 Hz', this._firF1),
       labeled('F2 Hz', this._firF2),
       labeled('Taps', this._firTaps),
       this._btnApplyFir,
     ));
 
-    this._cbDcRemove = el('input');
-    this._cbDcRemove.type = 'checkbox';
-    this._cbDcRemove.addEventListener('change', () => {
-      this._dispatch('dc-remove-toggled', { enabled: this._cbDcRemove.checked });
-    });
-    this._lblDcVal = el('span', 'dc-label', 'DC: --');
-    firBox.appendChild(row(labeled('Remove DC', this._cbDcRemove), this._lblDcVal, this._lblFirStatus));
+    firBox.appendChild(row(this._lblFirStatus));
     root.appendChild(firBox);
 
     this._btnTest = el('button', null, 'Test');
@@ -183,11 +169,6 @@ export class SlavePanel extends EventTarget {
     this._btnLatency = el('button', null, 'Probe latency');
     this._btnLatency.addEventListener('click', () => this._dispatch('latency-requested'));
     root.appendChild(row(this._btnTest, this._btnVer, this._btnLatency));
-
-    this._btnSendAll = el('button', null, 'Enviar Config');
-    this._btnSendAll.title = 'Envia la configuracion de PGA al PSoC';
-    this._btnSendAll.addEventListener('click', () => this._dispatch('send-all-requested'));
-    root.appendChild(row(this._btnSendAll));
 
     /* ── Controles hardware FIR / EEPROM / identificación ──────────────────── */
     const hwBox = el('div', 'filter-box');
@@ -218,10 +199,10 @@ export class SlavePanel extends EventTarget {
     const stats = el('div', 'slave-stats');
     this._lblStats = el('div', 'stat-line', 'Batches: 0  Samples: 0');
     this._lblLastVal = el('div', 'stat-line', 'Last: --');
-    this._lblDrift = el('div', 'stat-line', 'Drift: --');
     this._lblLatency = el('div', 'stat-line', 'Latency: --');
     this._lblPsoc = el('div', 'stat-line', 'PSoC: ?');
-    for (const l of [this._lblStats, this._lblLastVal, this._lblDrift, this._lblLatency, this._lblPsoc]) {
+    this._lblVdac = el('div', 'stat-line', 'VDAC: --');
+    for (const l of [this._lblStats, this._lblLastVal, this._lblLatency, this._lblPsoc, this._lblVdac]) {
       stats.appendChild(l);
     }
     root.appendChild(stats);
@@ -324,13 +305,9 @@ export class SlavePanel extends EventTarget {
     this._btnApplyFir.textContent = this._firActive ? 'Remove' : 'Apply';
   }
 
-  setDcRemove(enabled) {
-    this._cbDcRemove.checked = !!enabled;
-  }
+  setDcRemove(_enabled) {}
 
-  setDcValue(v) {
-    this._lblDcVal.textContent = (v === null || v === undefined) ? 'DC: --' : `DC: ${v.toFixed(5)} V`;
-  }
+  setDcValue(_v) {}
 
   setPga(code) {
     if (code < 0 || code >= cfg.GAIN_NAMES.length) return;
@@ -351,11 +328,19 @@ export class SlavePanel extends EventTarget {
            'Calibracion sin ejecutar', busyTip);
   }
 
-  updateStats(batchCount, totalSamples, lastVal, driftStr, latencyStr, psocOk) {
+  setVdac(vdacByte) {
+    if (vdacByte === null || vdacByte === undefined) {
+      this._lblVdac.textContent = 'VDAC: --';
+    } else {
+      const pct = ((vdacByte / 255) * 100).toFixed(1);
+      this._lblVdac.textContent = `VDAC: ${vdacByte} (${pct}%)`;
+    }
+  }
+
+  updateStats(batchCount, totalSamples, lastVal, _driftStr, latencyStr, psocOk) {
     this._lblStats.textContent = `Batches: ${batchCount}  Samples: ${totalSamples}`;
     this._lblLastVal.textContent = (lastVal === null || lastVal === undefined)
       ? 'Last: --' : `Last: ${lastVal.toFixed(6)} V`;
-    this._lblDrift.textContent = `Drift: ${driftStr}`;
     this._lblLatency.textContent = `Latency: ${latencyStr}`;
     this._lblPsoc.textContent = (psocOk === null || psocOk === undefined)
       ? 'PSoC: ?' : (psocOk ? 'PSoC: DETECTED' : 'PSoC: not detected');
@@ -374,9 +359,7 @@ export class SlavePanel extends EventTarget {
     this._inpOffset.value = String(Number.isFinite(v) ? v : 0);
   }
 
-  setYOffset(mv) {
-    this._inpYOffset.value = String(Number.isFinite(mv) ? mv : 0);
-  }
+  setYOffset(_mv) {}
 
   setInvertSignal(enabled) {
     this._cbInvert.checked = !!enabled;

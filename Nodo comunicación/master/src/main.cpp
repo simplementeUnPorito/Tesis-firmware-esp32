@@ -101,6 +101,9 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
 #ifndef STORE_AUTO_DUMP_MIN_MS
   #define STORE_AUTO_DUMP_MIN_MS 500
 #endif
+#ifndef STORE_CAPTURE_TIMEOUT_MIN_MS
+  #define STORE_CAPTURE_TIMEOUT_MIN_MS 2500
+#endif
 #ifndef DUMP_NACK_RETRY_DELAY_MS
   #define DUMP_NACK_RETRY_DELAY_MS 100
 #endif
@@ -184,6 +187,7 @@ static uint32_t g_dumpReqMs       = 0;   /* millis() del último REQ_BATCH envia
 static bool     g_dumpRetryPaused = false;
 static uint32_t g_dumpRetryDueMs  = 0;
 static uint32_t g_captureDumpDueMs = 0;
+static uint32_t g_captureDoneMask = 0;
 #define DUMP_MAX_RETRIES  30
 #define DUMP_BATCH_TIMEOUT_MS 300
 
@@ -274,6 +278,12 @@ static uint8_t countHotWaitAcks(uint32_t mask)
         if (mask & (1UL << node)) n++;
     }
     return n;
+}
+
+static bool allArmedCapturesDone()
+{
+    if (g_armedCount == 0 || g_armAckMask == 0) return false;
+    return (g_captureDoneMask & g_armAckMask) == g_armAckMask;
 }
 
 static uint16_t clampRecordBatches(uint16_t n)
@@ -379,6 +389,7 @@ static void onCfgAck(const MsgCfgAck &msg)
         g_viewNode = 0;
         g_streaming = false;
         g_captureDumpDueMs = 0;
+        g_captureDoneMask = 0;
         g_dumpRetryPaused = false;
         dumpDeliveryGuardReset();
         g_state = armedOrIdleState();
@@ -407,6 +418,35 @@ static void onCfgAck(const MsgCfgAck &msg)
         MASTER_LOG_PRINTF("[MASTER] VIEW capture done node=%d -> DUMP\n", msg.node_id);
         LOGM("VIEW_CAPTURE_DONE", "node=%d", msg.node_id);
         beginDump("view_done");
+    }
+
+    /* START ok=2: captura normal completa en el slave. Este es el camino
+     * principal; el timer queda solo como seguridad si algún ACK se pierde. */
+    if (msg.sub_cmd == CMD_START && !g_viewDump) {
+        if (msg.node_id > 0 && msg.node_id <= NUM_SLAVES &&
+            msg.ok == 2 && g_state == RUNNING) {
+            uint32_t bit = (1UL << msg.node_id);
+            if (g_armAckMask & bit) {
+                g_captureDoneMask |= bit;
+                uint8_t doneCount = countArmAcks(g_captureDoneMask & g_armAckMask);
+                MASTER_LOG_PRINTF("[MASTER] START capture done node=%d (%u/%u)\n",
+                                  msg.node_id, doneCount, g_armedCount);
+                LOGM("START_CAPTURE_DONE", "node=%d,done=%u,armed=%u,mask=0x%08lX",
+                     msg.node_id, doneCount, g_armedCount,
+                     (unsigned long)g_captureDoneMask);
+                if (allArmedCapturesDone()) {
+                    syncOutWrite(LOW);
+                    beginDump("start_done");
+                }
+            } else {
+                MASTER_LOG_PRINTF("[MASTER] START done from unarmed node=%d ignored\n",
+                                  msg.node_id);
+            }
+        } else if (msg.ok == 0 && (g_state == RUNNING || g_state == PRESTART)) {
+            MASTER_LOG_PRINTF("[MASTER] START failed node=%d state=%d\n",
+                              msg.node_id, (int)g_state);
+            LOGM("START_FAIL", "node=%d,state=%d", msg.node_id, (int)g_state);
+        }
     }
 
     /* REQ_BATCH NACK: si el slave todavía no tiene ese lote, reintentar antes de avanzar. */
@@ -538,22 +578,25 @@ static void beacon_resume(void)
 
 static void scheduleStoreDump(uint16_t nBatches)
 {
-    if (nBatches == 0 || (g_armedCount == 0 && !g_viewDump)) {
+    if (nBatches == 0 || g_viewDump || g_armedCount == 0) {
         g_captureDumpDueMs = 0;
         return;
     }
-    uint32_t waitMs = captureDurationMs(nBatches) + STORE_CAPTURE_MARGIN_MS;
-    if (waitMs < STORE_AUTO_DUMP_MIN_MS) waitMs = STORE_AUTO_DUMP_MIN_MS;
+    uint32_t durationMs = captureDurationMs(nBatches);
+    uint32_t waitMs = durationMs * 2u + STORE_CAPTURE_MARGIN_MS;
+    if (waitMs < STORE_CAPTURE_TIMEOUT_MIN_MS) waitMs = STORE_CAPTURE_TIMEOUT_MIN_MS;
     g_captureDumpDueMs = millis() + waitMs;
-    MASTER_LOG_PRINTF("[MASTER] auto DUMP in %u ms (n=%u)\n",
+    MASTER_LOG_PRINTF("[MASTER] DUMP safety timeout in %u ms (n=%u)\n",
                       (unsigned)waitMs, (unsigned)nBatches);
-    LOGM("DUMP_SCHEDULE", "n=%u,wait_ms=%u", nBatches, (unsigned)waitMs);
+    LOGM("DUMP_SAFETY_TIMEOUT", "n=%u,duration_ms=%u,wait_ms=%u",
+         nBatches, (unsigned)durationMs, (unsigned)waitMs);
 }
 
 static void beginDump(const char *reason)
 {
     beacon_resume();
     g_captureDumpDueMs = 0;
+    g_captureDoneMask = 0;
     g_dumpRetryPaused = false;
     g_dumpRetryDueMs = 0;
     /* VIEW dump: un solo nodo; normal dump: todos los esclavos armados */
@@ -656,6 +699,7 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param)
         MsgView msg = { CMD_VIEW, node_id, n };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
         g_captureDumpDueMs = 0;      /* el dump arranca solo con VIEW_DONE del esclavo */
+        g_captureDoneMask = 0;
         LOGM("VIEW", "node=%d,n=%u,store=1,wait_done=1", node_id, msg.n);
     } else if (sub_cmd == 0xB3) {
         MsgDebugPsoc msg = { CMD_DEBUG_PSOC, node_id, param };
@@ -802,6 +846,7 @@ static void abortPrestart(const char *reason)
     g_hotWaitSettling = false;
     g_streaming = false;
     g_captureDumpDueMs = 0;
+    g_captureDoneMask = 0;
     g_dumpRetryPaused = false;
     syncOutWrite(LOW);
     g_state = armedOrIdleState();
@@ -851,6 +896,7 @@ static void finishPrestartAction()
             }
         }
         g_captureDumpDueMs = 0;   /* dump al recibir VIEW_DONE del esclavo */
+        g_captureDoneMask = 0;
         g_state = RUNNING;
         matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         MASTER_LOG_PRINTF("[MASTER] VER HOT_WAIT done -> CMD_START node=%d\n", g_viewNode);
@@ -858,6 +904,17 @@ static void finishPrestartAction()
     } else {
         /* No modificar g_armedCount: intentar dump desde todos los slaves ARM'd.
            Los que no grabaron responderán NACK y se saltean via retry. */
+        g_armedCount = countArmAcks(g_armAckMask);
+        if (g_rec_n_batches == 0 || g_armedCount == 0 || g_armAckMask == 0) {
+            MASTER_LOG_PRINTF("[MASTER] START rejected after PRESTART n=%u armed=%u mask=0x%08lX\n",
+                              g_rec_n_batches, g_armedCount,
+                              (unsigned long)g_armAckMask);
+            LOGM("START_REJECT_PRESTART", "n=%u,armed=%u,mask=0x%08lX",
+                 g_rec_n_batches, g_armedCount, (unsigned long)g_armAckMask);
+            abortPrestart("no armed slaves");
+            return;
+        }
+        g_captureDoneMask = 0;
         matlab.sendReady(g_armedCount);
         broadcastStart();
         scheduleStoreDump(g_rec_n_batches);
@@ -955,6 +1012,7 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
                     g_testMode     = false;
                     g_streaming    = false;
                     g_captureDumpDueMs = 0;
+                    g_captureDoneMask = 0;
                     g_dumpRetryPaused  = false;
                 } else {
                     g_armedCount = countArmAcks(g_armAckMask);
@@ -965,22 +1023,43 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
             }
             break;
 
-        case 0xA3:   /* START — N de 16 bits en rxCmd.value */
-            if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
-                g_viewNode = 0;
-                g_viewBatchesRemaining = 0;
-                g_rec_n_batches = clampRecordBatches(rxCmd.value);
-                g_debugRamp = 0;
-                g_streaming = true;
-                beginPrestart(PRESTART_ACTION_START);
-                matlab.sendAck(0xFF, cmd, 1);
+        case 0xA3: { /* START — N de 16 bits en rxCmd.value */
+            uint16_t requestedBatches = clampRecordBatches(rxCmd.value);
+            g_armedCount = countArmAcks(g_armAckMask);
+            bool stateOk = (g_state == IDLE || g_state == ARMED || g_state == ARMING);
+            if (!stateOk || requestedBatches == 0 || g_armedCount == 0 || g_armAckMask == 0) {
+                MASTER_LOG_PRINTF("[MASTER] START rejected state=%d n=%u armed=%u mask=0x%08lX\n",
+                                  (int)g_state, requestedBatches, g_armedCount,
+                                  (unsigned long)g_armAckMask);
+                LOGM("START_REJECT", "state=%d,n=%u,armed=%u,mask=0x%08lX",
+                     (int)g_state, requestedBatches, g_armedCount,
+                     (unsigned long)g_armAckMask);
+                if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
+                    g_state = armedOrIdleState();
+                    matlab.sendReady(g_armedCount);
+                    matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+                }
+                matlab.sendAck(0xFF, cmd, 0);
+                break;
             }
+            g_viewNode = 0;
+            g_viewBatchesRemaining = 0;
+            g_viewDump = false;
+            g_rec_n_batches = requestedBatches;
+            g_captureDoneMask = 0;
+            g_captureDumpDueMs = 0;
+            g_debugRamp = 0;
+            g_streaming = true;
+            beginPrestart(PRESTART_ACTION_START);
+            matlab.sendAck(0xFF, cmd, 1);
             break;
+        }
 
         case 0xA4:   /* STOP */
             g_viewNode = 0;
             g_viewBatchesRemaining = 0;
             g_captureDumpDueMs = 0;
+            g_captureDoneMask = 0;
             g_dumpRetryPaused = false;
             broadcastStop();
             g_state = STOPPING;
@@ -1029,6 +1108,7 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd)
                 g_testMode  = false;
                 g_streaming = false;
                 g_captureDumpDueMs = 0;
+                g_captureDoneMask = 0;
                 g_dumpRetryPaused = false;
                 g_state     = armedOrIdleState();
                 syncOutWrite(LOW);
@@ -1297,11 +1377,17 @@ void loop()
         }
     }
 
-    /* Store-and-forward: cuando termina la ventana N, dumpear sin depender de STOP. */
-    if (g_state == RUNNING && g_rec_n_batches > 0 && g_captureDumpDueMs != 0 &&
+    /* Store-and-forward: timeout de seguridad. El camino normal es START ok=2
+     * desde todos los slaves armados; esto solo rescata ACKs perdidos. */
+    if (g_state == RUNNING && !g_viewDump && g_rec_n_batches > 0 && g_captureDumpDueMs != 0 &&
         (int32_t)(millis() - g_captureDumpDueMs) >= 0) {
         syncOutWrite(LOW);
-        beginDump("capture_done");
+        MASTER_LOG_PRINTF("[MASTER] START done ACK timeout mask=0x%08lX armed=0x%08lX -> DUMP\n",
+                          (unsigned long)g_captureDoneMask,
+                          (unsigned long)g_armAckMask);
+        LOGM("START_DONE_TIMEOUT", "done=0x%08lX,armed=0x%08lX",
+             (unsigned long)g_captureDoneMask, (unsigned long)g_armAckMask);
+        beginDump("capture_timeout");
     }
 
     /* Transición STOPPING → DUMPING (store-and-forward) o → IDLE (clásico) */
@@ -1373,6 +1459,7 @@ void loop()
                     g_streaming = false;
                     g_rec_n_batches = 0;
                     g_captureDumpDueMs = 0;
+                    g_captureDoneMask = 0;
                     g_dumpRetryPaused = false;
                     dumpDeliveryGuardReset();
                     matlab.sendReady(g_armedCount);

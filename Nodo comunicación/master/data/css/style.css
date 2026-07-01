@@ -1,4 +1,5 @@
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 :root {
   --bg: #111;
@@ -379,9 +380,9 @@ button:active { background: var(--input-active); }
 
 .preserve-row {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   gap: 0.45rem;
-  align-items: center;
+  align-items: start;
   padding: 0.35rem 0.4rem;
   background: var(--node-row-bg);
   border-radius: 6px;
@@ -417,12 +418,13 @@ button:active { background: var(--input-active); }
 }
 
 .preserve-offset {
-  display: inline-flex;
+  display: flex;
   gap: 0.25rem;
   align-items: center;
   white-space: nowrap;
   color: var(--muted);
   font-size: 0.8rem;
+  margin-top: 0.15rem;
 }
 
 .preserve-offset input {
@@ -499,16 +501,11 @@ button:active { background: var(--input-active); }
   }
 
   .preserve-row {
-    grid-template-columns: auto auto minmax(0, 1fr);
-  }
-
-  .preserve-offset {
-    grid-column: 3 / -1;
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
   }
 
   .preserve-row button {
-    grid-column: 3 / -1;
-    justify-self: start;
+    align-self: start;
   }
 
   .tab-btn {

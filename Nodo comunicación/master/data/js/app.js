@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-3';
-import { WsClient } from './ws_client.js?v=field-study-3';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-3';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-3';
-import { PlotArea } from './plot.js?v=field-study-3';
-import { SpectrumArea } from './spectrum.js?v=field-study-3';
-import { SlavePanel } from './slave_panel.js?v=field-study-3';
-import { compileFirCmd, dcRemove, filtFilt, lastFirError } from './signal_proc.js?v=field-study-3';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-3';
+import * as cfg from './config.js?v=field-study-8';
+import { WsClient } from './ws_client.js?v=field-study-8';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-8';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-8';
+import { PlotArea } from './plot.js?v=field-study-8';
+import { SpectrumArea } from './spectrum.js?v=field-study-8';
+import { SlavePanel } from './slave_panel.js?v=field-study-8';
+import { compileFirCmd, dcRemove, filtFilt, lastFirError } from './signal_proc.js?v=field-study-8';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-8';
 
 const $ = (id) => document.getElementById(id);
 
@@ -35,6 +35,9 @@ const PRESERVE_COLORS = [
 let masterState = 0;
 let activeSlaveCount = 0;
 let preserveSeq = 0;
+let pendingStart = null;
+
+const START_AUTO_ARM_TIMEOUT_MS = 4500;
 
 const SETTINGS_PREFIX = 'geophone_scope_web.';
 const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz_v2`;
@@ -218,6 +221,22 @@ function nodeConnectedForCapture(nd, index) {
     && (nd.fsKnown || !!nd.mac || nd.hwClass !== 0xFF || nd.rawBuf.length > 0 || nd.filtBuf.length > 0);
 }
 
+function nodeRole(nd) {
+  if (!nd) return 'unknown';
+  if (nd.hwClass === 1 || nd.alias === 'Hammer') return 'hammer';
+  if (nd.hwClass === 0 || String(nd.alias || '').startsWith('Geo')) return 'geo';
+  return 'unknown';
+}
+
+function geoNumberFromAlias(alias) {
+  const m = /^Geo(\d+)$/i.exec(String(alias || '').trim());
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function offsetFromHammer(nd) {
+  return nodeRole(nd) === 'hammer' ? 0 : (nd.hammerOffset ?? 0);
+}
+
 function nodeSnapshot(nd, index, options = {}) {
   const rawOrig = nd.rawBuf.toArray();
   const filtOrig = filteredArrayForNode(nd, rawOrig);
@@ -226,13 +245,22 @@ function nodeSnapshot(nd, index, options = {}) {
   const filtDc = signalMean(filtOrig);
   const raw = storeDcRemoved ? transformSignalForView(rawOrig, { removeDc: true }) : rawOrig;
   const filt = storeDcRemoved ? transformSignalForView(filtOrig, { removeDc: true }) : filtOrig;
+  const role = nodeRole(nd);
+  const offsetM = offsetFromHammer(nd);
+  const pcbId = nd.slaveId || (index === 0 ? 'M' : `S${index}`);
   return {
     index,
+    node_id: index,
+    pcb_id: pcbId,
+    physical_id: pcbId,
     name: cfg.NODE_NAMES[index] || `Node ${index}`,
     type: nd.alias || cfg.NODE_NAMES[index] || `Node ${index}`,
-    slave_id: nd.slaveId,
+    role,
+    geo_number: role === 'geo' ? geoNumberFromAlias(nd.alias) : null,
+    slave_id: pcbId,
     fs: nd.fs,
     fs_known: !!nd.fsKnown,
+    fs_exact_known: !!nd.fsExactKnown,
     connected: nodeConnectedForCapture(nd, index),
     raw,
     filt,
@@ -248,7 +276,9 @@ function nodeSnapshot(nd, index, options = {}) {
     psoc_ok: nd.psocOk,
     hw_class: nd.hwClass,
     hw_type: slaveHwClassName(nd.hwClass),
-    hammer_offset_m: nd.hammerOffset ?? 0,
+    hammer_offset_m: offsetM,
+    offset_m_from_hammer: offsetM,
+    position_m: offsetM,
     sample_offset: 0,
     mac: nd.mac || '',
     visible: !!nd.visible,
@@ -259,6 +289,7 @@ function nodeSnapshot(nd, index, options = {}) {
     raw_dc_v: rawDc,
     filt_dc_v: filtDc,
     invert_signal: !!nd.invertSignal,
+    display_y_offset_v: nd.yOffsetV || 0,
     drift_hist: nd.driftHist.slice(),
     latency_hist: nd.latencyHist.slice(),
     health: nd.health,
@@ -388,8 +419,7 @@ function renderPreservedList() {
     const sub = document.createElement('div');
     sub.className = 'sub';
     const dcText = capture.dc_removed_on_preserve ? 'sin DC' : 'con DC';
-    sub.textContent = `${capture.display_time} · ${capture.raw_count} raw · Fs ${capture.fs ? capture.fs.toFixed(0) : '?'} Hz · ${dcText} · X ${captureSampleOffset(capture)} muestras · Y ${captureYOffsetMv(capture)} mV`;
-    meta.append(title, sub);
+    sub.textContent = `${capture.display_time} · ${capture.raw_count} raw · Fs ${capture.fs ? capture.fs.toFixed(0) : '?'} Hz · ${dcText}`;
 
     const offsetWrap = document.createElement('label');
     offsetWrap.className = 'preserve-offset';
@@ -423,6 +453,8 @@ function renderPreservedList() {
     });
     yOffsetWrap.appendChild(yOffsetInput);
 
+    meta.append(title, sub, offsetWrap, yOffsetWrap);
+
     const del = document.createElement('button');
     del.type = 'button';
     del.textContent = 'Quitar';
@@ -433,7 +465,7 @@ function renderPreservedList() {
       refreshSlavePresentationOrder();
     });
 
-    row.append(chk, swatch, meta, offsetWrap, yOffsetWrap, del);
+    row.append(chk, swatch, meta, del);
     list.appendChild(row);
   }
   refreshPreservedStatus();
@@ -565,7 +597,7 @@ function setConnIndicator(isConnected) {
 }
 
 function setMasterState(stateCode) {
-  const name = cfg.MASTER_STATE_NAMES[stateCode] ?? `(${stateCode})`;
+  const name = masterStateName(stateCode);
   $('master-state').textContent = name;
 }
 
@@ -656,15 +688,16 @@ function applyReportedSlaveType(chIndex, hwClass) {
   if (hwClass === 1) {
     nd.alias = 'Hammer';
     nd.hammerOffset = 0;
+    saveSlaveSetting(chIndex, 'alias', 'Hammer');
+    saveSlaveSetting(chIndex, 'hammer_offset_m', 0);
     if (panel) {
       panel.setAlias('Hammer');
       panel.setOffset(0);
       panel.setDisplayName(`Hammer (${cfg.NODE_NAMES[chIndex]})`);
     }
+    reorderGeosByOffset();
   } else {
-    if (nd.alias === 'Hammer' || !String(nd.alias || '').startsWith('Geo')) {
-      nd.alias = `Geo${chIndex}`;
-    }
+    if (nd.alias === 'Hammer' || !String(nd.alias || '').startsWith('Geo')) nd.alias = 'Geo';
     if (panel) panel.setAlias(nd.alias);
     reorderGeosByOffset();
   }
@@ -691,6 +724,65 @@ function visibleSlaveCount() {
   return count;
 }
 
+function masterStateName(stateCode = masterState) {
+  return cfg.MASTER_STATE_NAMES[stateCode] ?? `(${stateCode})`;
+}
+
+function masterBusyForStart() {
+  return [
+    cfg.MASTER_STATE_RUNNING,
+    cfg.MASTER_STATE_STOPPING,
+    cfg.MASTER_STATE_DUMPING,
+    cfg.MASTER_STATE_PRESTART,
+    cfg.MASTER_STATE_SCOPE_MULTI,
+  ].includes(masterState);
+}
+
+function clearPendingStart() {
+  if (pendingStart?.timer) clearTimeout(pendingStart.timer);
+  pendingStart = null;
+}
+
+function makeStartRequestInfo() {
+  const requestedSecs = captureSeconds();
+  const info = captureLimitInfo(requestedSecs);
+  return { requestedSecs, info, n: info.n };
+}
+
+function runStartCapture(req, source = '') {
+  clearPendingStart();
+  data.clearAll();
+  plotArea.clearAll();
+  spectrumArea.clearAll();
+  sendStd16(cfg.CMD_START, req.n);
+  const capped = req.info.capped ? `, max; pedido ${req.requestedSecs.toFixed(2)} s` : '';
+  const suffix = source ? ` (${source})` : '';
+  appendLog(`START${suffix}: ${req.n} lotes (~${req.info.actualSecs.toFixed(2)} s real${capped})`);
+}
+
+function queueStartAfterArm(req, armCount) {
+  clearPendingStart();
+  pendingStart = {
+    req,
+    timer: setTimeout(() => {
+      pendingStart = null;
+      appendLog('START cancelado: ARM no devolvio READY; revisa enlace/esclavo');
+    }, START_AUTO_ARM_TIMEOUT_MS),
+  };
+  sendStd(cfg.CMD_ARM, armCount);
+  appendLog(`START: READY n=0, ARM automatico n=${armCount}; esperando READY`);
+}
+
+function maybeRunPendingStart(readyCount) {
+  if (!pendingStart) return;
+  if (masterBusyForStart()) {
+    appendLog(`START pendiente bloqueado: master ${masterStateName()}, envia STOP antes de otro START`);
+    clearPendingStart();
+    return;
+  }
+  if (readyCount > 0) runStartCapture(pendingStart.req, 'post-ARM');
+}
+
 function applySlaveVisibility(visibleSet) {
   for (let i = 1; i < cfg.MAX_NODES; i++) {
     const visible = visibleSet.has(i);
@@ -708,11 +800,6 @@ function rebalanceSlaveVisibility(preferredIndex = 0) {
     if (nodeHasPresence(i)) visibleSet.add(i);
   }
   if (preferredIndex > 0 && preferredIndex < cfg.MAX_NODES) visibleSet.add(preferredIndex);
-
-  const target = Math.max(activeSlaveCount, visibleSet.size);
-  for (let i = 1; visibleSet.size < target && i < cfg.MAX_NODES; i++) {
-    if (!visibleSet.has(i)) visibleSet.add(i);
-  }
 
   applySlaveVisibility(visibleSet);
   refreshSlavePresentationOrder();
@@ -842,8 +929,7 @@ function updateSlavePanelStats(chIndex) {
     nd.formatLatencyStats(),
     nd.psocOk,
   );
-  if (nd.rawBuf.length > 10) panel.setDcValue(nd.rawSum / nd.rawBuf.length);
-  else panel.setDcValue(null);
+  panel.setVdac(nd.vdacByte);
 }
 
 function adcCountsToVolts(counts) {
@@ -1207,12 +1293,12 @@ function loadSlavePanelState(chIndex, panel) {
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
 
   panel.setPga(nd.pgaCode);
-  panel.setDcRemove(nd.dcRemove);
   nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
+  if (nd.alias === 'Hammer') {
+    nd.hammerOffset = 0;
+    saveSlaveSetting(chIndex, 'hammer_offset_m', 0);
+  }
   panel.setOffset(nd.hammerOffset);
-
-  nd.yOffsetV = loadSlaveFloat(chIndex, 'y_offset_mv', 0) / 1000;
-  panel.setYOffset(nd.yOffsetV * 1000);
 
   nd.invertSignal = loadSlaveBool(chIndex, 'invert_signal', false);
   panel.setInvertSignal(nd.invertSignal);
@@ -1252,7 +1338,15 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('save-eeprom-requested', () => onSaveEepromRequested(chIndex));
   panel.addEventListener('fir-hw-toggled', (ev) => onFirHwToggled(chIndex, ev.detail.mode));
   panel.addEventListener('offset-changed', (ev) => {
-    data.nodes[chIndex].hammerOffset = ev.detail;
+    const nd = data.nodes[chIndex];
+    if (nodeRole(nd) === 'hammer') {
+      nd.hammerOffset = 0;
+      panel.setOffset(0);
+      saveSlaveSetting(chIndex, 'hammer_offset_m', 0);
+      reorderGeosByOffset();
+      return;
+    }
+    nd.hammerOffset = ev.detail;
     saveSlaveSetting(chIndex, 'hammer_offset_m', ev.detail);
     // Re-sort geo display names by distance whenever any offset changes.
     reorderGeosByOffset();
@@ -1280,6 +1374,12 @@ function buildSlavePanels() {
   }
 }
 
+function isGeoForOrdering(i) {
+  const nd = data.nodes[i];
+  if (!nd || !nodeHasPresence(i)) return false;
+  return nodeRole(nd) === 'geo';
+}
+
 /**
  * After any geo's offset changes, sort all geo-type nodes by distance from the hammer
  * and re-label their panels as Geo1, Geo2, ... (closest first).
@@ -1291,7 +1391,7 @@ function reorderGeosByOffset() {
   const geos = [];
   for (let i = 1; i < cfg.MAX_NODES; i++) {
     const nd = data.nodes[i];
-    if (nd.alias !== 'Hammer' && nodeHasPresence(i)) {
+    if (isGeoForOrdering(i)) {
       geos.push({ idx: i, dist: nd.hammerOffset || 0 });
     }
   }
@@ -1322,6 +1422,22 @@ function calibrationProgressLabel(v) {
 function handleAck(pkt, idx) {
   const ackCmd = pkt.ackCmd;
   const ackVal = pkt.ackVal;
+
+  if (ackCmd === cfg.CMD_START) {
+    if (ackVal) {
+      appendLog('START aceptado por master');
+    } else {
+      appendLog(`START rechazado por master: estado=${masterStateName()} READY n=${activeSlaveCount}`);
+      clearPendingStart();
+    }
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_SYNC_START && idx >= 1 && idx < cfg.MAX_NODES) {
+    if (ackVal === 2) appendLog(`S${idx} START captura completa`);
+    else if (ackVal === 0) appendLog(`S${idx} START fallo`);
+    return;
+  }
 
   // Progreso de calibracion (ok>=2): no consume el pending de la confirmacion
   // final, solo refleja fase/etapa en la UI.
@@ -1581,6 +1697,7 @@ $('auth-password').addEventListener('keydown', (ev) => {
 ws.addEventListener('connection', (ev) => {
   if (ev.detail) hideAuthModal();
   setConnIndicator(ev.detail);
+  if (!ev.detail) clearPendingStart();
   if (ev.detail) {
     // Ask for cached READY/HELLO immediately and once more if Fs is still
     // missing. This keeps Fs hardware-sourced, without requiring manual input
@@ -1615,6 +1732,7 @@ ws.addEventListener('packet', (ev) => {
       const panel = panelFor(idx);
       if (panel) {
         panel.setPga(nd.pgaCode);
+        panel.setVdac(nd.vdacByte);
       }
     }
   } else if (pkt.isAck) {
@@ -1622,6 +1740,7 @@ ws.addEventListener('packet', (ev) => {
   } else if (pkt.isReady) {
     setActiveSlaveCount(pkt.readyNSlaves);
     appendLog(`READY n_slaves=${pkt.readyNSlaves}`);
+    maybeRunPendingStart(pkt.readyNSlaves);
   } else if (pkt.isStatus) {
     handleStatus(pkt, idx);
   } else if (pkt.isLatency) {
@@ -1642,8 +1761,10 @@ $('btn-connect').addEventListener('click', async () => {
 
 $('btn-arm').addEventListener('click', () => {
   const n = clamp(parseInt($('arm-n').value, 10) || 0, 0, cfg.MAX_NODES - 1);
-  setActiveSlaveCount(n, true);
+  clearPendingStart();
+  setActiveSlaveCount(0);
   sendStd(cfg.CMD_ARM, n);
+  appendLog(`ARM solicitado n=${n || 'todos'}; esperando READY real`);
 });
 
 // Manual override for when no slave's HELLO carries Fs (e.g. master rebooted
@@ -1665,26 +1786,29 @@ $('btn-start').addEventListener('click', () => {
     appendLog('START cancelado: esperando Fs real del esclavo (HELLO no recibido aun)');
     return;
   }
-  const requestedSecs = captureSeconds();
-  const info = captureLimitInfo(requestedSecs);
-  const n = info.n;
-  data.clearAll();
-  plotArea.clearAll();
-  spectrumArea.clearAll();
-  sendStd16(cfg.CMD_START, n);
-  const capped = info.capped ? `, max; pedido ${requestedSecs.toFixed(2)} s` : '';
-  appendLog(`START: ${n} lotes (~${info.actualSecs.toFixed(2)} s real${capped})`);
+  if (masterBusyForStart()) {
+    appendLog(`START bloqueado: master ${masterStateName()}, envia STOP antes de otro START`);
+    return;
+  }
+  const req = makeStartRequestInfo();
+  if (activeSlaveCount > 0 || masterState === cfg.MASTER_STATE_ARMED) {
+    runStartCapture(req);
+    return;
+  }
+  const visibleCount = visibleSlaveCount();
+  if (visibleCount <= 0) {
+    appendLog('START cancelado: no hay esclavos visibles para armar');
+    return;
+  }
+  queueStartAfterArm(req, visibleCount);
 });
 
 $('btn-preserve').addEventListener('click', onPreserveRequested);
 
 $('btn-stop').addEventListener('click', () => {
+  clearPendingStart();
   sendStd(cfg.CMD_STOP, 0);
   sendStd(cfg.CMD_STREAM, 0);
-});
-
-$('btn-status').addEventListener('click', () => {
-  sendStd(cfg.CMD_STATUS, 0);
 });
 
 $('btn-cal-all').addEventListener('click', () => {

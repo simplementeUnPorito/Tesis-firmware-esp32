@@ -282,3 +282,63 @@ master ESP32 on COM8, geophone slave ESP32 on COM12, PSoC via KitProg, PC on
 - **Connectivity hiccup after reset**: PC kept IP `192.168.4.2` but no ARP/ping
   to `192.168.4.1`; user recompiled/reconnected to `GeoNetwork`, after which
   `/health` and WS tests succeeded.
+
+---
+
+## Session log — 2026-06-30 Claude session 2 (LED fix + VDAC + STATUS button)
+
+### Hardware programado
+
+| Dispositivo | Puerto | Resultado |
+|---|---|---|
+| PSoC AcondicionamientoAnalogico | KitProg (CMSIS-DAP/236111) | OK — 28206 bytes, filas 0..110 programadas y verificadas |
+| Master ESP32 firmware | COM8 | OK — 899008 bytes subidos |
+| Master ESP32 SPIFFS (web) | COM8 | OK — 1441792 bytes LittleFS |
+| Slave ESP32 (slave2, NODE_ID=2) | COM12 | OK — 753312 bytes |
+
+### Boot verificado (COM12 monitor serial, 12s post-reset)
+
+```
+[SLAVE 2] boot
+MAC: C8:2E:18:68:5F:6C  ch=1
+[ESPNOW] ready ch=1
+[SLAVE 2] Buscando PSoC...
+[PSoC] boot hw=0/GEO pstate=0/IDLE
+[SLAVE 2] PSoC: DETECTADO
+[AUTO_CAL] scheduled in 500 ms
+[SLAVE 2] listo, esperando ARM
+[AUTO_CAL] -> requesting calibration
+[CAL] done ok=1
+[SLAVE] PSoC cfg ack sub=0xB5 val=1 expected=1 ok=1
+```
+
+Calibracion automatica completada con `ok=1`, los 4 stages convergieron:
+
+| Stage | DAC | err counts | err mV | OK |
+|---|---|---|---|---|
+| GEO_PGA | 155 | -3223 | -61 | ok=1 |
+| GEO_BP | 149 | -142 | -3 | ok=1 |
+| GEO_ADDER | 150 | -135 | -3 | ok=1 |
+| GEO_LP | 148 | -1897 | -36 | ok=1 |
+
+### Cambios aplicados esta sesion
+
+1. **PSoC LED fix** (`main.c`): eliminadas las dos asignaciones
+   `g_comm_countdown = COMM_WINDOW_TICKS` del path UART (en `uart_send_batch`
+   y en el handler RX de `uart_service`). El LED ya no parpadea con cada
+   transaccion UART; permanece encendido solido mientras esta conectado al ESP.
+
+2. **VDAC en panel Esclavos** (`slave_panel.js` + `app.js`): cada panel esclavo
+   ahora muestra `VDAC: <byte> (<pct>%)` en el bloque de stats. Se actualiza
+   desde heartbeat junto con PGA.
+
+3. **Boton STATUS eliminado** (`index.html` + `app.js`): el boton no hacia nada
+   util (el STATUS automatico al conectar sigue funcionando internamente).
+
+### Pendiente de verificar en UI web
+
+- Conectar a GeoNetwork (192.168.4.1) y confirmar:
+  - Que el panel de S2 muestra `VDAC: <valor>` en stats
+  - Que el boton STATUS no aparece mas en la sidebar
+  - Hacer ARM n=1, START, confirmar datos de S2 llegan
+  - Verificar que el LED del PSoC NO parpadea durante la captura de datos

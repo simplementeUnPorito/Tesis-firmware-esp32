@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-study-3">
+  <link rel="stylesheet" href="/css/style.css?v=field-study-8">
 </head>
 <body>
   <header>
@@ -48,7 +48,6 @@
         <button id="tab-btn-capture" class="tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="tab-capture" data-tab-target="tab-capture">Captura</button>
         <button id="tab-btn-slaves" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-slaves" data-tab-target="tab-slaves">Esclavos</button>
         <button id="tab-btn-preserved" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-preserved" data-tab-target="tab-preserved">Preservados</button>
-        <button id="tab-btn-export" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-export" data-tab-target="tab-export">Export</button>
         <button id="tab-btn-log" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-log" data-tab-target="tab-log">Log</button>
       </nav>
 
@@ -56,7 +55,7 @@
         <section id="tab-capture" class="panel tab-page active" role="tabpanel" aria-labelledby="tab-btn-capture">
           <h2>Captura</h2>
           <div class="row">
-            <label>ARM n_esclavos <input id="arm-n" type="number" min="0" max="3" value="0"></label>
+            <label>ARM n_esclavos <input id="arm-n" type="number" min="0" max="8" value="0"></label>
             <button id="btn-arm">ARM</button>
           </div>
           <div class="row">
@@ -71,26 +70,31 @@
           </div>
           <div class="row">
             <button id="btn-stop">STOP</button>
-            <button id="btn-status">STATUS</button>
           </div>
           <div class="row">
             <button id="btn-cal-all">Calibrar todos</button>
           </div>
+          <div class="subhead capture-subhead">Exportar</div>
+          <div class="row">
+            <label>Nombre <input id="export-name" type="text" value="muestra"></label>
+            <button id="btn-export">Guardar CSV/ZIP</button>
+          </div>
+          <div id="export-status" class="status-text">--</div>
           <div class="subhead capture-subhead">Nodos</div>
           <div class="node-list">
-            <div class="node-row" id="node-1">
+            <div class="node-row" id="node-1" hidden>
               <span class="name">Esclavo 1</span>
               <span class="raw">--</span>
               <span class="stats">--</span>
               <span class="cfg">--</span>
             </div>
-            <div class="node-row" id="node-2">
+            <div class="node-row" id="node-2" hidden>
               <span class="name">Esclavo 2</span>
               <span class="raw">--</span>
               <span class="stats">--</span>
               <span class="cfg">--</span>
             </div>
-            <div class="node-row" id="node-3">
+            <div class="node-row" id="node-3" hidden>
               <span class="name">Esclavo 3</span>
               <span class="raw">--</span>
               <span class="stats">--</span>
@@ -114,15 +118,6 @@
           <div id="preserve-list" class="preserve-list"></div>
         </section>
 
-        <section id="tab-export" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-export">
-          <h2>Exportar</h2>
-          <div class="row">
-            <label>Nombre <input id="export-name" type="text" value="muestra"></label>
-            <button id="btn-export">Guardar CSV/ZIP</button>
-          </div>
-          <div id="export-status" class="status-text">--</div>
-        </section>
-
         <section id="tab-log" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-log">
           <h2>Log</h2>
           <div id="log" class="log"></div>
@@ -144,6 +139,6 @@
     </div>
   </div>
 
-  <script type="module" src="/js/app.js?v=field-study-3"></script>
+  <script type="module" src="/js/app.js?v=field-study-8"></script>
 </body>
 </html>

@@ -27,6 +27,7 @@ export const CMD_SET_RECLEN = 0xAE;
 export const SUBCMD_PGA = 0xA6;
 export const SUBCMD_VDAC = 0xAA;
 export const SUBCMD_DEBUG = 0xA7;
+export const SUBCMD_SYNC_START = 0x12;
 export const SUBCMD_VER = 0xB2;
 export const SUBCMD_CALIBRATE     = 0xB5;
 export const SUBCMD_SAVE_EEPROM   = 0xB6;   /* mismo código que PSOC_CMD_SAVE_EEPROM */
@@ -78,9 +79,12 @@ export const MASTER_STATE_NAMES = {
   4: 'STOPPING', 5: 'DUMPING', 6: 'PRESTART', 7: 'SCOPE_MULTI',
 };
 export const MASTER_STATE_IDLE = 0;
+export const MASTER_STATE_ARMING = 1;
 export const MASTER_STATE_ARMED = 2;
 export const MASTER_STATE_RUNNING = 3;
+export const MASTER_STATE_STOPPING = 4;
 export const MASTER_STATE_DUMPING = 5;
+export const MASTER_STATE_PRESTART = 6;
 export const MASTER_STATE_SCOPE_MULTI = 7;
 
 // TX modes

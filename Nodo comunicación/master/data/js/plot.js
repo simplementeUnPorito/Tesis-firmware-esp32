@@ -4,8 +4,8 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-study-3';
-import { hilbertEnvelope } from './signal_proc.js?v=field-study-3';
+import * as cfg from './config.js?v=field-study-8';
+import { hilbertEnvelope } from './signal_proc.js?v=field-study-8';
 
 const RAW_COLOR = 'rgb(80, 140, 255)';
 const FILT_COLOR = 'rgb(255, 80, 80)';
@@ -365,10 +365,10 @@ class ChannelPlot {
       lo = Math.min(lo, range.lo);
       hi = Math.max(hi, range.hi);
     };
-    const includeEnvelope = (env) => {
+    const includeEnvelope = (env, yOffset = 0) => {
       if (!env || !(env.peak > 0)) return;
-      lo = Math.min(lo, -env.peak);
-      hi = Math.max(hi, env.peak);
+      lo = Math.min(lo, yOffset - env.peak);
+      hi = Math.max(hi, yOffset + env.peak);
     };
     if (showRaw) {
       includeRange(minMax(raw));
@@ -381,8 +381,9 @@ class ChannelPlot {
     for (const overlay of overlays) {
       if (this._showRaw && overlay.raw) includeRange(minMax(overlay.raw));
       if (this._showFilt && overlay.filt) includeRange(minMax(overlay.filt, overlay.filtTrimSamp));
-      if (this._showRawEnvelope) includeEnvelope(overlay.envRaw);
-      if (this._showFiltEnvelope) includeEnvelope(overlay.envFilt);
+      const oYOff = (overlay.y_offset_mv || 0) / 1000;
+      if (this._showRawEnvelope) includeEnvelope(overlay.envRaw, oYOff);
+      if (this._showFiltEnvelope) includeEnvelope(overlay.envFilt, oYOff);
     }
     if (Number.isFinite(lo) && Number.isFinite(hi)) {
       if (lo === hi) { lo -= 1; hi += 1; }
@@ -455,7 +456,7 @@ class ChannelPlot {
       ctx.stroke();
       ctx.setLineDash([]);
     };
-    const drawEnvBilateral = (env, color, xStartSamp = this._xStartSamp) => {
+    const drawEnvBilateral = (env, color, xStartSamp = this._xStartSamp, yOffset = 0) => {
       if (!env || !env.values || env.values.length < 2) return;
       ctx.strokeStyle = color;
       ctx.lineWidth = Math.max(1, dpr);
@@ -465,7 +466,7 @@ class ChannelPlot {
         let started = false;
         for (let i = 0; i < env.values.length; i++) {
           const px = xTo((xStartSamp + i) / this._fs);
-          const py = yTo(sign * env.values[i]);
+          const py = yTo(sign * env.values[i] + yOffset);
           if (!started) { ctx.moveTo(px, py); started = true; }
           else ctx.lineTo(px, py);
         }
@@ -486,8 +487,9 @@ class ChannelPlot {
           xStart,
         );
       }
-      if (this._showRawEnvelope) drawEnvBilateral(overlay.envRaw, withAlpha(color, 0.38), xStart);
-      if (this._showFiltEnvelope) drawEnvBilateral(overlay.envFilt, withAlpha(color, 0.58), xStart);
+      const oYOff = (overlay.y_offset_mv || 0) / 1000;
+      if (this._showRawEnvelope) drawEnvBilateral(overlay.envRaw, withAlpha(color, 0.38), xStart, oYOff);
+      if (this._showFiltEnvelope) drawEnvBilateral(overlay.envFilt, withAlpha(color, 0.58), xStart, oYOff);
     }
 
     if (this._showRaw) drawCurve(raw, RAW_COLOR, 0);
@@ -810,6 +812,7 @@ export class PlotArea {
         overlays.push({
           label: capture.label,
           color: capture.color,
+          y_offset_mv: capture.y_offset_mv || 0,
           raw: nodeRaw ? nodeRaw.subarray(Math.min(rawSrcStart, nodeRaw.length), Math.min(rawSrcEnd, nodeRaw.length)) : null,
           filt: nodeFilt ? nodeFilt.subarray(Math.min(filtSrcStart, nodeFilt.length), Math.min(filtSrcEnd, nodeFilt.length)) : null,
           filtTrimSamp: oTrim,

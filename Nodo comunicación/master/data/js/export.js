@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-3';
+import * as cfg from './config.js?v=field-study-8';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-3';
+import { effectiveFs } from './data_store.js?v=field-study-8';
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -60,6 +60,54 @@ function gainValue(code) {
   return (code >= 0 && code < cfg.GAIN_CODES.length) ? cfg.GAIN_CODES[code] : null;
 }
 
+function pcbIdForNode(index, explicitId = '') {
+  return explicitId || (index === 0 ? 'M' : `S${index}`);
+}
+
+function geoNumberFromType(type) {
+  const m = /^Geo(\d+)$/i.exec(String(type || '').trim());
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function roleFromFields(type, hwType, hwClass) {
+  const t = String(type || '').trim();
+  const hw = String(hwType || '').trim().toUpperCase();
+  if (hwClass === 1 || hw === 'HAMMER' || t === 'Hammer') return 'hammer';
+  if (hwClass === 0 || hw === 'GEO' || /^Geo\d*$/i.test(t)) return 'geo';
+  return 'unknown';
+}
+
+function offsetFromHammer(value, role) {
+  if (role === 'hammer') return 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function roleRank(role) {
+  if (role === 'hammer') return 0;
+  if (role === 'geo') return 1;
+  return 2;
+}
+
+function compareExportNodes(a, b) {
+  const ar = roleFromFields(a?.type || a?.alias, a?.hw_type, a?.hw_class);
+  const br = roleFromFields(b?.type || b?.alias, b?.hw_type, b?.hw_class);
+  const ag = geoNumberFromType(a?.type || a?.alias) ?? 9999;
+  const bg = geoNumberFromType(b?.type || b?.alias) ?? 9999;
+  const ao = offsetFromHammer(a?.hammer_offset_m, ar);
+  const bo = offsetFromHammer(b?.hammer_offset_m, br);
+  return (roleRank(ar) - roleRank(br))
+    || (ag - bg)
+    || (ao - bo)
+    || ((a?.index ?? 0) - (b?.index ?? 0));
+}
+
+function dirBaseForNode(type, pcbId, fallback) {
+  const typeSlug = slugPart(type, fallback);
+  const pcbSlug = slugPart(pcbId, '');
+  return pcbSlug ? `${typeSlug}_${pcbSlug}` : typeSlug;
+}
+
 function slugPart(value, fallback) {
   const text = String(value || fallback || '').trim().toLowerCase();
   const slug = text
@@ -81,7 +129,6 @@ function uniqueDir(base, used, index) {
 
 function slaveConnectedForExport(nd, index, nSlaves) {
   return index > 0
-    && index <= nSlaves
     && nd.visible
     && (nd.fsKnown || !!nd.mac || nd.rawBuf.length > 0 || nd.filtBuf.length > 0);
 }
@@ -104,13 +151,24 @@ function orderedSlaveIndices(dataStore, limit = cfg.MAX_NODES - 1) {
 }
 
 function nodeMetadata(nd, index, paths, connected) {
+  const type = nd.alias || cfg.NODE_NAMES[index] || `Node ${index}`;
+  const hwType = nd.hwClass === 0 ? 'GEO' : (nd.hwClass === 1 ? 'HAMMER' : 'UNKNOWN');
+  const role = roleFromFields(type, hwType, nd.hwClass);
+  const pcbId = pcbIdForNode(index, nd.slaveId);
+  const offsetM = offsetFromHammer(nd.hammerOffset, role);
   return {
     index,
+    node_id: index,
+    pcb_id: pcbId,
+    physical_id: pcbId,
     name: cfg.NODE_NAMES[index] || `Node ${index}`,
-    type: nd.alias || cfg.NODE_NAMES[index] || `Node ${index}`,
-    slave_id: nd.slaveId,
+    type,
+    role,
+    geo_number: role === 'geo' ? geoNumberFromType(type) : null,
+    slave_id: pcbId,
     fs: nd.fs,
     fs_known: !!nd.fsKnown,
+    fs_exact_known: !!nd.fsExactKnown,
     connected: !!connected,
     data_dir: paths ? paths.dir : null,
     raw_file: paths ? paths.raw : null,
@@ -127,12 +185,18 @@ function nodeMetadata(nd, index, paths, connected) {
     pgavdac_code: nd.pgavdac,
     pgavdac_gain: gainValue(nd.pgavdac),
     psoc_ok: nd.psocOk,
-    hammer_offset_m: nd.hammerOffset ?? 0,
+    hw_class: nd.hwClass,
+    hw_type: hwType,
+    hammer_offset_m: offsetM,
+    offset_m_from_hammer: offsetM,
+    position_m: offsetM,
     sample_offset: 0,
     mac: nd.mac || '',
     visible: !!nd.visible,
     fir_cmd: nd.filtCmd || '',
     dc_remove: !!nd.dcRemove,
+    invert_signal: !!nd.invertSignal,
+    display_y_offset_v: nd.yOffsetV || 0,
     drift_hist: nd.driftHist.slice(),
     latency_hist: nd.latencyHist.slice(),
     health: nd.health,
@@ -145,13 +209,23 @@ function nodeMetadata(nd, index, paths, connected) {
 function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
   const raw = signalValues(node, 'raw');
   const filt = signalValues(node, 'filt');
+  const type = node?.type || cfg.NODE_NAMES[index] || `Node ${index}`;
+  const role = roleFromFields(type, node?.hw_type, node?.hw_class);
+  const pcbId = pcbIdForNode(index, node?.pcb_id || node?.physical_id || node?.slave_id);
+  const offsetM = offsetFromHammer(node?.hammer_offset_m, role);
   return {
     index,
+    node_id: index,
+    pcb_id: pcbId,
+    physical_id: pcbId,
     name: node?.name || cfg.NODE_NAMES[index] || `Node ${index}`,
-    type: node?.type || cfg.NODE_NAMES[index] || `Node ${index}`,
-    slave_id: node?.slave_id || (index === 0 ? 'M' : `S${index}`),
+    type,
+    role,
+    geo_number: role === 'geo' ? geoNumberFromType(type) : null,
+    slave_id: pcbId,
     fs: node?.fs ?? 0,
     fs_known: !!node?.fs_known,
+    fs_exact_known: !!node?.fs_exact_known,
     connected: !!connected,
     data_dir: paths ? paths.dir : null,
     raw_file: paths ? paths.raw : null,
@@ -168,13 +242,22 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     pgavdac_code: node?.pgavdac_code ?? 0,
     pgavdac_gain: node?.pgavdac_gain ?? gainValue(node?.pgavdac_code ?? 0),
     psoc_ok: node?.psoc_ok ?? null,
-    hammer_offset_m: node?.hammer_offset_m ?? 0,
+    hw_class: node?.hw_class ?? null,
+    hw_type: node?.hw_type || (role === 'hammer' ? 'HAMMER' : (role === 'geo' ? 'GEO' : 'UNKNOWN')),
+    hammer_offset_m: offsetM,
+    offset_m_from_hammer: offsetM,
+    position_m: offsetM,
     sample_offset: sampleOffset(captureOffset),
     mac: node?.mac || '',
     visible: !!node?.visible,
     fir_cmd: node?.fir_cmd || '',
     filt_trim_samples: node?.filt_trim_samples ?? 0,
     dc_remove: !!node?.dc_remove,
+    dc_removed_on_preserve: !!node?.dc_removed_on_preserve,
+    raw_dc_v: node?.raw_dc_v ?? null,
+    filt_dc_v: node?.filt_dc_v ?? null,
+    invert_signal: !!node?.invert_signal,
+    display_y_offset_v: node?.display_y_offset_v ?? 0,
     drift_hist: Array.isArray(node?.drift_hist) ? node.drift_hist.slice() : [],
     latency_hist: Array.isArray(node?.latency_hist) ? node.latency_hist.slice() : [],
     health: node?.health ?? 0,
@@ -197,7 +280,10 @@ function buildCombinedSignalsCsv(captures) {
     'capture_source',
     'node_index',
     'node_type',
+    'node_role',
+    'geo_number',
     'slave_id',
+    'pcb_id',
     'signal',
     'sample',
     'time_s',
@@ -207,6 +293,7 @@ function buildCombinedSignalsCsv(captures) {
     'aligned_time_s',
     'fs_hz',
     'hammer_offset_m',
+    'position_m',
     'pga_code',
     'pga_gain',
     'vdac_byte',
@@ -218,6 +305,10 @@ function buildCombinedSignalsCsv(captures) {
     for (const node of capture.nodes || []) {
       if (!node || node.index <= 0) continue;
       const fs = node.fs || capture.fs || 0;
+      const role = node.role || roleFromFields(node.type, node.hw_type, node.hw_class);
+      const geoNumber = node.geo_number ?? (role === 'geo' ? geoNumberFromType(node.type) : null);
+      const pcbId = pcbIdForNode(node.index, node.pcb_id || node.physical_id || node.slave_id);
+      const positionM = offsetFromHammer(node.hammer_offset_m, role);
       for (const signal of ['raw', 'filt']) {
         const values = signalValues(node, signal);
         for (let i = 0; i < values.length; i++) {
@@ -228,7 +319,10 @@ function buildCombinedSignalsCsv(captures) {
             capture.source || '',
             node.index,
             node.type || '',
-            node.slave_id || '',
+            role,
+            geoNumber ?? '',
+            node.slave_id || pcbId,
+            pcbId,
             signal,
             i,
             fs > 0 ? (i / fs).toFixed(9) : '',
@@ -237,7 +331,8 @@ function buildCombinedSignalsCsv(captures) {
             i + offset,
             fs > 0 ? ((i + offset) / fs).toFixed(9) : '',
             fs || '',
-            node.hammer_offset_m ?? 0,
+            positionM,
+            node.position_m ?? positionM,
             node.pga_code ?? '',
             node.pga_gain ?? '',
             node.vdac_byte ?? '',
@@ -262,6 +357,10 @@ function buildCaptureSummaryCsv(captures) {
     'raw_count',
     'filt_count',
     'sample_offset',
+    'y_offset_mv',
+    'dc_removed_on_preserve',
+    'active_node_indices',
+    'metadata_file',
     'visible',
   ])];
   for (const capture of captures) {
@@ -276,8 +375,134 @@ function buildCaptureSummaryCsv(captures) {
       capture.raw_count ?? 0,
       capture.filt_count ?? 0,
       sampleOffset(capture.sample_offset),
+      capture.y_offset_mv ?? 0,
+      capture.dc_removed_on_preserve ? 1 : 0,
+      Array.isArray(capture.active_node_indices) ? capture.active_node_indices.join('|') : '',
+      capture.metadata_file || '',
       capture.visible ? 1 : 0,
     ]));
+  }
+  return lines.join('\n') + '\n';
+}
+
+function buildNodeSummaryCsv(nodes) {
+  const lines = [csvRow([
+    'node_index',
+    'node_name',
+    'type',
+    'role',
+    'geo_number',
+    'slave_id',
+    'pcb_id',
+    'mac',
+    'fs_hz',
+    'fs_known',
+    'fs_exact_known',
+    'hw_class',
+    'hw_type',
+    'position_m',
+    'hammer_offset_m',
+    'connected',
+    'visible',
+    'raw_count',
+    'filt_count',
+    'pga_code',
+    'pga_gain',
+    'vdac_byte',
+    'psoc_ok',
+    'invert_signal',
+    'fir_cmd',
+  ])];
+  for (const node of nodes) {
+    if (!node || node.index <= 0) continue;
+    lines.push(csvRow([
+      node.index,
+      node.name || '',
+      node.type || '',
+      node.role || '',
+      node.geo_number ?? '',
+      node.slave_id || '',
+      node.pcb_id || node.slave_id || '',
+      node.mac || '',
+      node.fs || '',
+      node.fs_known ? 1 : 0,
+      node.fs_exact_known ? 1 : 0,
+      node.hw_class ?? '',
+      node.hw_type || '',
+      node.position_m ?? node.hammer_offset_m ?? 0,
+      node.hammer_offset_m ?? 0,
+      node.connected ? 1 : 0,
+      node.visible ? 1 : 0,
+      node.raw_count ?? 0,
+      node.filt_count ?? 0,
+      node.pga_code ?? '',
+      node.pga_gain ?? '',
+      node.vdac_byte ?? '',
+      node.psoc_ok === null || node.psoc_ok === undefined ? '' : (node.psoc_ok ? 1 : 0),
+      node.invert_signal ? 1 : 0,
+      node.fir_cmd || '',
+    ]));
+  }
+  return lines.join('\n') + '\n';
+}
+
+function buildCaptureNodeSummaryCsv(captures) {
+  const lines = [csvRow([
+    'capture_order',
+    'capture_id',
+    'capture_label',
+    'node_index',
+    'type',
+    'role',
+    'geo_number',
+    'slave_id',
+    'pcb_id',
+    'mac',
+    'fs_hz',
+    'position_m',
+    'hammer_offset_m',
+    'raw_count',
+    'filt_count',
+    'pga_code',
+    'pga_gain',
+    'vdac_byte',
+    'raw_dc_v',
+    'filt_dc_v',
+    'dc_removed_on_preserve',
+    'invert_signal',
+    'data_dir',
+    'metadata_file',
+  ])];
+  for (const capture of captures) {
+    for (const node of capture.nodes || []) {
+      if (!node || node.index <= 0) continue;
+      lines.push(csvRow([
+        capture.order ?? '',
+        capture.id || '',
+        capture.label || '',
+        node.index,
+        node.type || '',
+        node.role || '',
+        node.geo_number ?? '',
+        node.slave_id || '',
+        node.pcb_id || node.slave_id || '',
+        node.mac || '',
+        node.fs || '',
+        node.position_m ?? node.hammer_offset_m ?? 0,
+        node.hammer_offset_m ?? 0,
+        node.raw_count ?? 0,
+        node.filt_count ?? 0,
+        node.pga_code ?? '',
+        node.pga_gain ?? '',
+        node.vdac_byte ?? '',
+        node.raw_dc_v ?? '',
+        node.filt_dc_v ?? '',
+        node.dc_removed_on_preserve ? 1 : 0,
+        node.invert_signal ? 1 : 0,
+        node.data_dir || '',
+        capture.metadata_file || '',
+      ]));
+    }
   }
   return lines.join('\n') + '\n';
 }
@@ -304,7 +529,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     if (!duplicate || exportCaptures.length === 0) exportCaptures.push(liveCapture);
   }
 
-  for (const i of orderedSlaveIndices(dataStore, nSlaves)) {
+  for (const i of orderedSlaveIndices(dataStore, cfg.MAX_NODES - 1)) {
     const nd = dataStore.nodes[i];
     const connected = slaveConnectedForExport(nd, i, nSlaves);
     connectedByNode.set(i, connected);
@@ -312,7 +537,8 @@ export function buildCaptureZip(dataStore, options = {}) {
 
     const raw = nd.rawBuf.toArray();
     const filt = nd.filtBuf.toArray();
-    const dirBase = slugPart(nd.alias || cfg.NODE_NAMES[i], `slave${i}`);
+    const pcbId = pcbIdForNode(i, nd.slaveId);
+    const dirBase = dirBaseForNode(nd.alias || cfg.NODE_NAMES[i], pcbId, `slave${i}`);
     const dir = uniqueDir(dirBase, usedDirs, i);
     const paths = {
       dir,
@@ -352,7 +578,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     const captureDir = `captures/${String(captureIdx + 1).padStart(3, '0')}_${captureSlug}`;
     const capUsedDirs = new Set();
     const capNodeMetas = [];
-    const sortedNodes = (capture.nodes || []).slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    const sortedNodes = (capture.nodes || []).slice().sort(compareExportNodes);
     const captureOffset = sampleOffset(capture.sample_offset);
 
     for (const node of sortedNodes) {
@@ -364,7 +590,8 @@ export function buildCaptureZip(dataStore, options = {}) {
       let paths = null;
 
       if (index > 0 && hasData) {
-        const dirBase = `${captureDir}/${slugPart(node.type || cfg.NODE_NAMES[index], `slave${index}`)}`;
+        const pcbId = pcbIdForNode(index, node.pcb_id || node.physical_id || node.slave_id);
+        const dirBase = `${captureDir}/${dirBaseForNode(node.type || cfg.NODE_NAMES[index], pcbId, `slave${index}`)}`;
         const dir = uniqueDir(dirBase, capUsedDirs, index);
         paths = {
           dir,
@@ -397,6 +624,11 @@ export function buildCaptureZip(dataStore, options = {}) {
       max_buf_secs: capture.max_buf_secs ?? cfg.MAX_BUF_S,
       visible: !!capture.visible,
       sample_offset: captureOffset,
+      y_offset_mv: capture.y_offset_mv ?? 0,
+      dc_removed_on_preserve: !!capture.dc_removed_on_preserve,
+      active_node_indices: Array.isArray(capture.active_node_indices)
+        ? capture.active_node_indices.slice()
+        : [],
       signature: capture.signature || null,
       data_dir: captureDir,
       metadata_file: `${captureDir}/metadata.json`,
@@ -410,19 +642,30 @@ export function buildCaptureZip(dataStore, options = {}) {
 
   const combinedSignalsPath = captureMetas.length ? 'combined/signals.csv' : null;
   const captureSummaryPath = captureMetas.length ? 'combined/captures.csv' : null;
+  const nodeSummaryPath = 'combined/nodes.csv';
+  const captureNodeSummaryPath = captureMetas.length ? 'combined/capture_nodes.csv' : null;
   if (captureMetas.length) {
     files.push({ name: combinedSignalsPath, data: buildCombinedSignalsCsv(exportCaptures) });
-    files.push({ name: captureSummaryPath, data: buildCaptureSummaryCsv(exportCaptures) });
+    files.push({ name: captureSummaryPath, data: buildCaptureSummaryCsv(captureMetas) });
+    files.push({ name: captureNodeSummaryPath, data: buildCaptureNodeSummaryCsv(captureMetas) });
   }
+  files.push({ name: nodeSummaryPath, data: buildNodeSummaryCsv(nodes) });
 
   const metadata = {
-    schema: 'geophone_scope_web_zip_v3',
+    schema: 'geophone_scope_web_zip_v4',
     schema_target: 'geophone_scope_mat_node_prefix_v1',
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'phase5',
-    layout: 'maestro_metadata_plus_slave_type_dirs',
+    web_app_version: 'field-study-8',
+    layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
+    id_semantics: {
+      hammer_origin_m: 0,
+      position_m: 'Distance from Hammer/source origin in meters. Hammer is always 0.',
+      geo_number: 'Assigned by position_m ascending among GEO receivers at capture/export time.',
+      pcb_id: 'Physical PCB/slave identifier (S1, S2, ...); use only to identify the hardware board used.',
+      slave_id: 'Compatibility alias for pcb_id.',
+    },
     fs: effectiveFs(dataStore),
     n_slaves: nSlaves,
     n_batches: options.nBatches ?? 0,
@@ -434,10 +677,22 @@ export function buildCaptureZip(dataStore, options = {}) {
     max_buf_secs: options.maxBufSecs ?? cfg.MAX_BUF_S,
     visible_nodes: visibleNodes,
     exported_nodes: exportedNodes,
+    exported_pcb_ids: exportedNodes.map((i) => pcbIdForNode(i, dataStore.nodes[i]?.slaveId)),
     capture_count: captureMetas.length || (exportedNodes.length ? 1 : 0),
     preserved_count: preservedCaptures.length,
     combined_csv_file: combinedSignalsPath,
     capture_summary_csv_file: captureSummaryPath,
+    node_summary_csv_file: nodeSummaryPath,
+    capture_node_summary_csv_file: captureNodeSummaryPath,
+    metadata_files: [
+      'metadata.json',
+      'maestro/metadata.json',
+      'maestro/config.json',
+      nodeSummaryPath,
+      ...(captureSummaryPath ? [captureSummaryPath] : []),
+      ...(captureNodeSummaryPath ? [captureNodeSummaryPath] : []),
+      ...captureMetas.map((capture) => capture.metadata_file),
+    ],
     captures: captureMetas,
     dtype: 'float32',
     endian: 'little',
@@ -455,21 +710,16 @@ export function buildCaptureZip(dataStore, options = {}) {
     max_buf_secs: metadata.max_buf_secs,
     active_slave_indices: visibleNodes,
     exported_slave_indices: exportedNodes,
+    exported_pcb_ids: metadata.exported_pcb_ids,
     capture_count: metadata.capture_count,
     preserved_count: metadata.preserved_count,
     combined_csv_file: metadata.combined_csv_file,
     capture_summary_csv_file: metadata.capture_summary_csv_file,
-    captures: captureMetas.map((capture) => ({
-      id: capture.id,
-      order: capture.order,
-      label: capture.label,
-      source: capture.source,
-      data_dir: capture.data_dir,
-      metadata_file: capture.metadata_file,
-      raw_count: capture.raw_count,
-      filt_count: capture.filt_count,
-      sample_offset: capture.sample_offset,
-    })),
+    node_summary_csv_file: metadata.node_summary_csv_file,
+    capture_node_summary_csv_file: metadata.capture_node_summary_csv_file,
+    metadata_files: metadata.metadata_files,
+    id_semantics: metadata.id_semantics,
+    captures: captureMetas,
     slaves: nodes.filter((node) => node.index > 0),
   };
   const metadataJson = JSON.stringify(metadata, null, 2) + '\n';
