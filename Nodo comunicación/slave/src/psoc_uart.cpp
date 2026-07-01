@@ -201,6 +201,7 @@ void PsocUART::calibrate()             { _sendCmd1(PSOC_CMD_CALIBRATE, 1); }
 void PsocUART::saveEeprom()            { _sendCmd1(PSOC_CMD_SAVE_EEPROM, 0); }
 void PsocUART::selectStream(uint8_t m) { _sendCmd1(PSOC_CMD_SELECT_STREAM, m); }
 void PsocUART::adcSnapshot()           { _sendCmd1(PSOC_CMD_ADC_SNAPSHOT, 1); }
+void PsocUART::blinkLed()              { _sendCmd1(PSOC_CMD_BLINK_LED, 1); }
 void PsocUART::debugRamp(bool en)      { _sendCmd1(PSOC_CMD_DEBUG, en ? 1 : 0); }
 void PsocUART::requestStatus()         { _sendCmd1(PSOC_CMD_STATUS, 0); }
 void PsocUART::sendPong()              { _sendCmd1(PSOC_CTRL_PONG, 0); }

@@ -4,8 +4,8 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-study-8';
-import { hilbertEnvelope } from './signal_proc.js?v=field-study-8';
+import * as cfg from './config.js?v=field-study-10';
+import { hilbertEnvelope } from './signal_proc.js?v=field-study-10';
 
 const RAW_COLOR = 'rgb(80, 140, 255)';
 const FILT_COLOR = 'rgb(255, 80, 80)';
@@ -201,6 +201,12 @@ class ChannelPlot {
     }
   }
 
+  _clientXToPlotFrac(clientX) {
+    const rect = this.canvas.getBoundingClientRect();
+    const plotW = Math.max(1, rect.width - MARGIN.left - MARGIN.right);
+    return clamp((clientX - rect.left - MARGIN.left) / plotW, 0, 1);
+  }
+
   _wirePointerControls() {
     const pointerPair = () => Array.from(this._activePointers.values()).slice(0, 2);
     const pointerDistance = () => {
@@ -210,17 +216,15 @@ class ChannelPlot {
     };
     const pointerCenterFrac = () => {
       const pts = pointerPair();
-      const rect = this.canvas.getBoundingClientRect();
       if (pts.length < 2) return 0.5;
       const centerX = (pts[0].x + pts[1].x) / 2;
-      return clamp((centerX - rect.left) / Math.max(1, rect.width), 0, 1);
+      return this._clientXToPlotFrac(centerX);
     };
 
     this.canvas.addEventListener('wheel', (ev) => {
       if (!this._handlers.onZoom) return;
       ev.preventDefault();
-      const rect = this.canvas.getBoundingClientRect();
-      const frac = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+      const frac = this._clientXToPlotFrac(ev.clientX);
       const factor = ev.deltaY < 0 ? 1.25 : 1 / 1.25;
       this._handlers.onZoom(factor, frac);
     }, { passive: false });
@@ -291,8 +295,7 @@ class ChannelPlot {
         return;
       }
       if (this._dragLastX !== null && !this._dragMoved) {
-        const rect = this.canvas.getBoundingClientRect();
-        const frac = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+        const frac = this._clientXToPlotFrac(ev.clientX);
         if (this._cursorMode !== null && this._handlers.onCursorClick) {
           this._handlers.onCursorClick(frac);
         } else if (this._handlers.onZoom) {

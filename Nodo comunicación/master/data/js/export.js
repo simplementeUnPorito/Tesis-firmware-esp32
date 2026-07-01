@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-8';
+import * as cfg from './config.js?v=field-study-10';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-8';
+import { effectiveFs } from './data_store.js?v=field-study-10';
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -58,6 +58,58 @@ function sampleOffset(value) {
 
 function gainValue(code) {
   return (code >= 0 && code < cfg.GAIN_CODES.length) ? cfg.GAIN_CODES[code] : null;
+}
+
+function calVdacsForNode(node) {
+  const src = node?.calVdacs || node?.cal_vdacs;
+  if (!Array.isArray(src)) return [];
+  return src.map((value) => Number.isFinite(value) ? value : null);
+}
+
+function vdacCodeMv(code) {
+  return Number.isFinite(code) ? Math.round(code * cfg.VDAC_MV_PER_CODE) : null;
+}
+
+function calVdacDetailsForNode(node) {
+  const codes = calVdacsForNode(node);
+  const src = node?.calVdacDetails || node?.cal_vdac_details;
+  const details = Array.isArray(src) ? src : [];
+  const out = [];
+  const count = Math.max(codes.length, details.length);
+  for (let i = 0; i < count; i++) {
+    const detail = details[i] || {};
+    const code = Number.isFinite(detail.code) ? detail.code : codes[i];
+    const targetMv = Number.isFinite(detail.target_mV) ? detail.target_mV : null;
+    const errorMv = Number.isFinite(detail.error_mV) ? detail.error_mV : null;
+    const errorPct = Number.isFinite(detail.error_pct) ? detail.error_pct
+      : (Number.isFinite(targetMv) && targetMv !== 0 && Number.isFinite(errorMv)
+        ? (errorMv / Math.abs(targetMv)) * 100
+        : null);
+    if (!Number.isFinite(code) && targetMv === null && errorMv === null) {
+      out.push(null);
+      continue;
+    }
+    out.push({
+      stage: Number.isFinite(detail.stage) ? detail.stage : i,
+      code: Number.isFinite(code) ? code : null,
+      code_mV: Number.isFinite(detail.code_mV) ? detail.code_mV
+        : (Number.isFinite(detail.code_mv) ? detail.code_mv : vdacCodeMv(code)),
+      target_mV: targetMv,
+      error_mV: errorMv,
+      error_pct: errorPct,
+      error_abs_pct: Number.isFinite(errorPct) ? Math.abs(errorPct) : null,
+    });
+  }
+  return out;
+}
+
+function calVdacsCsv(value) {
+  const vdacs = Array.isArray(value) ? value : [];
+  return JSON.stringify(vdacs);
+}
+
+function calVdacDetailsCsv(value) {
+  return JSON.stringify(Array.isArray(value) ? value : []);
 }
 
 function pcbIdForNode(index, explicitId = '') {
@@ -182,6 +234,8 @@ function nodeMetadata(nd, index, paths, connected) {
     pga_code: nd.pgaCode,
     pga_gain: gainValue(nd.pgaCode),
     vdac_byte: nd.vdacByte,
+    cal_vdacs: calVdacsForNode(nd),
+    cal_vdac_details: calVdacDetailsForNode(nd),
     pgavdac_code: nd.pgavdac,
     pgavdac_gain: gainValue(nd.pgavdac),
     psoc_ok: nd.psocOk,
@@ -239,6 +293,8 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     pga_code: node?.pga_code ?? 0,
     pga_gain: node?.pga_gain ?? gainValue(node?.pga_code ?? 0),
     vdac_byte: node?.vdac_byte ?? 128,
+    cal_vdacs: calVdacsForNode(node),
+    cal_vdac_details: calVdacDetailsForNode(node),
     pgavdac_code: node?.pgavdac_code ?? 0,
     pgavdac_gain: node?.pgavdac_gain ?? gainValue(node?.pgavdac_code ?? 0),
     psoc_ok: node?.psoc_ok ?? null,
@@ -409,6 +465,8 @@ function buildNodeSummaryCsv(nodes) {
     'pga_code',
     'pga_gain',
     'vdac_byte',
+    'cal_vdacs',
+    'cal_vdac_details',
     'psoc_ok',
     'invert_signal',
     'fir_cmd',
@@ -438,6 +496,8 @@ function buildNodeSummaryCsv(nodes) {
       node.pga_code ?? '',
       node.pga_gain ?? '',
       node.vdac_byte ?? '',
+      calVdacsCsv(node.cal_vdacs),
+      calVdacDetailsCsv(node.cal_vdac_details),
       node.psoc_ok === null || node.psoc_ok === undefined ? '' : (node.psoc_ok ? 1 : 0),
       node.invert_signal ? 1 : 0,
       node.fir_cmd || '',
@@ -466,6 +526,8 @@ function buildCaptureNodeSummaryCsv(captures) {
     'pga_code',
     'pga_gain',
     'vdac_byte',
+    'cal_vdacs',
+    'cal_vdac_details',
     'raw_dc_v',
     'filt_dc_v',
     'dc_removed_on_preserve',
@@ -495,6 +557,8 @@ function buildCaptureNodeSummaryCsv(captures) {
         node.pga_code ?? '',
         node.pga_gain ?? '',
         node.vdac_byte ?? '',
+        calVdacsCsv(node.cal_vdacs),
+        calVdacDetailsCsv(node.cal_vdac_details),
         node.raw_dc_v ?? '',
         node.filt_dc_v ?? '',
         node.dc_removed_on_preserve ? 1 : 0,
@@ -657,7 +721,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-8',
+    web_app_version: 'field-study-10',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,

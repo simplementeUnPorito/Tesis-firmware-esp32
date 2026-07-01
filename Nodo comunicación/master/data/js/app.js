@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-8';
-import { WsClient } from './ws_client.js?v=field-study-8';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-8';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-8';
-import { PlotArea } from './plot.js?v=field-study-8';
-import { SpectrumArea } from './spectrum.js?v=field-study-8';
-import { SlavePanel } from './slave_panel.js?v=field-study-8';
-import { compileFirCmd, dcRemove, filtFilt, lastFirError } from './signal_proc.js?v=field-study-8';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-8';
+import * as cfg from './config.js?v=field-study-10';
+import { WsClient } from './ws_client.js?v=field-study-10';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-10';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-10';
+import { PlotArea } from './plot.js?v=field-study-10';
+import { SpectrumArea } from './spectrum.js?v=field-study-10';
+import { SlavePanel } from './slave_panel.js?v=field-study-10';
+import { compileFirCmd, dcRemove, filtFilt, lastFirError } from './signal_proc.js?v=field-study-10';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-10';
 
 const $ = (id) => document.getElementById(id);
 
@@ -91,6 +91,14 @@ function settingKey(chIndex, name) {
 function saveSlaveSetting(chIndex, name, value) {
   try {
     localStorage.setItem(settingKey(chIndex, name), String(value));
+  } catch (_) {
+    // localStorage can be disabled on some phone browser/privacy modes.
+  }
+}
+
+function clearSlaveSetting(chIndex, name) {
+  try {
+    localStorage.removeItem(settingKey(chIndex, name));
   } catch (_) {
     // localStorage can be disabled on some phone browser/privacy modes.
   }
@@ -190,6 +198,67 @@ function gainValue(code) {
   return (code >= 0 && code < cfg.GAIN_CODES.length) ? cfg.GAIN_CODES[code] : null;
 }
 
+function emptyCalVdacs() {
+  return Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
+}
+
+function emptyCalVdacDetails() {
+  return Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
+}
+
+function vdacCodeMv(code) {
+  return Number.isFinite(code) ? Math.round(code * cfg.VDAC_MV_PER_CODE) : null;
+}
+
+function signed16FromBytes(hi, lo) {
+  const raw = ((hi & 0xFF) << 8) | (lo & 0xFF);
+  return raw >= 0x8000 ? raw - 0x10000 : raw;
+}
+
+function cloneCalVdacDetails(details) {
+  if (!Array.isArray(details)) return emptyCalVdacDetails();
+  return details.map((item) => item ? { ...item } : null);
+}
+
+function ensureCalVdacDetail(nd, stage) {
+  if (!Array.isArray(nd.calVdacDetails)) nd.calVdacDetails = emptyCalVdacDetails();
+  if (!nd.calVdacDetails[stage]) nd.calVdacDetails[stage] = { stage };
+  return nd.calVdacDetails[stage];
+}
+
+function updateCalVdacComputed(detail) {
+  if (!detail) return;
+  detail.code_mV = vdacCodeMv(detail.code);
+  const target = Number(detail.target_mV);
+  const error = Number(detail.error_mV);
+  if (Number.isFinite(target) && target !== 0 && Number.isFinite(error)) {
+    detail.error_pct = (error / Math.abs(target)) * 100;
+    detail.error_abs_pct = Math.abs(error) / Math.abs(target) * 100;
+  } else {
+    detail.error_pct = null;
+    detail.error_abs_pct = null;
+  }
+}
+
+function setCalVdacCode(nd, stage, code) {
+  if (!Array.isArray(nd.calVdacs)) nd.calVdacs = emptyCalVdacs();
+  nd.calVdacs[stage] = code;
+  const detail = ensureCalVdacDetail(nd, stage);
+  detail.code = code;
+  updateCalVdacComputed(detail);
+}
+
+function setCalVdacSignedWord(nd, stage, field, part, byteValue) {
+  const detail = ensureCalVdacDetail(nd, stage);
+  detail[`_${field}_${part}`] = byteValue & 0xFF;
+  if (Number.isFinite(detail[`_${field}_hi`]) && Number.isFinite(detail[`_${field}_lo`])) {
+    detail[field] = signed16FromBytes(detail[`_${field}_hi`], detail[`_${field}_lo`]);
+    delete detail[`_${field}_hi`];
+    delete detail[`_${field}_lo`];
+    updateCalVdacComputed(detail);
+  }
+}
+
 function signalMean(arr) {
   if (!arr || !arr.length) return 0;
   let sum = 0;
@@ -271,6 +340,8 @@ function nodeSnapshot(nd, index, options = {}) {
     pga_code: nd.pgaCode,
     pga_gain: gainValue(nd.pgaCode),
     vdac_byte: nd.vdacByte,
+    cal_vdacs: Array.isArray(nd.calVdacs) ? nd.calVdacs.slice() : [],
+    cal_vdac_details: cloneCalVdacDetails(nd.calVdacDetails),
     pgavdac_code: nd.pgavdac,
     pgavdac_gain: gainValue(nd.pgavdac),
     psoc_ok: nd.psocOk,
@@ -323,6 +394,11 @@ function captureSignature(nodes) {
 
 function captureSampleOffset(capture) {
   return Number.isFinite(capture?.sample_offset) ? Math.round(capture.sample_offset) : 0;
+}
+
+function captureXOffsetStep(capture) {
+  const fs = Number(capture?.fs) || displayFsHz();
+  return Math.max(1, Math.round((fs || cfg.DEFAULT_SAMPLE_RATE_HZ) / 10));
 }
 
 function captureYOffsetMv(capture) {
@@ -426,15 +502,17 @@ function renderPreservedList() {
     offsetWrap.appendChild(document.createTextNode('Offset X '));
     const offsetInput = document.createElement('input');
     offsetInput.type = 'number';
-    offsetInput.step = '1';
+    offsetInput.step = String(captureXOffsetStep(capture));
     offsetInput.value = String(captureSampleOffset(capture));
     offsetInput.title = 'Mueve esta captura en el eje X, en muestras. Acepta valores positivos o negativos.';
-    offsetInput.addEventListener('change', () => {
+    const applyXOffset = (rerender = false) => {
       const parsed = parseInt(offsetInput.value, 10);
       capture.sample_offset = Number.isFinite(parsed) ? parsed : 0;
-      renderPreservedList();
+      if (rerender) renderPreservedList();
       refreshSlavePresentationOrder();
-    });
+    };
+    offsetInput.addEventListener('input', () => applyXOffset(false));
+    offsetInput.addEventListener('change', () => applyXOffset(true));
     offsetWrap.appendChild(offsetInput);
 
     const yOffsetWrap = document.createElement('label');
@@ -688,7 +766,6 @@ function applyReportedSlaveType(chIndex, hwClass) {
   if (hwClass === 1) {
     nd.alias = 'Hammer';
     nd.hammerOffset = 0;
-    saveSlaveSetting(chIndex, 'alias', 'Hammer');
     saveSlaveSetting(chIndex, 'hammer_offset_m', 0);
     if (panel) {
       panel.setAlias('Hammer');
@@ -929,7 +1006,7 @@ function updateSlavePanelStats(chIndex) {
     nd.formatLatencyStats(),
     nd.psocOk,
   );
-  panel.setVdac(nd.vdacByte);
+  panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
 }
 
 function adcCountsToVolts(counts) {
@@ -1166,11 +1243,16 @@ function onSendAll(chIndex) {
 
 function onCalibrateRequested(chIndex) {
   const nd = data.nodes[chIndex];
+  nd.calVdacs = emptyCalVdacs();
+  nd.calVdacDetails = emptyCalVdacDetails();
   sendDirected(chIndex, cfg.SUBCMD_CALIBRATE, 1);
   nd.pending.set(cfg.SUBCMD_CALIBRATE, { param: 1, sendTime: performance.now(), retries: 0 });
   nd.calProgressLogMs = 0;
   const panel = panelFor(chIndex);
-  if (panel) panel.setCalibrationLock(3, 'solicitada');
+  if (panel) {
+    panel.setCalibrationLock(3, 'solicitada');
+    panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
+  }
   appendLog(`S${chIndex} calibracion solicitada`);
 }
 
@@ -1283,11 +1365,7 @@ function onDcRemoveToggled(chIndex, enabled) {
 
 function loadSlavePanelState(chIndex, panel) {
   const nd = data.nodes[chIndex];
-  const alias = loadSetting(settingKey(chIndex, 'alias'));
-  if (alias) {
-    nd.alias = alias;
-    panel.setAlias(alias);
-  }
+  clearSlaveSetting(chIndex, 'alias');
 
   nd.pgaCode = loadSlaveInt(chIndex, 'pga_code', nd.pgaCode, 0, cfg.GAIN_CODES.length - 1);
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
@@ -1318,13 +1396,6 @@ function loadSlavePanelState(chIndex, panel) {
 }
 
 function wireSlavePanel(chIndex, panel) {
-  panel.addEventListener('alias-changed', (ev) => {
-    data.nodes[chIndex].alias = ev.detail;
-    saveSlaveSetting(chIndex, 'alias', ev.detail);
-    renderNodeRow(chIndex);
-    refreshSlavePresentationOrder();
-    appendLog(`Orden de salida: ${orderedSlaveIndices(true).map((idx) => nodeTitle(idx)).join(', ') || '--'}`);
-  });
   panel.addEventListener('pga-changed', (ev) => onPgaChanged(chIndex, ev.detail));
   panel.addEventListener('fir-apply', (ev) => onFirApply(chIndex, ev.detail.cmd));
   panel.addEventListener('fir-remove', () => onFirRemove(chIndex));
@@ -1400,7 +1471,6 @@ function reorderGeosByOffset() {
   geos.forEach(({ idx }, rank) => {
     const name = `Geo${rank + 1}`;
     data.nodes[idx].alias = name;
-    saveSlaveSetting(idx, 'alias', name);
     const panel = slavePanels[idx];
     if (panel) {
       panel.setAlias(name);
@@ -1470,6 +1540,62 @@ function handleAck(pkt, idx) {
     }
     const expected = pending ? pending.param : data.nodes[idx].pgaCode;
     appendLog(`S${idx} PGA ${ackVal ? 'confirmado' : 'sin lock'}: ${cfg.GAIN_NAMES[expected] ?? expected}`);
+    return;
+  }
+
+  if (ackCmd >= cfg.SUBCMD_CAL_VDAC_BASE &&
+      ackCmd < cfg.SUBCMD_CAL_VDAC_BASE + cfg.CAL_VDAC_STAGE_COUNT &&
+      idx >= 1 && idx < cfg.MAX_NODES) {
+    const stage = ackCmd - cfg.SUBCMD_CAL_VDAC_BASE;
+    const nd = data.nodes[idx];
+    setCalVdacCode(nd, stage, ackVal);
+    const panel = panelFor(idx);
+    if (panel) panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
+    appendLog(`S${idx} VDAC ${stage + 1}: ${ackVal} (${vdacCodeMv(ackVal)} mV)`);
+    return;
+  }
+
+  if (ackCmd >= cfg.SUBCMD_CAL_TARGET_MV_HI_BASE &&
+      ackCmd < cfg.SUBCMD_CAL_TARGET_MV_HI_BASE + cfg.CAL_VDAC_STAGE_COUNT &&
+      idx >= 1 && idx < cfg.MAX_NODES) {
+    const stage = ackCmd - cfg.SUBCMD_CAL_TARGET_MV_HI_BASE;
+    const nd = data.nodes[idx];
+    setCalVdacSignedWord(nd, stage, 'target_mV', 'hi', ackVal);
+    const panel = panelFor(idx);
+    if (panel) panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
+    return;
+  }
+
+  if (ackCmd >= cfg.SUBCMD_CAL_TARGET_MV_LO_BASE &&
+      ackCmd < cfg.SUBCMD_CAL_TARGET_MV_LO_BASE + cfg.CAL_VDAC_STAGE_COUNT &&
+      idx >= 1 && idx < cfg.MAX_NODES) {
+    const stage = ackCmd - cfg.SUBCMD_CAL_TARGET_MV_LO_BASE;
+    const nd = data.nodes[idx];
+    setCalVdacSignedWord(nd, stage, 'target_mV', 'lo', ackVal);
+    const panel = panelFor(idx);
+    if (panel) panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
+    return;
+  }
+
+  if (ackCmd >= cfg.SUBCMD_CAL_ERROR_MV_HI_BASE &&
+      ackCmd < cfg.SUBCMD_CAL_ERROR_MV_HI_BASE + cfg.CAL_VDAC_STAGE_COUNT &&
+      idx >= 1 && idx < cfg.MAX_NODES) {
+    const stage = ackCmd - cfg.SUBCMD_CAL_ERROR_MV_HI_BASE;
+    const nd = data.nodes[idx];
+    setCalVdacSignedWord(nd, stage, 'error_mV', 'hi', ackVal);
+    const panel = panelFor(idx);
+    if (panel) panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
+    return;
+  }
+
+  if (ackCmd >= cfg.SUBCMD_CAL_ERROR_MV_LO_BASE &&
+      ackCmd < cfg.SUBCMD_CAL_ERROR_MV_LO_BASE + cfg.CAL_VDAC_STAGE_COUNT &&
+      idx >= 1 && idx < cfg.MAX_NODES) {
+    const stage = ackCmd - cfg.SUBCMD_CAL_ERROR_MV_LO_BASE;
+    const nd = data.nodes[idx];
+    setCalVdacSignedWord(nd, stage, 'error_mV', 'lo', ackVal);
+    const panel = panelFor(idx);
+    if (panel) panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
     return;
   }
 
@@ -1732,7 +1858,7 @@ ws.addEventListener('packet', (ev) => {
       const panel = panelFor(idx);
       if (panel) {
         panel.setPga(nd.pgaCode);
-        panel.setVdac(nd.vdacByte);
+        panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
       }
     }
   } else if (pkt.isAck) {

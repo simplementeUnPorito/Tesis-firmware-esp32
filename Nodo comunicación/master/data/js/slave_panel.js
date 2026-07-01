@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-study-8';
+import * as cfg from './config.js?v=field-study-10';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -40,10 +40,22 @@ function setDot(d, state, okTip, badTip, unkTip, busyTip) {
   else { d.title = unkTip; }
 }
 
+function vdacMv(value) {
+  return Number.isFinite(value) ? Math.round(value * cfg.VDAC_MV_PER_CODE) : null;
+}
+
+function fmtSignedMv(value) {
+  return Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${Math.round(value)}mV` : '--';
+}
+
+function fmtSignedPct(value) {
+  return Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}%` : '--';
+}
+
 /**
  * Controls for one slave node (channels 1-3, displayed as Esclavo 1-3).
  *
- * Events: 'alias-changed' {alias}, 'pga-changed' {code},
+ * Events: 'pga-changed' {code},
  *         'fir-apply' {cmd}, 'fir-remove',
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
  *         'send-all-requested', 'calibrate-requested', 'latency-requested',
@@ -68,13 +80,7 @@ export class SlavePanel extends EventTarget {
     const root = el('section', 'panel slave-panel');
     root.appendChild(el('h2', null, cfg.NODE_NAMES[this.chIndex]));
 
-    this._ddType = el('select');
-    for (const t of cfg.SLAVE_TYPE_ORDER) this._ddType.appendChild(new Option(t, t));
-    this._ddType.value = cfg.SLAVE_TYPE_ORDER[this.chIndex - 1] || `Geo${this.chIndex}`;
-    this._ddType.addEventListener('change', () => {
-      this._dispatch('alias-changed', this._ddType.value);
-      this._syncTypeLayout();
-    });
+    this._slaveKind = 'unknown';
     this._lblMac = el('span', 'mac-label', 'MAC: --');
     root.appendChild(row(this._lblMac));
 
@@ -201,7 +207,7 @@ export class SlavePanel extends EventTarget {
     this._lblLastVal = el('div', 'stat-line', 'Last: --');
     this._lblLatency = el('div', 'stat-line', 'Latency: --');
     this._lblPsoc = el('div', 'stat-line', 'PSoC: ?');
-    this._lblVdac = el('div', 'stat-line', 'VDAC: --');
+    this._lblVdac = el('div', 'stat-line', 'VDACs: --');
     for (const l of [this._lblStats, this._lblLastVal, this._lblLatency, this._lblPsoc, this._lblVdac]) {
       stats.appendChild(l);
     }
@@ -215,7 +221,7 @@ export class SlavePanel extends EventTarget {
   // -- Internal handlers -----------------------------------------------------
 
   _syncTypeLayout() {
-    const isHammer = this._ddType.value === 'Hammer';
+    const isHammer = this._slaveKind === 'hammer';
     this._rowOffset.hidden = isHammer;
     this._rowOffset.style.display = isHammer ? 'none' : '';
     if (isHammer) {
@@ -257,10 +263,11 @@ export class SlavePanel extends EventTarget {
   // -- Public API ------------------------------------------------------------
 
   setAlias(alias) {
-    if ([...this._ddType.options].some((o) => o.value === alias)) {
-      this._ddType.value = alias;
-      this._syncTypeLayout();
-    }
+    const name = String(alias || '').trim();
+    if (name === 'Hammer') this._slaveKind = 'hammer';
+    else if (/^Geo\d*$/i.test(name)) this._slaveKind = 'geo';
+    else this._slaveKind = 'unknown';
+    this._syncTypeLayout();
   }
 
   setVisible(visible) {
@@ -330,10 +337,33 @@ export class SlavePanel extends EventTarget {
 
   setVdac(vdacByte) {
     if (vdacByte === null || vdacByte === undefined) {
-      this._lblVdac.textContent = 'VDAC: --';
+      this._lblVdac.textContent = 'VDACs: --';
     } else {
       const pct = ((vdacByte / 255) * 100).toFixed(1);
-      this._lblVdac.textContent = `VDAC: ${vdacByte} (${pct}%)`;
+      this._lblVdac.textContent = `VDACs: legacy ${vdacByte} (${vdacMv(vdacByte)}mV, ${pct}%)`;
+    }
+  }
+
+  setVdacs(values, hwClass = 0xFF, legacyVdac = null, details = null) {
+    const labels = hwClass === 1 ? cfg.CAL_VDAC_LABELS_HAMMER : cfg.CAL_VDAC_LABELS_GEO;
+    const items = [];
+    for (let i = 0; i < labels.length; i++) {
+      const value = values && values[i];
+      if (Number.isFinite(value)) {
+        const detail = details && details[i];
+        const mv = vdacMv(value);
+        let text = `${labels[i]} ${value}/${mv}mV`;
+        if (detail && Number.isFinite(detail.error_mV)) {
+          const targetText = Number.isFinite(detail.target_mV) ? ` vs ${Math.round(detail.target_mV)}mV` : '';
+          text += ` err ${fmtSignedMv(detail.error_mV)}${targetText} (${fmtSignedPct(detail.error_pct)})`;
+        }
+        items.push(text);
+      }
+    }
+    if (items.length) {
+      this._lblVdac.textContent = `VDACs: ${items.join(' · ')}`;
+    } else {
+      this.setVdac(legacyVdac);
     }
   }
 
@@ -365,13 +395,9 @@ export class SlavePanel extends EventTarget {
     this._cbInvert.checked = !!enabled;
   }
 
-  /** Force the type dropdown to a specific value and sync layout (e.g. from firmware). */
+  /** Sync panel layout from the slave type reported by firmware. */
   setSlaveType(typeName) {
-    if ([...this._ddType.options].some(o => o.value === typeName)) {
-      this._ddType.value = typeName;
-      this._syncTypeLayout();
-      this._dispatch('alias-changed', typeName);
-    }
+    this.setAlias(typeName);
   }
 
   /** Label displayed in the panel header (replaces generic "Esclavo N" with geo alias). */

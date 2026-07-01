@@ -1,6 +1,6 @@
 # Codex handoff MASW web/ESP/PSoC
 
-Fecha: 2026-06-30
+Fecha: 2026-07-01
 
 Este es el documento principal para continuar el trabajo web/ESP/PSoC sin
 depender de handoffs dispersos. Los documentos chicos quedan linkeados abajo
@@ -179,16 +179,74 @@ ese es el unico esclavo que saludo.
   monitor serial del slave (`[SLAVE] BLINK_LED pin=2 active_low=0`) y probar
   con `BLINK_LED_PIN` diferente en `slave/platformio.ini`.
 
-- **Todos los VDACs GEO** (4 valores: PGA, BP, ADDER, LP): El heartbeat solo
-  lleva 1 byte de VDAC. Para mostrar los 4 valores se necesita un nuevo paquete
-  de protocolo post-calibracion (ver §6 del plan en `.claude/plans/`).
-  Nota: el mecanismo de "slave heartbeat" en la web (hbVdac via pkt.isHeartbeat)
-  nunca recibe datos de esclavos porque el master solo envia sendHeartbeat(nodeId=0).
-  Los VDAC de esclavos solo llegan via ACK de comandos de configuracion.
+## Cambios sesion 2026-07-01 (Codex)
 
-- **Nombres Geo por offset**: `reorderGeosByOffset()` ya existe y funciona
-  cuando se cambia el campo `Offset m`. Pendiente verificar que el orden
-  se guarda correctamente en localStorage y se restaura al reconectar.
+### Resuelto
+
+- **EEPROM de calibracion por ganancia PGA**:
+  - `psoc_nv` paso a layout v2: una fila EEPROM de 16 bytes por codigo PGA
+    `0..8`, con `magic`, version, `hw_class`, `pga_code`, `stage_count`,
+    mascara de etapas, `cal_dac[4]` y CRC.
+  - `PSOC_LOAD_NV_CAL_ON_BOOT` queda activo por defecto.
+  - Al arrancar y al cambiar de ganancia, el PSoC intenta cargar el ultimo slot
+    EEPROM valido de esa ganancia; si no existe, vuelve explicitamente a los
+    DAC nominales de tabla.
+  - Al pedir calibracion, primero verifica esos DAC sembrados contra la
+    tolerancia/deadband del PI. Si todas las etapas siguen bien, responde CAL OK
+    sin mover DACs; si alguna etapa sale de rango, corre la calibracion PI desde
+    esos mismos valores sembrados.
+  - La calibracion PI ahora arranca desde el DAC sembrado (`cal_stage_current_dac`)
+    y no vuelve siempre al centro de tabla.
+  - `Guardar EEPROM` solo actualiza el slot si hubo una calibracion real exitosa
+    y todas las etapas terminaron `ok=1`; una corrida con error no pisa la
+    calibracion anterior.
+
+- **Lista de VDACs en web**:
+  - El slave envia ACKs auxiliares `0x80..0x83` al cerrar cada etapa de
+    calibracion (`CAL_STAGE_OK`), con el DAC final de esa etapa.
+  - Continuacion: el slave ahora envia tambien target/error en mV por etapa:
+    `0x84..0x87` target high, `0x88..0x8B` target low, `0x8C..0x8F`
+    error high y `0x90..0x93` error low, todos int16 firmados.
+  - La UI muestra `VDACs: PGA/BP/ADDER/LP` para GEO y `PGA/LP` para HAMMER,
+    con codigo DAC, conversion a mV (`code * 16mV`), error en mV y error %
+    respecto del target cuando el target no es cero. Si el target es 0mV, el
+    porcentaje se muestra como `--` porque no hay divisor valido.
+  - El ZIP exporta `cal_vdacs` en los JSON y en `combined/nodes.csv` /
+    `combined/capture_nodes.csv`; ademas exporta `cal_vdac_details` con
+    `code`, `code_mV`, `target_mV`, `error_mV`, `error_pct` y
+    `error_abs_pct`.
+
+- **Tipo de esclavo y "S1 fantasma"**:
+  - El web ya no carga ni persiste un alias manual `Tipo` desde localStorage.
+  - Los esclavos arrancan como `Esclavo N`; `HELLO tipo=HAMMER/GEO` define el
+    rol real. Esto evita que S1 aparezca como Hammer por default cuando el nodo
+    conectado es S2/S5/etc.
+  - Hammer siempre queda en offset `0`; los GEO se renombran `Geo1`, `Geo2`, ...
+    por `Offset m` de menor a mayor, manteniendo la PCB/ID fisica como `Sx`.
+
+- **Offset X de preservados**:
+  - El step de las flechitas pasa a `round(Fs/10)` muestras.
+  - El input aplica el desplazamiento mientras se toca, sin reconstruir la lista
+    hasta el `change`.
+
+- **Cursor C1/C2 corrido**:
+  - El click ahora se convierte usando el rectangulo real del plot, descontando
+    margenes de eje. Esto corrige el cursor que caia unos pixeles a la derecha.
+
+- **FIR hardware aclarado/verificado en codigo**:
+  - La ruta PSoC ya usa `Reg_Select`: crudo `ADC -> DMA_DelSig_RAM`; FIR hardware
+    `ADC -> Filter -> DMA_Filter_RAM`.
+  - `PSOC_CMD_SELECT_STREAM=1` recarga `FIR_adquisition`, resetea historia del
+    filtro y enruta al Filter. La calibracion usa temporalmente `FIR_calibration`
+    y luego restaura adquisicion.
+
+### Verificacion 2026-07-01
+
+- `pio run -e esp32dev` en master: OK.
+- `pio run -e slave2` en slave: OK.
+- PSoC `cyprjmgr -build`: OK. Flash `31054` bytes, SRAM `49312` bytes.
+  Filas de programacion actuales: `0..121`.
+- Version web/cache: `field-study-10`.
 
 ## Archivos modificados importantes hasta ahora
 

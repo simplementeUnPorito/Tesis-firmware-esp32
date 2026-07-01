@@ -34,6 +34,12 @@ export const SUBCMD_SAVE_EEPROM   = 0xB6;   /* mismo código que PSOC_CMD_SAVE_E
 export const SUBCMD_SELECT_STREAM = 0xB7;   /* mismo código que PSOC_CMD_SELECT_STREAM */
 export const SUBCMD_BLINK_LED     = 0x70;
 export const SUBCMD_LATENCY       = 0xAF;
+export const SUBCMD_CAL_VDAC_BASE = 0x80;
+export const SUBCMD_CAL_TARGET_MV_HI_BASE = 0x84;
+export const SUBCMD_CAL_TARGET_MV_LO_BASE = 0x88;
+export const SUBCMD_CAL_ERROR_MV_HI_BASE = 0x8C;
+export const SUBCMD_CAL_ERROR_MV_LO_BASE = 0x90;
+export const CAL_VDAC_STAGE_COUNT = 4;
 
 // Acquisition parameters
 // NOTE: there is intentionally NO nominal/default sample-rate constant here.
@@ -63,12 +69,15 @@ export const MASTER_NODE_ID = 0xFF;
 // PGA
 export const GAIN_CODES = [1, 2, 4, 8, 16, 24, 32, 48, 50];
 export const GAIN_NAMES = ['1x', '2x', '4x', '8x', '16x', '24x', '32x', '48x', '50x'];
+export const CAL_VDAC_LABELS_GEO = ['PGA', 'BP', 'ADDER', 'LP'];
+export const CAL_VDAC_LABELS_HAMMER = ['PGA', 'LP'];
 
 // VDAC
 export const VDAC_STEP = 0.016;
 export const VDAC_MIN = 0;
 export const VDAC_MAX = 255;
 export const VDAC_FULL_SCALE_V = VDAC_MAX * VDAC_STEP;
+export const VDAC_MV_PER_CODE = VDAC_STEP * 1000;
 
 // ADC scaling — PSoC ADC config: 18-bit DelSig, +/-2.5V, left-aligned in firmware
 export const ADC_COUNTS_PER_VOLT = 52429.0;

@@ -32,6 +32,12 @@
 #define CMD_BLINK_LED   0x70  /* master → esclavo unicast: titilar LED para identificación */
 #define CMD_SAVE_EEPROM 0x71  /* master → esclavo unicast: guardar config PSoC en EEPROM */
 #define CMD_SELECT_STREAM 0x72 /* master → esclavo unicast: 0=crudo, 1=FIR hardware */
+#define CMD_CAL_VDAC_STAGE_BASE       0x80 /* esclavo -> maestro ACK auxiliar: 0x80..0x83 stage VDAC code */
+#define CMD_CAL_TARGET_MV_HI_BASE     0x84 /* 0x84..0x87 signed int16 target mV high byte */
+#define CMD_CAL_TARGET_MV_LO_BASE     0x88 /* 0x88..0x8B signed int16 target mV low byte */
+#define CMD_CAL_ERROR_MV_HI_BASE      0x8C /* 0x8C..0x8F signed int16 error mV high byte */
+#define CMD_CAL_ERROR_MV_LO_BASE      0x90 /* 0x90..0x93 signed int16 error mV low byte */
+#define CMD_CAL_VDAC_STAGE_COUNT      4
 
 #define SLAVE_HW_GEO     0u
 #define SLAVE_HW_HAMMER  1u

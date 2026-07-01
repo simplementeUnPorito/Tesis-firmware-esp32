@@ -160,27 +160,10 @@ static          uint32_t   g_cal_progress_ack_ms = 0; /* ultimo "calibrando..." 
 static          bool       g_auto_cal_requested = false;
 static          uint32_t   g_auto_cal_due_ms = 0;
 
-/* ── LED blink para identificación (CMD_BLINK_LED) ──────────────────────── */
-#ifndef BLINK_LED_PIN
-  #ifdef LED_BUILTIN
-    #define BLINK_LED_PIN LED_BUILTIN
-  #else
-    #define BLINK_LED_PIN 2
-  #endif
-#endif
-#ifndef BLINK_TIMES
-#define BLINK_TIMES       20u     /* flashes totales (on+off = 1 flash) */
-#endif
-#ifndef BLINK_INTERVAL_MS
-#define BLINK_INTERVAL_MS 250u
-#endif
-#ifndef BLINK_LED_ACTIVE_LOW
-#define BLINK_LED_ACTIVE_LOW 1u
-#endif
-#define BLINK_LED_ON_LEVEL  ((BLINK_LED_ACTIVE_LOW) ? LOW : HIGH)
-#define BLINK_LED_OFF_LEVEL ((BLINK_LED_ACTIVE_LOW) ? HIGH : LOW)
-static uint8_t   g_blink_count    = 0;
-static uint32_t  g_blink_last_ms  = 0;
+/* ── LED de identificación (CMD_BLINK_LED) ──────────────────────────────────
+ * El LED de identificación es el del PSoC (el ESP no tiene un LED útil en el
+ * pin 2). El esclavo solo reenvía el comando por UART con psoc.blinkLed(); el
+ * PSoC titila su LED de forma NO bloqueante usando su Timer. */
 
 /* ── Store-and-forward ───────────────────────────────────────────────────── */
 static uint16_t    g_rec_n_batches = 0;          /* 0 = modo streaming clásico */
@@ -479,6 +462,21 @@ static int32_t adcCountsToMv(int32_t counts)
         return (int32_t)((scaled + 26214LL) / 52429LL);
     }
     return (int32_t)((scaled - 26214LL) / 52429LL);
+}
+
+static int16_t clampInt16(int32_t value)
+{
+    if (value > 32767L) return 32767;
+    if (value < -32768L) return -32768;
+    return (int16_t)value;
+}
+
+static void sendCfgAckS16(uint8_t hiBase, uint8_t loBase, uint8_t stage, int32_t value)
+{
+    const int16_t clipped = clampInt16(value);
+    const uint16_t raw = (uint16_t)clipped;
+    sendCfgAck((uint8_t)(hiBase + stage), (uint8_t)((raw >> 8) & 0xFFu));
+    sendCfgAck((uint8_t)(loBase + stage), (uint8_t)(raw & 0xFFu));
 }
 
 static void onPsocDiag(const PsocDiagEvent &event)
@@ -850,6 +848,13 @@ static void onPsocDiag(const PsocDiagEvent &event)
         uint32_t absRaw = absCounts32(calMeasRawSigned);
         int32_t cmpRaw = psocCalCompareCounts(calMeasRawSigned);
         int32_t errRaw = calTargetValid ? (calTargetSigned - cmpRaw) : 0;
+        if (calStage < CMD_CAL_VDAC_STAGE_COUNT) {
+            sendCfgAck((uint8_t)(CMD_CAL_VDAC_STAGE_BASE + calStage), calDac);
+            sendCfgAckS16(CMD_CAL_TARGET_MV_HI_BASE, CMD_CAL_TARGET_MV_LO_BASE,
+                          calStage, calTargetValid ? adcCountsToMv(calTargetSigned) : 0);
+            sendCfgAckS16(CMD_CAL_ERROR_MV_HI_BASE, CMD_CAL_ERROR_MV_LO_BASE,
+                          calStage, adcCountsToMv(errRaw));
+        }
         SLAVE_LOG_PRINTF("[CAL] result stage=%u/%s ok=%u dac=%u raw=%ld raw_mV=%ld abs=%lu cmp=%ld cmp_mV=%ld target=%ld target_mV=%ld err=%ld err_mV=%ld meas16=%d\n",
                          calStage, psocCalStageName(calStage), event.value,
                          calDac, (long)calMeasRawSigned,
@@ -1326,6 +1331,14 @@ static void requestAdcSnapshotFromUsb()
          (unsigned)sent, PSOC_CMD_ADC_SNAPSHOT);
 }
 
+static void requestBlinkFromUsb()
+{
+    /* Titilar el LED del PSoC (mismo camino que CMD_BLINK_LED de la web). */
+    psoc.blinkLed();
+    SLAVE_LOG_PRINTF("[USB] blink -> PSoC CMD 0x%02X\n", PSOC_CMD_BLINK_LED);
+    LOGM("USB_CMD", "cmd=blink,ok=1,sub=0x%02X", PSOC_CMD_BLINK_LED);
+}
+
 static bool requestPsocGainFromUsb(uint8_t subCmd, uint8_t param, const char *name)
 {
     bool sent = false;
@@ -1369,15 +1382,19 @@ static void handleUsbCommand(const char *cmd)
                usbCommandEquals(cmd, "adc") ||
                usbCommandEquals(cmd, "snapshot")) {
         requestAdcSnapshotFromUsb();
+    } else if (usbCommandEquals(cmd, "b") ||
+               usbCommandEquals(cmd, "blink") ||
+               usbCommandEquals(cmd, "titilar")) {
+        requestBlinkFromUsb();
     } else if (usbParseGainParam(cmd, "pga", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGA, value, "pga");
     } else if (usbParseGainParam(cmd, "pgavdac", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
-        SLAVE_LOG_PRINTF("[USB] commands: cal, adc, pga N, pgavdac N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: cal, adc, blink, pga N, pgavdac N\n");
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
-        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: cal, adc, pga N, pgavdac N)\n", cmd);
+        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: cal, adc, blink, pga N, pgavdac N)\n", cmd);
         LOGM("USB_CMD", "cmd=unknown,ok=0,text=%s", cmd);
     }
 }
@@ -1803,16 +1820,13 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     else if (cmd == CMD_BLINK_LED && len >= (int)sizeof(MsgBlinkLed)) {
         const MsgBlinkLed *msg = (const MsgBlinkLed *)data;
         if (msg->node_id != 0u && msg->node_id != NODE_ID) return;
-        g_blink_count   = (BLINK_TIMES * 2u) - 1u;  /* ya queda prendido ahora */
-        g_blink_last_ms = millis();
-        digitalWrite(BLINK_LED_PIN, BLINK_LED_ON_LEVEL);
+        /* El LED de identificación vive en el PSoC: reenviamos el comando por
+         * UART. El PSoC titila su LED (no bloqueante, vía su Timer). Igual
+         * confirmamos al maestro para que la web muestre el ACK. */
+        psoc.blinkLed();
         sendCfgAck(CMD_BLINK_LED, 1);
-        SLAVE_LOG_PRINTF("[SLAVE] BLINK_LED node=%u pin=%d active_low=%u flashes=%u interval_ms=%u\n",
-                         NODE_ID, BLINK_LED_PIN, (unsigned)BLINK_LED_ACTIVE_LOW,
-                         (unsigned)BLINK_TIMES, (unsigned)BLINK_INTERVAL_MS);
-        LOGM("BLINK_LED", "node=%u,pin=%d,activeLow=%u,flashes=%u,interval_ms=%u",
-             NODE_ID, BLINK_LED_PIN, (unsigned)BLINK_LED_ACTIVE_LOW,
-             (unsigned)BLINK_TIMES, (unsigned)BLINK_INTERVAL_MS);
+        SLAVE_LOG_PRINTF("[SLAVE] BLINK_LED -> PSoC node=%u\n", NODE_ID);
+        LOGM("BLINK_LED", "node=%u,target=psoc", NODE_ID);
     }
 }
 /* SaveEEPROM (0xB6) y SelectStream (0xB7) llegan por CMD_SET_CONFIG → handleSetConfig */
@@ -1975,12 +1989,7 @@ void setup()
     }
     esp_now_register_recv_cb(onDataRecv);
 
-    /* LED de identificación */
-    pinMode(BLINK_LED_PIN, OUTPUT);
-    digitalWrite(BLINK_LED_PIN, BLINK_LED_OFF_LEVEL);
-    SLAVE_LOG_PRINTF("[SLAVE] blink LED pin=%d active_low=%u on=%d off=%d\n",
-                     BLINK_LED_PIN, (unsigned)BLINK_LED_ACTIVE_LOW,
-                     BLINK_LED_ON_LEVEL, BLINK_LED_OFF_LEVEL);
+    /* (El LED de identificación es el del PSoC; el ESP ya no maneja ningún LED.) */
 
     /* GPIO hardware sync — pull-down para evitar ISR espurias cuando no hay cable */
     pinMode(SYNC_IN_PIN,      INPUT_PULLDOWN);
@@ -2047,15 +2056,8 @@ void loop()
     serviceUsbCommands();
     serviceAutoCalibration();
 
-    /* LED blink para identificación: g_blink_count > 0 → toggle cada BLINK_INTERVAL_MS */
-    if (g_blink_count > 0 && (millis() - g_blink_last_ms) >= BLINK_INTERVAL_MS) {
-        g_blink_last_ms = millis();
-        digitalWrite(BLINK_LED_PIN, (g_blink_count % 2u) ? BLINK_LED_OFF_LEVEL : BLINK_LED_ON_LEVEL);
-        g_blink_count--;
-        if (g_blink_count == 0) {
-            digitalWrite(BLINK_LED_PIN, BLINK_LED_OFF_LEVEL);
-        }
-    }
+    /* (El parpadeo de identificación lo hace ahora el PSoC con su Timer; el ESP
+     * solo reenvía CMD_BLINK_LED por UART en onDataRecv.) */
 
     /* Mientras se llena el store (Ver/Test con n_batches>0), imprimir UART cada 1 s.
      * Esto separa cable/pin (uartBytes=0) de protocolo/baud (bytes sin frames)

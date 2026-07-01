@@ -3,7 +3,7 @@
 // are backed by a fixed-capacity RingBuffer (Float64Array) instead of a
 // maxlen-deque, since JS has no built-in bounded queue with O(1) push+evict.
 
-import * as cfg from './config.js?v=field-study-8';
+import * as cfg from './config.js?v=field-study-10';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -95,6 +95,8 @@ export class NodeData {
     // Per-node config (updated from heartbeat / ACK packets)
     this.pgaCode = 0;
     this.vdacByte = 128;
+    this.calVdacs = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
+    this.calVdacDetails = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
     this.pgavdac = 0;
     this.psocOk = null;   // null until first HELLO
     this.mac = '';
@@ -133,7 +135,7 @@ export class NodeData {
     this.visible = nodeIndex > 0;
 
     this.slaveId = nodeIndex === 0 ? 'M' : `S${nodeIndex}`;
-    this.alias = nodeIndex === 0 ? 'Maestro' : (cfg.SLAVE_TYPE_ORDER[nodeIndex - 1] || `Slave${nodeIndex}`);
+    this.alias = nodeIndex === 0 ? 'Maestro' : (cfg.NODE_NAMES[nodeIndex] || `S${nodeIndex}`);
 
     // Pending commands tracking: subCmd -> { param, sendTime, retries }
     this.pending = new Map();
