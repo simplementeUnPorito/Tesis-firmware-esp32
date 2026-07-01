@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-loop-33';
+import * as cfg from './config.js?v=field-study-3';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -47,7 +47,7 @@ function setDot(d, state, okTip, badTip, unkTip, busyTip) {
  *         'fir-apply' {cmd}, 'fir-remove',
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
  *         'send-all-requested', 'calibrate-requested', 'latency-requested',
- *         'offset-changed' {offset}
+ *         'offset-changed' {offset}, 'y-offset-changed' {offsetMv}
  */
 export class SlavePanel extends EventTarget {
   constructor(chIndex) {
@@ -70,9 +70,11 @@ export class SlavePanel extends EventTarget {
 
     this._ddType = el('select');
     for (const t of cfg.SLAVE_TYPE_ORDER) this._ddType.appendChild(new Option(t, t));
-    const typeDefaults = { 1: 'Hammer', 2: 'Geo1', 3: 'Geo2' };
-    this._ddType.value = typeDefaults[this.chIndex] ?? 'Geo1';
-    this._ddType.addEventListener('change', () => this._dispatch('alias-changed', this._ddType.value));
+    this._ddType.value = cfg.SLAVE_TYPE_ORDER[this.chIndex - 1] || `Geo${this.chIndex}`;
+    this._ddType.addEventListener('change', () => {
+      this._dispatch('alias-changed', this._ddType.value);
+      this._syncTypeLayout();
+    });
     this._lblMac = el('span', 'mac-label', 'MAC: --');
     root.appendChild(row(labeled('Tipo', this._ddType), this._lblMac));
 
@@ -83,10 +85,32 @@ export class SlavePanel extends EventTarget {
     this._inpOffset.value = '0';
     this._inpOffset.placeholder = 'dist. al hammer';
     this._inpOffset.title = 'Distancia desde el hammer (fuente) hasta este receptor [m]';
-    this._inpOffset.addEventListener('change', () => {
+    const emitOffsetChanged = () => {
       this._dispatch('offset-changed', parseFloat(this._inpOffset.value) || 0);
+    };
+    this._inpOffset.addEventListener('input', emitOffsetChanged);
+    this._inpOffset.addEventListener('change', emitOffsetChanged);
+    this._rowOffset = row(labeled('Offset m', this._inpOffset));
+    root.appendChild(this._rowOffset);
+
+    this._inpYOffset = el('input');
+    this._inpYOffset.type = 'number';
+    this._inpYOffset.step = '100';
+    this._inpYOffset.value = '0';
+    this._inpYOffset.placeholder = 'mV';
+    this._inpYOffset.title = 'Desplazamiento vertical de display [mV] — no afecta export ni análisis';
+    this._inpYOffset.addEventListener('change', () => {
+      this._dispatch('y-offset-changed', parseFloat(this._inpYOffset.value) || 0);
     });
-    root.appendChild(row(labeled('Offset m', this._inpOffset)));
+    root.appendChild(row(labeled('Offset Y (mV)', this._inpYOffset)));
+
+    this._cbInvert = el('input');
+    this._cbInvert.type = 'checkbox';
+    this._cbInvert.title = 'Invertir señal (×−1) para display y export';
+    this._cbInvert.addEventListener('change', () => {
+      this._dispatch('invert-toggled', { enabled: this._cbInvert.checked });
+    });
+    root.appendChild(row(labeled('Invertir señal', this._cbInvert)));
 
     this._ddPga = el('select');
     for (const name of cfg.GAIN_NAMES) this._ddPga.appendChild(new Option(name, name));
@@ -203,10 +227,20 @@ export class SlavePanel extends EventTarget {
     root.appendChild(stats);
 
     this._syncFirFields();
+    this._syncTypeLayout();
     return root;
   }
 
   // -- Internal handlers -----------------------------------------------------
+
+  _syncTypeLayout() {
+    const isHammer = this._ddType.value === 'Hammer';
+    this._rowOffset.hidden = isHammer;
+    this._rowOffset.style.display = isHammer ? 'none' : '';
+    if (isHammer) {
+      this._inpOffset.value = '0';
+    }
+  }
 
   _onPgaChanged() {
     const index = this._ddPga.selectedIndex;
@@ -242,7 +276,10 @@ export class SlavePanel extends EventTarget {
   // -- Public API ------------------------------------------------------------
 
   setAlias(alias) {
-    if ([...this._ddType.options].some((o) => o.value === alias)) this._ddType.value = alias;
+    if ([...this._ddType.options].some((o) => o.value === alias)) {
+      this._ddType.value = alias;
+      this._syncTypeLayout();
+    }
   }
 
   setVisible(visible) {
@@ -335,5 +372,28 @@ export class SlavePanel extends EventTarget {
 
   setOffset(v) {
     this._inpOffset.value = String(Number.isFinite(v) ? v : 0);
+  }
+
+  setYOffset(mv) {
+    this._inpYOffset.value = String(Number.isFinite(mv) ? mv : 0);
+  }
+
+  setInvertSignal(enabled) {
+    this._cbInvert.checked = !!enabled;
+  }
+
+  /** Force the type dropdown to a specific value and sync layout (e.g. from firmware). */
+  setSlaveType(typeName) {
+    if ([...this._ddType.options].some(o => o.value === typeName)) {
+      this._ddType.value = typeName;
+      this._syncTypeLayout();
+      this._dispatch('alias-changed', typeName);
+    }
+  }
+
+  /** Label displayed in the panel header (replaces generic "Esclavo N" with geo alias). */
+  setDisplayName(name) {
+    const h2 = this.root.querySelector('h2');
+    if (h2) h2.textContent = name;
   }
 }

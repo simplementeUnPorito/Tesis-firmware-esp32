@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-loop-33';
-import { WsClient } from './ws_client.js?v=field-loop-33';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-loop-33';
-import { DataStore, effectiveFs } from './data_store.js?v=field-loop-33';
-import { PlotArea } from './plot.js?v=field-loop-33';
-import { SpectrumArea } from './spectrum.js?v=field-loop-33';
-import { SlavePanel } from './slave_panel.js?v=field-loop-33';
-import { compileFirCmd, dcRemove, filtFilt, firFilter, lastFirError } from './signal_proc.js?v=field-loop-33';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-loop-33';
+import * as cfg from './config.js?v=field-study-3';
+import { WsClient } from './ws_client.js?v=field-study-3';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-3';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-3';
+import { PlotArea } from './plot.js?v=field-study-3';
+import { SpectrumArea } from './spectrum.js?v=field-study-3';
+import { SlavePanel } from './slave_panel.js?v=field-study-3';
+import { compileFirCmd, dcRemove, filtFilt, lastFirError } from './signal_proc.js?v=field-study-3';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-3';
 
 const $ = (id) => document.getElementById(id);
 
@@ -43,6 +43,7 @@ const SHOW_FILT_KEY = `${SETTINGS_PREFIX}show_filt`;
 const SHOW_ENV_RAW_KEY = `${SETTINGS_PREFIX}show_env_raw`;
 const SHOW_ENV_FILT_KEY = `${SETTINGS_PREFIX}show_env_filt`;
 const SHOW_HILBERT_KEY = `${SETTINGS_PREFIX}show_hilbert`;
+const DISPLAY_DC_REMOVE_KEY = `${SETTINGS_PREFIX}display_dc_remove`;
 const WS_TOKEN_KEY  = `${SETTINGS_PREFIX}ws_token`;
 
 function clamp(value, lo, hi) {
@@ -186,15 +187,45 @@ function gainValue(code) {
   return (code >= 0 && code < cfg.GAIN_CODES.length) ? cfg.GAIN_CODES[code] : null;
 }
 
+function signalMean(arr) {
+  if (!arr || !arr.length) return 0;
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) sum += arr[i];
+  return sum / arr.length;
+}
+
+function displayDcRemoveEnabled() {
+  const cb = $('chk-dc-remove');
+  return !cb || cb.checked;
+}
+
+function transformSignalForView(arr, options = {}) {
+  if (!arr || !arr.length) return arr || null;
+  const removeDc = !!options.removeDc && arr.length > 1;
+  const invert = !!options.invert;
+  const yOffsetV = Number.isFinite(options.yOffsetV) ? options.yOffsetV : 0;
+  if (!removeDc && !invert && !yOffsetV) return arr;
+  const mean = removeDc ? signalMean(arr) : 0;
+  const sign = invert ? -1 : 1;
+  const out = new Float64Array(arr.length);
+  for (let i = 0; i < arr.length; i++) out[i] = (arr[i] - mean) * sign + yOffsetV;
+  return out;
+}
+
 function nodeConnectedForCapture(nd, index) {
   return index > 0
     && (nd.visible || nd.rawBuf.length > 0 || nd.filtBuf.length > 0)
-    && (nd.fsKnown || !!nd.mac || nd.rawBuf.length > 0 || nd.filtBuf.length > 0);
+    && (nd.fsKnown || !!nd.mac || nd.hwClass !== 0xFF || nd.rawBuf.length > 0 || nd.filtBuf.length > 0);
 }
 
-function nodeSnapshot(nd, index) {
-  const raw = nd.rawBuf.toArray();
-  const filt = filteredArrayForNode(nd, raw);
+function nodeSnapshot(nd, index, options = {}) {
+  const rawOrig = nd.rawBuf.toArray();
+  const filtOrig = filteredArrayForNode(nd, rawOrig);
+  const storeDcRemoved = !!options.storeDcRemoved;
+  const rawDc = signalMean(rawOrig);
+  const filtDc = signalMean(filtOrig);
+  const raw = storeDcRemoved ? transformSignalForView(rawOrig, { removeDc: true }) : rawOrig;
+  const filt = storeDcRemoved ? transformSignalForView(filtOrig, { removeDc: true }) : filtOrig;
   return {
     index,
     name: cfg.NODE_NAMES[index] || `Node ${index}`,
@@ -215,6 +246,8 @@ function nodeSnapshot(nd, index) {
     pgavdac_code: nd.pgavdac,
     pgavdac_gain: gainValue(nd.pgavdac),
     psoc_ok: nd.psocOk,
+    hw_class: nd.hwClass,
+    hw_type: slaveHwClassName(nd.hwClass),
     hammer_offset_m: nd.hammerOffset ?? 0,
     sample_offset: 0,
     mac: nd.mac || '',
@@ -222,6 +255,10 @@ function nodeSnapshot(nd, index) {
     fir_cmd: nd.filtCmd || '',
     filt_trim_samples: 0,
     dc_remove: !!nd.dcRemove,
+    dc_removed_on_preserve: storeDcRemoved,
+    raw_dc_v: rawDc,
+    filt_dc_v: filtDc,
+    invert_signal: !!nd.invertSignal,
     drift_hist: nd.driftHist.slice(),
     latency_hist: nd.latencyHist.slice(),
     health: nd.health,
@@ -257,11 +294,17 @@ function captureSampleOffset(capture) {
   return Number.isFinite(capture?.sample_offset) ? Math.round(capture.sample_offset) : 0;
 }
 
+function captureYOffsetMv(capture) {
+  const mv = Number(capture?.y_offset_mv);
+  return Number.isFinite(mv) ? mv : 0;
+}
+
 function makeCaptureSnapshot(label, options = {}) {
   const now = new Date();
   const source = options.source || 'preserved';
   const order = Number.isFinite(options.order) ? options.order : 0;
-  const nodes = data.nodes.map((nd, index) => nodeSnapshot(nd, index));
+  const storeDcRemoved = options.storeDcRemoved === true;
+  const nodes = data.nodes.map((nd, index) => nodeSnapshot(nd, index, { storeDcRemoved }));
   const fs = currentFsHz() || nodes.find((node) => node.fs > 0)?.fs || 0;
   const capture = {
     id: options.id || `${source}_${now.getTime()}_${order || preserveSeq + 1}`,
@@ -273,9 +316,11 @@ function makeCaptureSnapshot(label, options = {}) {
     display_time: humanTimestamp(now),
     visible: options.visible !== false,
     sample_offset: Number.isFinite(options.sampleOffset) ? Math.round(options.sampleOffset) : 0,
+    y_offset_mv: Number.isFinite(options.yOffsetMv) ? options.yOffsetMv : 0,
+    dc_removed_on_preserve: storeDcRemoved,
     color: options.color || PRESERVE_COLORS[Math.max(0, order - 1) % PRESERVE_COLORS.length],
     fs,
-    n_slaves: activeSlaveCount,
+    n_slaves: visibleSlaveCount(),
     n_batches: captureBatches(),
     samples_per_batch: cfg.SAMPLES_PER_BATCH,
     display_secs: parseInt($('disp-secs').value, 10) || null,
@@ -342,12 +387,13 @@ function renderPreservedList() {
     title.textContent = capture.label;
     const sub = document.createElement('div');
     sub.className = 'sub';
-    sub.textContent = `${capture.display_time} · ${capture.raw_count} raw · Fs ${capture.fs ? capture.fs.toFixed(0) : '?'} Hz · offset ${captureSampleOffset(capture)} muestras`;
+    const dcText = capture.dc_removed_on_preserve ? 'sin DC' : 'con DC';
+    sub.textContent = `${capture.display_time} · ${capture.raw_count} raw · Fs ${capture.fs ? capture.fs.toFixed(0) : '?'} Hz · ${dcText} · X ${captureSampleOffset(capture)} muestras · Y ${captureYOffsetMv(capture)} mV`;
     meta.append(title, sub);
 
     const offsetWrap = document.createElement('label');
     offsetWrap.className = 'preserve-offset';
-    offsetWrap.appendChild(document.createTextNode('Offset '));
+    offsetWrap.appendChild(document.createTextNode('Offset X '));
     const offsetInput = document.createElement('input');
     offsetInput.type = 'number';
     offsetInput.step = '1';
@@ -361,6 +407,22 @@ function renderPreservedList() {
     });
     offsetWrap.appendChild(offsetInput);
 
+    const yOffsetWrap = document.createElement('label');
+    yOffsetWrap.className = 'preserve-offset';
+    yOffsetWrap.appendChild(document.createTextNode('Offset Y mV '));
+    const yOffsetInput = document.createElement('input');
+    yOffsetInput.type = 'number';
+    yOffsetInput.step = '100';
+    yOffsetInput.value = String(captureYOffsetMv(capture));
+    yOffsetInput.title = 'Desplaza verticalmente esta captura preservada despues de quitar DC.';
+    yOffsetInput.addEventListener('change', () => {
+      const parsed = parseFloat(yOffsetInput.value);
+      capture.y_offset_mv = Number.isFinite(parsed) ? parsed : 0;
+      renderPreservedList();
+      refreshSlavePresentationOrder();
+    });
+    yOffsetWrap.appendChild(yOffsetInput);
+
     const del = document.createElement('button');
     del.type = 'button';
     del.textContent = 'Quitar';
@@ -371,7 +433,7 @@ function renderPreservedList() {
       refreshSlavePresentationOrder();
     });
 
-    row.append(chk, swatch, meta, offsetWrap, del);
+    row.append(chk, swatch, meta, offsetWrap, yOffsetWrap, del);
     list.appendChild(row);
   }
   refreshPreservedStatus();
@@ -395,6 +457,7 @@ function onPreserveRequested() {
     source: 'preserved',
     order: nextOrder,
     visible: true,
+    storeDcRemoved: displayDcRemoveEnabled(),
   });
   if (!captureHasSamples(capture)) {
     appendLog('Preservar cancelado: no hay muestras en el buffer actual');
@@ -515,6 +578,32 @@ function appendLog(msg) {
   log.scrollTop = log.scrollHeight;
 }
 
+function createNodeRow(i) {
+  const row = document.createElement('div');
+  row.className = 'node-row';
+  row.id = `node-${i}`;
+  for (const [className, text] of [
+    ['name', cfg.NODE_NAMES[i] || `Esclavo ${i}`],
+    ['raw', '--'],
+    ['stats', '--'],
+    ['cfg', '--'],
+  ]) {
+    const span = document.createElement('span');
+    span.className = className;
+    span.textContent = text;
+    row.appendChild(span);
+  }
+  return row;
+}
+
+function buildNodeRows() {
+  const list = document.querySelector('.node-list');
+  if (!list) return;
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (!$(`node-${i}`)) list.appendChild(createNodeRow(i));
+  }
+}
+
 async function resetWsLock() {
   try {
     await fetch('/ws-reset', { cache: 'no-store' });
@@ -548,6 +637,86 @@ function nodeTitle(i) {
   if (i <= 0) return cfg.NODE_NAMES[i] || 'Maestro';
   const alias = data.nodes[i].alias || cfg.NODE_NAMES[i] || `S${i}`;
   return `${alias} (S${i})`;
+}
+
+function slaveHwClassName(hwClass) {
+  if (hwClass === 0) return 'GEO';
+  if (hwClass === 1) return 'HAMMER';
+  return 'UNKNOWN';
+}
+
+function applyReportedSlaveType(chIndex, hwClass) {
+  if (chIndex <= 0 || chIndex >= cfg.MAX_NODES) return;
+  if (hwClass !== 0 && hwClass !== 1) return;
+
+  const nd = data.nodes[chIndex];
+  const panel = panelFor(chIndex);
+  nd.hwClass = hwClass;
+
+  if (hwClass === 1) {
+    nd.alias = 'Hammer';
+    nd.hammerOffset = 0;
+    if (panel) {
+      panel.setAlias('Hammer');
+      panel.setOffset(0);
+      panel.setDisplayName(`Hammer (${cfg.NODE_NAMES[chIndex]})`);
+    }
+  } else {
+    if (nd.alias === 'Hammer' || !String(nd.alias || '').startsWith('Geo')) {
+      nd.alias = `Geo${chIndex}`;
+    }
+    if (panel) panel.setAlias(nd.alias);
+    reorderGeosByOffset();
+  }
+
+  renderNodeRow(chIndex);
+  refreshSlavePresentationOrder();
+}
+
+function nodeHasPresence(i) {
+  const nd = data.nodes[i];
+  return !!nd.mac
+    || nd.psocOk !== null
+    || nd.hwClass !== 0xFF
+    || nd.fsExactKnown
+    || nd.rawBuf.length > 0
+    || nd.filtBuf.length > 0;
+}
+
+function visibleSlaveCount() {
+  let count = 0;
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (data.nodes[i].visible) count++;
+  }
+  return count;
+}
+
+function applySlaveVisibility(visibleSet) {
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    const visible = visibleSet.has(i);
+    data.nodes[i].visible = visible;
+    const row = $(`node-${i}`);
+    if (row) row.hidden = !visible;
+    const panel = panelFor(i);
+    if (panel) panel.setVisible(visible);
+  }
+}
+
+function rebalanceSlaveVisibility(preferredIndex = 0) {
+  const visibleSet = new Set();
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (nodeHasPresence(i)) visibleSet.add(i);
+  }
+  if (preferredIndex > 0 && preferredIndex < cfg.MAX_NODES) visibleSet.add(preferredIndex);
+
+  const target = Math.max(activeSlaveCount, visibleSet.size);
+  for (let i = 1; visibleSet.size < target && i < cfg.MAX_NODES; i++) {
+    if (!visibleSet.has(i)) visibleSet.add(i);
+  }
+
+  applySlaveVisibility(visibleSet);
+  refreshSlavePresentationOrder();
+  updateCapturePreview();
 }
 
 function refreshSlavePresentationOrder() {
@@ -619,21 +788,12 @@ function setActiveSlaveCount(nSlaves, zeroMeansAll = false) {
     ? maxSlaves
     : clamp(parsed, 0, maxSlaves);
   activeSlaveCount = count;
-  for (let i = 1; i < cfg.MAX_NODES; i++) {
-    const visible = i <= count;
-    data.nodes[i].visible = visible;
-    const row = $(`node-${i}`);
-    if (row) row.hidden = !visible;
-    const panel = panelFor(i);
-    if (panel) panel.setVisible(visible);
-  }
-  refreshSlavePresentationOrder();
-  updateCapturePreview();
+  rebalanceSlaveVisibility();
 }
 
 function ensureSlaveVisible(chIndex) {
   if (chIndex <= 0 || chIndex >= cfg.MAX_NODES) return;
-  if (chIndex > activeSlaveCount) setActiveSlaveCount(chIndex);
+  rebalanceSlaveVisibility(chIndex);
 }
 
 function applyDisplayWindow() {
@@ -703,14 +863,8 @@ function handleData(nd, pkt) {
   nd.totalSamples++;
   if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
 
-  let filtVal = rawVal;
-  if (nd.filtB) {
-    const result = firFilter(nd.filtB, new Float64Array([rawVal]), nd.filtZi);
-    nd.filtZi = result.zi;
-    filtVal = result.y[0];
-  }
-  if (nd.dcRemove && nd.rawBuf.length > 1) filtVal -= nd.rawSum / nd.rawBuf.length;
-  nd.filtBuf.push(filtVal);
+  // Filtered signal is computed via filtFilt (zero-phase) at render time from rawBuf.
+  // No per-sample causal filtering here — that would introduce group delay.
 }
 
 function fillRingBuffer(ring, arr) {
@@ -750,8 +904,12 @@ function reprocessFiltBuf(chIndex) {
 function recompileNodeFirForFs(chIndex) {
   const nd = data.nodes[chIndex];
   if (!nd.filtCmd) return true;
-  const b = compileFirCmd(nd.filtCmd, nd.fs);
   const panel = panelFor(chIndex);
+  if (!(nd.fs > 0)) {
+    if (panel) panel.setFirStatus(`Pendiente Fs: ${nd.filtCmd}`.slice(0, 80));
+    return false;
+  }
+  const b = compileFirCmd(nd.filtCmd, nd.fs);
   if (!b) {
     nd.filtB = null;
     nd.filtZi = null;
@@ -841,10 +999,9 @@ function schedulePgaLockTimeout(chIndex, expectedCode) {
 }
 
 function prepareNodeCapture(chIndex) {
-  if (chIndex > activeSlaveCount) setActiveSlaveCount(chIndex);
   const nd = data.nodes[chIndex];
   nd.clear();
-  nd.visible = true;
+  rebalanceSlaveVisibility(chIndex);
   plotArea.clearNode(chIndex);
   renderNodeRow(chIndex);
   updateSlavePanelStats(chIndex);
@@ -970,7 +1127,7 @@ function onExportRequested() {
     const liveCapture = makeCaptureSnapshot('Actual', { source: 'live', visible: false });
     const { blob, filename, metadata } = buildCaptureZip(data, {
       baseName,
-      nSlaves: activeSlaveCount,
+      nSlaves: visibleSlaveCount(),
       nBatches,
       displaySecs,
       preservedCaptures: preservedCaptures.slice(),
@@ -1054,6 +1211,12 @@ function loadSlavePanelState(chIndex, panel) {
   nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
   panel.setOffset(nd.hammerOffset);
 
+  nd.yOffsetV = loadSlaveFloat(chIndex, 'y_offset_mv', 0) / 1000;
+  panel.setYOffset(nd.yOffsetV * 1000);
+
+  nd.invertSignal = loadSlaveBool(chIndex, 'invert_signal', false);
+  panel.setInvertSignal(nd.invertSignal);
+
   panel.setFirPreset(
     loadSetting(settingKey(chIndex, 'fir_type')) || 'lp',
     loadSlaveFloat(chIndex, 'fir_f1', 10),
@@ -1062,14 +1225,8 @@ function loadSlavePanelState(chIndex, panel) {
   );
   const firCmd = loadSetting(settingKey(chIndex, 'fir_cmd')) || '';
   if (firCmd.trim()) {
-    const b = compileFirCmd(firCmd, nd.fs);
-    if (b) {
-      nd.filtB = b;
-      nd.filtCmd = firCmd;
-      panel.setFirStatus(`${b.length} taps ${firCmd}`);
-    } else {
-      panel.setFirStatus(`Invalid: ${lastFirError()}`.slice(0, 80));
-    }
+    nd.filtCmd = firCmd;
+    recompileNodeFirForFs(chIndex);
   }
   panel.updateStats(0, 0, null, nd.formatDriftStats(), nd.formatLatencyStats(), nd.psocOk);
 }
@@ -1097,6 +1254,17 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('offset-changed', (ev) => {
     data.nodes[chIndex].hammerOffset = ev.detail;
     saveSlaveSetting(chIndex, 'hammer_offset_m', ev.detail);
+    // Re-sort geo display names by distance whenever any offset changes.
+    reorderGeosByOffset();
+  });
+  panel.addEventListener('y-offset-changed', (ev) => {
+    const mv = ev.detail || 0;
+    data.nodes[chIndex].yOffsetV = mv / 1000;
+    saveSlaveSetting(chIndex, 'y_offset_mv', mv);
+  });
+  panel.addEventListener('invert-toggled', (ev) => {
+    data.nodes[chIndex].invertSignal = !!ev.detail.enabled;
+    saveSlaveSetting(chIndex, 'invert_signal', data.nodes[chIndex].invertSignal ? 1 : 0);
   });
 }
 
@@ -1110,6 +1278,37 @@ function buildSlavePanels() {
     wireSlavePanel(i, panel);
     host.appendChild(panel.root);
   }
+}
+
+/**
+ * After any geo's offset changes, sort all geo-type nodes by distance from the hammer
+ * and re-label their panels as Geo1, Geo2, ... (closest first).
+ * Slave IDs (S1, S2...) remain static — only the display name changes.
+ */
+function reorderGeosByOffset() {
+  // Collect connected/present geo indices. Hidden placeholders must not steal
+  // Geo1/Geo2 labels from real nodes when their default offset is zero.
+  const geos = [];
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    const nd = data.nodes[i];
+    if (nd.alias !== 'Hammer' && nodeHasPresence(i)) {
+      geos.push({ idx: i, dist: nd.hammerOffset || 0 });
+    }
+  }
+  // Sort by distance ascending (closest to source = Geo1)
+  geos.sort((a, b) => (a.dist - b.dist) || (a.idx - b.idx));
+  geos.forEach(({ idx }, rank) => {
+    const name = `Geo${rank + 1}`;
+    data.nodes[idx].alias = name;
+    saveSlaveSetting(idx, 'alias', name);
+    const panel = slavePanels[idx];
+    if (panel) {
+      panel.setAlias(name);
+      panel.setDisplayName(`${name} (${cfg.NODE_NAMES[idx]})`);
+    }
+    renderNodeRow(idx);
+  });
+  refreshSlavePresentationOrder();
 }
 
 function calibrationProgressLabel(v) {
@@ -1178,7 +1377,7 @@ function handleAck(pkt, idx) {
   }
 
   if (ackCmd === cfg.SUBCMD_BLINK_LED && idx >= 1 && idx < cfg.MAX_NODES) {
-    appendLog(`S${idx} LED titilando`);
+    appendLog(`S${idx} LED blink ACK`);
     return;
   }
 
@@ -1231,6 +1430,14 @@ function handleStatus(pkt, idx) {
     return;
   }
 
+  if (pkt.helloMacSub === 0x06) {
+    applyReportedSlaveType(idx, pkt.helloHwClass);
+    updateSlavePanelStats(idx);
+    renderNodeRow(idx);
+    appendLog(`HELLO slave=${idx} tipo=${slaveHwClassName(pkt.helloHwClass)}`);
+    return;
+  }
+
   if (pkt.helloMacSub === 0x01) {
     const nd = data.nodes[idx];
     nd.psocOk = pkt.helloPsocOk;
@@ -1241,19 +1448,48 @@ function handleStatus(pkt, idx) {
   }
 }
 
+function preparePreservedOverlay(capture) {
+  const removeDc = displayDcRemoveEnabled();
+  const yOffsetV = captureYOffsetMv(capture) / 1000;
+  return {
+    ...capture,
+    nodes: (capture.nodes || []).map((node) => {
+      if (!node) return node;
+      const invert = !!node.invert_signal;
+      return {
+        ...node,
+        raw: transformSignalForView(node.raw, { removeDc, invert, yOffsetV }),
+        filt: transformSignalForView(node.filt, { removeDc, invert, yOffsetV }),
+      };
+    }),
+  };
+}
+
 function renderTick() {
   const fs = displayFsHz();
-  const rawBufs = data.nodes.map((nd) => (nd.rawBuf.length ? nd.rawBuf.toArray() : null));
-  const filtBufs = data.nodes.map((nd, i) => (rawBufs[i] ? filteredArrayForNode(nd, rawBufs[i]) : null));
-  // filtFilt is zero-phase already: no group-delay trim is needed for display/export.
+  const removeDc = displayDcRemoveEnabled();
+  const rawBufsOrig = data.nodes.map((nd) => (nd.rawBuf.length ? nd.rawBuf.toArray() : null));
+  const filtBufs = data.nodes.map((nd, i) => (rawBufsOrig[i] ? filteredArrayForNode(nd, rawBufsOrig[i]) : null));
+  // filtFilt is zero-phase — no group-delay trim needed.
   const filtTrims = data.nodes.map(() => 0);
   updateWaveVelocityLabel(fs);
-  const overlays = selectedPreservedCaptures();
-  plotArea.update(rawBufs, filtBufs, fs, filtTrims, overlays);
-  if (!$('spectra').hidden) spectrumArea.update(rawBufs, fs, overlays);
+  const overlays = selectedPreservedCaptures().map(preparePreservedOverlay);
+
+  // Apply display DC removal and signal inversion to copies only.
+  const rawBufsDisplay = rawBufsOrig.map((orig, i) => {
+    const nd = data.nodes[i];
+    return transformSignalForView(orig, { removeDc, invert: nd.invertSignal });
+  });
+  const filtBufsDisplay = filtBufs.map((filt, i) => {
+    const nd = data.nodes[i];
+    return transformSignalForView(filt, { removeDc, invert: nd.invertSignal });
+  });
+
+  plotArea.update(rawBufsDisplay, filtBufsDisplay, fs, filtTrims, overlays);
+  if (!$('spectra').hidden) spectrumArea.update(rawBufsDisplay, fs, overlays);
 
   updateGlobalFsDisplay();
-  for (let i = 1; i <= activeSlaveCount; i++) {
+  for (const i of orderedSlaveIndices(true)) {
     renderNodeRow(i);
     updateSlavePanelStats(i);
   }
@@ -1310,6 +1546,7 @@ $('btn-theme').addEventListener('click', () => {
 
 initTheme();
 initTabs();
+buildNodeRows();
 buildSlavePanels();
 renderPreservedList();
 restoreFsFromLocalCache();
@@ -1365,7 +1602,6 @@ ws.addEventListener('packet', (ev) => {
   const idx = pkt.nodeId === cfg.MASTER_NODE_ID ? 0 : pkt.nodeId;
   if (idx < 0 || idx >= cfg.MAX_NODES) return;
   const nd = data.nodes[idx];
-  if (idx > 0) ensureSlaveVisible(idx);
 
   if (pkt.isData) {
     handleData(nd, pkt);
@@ -1393,6 +1629,7 @@ ws.addEventListener('packet', (ev) => {
     updateSlavePanelStats(idx);
     appendLog(`LATENCY node=${pkt.nodeId} ${pkt.value24u} us`);
   }
+  if (idx > 0) ensureSlaveVisible(idx);
 });
 
 // Controls
@@ -1478,10 +1715,20 @@ function setCursorEditMode(mode) {
 $('btn-cursor-1').addEventListener('click', () => setCursorEditMode(0));
 $('btn-cursor-2').addEventListener('click', () => setCursorEditMode(1));
 
-$('btn-spectrum').addEventListener('click', () => {
-  const active = $('btn-spectrum').classList.toggle('active');
+$('chk-spectrum').addEventListener('change', () => {
+  const active = $('chk-spectrum').checked;
+  $('plots').hidden = active;
   $('spectra').hidden = !active;
   if (active) spectrumArea.resetView();
+});
+
+// Global DC removal (applies to all nodes, raw AND filtered).
+$('chk-dc-remove').addEventListener('change', () => {
+  const enabled = $('chk-dc-remove').checked;
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    data.nodes[i].dcRemove = enabled;
+    reprocessFiltBuf(i);
+  }
 });
 
 // Display-only curve visibility — saving/export always keeps raw AND filtered regardless of these.

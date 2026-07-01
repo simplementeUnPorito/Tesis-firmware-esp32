@@ -11,7 +11,7 @@
 #include "sync_protocol.h"
 #include "master_log.h"
 
-#define MAX_NODES 8
+#define MAX_NODES 9
 
 /* Un batch reensamblado */
 struct ReassembledBatch {
@@ -119,8 +119,12 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         instance->_handleStatus((const MsgStatus *)data);
     } else if (first == CMD_CFG_ACK && (size_t)len >= sizeof(MsgCfgAck)) {
         instance->_handleCfgAck((const MsgCfgAck *)data);
-    } else if (first == CMD_HELLO && (size_t)len >= sizeof(MsgHello)) {
-        instance->_handleHello((const MsgHello *)data, mac);
+    } else if (first == CMD_HELLO && (size_t)len >= MSG_HELLO_LEGACY_BYTES) {
+        MsgHello hello = {};
+        const size_t copyLen = ((size_t)len < sizeof(MsgHello)) ? (size_t)len : sizeof(MsgHello);
+        memcpy(&hello, data, copyLen);
+        if ((size_t)len < sizeof(MsgHello)) hello.hw_class = SLAVE_HW_UNKNOWN;
+        instance->_handleHello(&hello, mac);
     } else if (first == CMD_START_ACK && (size_t)len >= sizeof(MsgStartAck)) {
         instance->_handleStartAck((const MsgStartAck *)data);
     } else if (first == CMD_HOTWAIT_ACK && (size_t)len >= sizeof(MsgHotWaitAck)) {

@@ -168,8 +168,12 @@ static          uint32_t   g_auto_cal_due_ms = 0;
     #define BLINK_LED_PIN 2
   #endif
 #endif
-#define BLINK_TIMES       10u     /* flashes totales (on+off = 1 flash) */
-#define BLINK_INTERVAL_MS 150u
+#ifndef BLINK_TIMES
+#define BLINK_TIMES       20u     /* flashes totales (on+off = 1 flash) */
+#endif
+#ifndef BLINK_INTERVAL_MS
+#define BLINK_INTERVAL_MS 250u
+#endif
 #ifndef BLINK_LED_ACTIVE_LOW
 #define BLINK_LED_ACTIVE_LOW 1u
 #endif
@@ -1784,8 +1788,12 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_blink_last_ms = millis();
         digitalWrite(BLINK_LED_PIN, BLINK_LED_ON_LEVEL);
         sendCfgAck(CMD_BLINK_LED, 1);
-        SLAVE_LOG_PRINTF("[SLAVE] BLINK_LED node=%u\n", NODE_ID);
-        LOGM("BLINK_LED", "node=%u", NODE_ID);
+        SLAVE_LOG_PRINTF("[SLAVE] BLINK_LED node=%u pin=%d active_low=%u flashes=%u interval_ms=%u\n",
+                         NODE_ID, BLINK_LED_PIN, (unsigned)BLINK_LED_ACTIVE_LOW,
+                         (unsigned)BLINK_TIMES, (unsigned)BLINK_INTERVAL_MS);
+        LOGM("BLINK_LED", "node=%u,pin=%d,activeLow=%u,flashes=%u,interval_ms=%u",
+             NODE_ID, BLINK_LED_PIN, (unsigned)BLINK_LED_ACTIVE_LOW,
+             (unsigned)BLINK_TIMES, (unsigned)BLINK_INTERVAL_MS);
     }
 }
 /* SaveEEPROM (0xB6) y SelectStream (0xB7) llegan por CMD_SET_CONFIG → handleSetConfig */
@@ -2097,7 +2105,10 @@ void loop()
         !(g_state == STOPPED && g_rec_n_batches > 0) &&
         millis() - lastHelloMs >= 2000) {
         lastHelloMs = millis();
-        MsgHello h = { CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected, effectivePsocSampleRateHz() };
+        MsgHello h = {
+            CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected,
+            effectivePsocSampleRateHz(), g_psoc_hw_class
+        };
         esp_err_t err = espnowSend(MASTER_MAC, (const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX
         SLAVE_LOG_PRINTF("[SLAVE] HELLO tx err=%d txOK=%u txFail=%u\n",

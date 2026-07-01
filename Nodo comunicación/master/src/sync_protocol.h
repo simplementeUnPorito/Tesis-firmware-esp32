@@ -30,6 +30,12 @@
 #define CMD_SAVE_EEPROM 0x71  /* master → esclavo unicast: guardar config PSoC en EEPROM */
 #define CMD_SELECT_STREAM 0x72 /* master → esclavo unicast: 0=crudo, 1=FIR hardware */
 
+#define SLAVE_HW_GEO     0u
+#define SLAVE_HW_HAMMER  1u
+#define SLAVE_HW_UNKNOWN 0xFFu
+
+#define MSG_HELLO_LEGACY_BYTES 5u
+
 #pragma pack(push, 1)
 
 struct MsgArm    { uint8_t cmd; };
@@ -115,6 +121,7 @@ struct MsgHello {
     uint8_t  node_id;
     uint8_t  psoc_ok;     /* 1=PSoC detectado en boot, 0=no detectado */
     uint16_t sample_rate; /* ADC sample rate en Hz reportado por PSoC; 0=desconocido */
+    uint8_t  hw_class;    /* SLAVE_HW_* reportado por el PSoC (GEO/HAMMER/UNKNOWN) */
 };
 
 struct MsgSetRecLen {

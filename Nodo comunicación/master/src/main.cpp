@@ -214,6 +214,7 @@ struct CachedHello {
     bool valid = false;
     uint8_t psoc_ok = 0;
     uint16_t sample_rate = 0;
+    uint8_t hw_class = SLAVE_HW_UNKNOWN;
     uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
 };
 static CachedHello g_cachedHello[NUM_SLAVES + 1];
@@ -260,7 +261,7 @@ static void addPeerIfNeeded(const uint8_t mac[6])
 static uint8_t countArmAcks(uint32_t mask)
 {
     uint8_t n = 0;
-    for (uint8_t node = 1; node <= g_expectedSlaves; node++) {
+    for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
         if (mask & (1UL << node)) n++;
     }
     return n;
@@ -269,7 +270,7 @@ static uint8_t countArmAcks(uint32_t mask)
 static uint8_t countHotWaitAcks(uint32_t mask)
 {
     uint8_t n = 0;
-    for (uint8_t node = 1; node <= g_expectedSlaves; node++) {
+    for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
         if (mask & (1UL << node)) n++;
     }
     return n;
@@ -297,7 +298,7 @@ static void sendCachedStateToWeb()
     for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
         const CachedHello &h = g_cachedHello[node];
         if (h.valid) {
-            matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate);
+            matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate, h.hw_class);
         }
     }
     MASTER_LOG_PRINTLN("[WEB] cached READY/HELLO replay sent");
@@ -429,17 +430,29 @@ static void onCfgAck(const MsgCfgAck &msg)
     matlab.sendAck(msg.node_id, msg.sub_cmd, msg.ok);
 }
 
+static const char *slaveHwName(uint8_t hwClass)
+{
+    switch (hwClass) {
+        case SLAVE_HW_GEO:    return "GEO";
+        case SLAVE_HW_HAMMER: return "HAMMER";
+        default:              return "UNKNOWN";
+    }
+}
+
 static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
 {
-    MASTER_LOG_PRINTF("[MASTER] HELLO node=%d psoc=%d fs=%u\n", msg.node_id, msg.psoc_ok, msg.sample_rate);
+    MASTER_LOG_PRINTF("[MASTER] HELLO node=%d psoc=%d fs=%u hw=%u/%s\n",
+                      msg.node_id, msg.psoc_ok, msg.sample_rate,
+                      msg.hw_class, slaveHwName(msg.hw_class));
     if (msg.node_id > 0 && msg.node_id <= NUM_SLAVES) {
         CachedHello &h = g_cachedHello[msg.node_id];
         h.valid = true;
         h.psoc_ok = msg.psoc_ok;
         h.sample_rate = msg.sample_rate;
+        h.hw_class = msg.hw_class;
         memcpy(h.mac, senderMac, 6);
     }
-    matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate);
+    matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate, msg.hw_class);
 }
 
 static void onStartAck(const MsgStartAck &msg)
@@ -475,7 +488,7 @@ static void onStartAck(const MsgStartAck &msg)
 static void onHotWaitAck(const MsgHotWaitAck &msg)
 {
     if (msg.node_id == 0 || msg.node_id > NUM_SLAVES) return;
-    if (msg.ok && msg.node_id <= g_expectedSlaves) {
+    if (msg.ok && msg.node_id <= NUM_SLAVES) {
         g_hotWaitAckMask |= (1UL << msg.node_id);
     }
     MASTER_LOG_PRINTF("[MASTER] HOTWAIT_ACK node=%d ok=%d state=%d n=%u mask=0x%08X\n",
@@ -544,11 +557,19 @@ static void beginDump(const char *reason)
     g_dumpRetryPaused = false;
     g_dumpRetryDueMs = 0;
     /* VIEW dump: un solo nodo; normal dump: todos los esclavos armados */
+    /* Primer nodo armado (por mask) para no iterar nodos inexistentes */
+    uint8_t firstArmedNode = 1;
+    if (!g_viewDump) {
+        firstArmedNode = NUM_SLAVES + 1;
+        for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
+            if (g_armAckMask & (1UL << n)) { firstArmedNode = n; break; }
+        }
+    }
     bool canDump = g_rec_n_batches > 0 && (g_armedCount > 0 || g_viewDump);
     if (canDump) {
         g_state        = DUMPING;
         g_streaming    = true;
-        g_dumpSlaveIdx = g_viewDump ? g_viewNode : 1;
+        g_dumpSlaveIdx = g_viewDump ? g_viewNode : firstArmedNode;
         g_dumpBatchSeq = 0;
         g_dumpBatchRx  = false;
         dumpDeliveryGuardReset();
@@ -1227,15 +1248,17 @@ void loop()
                     finishPrestartAction();
                 }
             } else {
-                while (g_hotWaitQueryNode <= g_expectedSlaves &&
-                       hotWaitAcked(g_hotWaitQueryNode)) {
+                /* Avanzar: saltar nodos ya confirmados O que nunca ARM'd */
+                while (g_hotWaitQueryNode <= NUM_SLAVES &&
+                       (hotWaitAcked(g_hotWaitQueryNode) ||
+                        !(g_armAckMask & (1UL << g_hotWaitQueryNode)))) {
                     g_hotWaitQueryNode++;
                     g_hotWaitRetries = 0;
                     g_hotWaitQueryInFlight = false;
                     g_hotWaitQueryMs = millis();
                 }
 
-                if (g_hotWaitQueryNode > g_expectedSlaves) {
+                if (g_hotWaitQueryNode > NUM_SLAVES) {
                     g_hotWaitSettling    = true;
                     g_hotWaitSettleDueMs = millis() + HOTWAIT_SETTLE_MS;
                     MASTER_LOG_PRINTF("[MASTER] HOT_WAIT all ready, settle %u ms\n",
@@ -1330,8 +1353,14 @@ void loop()
             if (g_dumpBatchSeq >= g_rec_n_batches) {
                 g_dumpBatchSeq = 0;
                 g_dumpSlaveIdx++;
-                /* VIEW dump: solo un nodo; dump normal: todos los armados */
-                uint8_t dumpLimit = g_viewDump ? g_viewNode : g_armedCount;
+                /* VIEW dump: solo un nodo; dump normal: saltar nodos no armados */
+                if (!g_viewDump) {
+                    while (g_dumpSlaveIdx <= NUM_SLAVES &&
+                           !(g_armAckMask & (1UL << g_dumpSlaveIdx))) {
+                        g_dumpSlaveIdx++;
+                    }
+                }
+                uint8_t dumpLimit = g_viewDump ? g_viewNode : NUM_SLAVES;
                 if (g_dumpSlaveIdx > dumpLimit) {
                     if (g_viewDump) {
                         broadcastRecordLength(0);

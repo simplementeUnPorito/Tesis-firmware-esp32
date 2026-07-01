@@ -68,7 +68,8 @@ public:
     /* Diagnóstico: estado ESP-NOW del maestro al arrancar */
     void sendStatus(uint8_t espnow_ok, uint8_t ap_ch);
     /* Diagnóstico: maestro recibió HELLO de un esclavo (incluye estado PSoC + MAC + FS) */
-    void sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok = 0, const uint8_t mac[6] = nullptr, uint16_t fs = 0);
+    void sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok = 0, const uint8_t mac[6] = nullptr,
+                        uint16_t fs = 0, uint8_t hw_class = 0xFF);
 
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
@@ -195,7 +196,8 @@ inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)
     _emit(pkt);
 }
 
-inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6], uint16_t fs)
+inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6],
+                                            uint16_t fs, uint8_t hw_class)
 {
     /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
     uint8_t fs_code = (fs >= 100u) ? (uint8_t)(fs / 100u) : 0u;
@@ -212,6 +214,11 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
             (uint8_t)(fs & 0xFFu),
         };
         _emit(fsExact);
+    }
+    if (hw_class != 0xFFu) {
+        /* b2=0x06: clase hardware reportada por PSoC: 0=GEO, 1=HAMMER. */
+        uint8_t hwPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x06, hw_class, 0x00 };
+        _emit(hwPkt);
     }
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */

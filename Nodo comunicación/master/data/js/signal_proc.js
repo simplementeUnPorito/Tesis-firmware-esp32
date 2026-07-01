@@ -155,8 +155,9 @@ export function compileFirCmd(cmd, fs) {
 /**
  * Streaming FIR equivalent to scipy.signal.lfilter(b, 1, x, zi=...).
  * zi is the direct-form II transposed state (length b.length - 1).
+ * Not exported — used internally by filtFilt only.
  */
-export function firFilter(b, x, zi = null) {
+function firFilter(b, x, zi = null) {
   const coeff = ArrayBuffer.isView(b) ? b : new Float64Array(b);
   const input = ArrayBuffer.isView(x) ? x : new Float64Array(x);
   const state = zi ? new Float64Array(zi) : new Float64Array(Math.max(0, coeff.length - 1));

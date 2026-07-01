@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-loop-33">
+  <link rel="stylesheet" href="/css/style.css?v=field-study-3">
 </head>
 <body>
   <header>
@@ -29,13 +29,14 @@
           <button id="btn-plot-reset" title="Restablecer">Reset</button>
           <button id="btn-cursor-1" title="Cursor 1: click en la grafica para medir tiempo y amplitud">Cursor 1</button>
           <button id="btn-cursor-2" title="Cursor 2: click en la grafica para medir tiempo y amplitud">Cursor 2</button>
-          <button id="btn-spectrum" title="Mostrar espectro de frecuencias (FFT)">Espectro</button>
         </span>
         <span class="plot-tools">
           <label><input id="chk-show-raw" type="checkbox" checked> Cruda</label>
           <label><input id="chk-show-filt" type="checkbox" checked> Filtrada <span id="wave-velocity" class="velocity-readout"></span></label>
           <label><input id="chk-show-env-raw" type="checkbox"> Env cruda</label>
           <label><input id="chk-show-env-filt" type="checkbox"> Env filtrada</label>
+          <label><input id="chk-dc-remove" type="checkbox"> Sin offset DC</label>
+          <label><input id="chk-spectrum" type="checkbox"> Espectro</label>
         </span>
       </div>
       <div id="plots" class="plot-area"></div>
@@ -143,6 +144,6 @@
     </div>
   </div>
 
-  <script type="module" src="/js/app.js?v=field-loop-33"></script>
+  <script type="module" src="/js/app.js?v=field-study-3"></script>
 </body>
 </html>

@@ -53,9 +53,10 @@ export const MAX_BUF_S = 10;
 export const MAX_BUF = DEFAULT_SAMPLE_RATE_HZ * MAX_BUF_S;
 
 // Nodes
-export const MAX_NODES = 4;
-export const NODE_NAMES = ['Maestro', 'Esclavo 1', 'Esclavo 2', 'Esclavo 3'];
-export const SLAVE_TYPE_ORDER = ['Hammer', 'Geo1', 'Geo2'];
+export const MAX_NODES = 9; // node 0 = master, nodes 1..8 = slave slots
+export const NODE_NAMES = ['Maestro', ...Array.from({ length: MAX_NODES - 1 }, (_, i) => `Esclavo ${i + 1}`)];
+// Generate N geo options matching the number of slave slots so the UI scales with hardware
+export const SLAVE_TYPE_ORDER = ['Hammer', ...Array.from({ length: MAX_NODES - 1 }, (_, i) => `Geo${i + 1}`)];
 export const MASTER_NODE_ID = 0xFF;
 
 // PGA

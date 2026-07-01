@@ -5,7 +5,7 @@
 // CustomEvents instead of Qt signals.
 
 import { decodePacket } from './protocol.js';
-import { PKT_LEN, PKT_HEADER } from './config.js?v=field-loop-33';
+import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-3';
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
