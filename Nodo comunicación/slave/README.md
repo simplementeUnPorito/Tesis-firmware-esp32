@@ -37,6 +37,33 @@ Al detectar el PSoC al arrancar, el esclavo programa una auto-calibración
 Si el maestro envía `CMD_PRESTART` mientras hay auto-cal pendiente, se cancela
 y el esclavo entra en HOT_WAIT normalmente.
 
+## Comandos USB de laboratorio
+
+Por el monitor serial del ESP, baud 115200:
+
+```
+help
+probe
+status
+stream 0|1
+debugpsoc 0|1
+pre N
+sync
+cap N
+startnow N
+clear
+stop
+cal
+adc
+blink
+pga N
+pgavdac N
+```
+
+`cap N` hace `pre N` y luego `sync`. `clear` libera el buffer store-and-forward
+despues de una prueba USB para poder repetir capturas sin esperar un dump del
+maestro. `stop` tambien libera ese buffer y baja `SYNC_TO_PSOC`.
+
 ## Tipo de hardware (GEO/HAMMER)
 
 El PSoC reporta `PSOC_HW_CLASS` en `PSOC_EVT_BOOT`. El esclavo lo reenvía en

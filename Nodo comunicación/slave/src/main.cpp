@@ -339,6 +339,11 @@ static esp_err_t sendToMaster(const uint8_t *data, size_t len)
 }
 
 static void sendCfgAck(uint8_t sub_cmd, uint8_t ok);
+static void allocStore(uint16_t n_batches);
+static void enterHotWait(uint16_t n_batches);
+static uint16_t clampPsocCaptureBatches(uint16_t n);
+static bool storeReadyForHotWait();
+static void debugEspSetRamp(bool enable);
 
 static void IRAM_ATTR onPsocRxEdge()
 {
@@ -1356,6 +1361,38 @@ static bool usbParseGainParam(const char *cmd, const char *word, uint8_t &value)
     return *cmd == '\0';
 }
 
+static bool usbParseU16Param(const char *cmd, const char *word, uint16_t &value)
+{
+    uint32_t acc = 0;
+    if (!usbCommandStartsWithWord(cmd, word)) {
+        return false;
+    }
+    while (*cmd != '\0' && *cmd != ' ' && *cmd != '=' && *cmd != ':') {
+        cmd++;
+    }
+    while (*cmd == ' ' || *cmd == '=' || *cmd == ':') {
+        cmd++;
+    }
+    if (*cmd < '0' || *cmd > '9') {
+        return false;
+    }
+    while (*cmd >= '0' && *cmd <= '9') {
+        acc = (acc * 10u) + (uint32_t)(*cmd - '0');
+        if (acc > 65535u) {
+            return false;
+        }
+        cmd++;
+    }
+    while (*cmd == ' ') {
+        cmd++;
+    }
+    if (*cmd != '\0') {
+        return false;
+    }
+    value = (uint16_t)acc;
+    return true;
+}
+
 static void requestCalibrationFromUsb()
 {
     const bool sent = requestPsocCalibration("USB");
@@ -1380,6 +1417,156 @@ static void requestBlinkFromUsb()
     psoc.blinkLed();
     SLAVE_LOG_PRINTF("[USB] blink -> PSoC CMD 0x%02X\n", PSOC_CMD_BLINK_LED);
     LOGM("USB_CMD", "cmd=blink,ok=1,sub=0x%02X", PSOC_CMD_BLINK_LED);
+}
+
+static void requestProbeFromUsb()
+{
+    g_psocConnected = psoc.probe(400);
+    SLAVE_LOG_PRINTF("[USB] probe psoc=%u\n", (unsigned)g_psocConnected);
+    logPsocUartDiag("USB_PROBE");
+    LOGM("USB_CMD", "cmd=probe,ok=%u", (unsigned)g_psocConnected);
+}
+
+static void requestStatusFromUsb()
+{
+    psoc.requestStatus();
+    delay(40);
+    psoc.poll();
+    servicePsocConfigAck();
+    logPsocUartDiag("USB_STATUS");
+    LOGM("USB_CMD", "cmd=status,ok=1");
+}
+
+static void requestStreamFromUsb(uint16_t mode)
+{
+    const uint8_t streamMode = (mode != 0u) ? 1u : 0u;
+    psoc.selectStream(streamMode);
+    SLAVE_LOG_PRINTF("[USB] stream %u -> PSoC CMD 0x%02X\n",
+                     (unsigned)streamMode, PSOC_CMD_SELECT_STREAM);
+    LOGM("USB_CMD", "cmd=stream,mode=%u", (unsigned)streamMode);
+}
+
+static void requestDebugPsocFromUsb(uint16_t enable)
+{
+    psoc.debugRamp(enable != 0u);
+    SLAVE_LOG_PRINTF("[USB] debugpsoc %u -> PSoC CMD 0x%02X\n",
+                     (unsigned)(enable != 0u), PSOC_CMD_DEBUG);
+    LOGM("USB_CMD", "cmd=debugpsoc,en=%u", (unsigned)(enable != 0u));
+}
+
+static void requestPrestartFromUsb(uint16_t n)
+{
+    if (captureOrDumpBusy()) {
+        SLAVE_LOG_PRINTF("[USB] pre ignored: busy state=%d fill=%u/%u\n",
+                         (int)g_state, (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+        return;
+    }
+    enterHotWait(n);
+    g_view_store_active = false;
+    g_start_store_active = false;
+    SLAVE_LOG_PRINTF("[USB] pre n=%u state=%d ready=%u\n",
+                     (unsigned)g_rec_n_batches, (int)g_state,
+                     (unsigned)storeReadyForHotWait());
+    LOGM("USB_CMD", "cmd=pre,n=%u,ready=%u",
+         (unsigned)g_rec_n_batches, (unsigned)storeReadyForHotWait());
+}
+
+static void requestUsbStartFromHotWait()
+{
+    if (g_state != HOT_WAIT || !storeReadyForHotWait()) {
+        SLAVE_LOG_PRINTF("[USB] sync ignored state=%d ready=%u\n",
+                         (int)g_state, (unsigned)storeReadyForHotWait());
+        return;
+    }
+    uint32_t nowUs = (uint32_t)micros();
+    int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
+    digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+    int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
+    g_t_start_us = (uint64_t)nowUs;
+    g_store_fill = 0;
+    g_debug_count = 0;
+    g_debug_last_us = nowUs;
+    g_sampling_start_ms = millis();
+    g_sampling_start_psoc_bytes = psoc.bytesRx();
+    g_sampling_start_batches_ok = psoc.batchesOK();
+    g_view_store_active = false;
+    g_start_store_active = (g_rec_n_batches > 0 && g_store_buf != nullptr);
+    g_start_fallback_sent = false;
+    g_state = SAMPLING;
+    SLAVE_LOG_PRINTF("[USB] sync start n=%u sync=%d->%d bytes=%lu\n",
+                     (unsigned)g_rec_n_batches, syncBefore, syncAfter,
+                     (unsigned long)g_sampling_start_psoc_bytes);
+    LOGM("USB_CMD", "cmd=sync,n=%u,syncBefore=%d,syncAfter=%d",
+         (unsigned)g_rec_n_batches, syncBefore, syncAfter);
+}
+
+static void requestStartNowFromUsb(uint16_t n)
+{
+    uint32_t nowUs;
+    n = clampPsocCaptureBatches(n);
+    if (captureOrDumpBusy()) {
+        SLAVE_LOG_PRINTF("[USB] startnow ignored: busy state=%d fill=%u/%u\n",
+                         (int)g_state, (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+        return;
+    }
+    allocStore(n);
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    g_view_store_active = false;
+    g_start_store_active = (g_rec_n_batches > 0 && g_store_buf != nullptr);
+    g_start_fallback_sent = false;
+    g_store_fill = 0;
+    nowUs = (uint32_t)micros();
+    g_t_start_us = (uint64_t)nowUs;
+    g_debug_count = 0;
+    g_debug_last_us = nowUs;
+    g_sampling_start_ms = millis();
+    g_sampling_start_psoc_bytes = psoc.bytesRx();
+    g_sampling_start_batches_ok = psoc.batchesOK();
+    g_state = SAMPLING;
+    psoc.setN(g_rec_n_batches);
+    psoc.startNow();
+    SLAVE_LOG_PRINTF("[USB] startnow n=%u bytes=%lu store=%u\n",
+                     (unsigned)g_rec_n_batches,
+                     (unsigned long)g_sampling_start_psoc_bytes,
+                     (unsigned)g_start_store_active);
+    LOGM("USB_CMD", "cmd=startnow,n=%u,store=%u",
+         (unsigned)g_rec_n_batches, (unsigned)g_start_store_active);
+}
+
+static void requestCaptureFromUsb(uint16_t n)
+{
+    requestPrestartFromUsb(n);
+    requestUsbStartFromHotWait();
+}
+
+static void requestStopFromUsb()
+{
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    g_debug_mode = false;
+    debugEspSetRamp(false);
+    psoc.debugRamp(false);
+    g_view_store_active = false;
+    g_start_store_active = false;
+    g_start_fallback_sent = false;
+    g_view_remaining = 0;
+    allocStore(0);
+    g_state = STOPPED;
+    SLAVE_LOG_PRINTLN("[USB] stop");
+    LOGM("USB_CMD", "cmd=stop,ok=1");
+}
+
+static void requestClearFromUsb()
+{
+    g_view_store_active = false;
+    g_start_store_active = false;
+    g_start_fallback_sent = false;
+    g_view_remaining = 0;
+    allocStore(0);
+    if (g_state != SAMPLING && g_state != HOT_WAIT) {
+        g_state = STOPPED;
+    }
+    SLAVE_LOG_PRINTLN("[USB] clear");
+    LOGM("USB_CMD", "cmd=clear,ok=1");
 }
 
 static bool requestPsocGainFromUsb(uint8_t subCmd, uint8_t param, const char *name)
@@ -1414,10 +1601,36 @@ static bool requestPsocGainFromUsb(uint8_t subCmd, uint8_t param, const char *na
 static void handleUsbCommand(const char *cmd)
 {
     uint8_t value = 0u;
+    uint16_t value16 = 0u;
     if (cmd[0] == '\0') {
         return;
     }
-    if (usbCommandEquals(cmd, "c") ||
+    if (usbCommandEquals(cmd, "probe")) {
+        requestProbeFromUsb();
+    } else if (usbCommandEquals(cmd, "status") || usbCommandEquals(cmd, "s")) {
+        requestStatusFromUsb();
+    } else if (usbParseU16Param(cmd, "stream", value16)) {
+        requestStreamFromUsb(value16);
+    } else if (usbParseU16Param(cmd, "debugpsoc", value16) ||
+               usbParseU16Param(cmd, "dpsoc", value16)) {
+        requestDebugPsocFromUsb(value16);
+    } else if (usbParseU16Param(cmd, "pre", value16) ||
+               usbParseU16Param(cmd, "prestart", value16)) {
+        requestPrestartFromUsb(value16);
+    } else if (usbCommandEquals(cmd, "sync") || usbCommandEquals(cmd, "go")) {
+        requestUsbStartFromHotWait();
+    } else if (usbParseU16Param(cmd, "startnow", value16) ||
+               usbParseU16Param(cmd, "now", value16)) {
+        requestStartNowFromUsb(value16);
+    } else if (usbParseU16Param(cmd, "cap", value16) ||
+               usbParseU16Param(cmd, "capture", value16) ||
+               usbParseU16Param(cmd, "start", value16)) {
+        requestCaptureFromUsb(value16);
+    } else if (usbCommandEquals(cmd, "clear") || usbCommandEquals(cmd, "flush")) {
+        requestClearFromUsb();
+    } else if (usbCommandEquals(cmd, "stop")) {
+        requestStopFromUsb();
+    } else if (usbCommandEquals(cmd, "c") ||
         usbCommandEquals(cmd, "cal") ||
         usbCommandEquals(cmd, "calibrate")) {
         requestCalibrationFromUsb();
@@ -1434,17 +1647,17 @@ static void handleUsbCommand(const char *cmd)
     } else if (usbParseGainParam(cmd, "pgavdac", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
-        SLAVE_LOG_PRINTF("[USB] commands: cal, adc, blink, pga N, pgavdac N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N\n");
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
-        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: cal, adc, blink, pga N, pgavdac N)\n", cmd);
+        SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: help)\n", cmd);
         LOGM("USB_CMD", "cmd=unknown,ok=0,text=%s", cmd);
     }
 }
 
 static void serviceUsbCommands()
 {
-    static char line[16];
+    static char line[32];
     static uint8_t pos = 0;
 
     while (Serial.available() > 0) {
