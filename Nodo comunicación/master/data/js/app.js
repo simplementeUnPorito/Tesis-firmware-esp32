@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-10';
-import { WsClient } from './ws_client.js?v=field-study-10';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-10';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-10';
-import { PlotArea } from './plot.js?v=field-study-10';
-import { SpectrumArea } from './spectrum.js?v=field-study-10';
-import { SlavePanel } from './slave_panel.js?v=field-study-10';
-import { compileFirCmd, dcRemove, filtFilt, lastFirError } from './signal_proc.js?v=field-study-10';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-10';
+import * as cfg from './config.js?v=field-study-17';
+import { WsClient } from './ws_client.js?v=field-study-17';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-17';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-17';
+import { PlotArea } from './plot.js?v=field-study-17';
+import { SpectrumArea } from './spectrum.js?v=field-study-17';
+import { SlavePanel } from './slave_panel.js?v=field-study-17';
+import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-17';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-17';
 
 const $ = (id) => document.getElementById(id);
 
@@ -21,6 +21,7 @@ const spectrumArea = new SpectrumArea($('spectra'));
 const slavePanels = new Array(cfg.MAX_NODES).fill(null);
 const macPartial = new Map();
 const pgaLockTimers = new Map();
+const adcConfigLockTimers = new Map();
 const testTimers = new Map();
 const preservedCaptures = [];
 const PRESERVE_COLORS = [
@@ -35,12 +36,13 @@ const PRESERVE_COLORS = [
 let masterState = 0;
 let activeSlaveCount = 0;
 let preserveSeq = 0;
+let currentCaptureSignature = '';
 let pendingStart = null;
 
 const START_AUTO_ARM_TIMEOUT_MS = 4500;
 
 const SETTINGS_PREFIX = 'geophone_scope_web.';
-const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz_v2`;
+const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz_v3`;
 const SHOW_RAW_KEY = `${SETTINGS_PREFIX}show_raw`;
 const SHOW_FILT_KEY = `${SETTINGS_PREFIX}show_filt`;
 const SHOW_ENV_RAW_KEY = `${SETTINGS_PREFIX}show_env_raw`;
@@ -48,6 +50,13 @@ const SHOW_ENV_FILT_KEY = `${SETTINGS_PREFIX}show_env_filt`;
 const SHOW_HILBERT_KEY = `${SETTINGS_PREFIX}show_hilbert`;
 const DISPLAY_DC_REMOVE_KEY = `${SETTINGS_PREFIX}display_dc_remove`;
 const WS_TOKEN_KEY  = `${SETTINGS_PREFIX}ws_token`;
+
+const CURVE_SOURCE_DEFS = [
+  { key: 'raw', checkboxId: 'chk-show-raw', label: 'Cruda', color: cfg.RAW_COLOR },
+  { key: 'filt', checkboxId: 'chk-show-filt', label: 'Filtrada', color: cfg.FILT_COLOR },
+  { key: 'envRaw', checkboxId: 'chk-show-env-raw', label: 'Env cruda', color: cfg.ENV_RAW_COLOR },
+  { key: 'envFilt', checkboxId: 'chk-show-env-filt', label: 'Env filtrada', color: cfg.ENV_FILT_COLOR },
+];
 
 function clamp(value, lo, hi) {
   return Math.max(lo, Math.min(hi, value));
@@ -198,6 +207,17 @@ function gainValue(code) {
   return (code >= 0 && code < cfg.GAIN_CODES.length) ? cfg.GAIN_CODES[code] : null;
 }
 
+function adcConfigForCode(code) {
+  return cfg.ADC_CONFIGS.find((item) => item.code === code) || cfg.ADC_CONFIGS[0];
+}
+
+function applyNodeAdcConfig(nd, code) {
+  const adcCfg = adcConfigForCode(code);
+  nd.adcConfigCode = adcCfg.code;
+  nd.countsPerVolt = adcCfg.countsPerVolt;
+  return adcCfg;
+}
+
 function emptyCalVdacs() {
   return Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
 }
@@ -271,6 +291,12 @@ function displayDcRemoveEnabled() {
   return !cb || cb.checked;
 }
 
+function clampLineNotchHarm(value) {
+  const v = parseInt(value, 10);
+  if (!Number.isFinite(v)) return cfg.LINE_NOTCH_DEFAULT_HARM;
+  return Math.min(cfg.LINE_NOTCH_MAX_HARM, Math.max(1, v));
+}
+
 function transformSignalForView(arr, options = {}) {
   if (!arr || !arr.length) return arr || null;
   const removeDc = !!options.removeDc && arr.length > 1;
@@ -281,6 +307,36 @@ function transformSignalForView(arr, options = {}) {
   const sign = invert ? -1 : 1;
   const out = new Float64Array(arr.length);
   for (let i = 0; i < arr.length; i++) out[i] = (arr[i] - mean) * sign + yOffsetV;
+  return out;
+}
+
+function envelopeForSpectrum(src) {
+  if (!src || src.length < 2) return null;
+  let mean = 0;
+  for (let i = 0; i < src.length; i++) mean += src[i];
+  mean /= src.length;
+  const centered = new Float64Array(src.length);
+  for (let i = 0; i < src.length; i++) centered[i] = src[i] - mean;
+  return hilbertEnvelope(centered);
+}
+
+function selectedCurveSourceDefs() {
+  return CURVE_SOURCE_DEFS.filter((def) => {
+    const cb = $(def.checkboxId);
+    return cb && cb.checked;
+  });
+}
+
+function buildSpectrumSources(raw, filt) {
+  const out = [];
+  for (const def of selectedCurveSourceDefs()) {
+    let data = null;
+    if (def.key === 'raw') data = raw;
+    else if (def.key === 'filt') data = filt;
+    else if (def.key === 'envRaw') data = envelopeForSpectrum(raw);
+    else if (def.key === 'envFilt') data = envelopeForSpectrum(filt);
+    if (data && data.length) out.push({ key: def.key, label: def.label, color: def.color, data });
+  }
   return out;
 }
 
@@ -308,7 +364,7 @@ function offsetFromHammer(nd) {
 
 function nodeSnapshot(nd, index, options = {}) {
   const rawOrig = nd.rawBuf.toArray();
-  const filtOrig = filteredArrayForNode(nd, rawOrig);
+  const filtOrig = filteredArrayForSnapshot(index, rawOrig);
   const storeDcRemoved = !!options.storeDcRemoved;
   const rawDc = signalMean(rawOrig);
   const filtDc = signalMean(filtOrig);
@@ -339,6 +395,10 @@ function nodeSnapshot(nd, index, options = {}) {
     total_samples: nd.totalSamples,
     pga_code: nd.pgaCode,
     pga_gain: gainValue(nd.pgaCode),
+    adc_config: nd.adcConfigCode,
+    adc_config_label: adcConfigForCode(nd.adcConfigCode).label,
+    adc_range_v: adcConfigForCode(nd.adcConfigCode).rangeV,
+    adc_counts_per_volt: nd.countsPerVolt || cfg.ADC_COUNTS_PER_VOLT,
     vdac_byte: nd.vdacByte,
     cal_vdacs: Array.isArray(nd.calVdacs) ? nd.calVdacs.slice() : [],
     cal_vdac_details: cloneCalVdacDetails(nd.calVdacDetails),
@@ -357,6 +417,8 @@ function nodeSnapshot(nd, index, options = {}) {
     filt_trim_samples: 0,
     dc_remove: !!nd.dcRemove,
     dc_removed_on_preserve: storeDcRemoved,
+    notch_enabled: !!nd.notchEnabled,
+    notch_harm: nd.notchHarm | 0,
     raw_dc_v: rawDc,
     filt_dc_v: filtDc,
     invert_signal: !!nd.invertSignal,
@@ -380,6 +442,11 @@ function captureSampleCount(capture, signal = 'raw') {
 
 function captureHasSamples(capture) {
   return captureSampleCount(capture, 'raw') > 0 || captureSampleCount(capture, 'filt') > 0;
+}
+
+function findPreservedCaptureIndexBySignature(signature) {
+  if (!signature) return -1;
+  return preservedCaptures.findIndex((capture) => capture.signature === signature);
 }
 
 function captureSignature(nodes) {
@@ -425,6 +492,7 @@ function makeCaptureSnapshot(label, options = {}) {
     sample_offset: Number.isFinite(options.sampleOffset) ? Math.round(options.sampleOffset) : 0,
     y_offset_mv: Number.isFinite(options.yOffsetMv) ? options.yOffsetMv : 0,
     dc_removed_on_preserve: storeDcRemoved,
+    notch_f0: cfg.LINE_NOTCH_F0,
     color: options.color || PRESERVE_COLORS[Math.max(0, order - 1) % PRESERVE_COLORS.length],
     fs,
     n_slaves: visibleSlaveCount(),
@@ -557,11 +625,22 @@ function setAllPreservedVisible(visible) {
 
 function clearPreservedCaptures() {
   preservedCaptures.length = 0;
+  currentCaptureSignature = '';
   renderPreservedList();
   refreshSlavePresentationOrder();
 }
 
-function onPreserveRequested() {
+function clearLiveCapture() {
+  data.clearAll();
+  plotArea.clearAll();
+  spectrumArea.clearAll();
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    renderNodeRow(i);
+    updateSlavePanelStats(i);
+  }
+}
+
+function preserveCurrentCapture(reason = 'captura completa') {
   const nextOrder = preserveSeq + 1;
   const capture = makeCaptureSnapshot(`Start ${nextOrder}`, {
     source: 'preserved',
@@ -570,14 +649,48 @@ function onPreserveRequested() {
     storeDcRemoved: displayDcRemoveEnabled(),
   });
   if (!captureHasSamples(capture)) {
-    appendLog('Preservar cancelado: no hay muestras en el buffer actual');
-    return;
+    currentCaptureSignature = '';
+    return null;
   }
+  const duplicateIdx = findPreservedCaptureIndexBySignature(capture.signature);
+  if (duplicateIdx >= 0) {
+    currentCaptureSignature = capture.signature;
+    return preservedCaptures[duplicateIdx];
+  }
+
   preserveSeq = nextOrder;
+  currentCaptureSignature = capture.signature;
   preservedCaptures.push(capture);
   renderPreservedList();
   refreshSlavePresentationOrder();
-  appendLog(`Preservado ${capture.label}: ${capture.raw_count} muestras raw`);
+  appendLog(`Guardado automatico ${capture.label} (${reason}): ${capture.raw_count} muestras raw`);
+  return capture;
+}
+
+function onDiscountRequested() {
+  const liveCapture = makeCaptureSnapshot('Actual', {
+    source: 'live',
+    visible: false,
+    storeDcRemoved: displayDcRemoveEnabled(),
+  });
+  const liveHasSamples = captureHasSamples(liveCapture);
+  const signature = currentCaptureSignature || (liveHasSamples ? liveCapture.signature : '');
+  const idx = findPreservedCaptureIndexBySignature(signature);
+
+  if (idx >= 0) {
+    const [removed] = preservedCaptures.splice(idx, 1);
+    appendLog(`Descontado ${removed.label}: muestra borrada`);
+  } else if (liveHasSamples) {
+    appendLog('Descontado: buffer actual borrado');
+  } else {
+    appendLog('Descontar: no hay muestra actual para borrar');
+    return;
+  }
+
+  currentCaptureSignature = '';
+  clearLiveCapture();
+  renderPreservedList();
+  refreshSlavePresentationOrder();
 }
 
 function captureSeconds() {
@@ -629,6 +742,21 @@ function updateCapturePreview() {
   const info = captureLimitInfo(secs);
   const capped = info.capped ? ` (max; pedido ${secs.toFixed(2)} s)` : '';
   el.textContent = `${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}`;
+}
+
+function setCaptureToMaxBatches() {
+  const fs = currentFsHz();
+  if (!fs) {
+    appendLog('Max paquetes cancelado: esperando Fs del esclavo');
+    return;
+  }
+  const secs = (cfg.PSOC_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fs;
+  const roundedUp = Math.ceil(secs * 100) / 100;
+  const el = $('capture-secs');
+  if (el) el.value = roundedUp.toFixed(2);
+  updateCapturePreview();
+  syncDisplayWindowToCaptureDuration();
+  appendLog(`Duracion fijada al maximo: ${cfg.PSOC_CAPTURE_MAX_BATCHES} lotes (~${secs.toFixed(2)} s)`);
 }
 
 function syncDisplayWindowToCaptureDuration() {
@@ -828,6 +956,7 @@ function makeStartRequestInfo() {
 
 function runStartCapture(req, source = '') {
   clearPendingStart();
+  currentCaptureSignature = '';
   data.clearAll();
   plotArea.clearAll();
   spectrumArea.clearAll();
@@ -971,9 +1100,11 @@ function applyDisplayWindow() {
 function syncDataBufferForFs() {
   const fs = currentFsHz();
   if (!fs) return;   // wait for the real Fs — never size buffers off a guess
+  const maxCaptureSamples = cfg.PSOC_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH;
   const maxSamples = Math.max(
     cfg.SAMPLES_PER_BATCH,
     Math.round(cfg.MAX_BUF_S * fs),
+    maxCaptureSamples,
   );
   data.resizeAll(maxSamples);
 }
@@ -990,6 +1121,8 @@ function renderNodeRow(i) {
   row.querySelector('.stats').textContent = `${nd.batchCount} lotes / ${nd.totalSamples} muestras`;
   row.querySelector('.cfg').textContent =
     `pga=${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}` +
+    ` adc=${adcConfigForCode(nd.adcConfigCode).label}` +
+    (nd.notchEnabled ? ` notch=N${nd.notchHarm}` : '') +
     (nd.psocOk === null ? '' : ` psoc=${nd.psocOk ? 'ok' : 'no'}`);
 }
 
@@ -1009,12 +1142,12 @@ function updateSlavePanelStats(chIndex) {
   panel.setVdacs(nd.calVdacs, nd.hwClass, nd.vdacByte, nd.calVdacDetails);
 }
 
-function adcCountsToVolts(counts) {
-  return counts / cfg.ADC_COUNTS_PER_VOLT;
+function adcCountsToVolts(counts, nd) {
+  return counts / (nd?.countsPerVolt || cfg.ADC_COUNTS_PER_VOLT);
 }
 
 function handleData(nd, pkt) {
-  const rawVal = adcCountsToVolts(pkt.value24);
+  const rawVal = adcCountsToVolts(pkt.value24, nd);
 
   if (!nd.gotFirst) {
     nd.gotFirst = true;
@@ -1026,8 +1159,12 @@ function handleData(nd, pkt) {
   nd.totalSamples++;
   if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
 
-  // Filtered signal is computed via filtFilt (zero-phase) at render time from rawBuf.
-  // No per-sample causal filtering here — that would introduce group delay.
+  // The filtered signal is a full-capture product: keep it blank/dirty while
+  // raw is still arriving so FIR/filtFilt and harmonic LS see the whole signal.
+  nd.captureActive = true;
+  nd.filterDirty = true;
+  nd.filterReady = false;
+  if (nd.filtBuf.length) nd.filtBuf.clear();
 }
 
 function fillRingBuffer(ring, arr) {
@@ -1040,28 +1177,92 @@ function filteredArrayForNode(nd, rawArray = null) {
   if (!raw.length) return new Float64Array(0);
   let arr = nd.filtB ? filtFilt(nd.filtB, raw) : new Float64Array(raw);
   if (nd.dcRemove && arr.length > 1) arr = dcRemove(arr);
+  // Cancelación de ruido de línea: LS de armónicos de 50 Hz sobre la ventana
+  // completa, y(n)−f(n). Último paso de la cadena (FIR → DC → notch), igual
+  // que el scope Python; queda también en snapshots/export, flageado en
+  // metadata como notch_enabled/notch_harm.
+  if (nd.notchEnabled && arr.length > 1) {
+    const fs = nd.fs > 0 ? nd.fs : currentFsHz();
+    arr = harmonicNotch(arr, fs, cfg.LINE_NOTCH_F0, nd.notchHarm, cfg.LINE_NOTCH_SEARCH_HZ);
+  }
   return arr;
 }
 
+function storedFilteredArray(nd) {
+  return nd && nd.filtBuf.length ? nd.filtBuf.toArray() : new Float64Array(0);
+}
+
+function filteredArrayForSnapshot(chIndex, rawArray = null) {
+  const nd = data.nodes[chIndex];
+  if (!nd) return new Float64Array(0);
+  if (nd.filterDirty && !nd.captureActive) {
+    reprocessFiltBuf(chIndex, { force: true, log: false });
+  }
+  return storedFilteredArray(nd);
+}
+
 function syncZeroPhaseFiltBuffers() {
-  for (const nd of data.nodes) {
-    fillRingBuffer(nd.filtBuf, filteredArrayForNode(nd));
-    nd.filtZi = null;
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (!data.nodes[i].captureActive) reprocessFiltBuf(i, { force: true, log: false });
   }
 }
 
-function reprocessFiltBuf(chIndex) {
+function reprocessFiltBuf(chIndex, options = {}) {
   const nd = data.nodes[chIndex];
   const raw = nd.rawBuf.toArray();
   if (!raw.length) {
     nd.filtBuf.clear();
     nd.filtZi = null;
+    nd.filterDirty = false;
+    nd.filterReady = false;
+    return;
+  }
+
+  if (nd.captureActive && !options.force) {
+    nd.filtBuf.clear();
+    nd.filtZi = null;
+    nd.filterDirty = true;
+    nd.filterReady = false;
     return;
   }
 
   const arr = filteredArrayForNode(nd, raw);
   nd.filtZi = null;
   fillRingBuffer(nd.filtBuf, arr);
+  nd.filterDirty = false;
+  nd.filterReady = true;
+}
+
+function finalizeNodeFilter(chIndex, reason = '') {
+  const nd = data.nodes[chIndex];
+  if (!nd || !nd.rawBuf.length) return false;
+  nd.captureActive = false;
+  reprocessFiltBuf(chIndex, { force: true });
+  const panel = panelFor(chIndex);
+  if (panel && nd.filtB && nd.filtCmd && nd.filterReady) panel.setFirStatus(`${nd.filtB.length} taps ${nd.filtCmd}`);
+  return nd.filterReady;
+}
+
+function finalizeCompletedRaw(reason = '') {
+  let count = 0;
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    const nd = data.nodes[i];
+    if (!nd.rawBuf.length || (!nd.filterDirty && nd.filterReady)) continue;
+    if (finalizeNodeFilter(i, reason)) count++;
+  }
+  if (count) {
+    appendLog(`Filtrado final (${reason || 'captura completa'}): ${count} nodo(s)`);
+    preserveCurrentCapture(reason || 'captura completa');
+  }
+}
+
+function markNodeFilterDirty(chIndex) {
+  const nd = data.nodes[chIndex];
+  if (!nd) return;
+  nd.filterDirty = nd.rawBuf.length > 0;
+  nd.filterReady = false;
+  nd.filtBuf.clear();
+  if (!nd.captureActive) reprocessFiltBuf(chIndex, { force: true });
 }
 
 function recompileNodeFirForFs(chIndex) {
@@ -1161,6 +1362,21 @@ function schedulePgaLockTimeout(chIndex, expectedCode) {
   pgaLockTimers.set(chIndex, timer);
 }
 
+function scheduleAdcConfigLockTimeout(chIndex, expectedCode) {
+  if (adcConfigLockTimers.has(chIndex)) clearTimeout(adcConfigLockTimers.get(chIndex));
+  const timer = setTimeout(() => {
+    adcConfigLockTimers.delete(chIndex);
+    const nd = data.nodes[chIndex];
+    const pending = nd.pending.get(cfg.SUBCMD_ADC_CONFIG);
+    if (!pending || pending.param !== expectedCode) return;
+    nd.pending.delete(cfg.SUBCMD_ADC_CONFIG);
+    const panel = panelFor(chIndex);
+    if (panel) panel.setAdcConfigLock(2);
+    appendLog(`S${chIndex} rango ADC sin confirmacion: ${adcConfigForCode(expectedCode).label}`);
+  }, Math.round(cfg.RETRY_SEC * 1000));
+  adcConfigLockTimers.set(chIndex, timer);
+}
+
 function prepareNodeCapture(chIndex) {
   const nd = data.nodes[chIndex];
   nd.clear();
@@ -1181,6 +1397,22 @@ function onPgaChanged(chIndex, pgaCode) {
   sendDirected(chIndex, cfg.SUBCMD_PGA, nd.pgaCode);
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
   appendLog(`S${chIndex} PGA -> ${cfg.GAIN_NAMES[nd.pgaCode]}`);
+}
+
+function onAdcConfigChanged(chIndex, adcCode) {
+  const nd = data.nodes[chIndex];
+  const adcCfg = applyNodeAdcConfig(nd, adcCode);
+  nd.pending.set(cfg.SUBCMD_ADC_CONFIG, { param: adcCfg.code, sendTime: performance.now(), retries: 0 });
+  saveSlaveSetting(chIndex, 'adc_config_code', adcCfg.code);
+  const panel = panelFor(chIndex);
+  if (panel) {
+    panel.setAdcConfig(adcCfg.code);
+    panel.setAdcConfigLock(2);
+  }
+  sendDirected(chIndex, cfg.SUBCMD_ADC_CONFIG, adcCfg.code);
+  scheduleAdcConfigLockTimeout(chIndex, adcCfg.code);
+  renderNodeRow(chIndex);
+  appendLog(`S${chIndex} rango ADC -> ${adcCfg.label}`);
 }
 
 function onVerRequested(chIndex) {
@@ -1233,12 +1465,16 @@ function onSendAll(chIndex) {
   const nd = data.nodes[chIndex];
   sendDirected(chIndex, cfg.SUBCMD_PGA, nd.pgaCode);
   nd.pending.set(cfg.SUBCMD_PGA, { param: nd.pgaCode, sendTime: performance.now(), retries: 0 });
+  sendDirected(chIndex, cfg.SUBCMD_ADC_CONFIG, nd.adcConfigCode);
+  nd.pending.set(cfg.SUBCMD_ADC_CONFIG, { param: nd.adcConfigCode, sendTime: performance.now(), retries: 0 });
   const panel = panelFor(chIndex);
   if (panel) {
     panel.setPgaLock(2);
+    panel.setAdcConfigLock(2);
   }
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
-  appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}`);
+  scheduleAdcConfigLockTimeout(chIndex, nd.adcConfigCode);
+  appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}, ADC ${adcConfigForCode(nd.adcConfigCode).label}`);
 }
 
 function onCalibrateRequested(chIndex) {
@@ -1363,14 +1599,26 @@ function onDcRemoveToggled(chIndex, enabled) {
   saveSlaveSetting(chIndex, 'dc_remove', nd.dcRemove ? 1 : 0);
 }
 
+function onLineNotchChanged(chIndex, enabled, nHarm) {
+  const nd = data.nodes[chIndex];
+  nd.notchEnabled = !!enabled;
+  nd.notchHarm = clampLineNotchHarm(nHarm);
+  markNodeFilterDirty(chIndex);
+  saveSlaveSetting(chIndex, 'notch_enabled', nd.notchEnabled ? 1 : 0);
+  saveSlaveSetting(chIndex, 'notch_harm', nd.notchHarm);
+  appendLog(`S${chIndex} ruido linea ${nd.notchEnabled ? 'ON' : 'OFF'} N=${nd.notchHarm}`);
+}
+
 function loadSlavePanelState(chIndex, panel) {
   const nd = data.nodes[chIndex];
   clearSlaveSetting(chIndex, 'alias');
 
   nd.pgaCode = loadSlaveInt(chIndex, 'pga_code', nd.pgaCode, 0, cfg.GAIN_CODES.length - 1);
+  applyNodeAdcConfig(nd, loadSlaveInt(chIndex, 'adc_config_code', nd.adcConfigCode, 1, 2));
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
 
   panel.setPga(nd.pgaCode);
+  panel.setAdcConfig(nd.adcConfigCode);
   nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
   if (nd.alias === 'Hammer') {
     nd.hammerOffset = 0;
@@ -1392,14 +1640,25 @@ function loadSlavePanelState(chIndex, panel) {
     nd.filtCmd = firCmd;
     recompileNodeFirForFs(chIndex);
   }
+  const legacyNotchEnabled = loadBoolSetting(`${SETTINGS_PREFIX}line_notch_on`, false);
+  const legacyNotchHarm = clampLineNotchHarm(loadSetting(`${SETTINGS_PREFIX}line_notch_n`) ?? cfg.LINE_NOTCH_DEFAULT_HARM);
+  nd.notchEnabled = loadSlaveBool(chIndex, 'notch_enabled', legacyNotchEnabled);
+  nd.notchHarm = loadSlaveInt(chIndex, 'notch_harm', legacyNotchHarm, 1, cfg.LINE_NOTCH_MAX_HARM);
+  panel.setLineNotch(nd.notchEnabled, nd.notchHarm);
   panel.updateStats(0, 0, null, nd.formatDriftStats(), nd.formatLatencyStats(), nd.psocOk);
 }
 
 function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('pga-changed', (ev) => onPgaChanged(chIndex, ev.detail));
+  panel.addEventListener('adc-config-changed', (ev) => onAdcConfigChanged(chIndex, ev.detail.code));
   panel.addEventListener('fir-apply', (ev) => onFirApply(chIndex, ev.detail.cmd));
   panel.addEventListener('fir-remove', () => onFirRemove(chIndex));
   panel.addEventListener('dc-remove-toggled', (ev) => onDcRemoveToggled(chIndex, !!ev.detail.enabled));
+  panel.addEventListener('line-notch-changed', (ev) => onLineNotchChanged(
+    chIndex,
+    !!ev.detail.enabled,
+    ev.detail.nHarm,
+  ));
   panel.addEventListener('test-requested', () => onTestRequested(chIndex));
   panel.addEventListener('ver-requested', () => onVerRequested(chIndex));
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
@@ -1540,6 +1799,30 @@ function handleAck(pkt, idx) {
     }
     const expected = pending ? pending.param : data.nodes[idx].pgaCode;
     appendLog(`S${idx} PGA ${ackVal ? 'confirmado' : 'sin lock'}: ${cfg.GAIN_NAMES[expected] ?? expected}`);
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_ADC_CONFIG && idx >= 1 && idx < cfg.MAX_NODES) {
+    const nd = data.nodes[idx];
+    const panel = panelFor(idx);
+    const expected = pending ? pending.param : nd.adcConfigCode;
+    if (adcConfigLockTimers.has(idx)) {
+      clearTimeout(adcConfigLockTimers.get(idx));
+      adcConfigLockTimers.delete(idx);
+    }
+    if (ackVal) {
+      const adcCfg = applyNodeAdcConfig(nd, expected);
+      saveSlaveSetting(idx, 'adc_config_code', adcCfg.code);
+      if (panel) {
+        panel.setAdcConfig(adcCfg.code);
+        panel.setAdcConfigLock(1);
+      }
+      renderNodeRow(idx);
+      appendLog(`S${idx} rango ADC confirmado: ${adcCfg.label}`);
+    } else {
+      if (panel) panel.setAdcConfigLock(2);
+      appendLog(`S${idx} rango ADC sin lock: ${adcConfigForCode(expected).label}`);
+    }
     return;
   }
 
@@ -1711,7 +1994,7 @@ function renderTick() {
   const fs = displayFsHz();
   const removeDc = displayDcRemoveEnabled();
   const rawBufsOrig = data.nodes.map((nd) => (nd.rawBuf.length ? nd.rawBuf.toArray() : null));
-  const filtBufs = data.nodes.map((nd, i) => (rawBufsOrig[i] ? filteredArrayForNode(nd, rawBufsOrig[i]) : null));
+  const filtBufs = data.nodes.map((nd) => (nd.filtBuf.length ? nd.filtBuf.toArray() : null));
   // filtFilt is zero-phase — no group-delay trim needed.
   const filtTrims = data.nodes.map(() => 0);
   updateWaveVelocityLabel(fs);
@@ -1728,7 +2011,16 @@ function renderTick() {
   });
 
   plotArea.update(rawBufsDisplay, filtBufsDisplay, fs, filtTrims, overlays);
-  if (!$('spectra').hidden) spectrumArea.update(rawBufsDisplay, fs, overlays);
+  if (!$('spectra').hidden) {
+    const spectrumSources = rawBufsDisplay.map((raw, i) => buildSpectrumSources(raw, filtBufsDisplay[i]));
+    const spectrumOverlays = overlays.map((capture) => ({
+      ...capture,
+      nodes: (capture.nodes || []).map((node) => (
+        node ? { ...node, spectrumSources: buildSpectrumSources(node.raw, node.filt) } : node
+      )),
+    }));
+    spectrumArea.update(spectrumSources, fs, spectrumOverlays);
+  }
 
   updateGlobalFsDisplay();
   for (const i of orderedSlaveIndices(true)) {
@@ -1852,8 +2144,15 @@ ws.addEventListener('packet', (ev) => {
     nd.pgaCode = pkt.hbPga;
     nd.vdacByte = pkt.hbVdac;
     if (idx === 0) {
+      const prevState = masterState;
       masterState = pkt.hbMasterState;
       setMasterState(masterState);
+      if (prevState === cfg.MASTER_STATE_DUMPING && masterState !== cfg.MASTER_STATE_DUMPING) {
+        finalizeCompletedRaw('dump completo');
+      } else if (prevState === cfg.MASTER_STATE_RUNNING &&
+                 ![cfg.MASTER_STATE_RUNNING, cfg.MASTER_STATE_STOPPING, cfg.MASTER_STATE_DUMPING].includes(masterState)) {
+        finalizeCompletedRaw('stream detenido');
+      }
     } else {
       const panel = panelFor(idx);
       if (panel) {
@@ -1929,7 +2228,7 @@ $('btn-start').addEventListener('click', () => {
   queueStartAfterArm(req, visibleCount);
 });
 
-$('btn-preserve').addEventListener('click', onPreserveRequested);
+$('btn-preserve').addEventListener('click', onDiscountRequested);
 
 $('btn-stop').addEventListener('click', () => {
   clearPendingStart();
@@ -1969,7 +2268,9 @@ $('chk-spectrum').addEventListener('change', () => {
   const active = $('chk-spectrum').checked;
   $('plots').hidden = active;
   $('spectra').hidden = !active;
-  if (active) spectrumArea.resetView();
+  if (active) {
+    spectrumArea.resetView();
+  }
 });
 
 // Global DC removal (applies to all nodes, raw AND filtered).
@@ -2020,6 +2321,7 @@ $('disp-secs').addEventListener('input', applyDisplayWindow);
 $('disp-secs').addEventListener('change', applyDisplayWindow);
 $('capture-secs').addEventListener('input', onCaptureDurationEdited);
 $('capture-secs').addEventListener('change', onCaptureDurationEdited);
+$('btn-max-batches').addEventListener('click', setCaptureToMaxBatches);
 syncDisplayWindowToCaptureDuration();
 
 ws.start();

@@ -1,7 +1,7 @@
 // spectrum.js — per-channel FFT magnitude spectrum, plain canvas.
 // Uses Hanning window + radix-2 Cooley-Tukey FFT, no external libraries.
 
-import * as cfg from './config.js?v=field-study-10';
+import * as cfg from './config.js?v=field-study-17';
 
 // ── FFT ──────────────────────────────────────────────────────────────────────
 
@@ -82,8 +82,9 @@ export function computeSpectrum(data, fs) {
 // ── Helpers (mirrored from plot.js so spectrum.js stays self-contained) ──────
 
 const MARGIN = { left: 46, right: 34, top: 12, bottom: 20 };
-const SPEC_COLOR = 'rgb(80,210,160)';
+const SPEC_COLOR = cfg.RAW_COLOR;
 const DB_FLOOR = -140;
+const MIN_LOG_FREQ_HZ = 1e-6;
 
 function niceNum(range, round) {
   if (!(range > 0)) return 1;
@@ -105,6 +106,40 @@ function niceTicks(lo, hi, count) {
   return ticks;
 }
 
+function trimFixed(value, digits) {
+  const s = value.toFixed(digits);
+  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
+}
+
+function formatFrequency(f, spaced = false) {
+  const sep = spaced ? ' ' : '';
+  if (!(f > 0)) return `0${sep}Hz`;
+  if (f >= 1000) return `${trimFixed(f / 1000, f < 10000 ? 2 : 1)}${sep}kHz`;
+  if (f >= 100) return `${trimFixed(f, 0)}${sep}Hz`;
+  if (f >= 10) return `${trimFixed(f, 1)}${sep}Hz`;
+  if (f >= 1) return `${trimFixed(f, 2)}${sep}Hz`;
+  return `${trimFixed(f, 3)}${sep}Hz`;
+}
+
+function logFrequencyTicks(lo, hi, maxTicks = 8) {
+  if (!(lo > 0) || !(hi > lo)) return [];
+  const minExp = Math.floor(Math.log10(lo));
+  const maxExp = Math.ceil(Math.log10(hi));
+  const dense = [];
+  for (let exp = minExp; exp <= maxExp; exp++) {
+    for (const m of [1, 2, 5]) {
+      const f = m * 10 ** exp;
+      if (f >= lo * (1 - 1e-10) && f <= hi * (1 + 1e-10)) dense.push(f);
+    }
+  }
+  if (dense.length <= maxTicks * 1.5) return dense;
+  const decades = dense.filter((f) => {
+    const exp = Math.round(Math.log10(f));
+    return Math.abs(f - 10 ** exp) <= f * 1e-9;
+  });
+  return decades.length >= 2 ? decades : dense.filter((_, i) => i % Math.ceil(dense.length / maxTicks) === 0);
+}
+
 function cssVar(el, name, fallback) {
   const v = getComputedStyle(el).getPropertyValue(name).trim();
   return v || fallback;
@@ -119,13 +154,90 @@ function withAlpha(color, alpha) {
   return `rgba(${rgba[1]}, ${rgba[2]}, ${rgba[3]}, ${a})`;
 }
 
+function normalizeSourceList(input, fallbackLabel = 'Cruda', fallbackColor = SPEC_COLOR) {
+  if (!input) return [];
+  if (ArrayBuffer.isView(input)) {
+    return [{ label: fallbackLabel, color: fallbackColor, data: input }];
+  }
+  if (Array.isArray(input) && input.length && typeof input[0] === 'number') {
+    return [{ label: fallbackLabel, color: fallbackColor, data: input }];
+  }
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((source) => {
+      if (!source) return null;
+      const data = source.data || source.raw || source.values || null;
+      if (!data || !data.length) return null;
+      return {
+        label: source.label || fallbackLabel,
+        color: source.color || fallbackColor,
+        data,
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildTrace(source, fs, isOverlay = false, overlayLabel = '') {
+  const spec = computeSpectrum(source.data, fs);
+  if (!spec) return null;
+  const label = overlayLabel ? `${overlayLabel} ${source.label || ''}`.trim() : (source.label || '');
+  return {
+    label,
+    color: source.color || SPEC_COLOR,
+    spec,
+    isOverlay,
+  };
+}
+
+function minPositiveFrequencyFromSources(input, fs) {
+  let minHz = Infinity;
+  for (const source of normalizeSourceList(input)) {
+    const len = source.data && source.data.length ? source.data.length : 0;
+    if (len < 8) continue;
+    const n = floorPow2(Math.min(len, 32768));
+    if (n >= 8) minHz = Math.min(minHz, fs / n);
+  }
+  return Number.isFinite(minHz) ? minHz : Infinity;
+}
+
+function minPositiveFrequencyForView(nodeSources, overlayCaptures, fs) {
+  let minHz = Infinity;
+  for (const sources of nodeSources || []) {
+    minHz = Math.min(minHz, minPositiveFrequencyFromSources(sources, fs));
+  }
+  for (const capture of overlayCaptures || []) {
+    for (const node of capture.nodes || []) {
+      if (!node) continue;
+      const sources = node.spectrumSources || (node.raw ? [{ data: node.raw }] : null);
+      minHz = Math.min(minHz, minPositiveFrequencyFromSources(sources, fs));
+    }
+  }
+  if (Number.isFinite(minHz)) return Math.max(MIN_LOG_FREQ_HZ, minHz);
+  return fs > 0 ? Math.max(MIN_LOG_FREQ_HZ, fs / 32768) : MIN_LOG_FREQ_HZ;
+}
+
+function logBounds(lo, hi, minFreq, maxFreq) {
+  const minHz = Math.max(MIN_LOG_FREQ_HZ, minFreq || MIN_LOG_FREQ_HZ);
+  const maxHz = Math.max(minHz * 1.000001, maxFreq || minHz * 10);
+  let outLo = Number.isFinite(lo) && lo > 0 ? lo : minHz;
+  let outHi = Number.isFinite(hi) && hi > 0 ? hi : maxHz;
+  outLo = clamp(outLo, minHz, maxHz / 1.000001);
+  outHi = clamp(outHi, outLo * 1.000001, maxHz);
+  return {
+    lo: outLo,
+    hi: outHi,
+    logLo: Math.log10(outLo),
+    logHi: Math.log10(outHi),
+  };
+}
+
 // ── SpectrumPlot ─────────────────────────────────────────────────────────────
 
 class SpectrumPlot {
   constructor(container, title, handlers = {}) {
     this.title = title;
-    this._spec = null;
-    this._overlays = [];
+    this._primaryTraces = [];
+    this._overlayTraces = [];
     this._fs = 0;
     this._visible = true;
     this._cursorHz = null;   // cursor position in Hz (null = no cursor)
@@ -157,26 +269,52 @@ class SpectrumPlot {
     this.title = title || this.title;
   }
 
-  setData(data, fs, overlays = []) {
-    this._spec = computeSpectrum(data, fs);
-    this._overlays = (overlays || [])
-      .map((overlay) => ({
-        label: overlay.label,
-        color: overlay.color,
-        spec: computeSpectrum(overlay.raw, fs),
-      }))
-      .filter((overlay) => !!overlay.spec);
+  setData(sources, fs, overlays = []) {
+    this._primaryTraces = normalizeSourceList(sources)
+      .map((source) => buildTrace(source, fs, false))
+      .filter(Boolean);
+    this._overlayTraces = [];
+    for (const overlay of overlays || []) {
+      const overlaySources = normalizeSourceList(
+        overlay.sources || overlay.spectrumSources || overlay.raw,
+        overlay.label || 'Preservada',
+        overlay.color || SPEC_COLOR,
+      );
+      for (const source of overlaySources) {
+        const trace = buildTrace(
+          { ...source, color: overlay.color || source.color },
+          fs,
+          true,
+          overlay.label || '',
+        );
+        if (trace) this._overlayTraces.push(trace);
+      }
+    }
     this._fs = fs || 0;
   }
 
   setFrequencyRange(lo, hi) {
-    this._freqLo = Math.max(0, Number.isFinite(lo) ? lo : 0);
-    this._freqHi = Math.max(this._freqLo, Number.isFinite(hi) ? hi : 0);
+    this._freqLo = Math.max(MIN_LOG_FREQ_HZ, Number.isFinite(lo) ? lo : MIN_LOG_FREQ_HZ);
+    this._freqHi = Math.max(this._freqLo, Number.isFinite(hi) ? hi : this._freqLo);
   }
 
   clear() {
-    this._spec = null;
-    this._overlays = [];
+    this._primaryTraces = [];
+    this._overlayTraces = [];
+  }
+
+  _minPositiveFrequency() {
+    let minHz = Infinity;
+    for (const item of [...this._primaryTraces, ...this._overlayTraces]) {
+      const spec = item.spec;
+      if (spec && spec.df > 0) minHz = Math.min(minHz, spec.df);
+    }
+    return Number.isFinite(minHz) ? Math.max(MIN_LOG_FREQ_HZ, minHz) : MIN_LOG_FREQ_HZ;
+  }
+
+  _logBounds() {
+    if (!(this._fs > 0)) return null;
+    return logBounds(this._freqLo, this._freqHi || this._fs / 2, this._minPositiveFrequency(), this._fs / 2);
   }
 
   _fitCanvas() {
@@ -209,7 +347,7 @@ class SpectrumPlot {
       this._dragMoved = false;
     });
     this.canvas.addEventListener('pointermove', (ev) => {
-      if (!this._spec || !this._fs) return;
+      if ((!this._primaryTraces.length && !this._overlayTraces.length) || !this._fs) return;
       const rect = this.canvas.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
       const W = this.canvas.width;
@@ -218,10 +356,10 @@ class SpectrumPlot {
                    top: MARGIN.top * dpr,  bottom: MARGIN.bottom * dpr };
       const plotW = Math.max(1, W - m.left - m.right);
       const px = (ev.clientX - rect.left) * dpr;
-      const fMax = this._fs / 2;
-      const fLo = clamp(this._freqLo, 0, fMax);
-      const fHi = clamp(this._freqHi || fMax, fLo + 1e-9, fMax);
-      this._cursorHz = clamp(fLo + ((px - m.left) / plotW) * (fHi - fLo), fLo, fHi);
+      const bounds = this._logBounds();
+      if (!bounds) return;
+      const frac = clamp((px - m.left) / plotW, 0, 1);
+      this._cursorHz = 10 ** (bounds.logLo + frac * (bounds.logHi - bounds.logLo));
 
       if (this._dragLastX !== null) {
         if (!this._dragMoved
@@ -281,11 +419,9 @@ class SpectrumPlot {
     ctx.fillStyle = colors.bg;
     ctx.fillRect(0, 0, W, H);
 
-    const spec = this._spec;
-    const overlaySpecs = this._overlays || [];
     const drawableSpecs = [
-      ...overlaySpecs.map((overlay) => ({ ...overlay, isOverlay: true })),
-      ...(spec ? [{ spec, color: SPEC_COLOR, isOverlay: false }] : []),
+      ...this._overlayTraces,
+      ...this._primaryTraces,
     ];
     if (!drawableSpecs.length || !(this._fs > 0)) {
       ctx.font = `${Math.round(11 * dpr)}px system-ui`;
@@ -297,11 +433,11 @@ class SpectrumPlot {
       return;
     }
 
-    const fMax = this._fs / 2;
-    const fLo = clamp(this._freqLo, 0, fMax);
-    const fHi = clamp(this._freqHi || fMax, fLo + 1e-9, fMax);
-    const fSpan = Math.max(1e-9, fHi - fLo);
-    const xTo = (f) => m.left + ((f - fLo) / fSpan) * plotW;
+    const bounds = this._logBounds();
+    if (!bounds) { ctx.restore(); return; }
+    const { lo: fLo, hi: fHi, logLo, logHi } = bounds;
+    const logSpan = Math.max(1e-12, logHi - logLo);
+    const xTo = (f) => m.left + ((Math.log10(Math.max(MIN_LOG_FREQ_HZ, f)) - logLo) / logSpan) * plotW;
 
     const specsWithDb = drawableSpecs.map((item) => {
       const { mag } = item.spec;
@@ -344,15 +480,20 @@ class SpectrumPlot {
       ctx.fillText(`${v.toFixed(0)}`, m.left - 6 * dpr, py);
     }
 
-    // X grid (Hz)
+    // X grid (Hz, logarithmic)
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
-    for (const f of niceTicks(fLo, fHi, 6)) {
+    let lastLabelRight = -Infinity;
+    for (const f of logFrequencyTicks(fLo, fHi, 8)) {
       if (f < fLo - 1e-9 || f > fHi + 1e-9) continue;
       const px = xTo(f);
       ctx.beginPath(); ctx.moveTo(px, m.top); ctx.lineTo(px, m.top + plotH); ctx.stroke();
-      const lbl = f >= 1000 ? `${(f / 1000).toFixed(1)}k` : `${f.toFixed(0)}`;
-      ctx.fillText(`${lbl}Hz`, px, m.top + plotH + 5 * dpr);
+      const lbl = formatFrequency(f);
+      const textW = ctx.measureText(lbl).width;
+      if (px - textW / 2 > lastLabelRight && px + textW / 2 < m.left + plotW + 2 * dpr) {
+        ctx.fillText(lbl, px, m.top + plotH + 5 * dpr);
+        lastLabelRight = px + textW / 2 + 6 * dpr;
+      }
     }
 
     ctx.strokeStyle = colors.border;
@@ -366,7 +507,7 @@ class SpectrumPlot {
     ctx.lineWidth = Math.max(1, dpr);
     for (const item of specsWithDb) {
       const { freqs } = item.spec;
-      ctx.strokeStyle = item.isOverlay ? withAlpha(item.color || SPEC_COLOR, 0.65) : SPEC_COLOR;
+      ctx.strokeStyle = item.isOverlay ? withAlpha(item.color || SPEC_COLOR, 0.65) : (item.color || SPEC_COLOR);
       ctx.setLineDash(item.isOverlay ? [5 * dpr, 3 * dpr] : []);
       ctx.beginPath();
       let started = false;
@@ -397,7 +538,7 @@ class SpectrumPlot {
       ctx.beginPath(); ctx.moveTo(cpx, m.top); ctx.lineTo(cpx, m.top + plotH); ctx.stroke();
       ctx.setLineDash([]);
 
-      const hzLabel = this._cursorHz >= 1000 ? `${(this._cursorHz / 1000).toFixed(2)} kHz` : `${this._cursorHz.toFixed(1)} Hz`;
+      const hzLabel = formatFrequency(this._cursorHz, true);
       const lines = [hzLabel, `${ampDb.toFixed(1)} dB`];
       ctx.font = `${Math.round(10 * dpr)}px ui-monospace, monospace`;
       const pad = 5 * dpr, lineH = 13 * dpr;
@@ -451,7 +592,8 @@ export class SpectrumArea {
     this._container = container;
     this._plots = [];
     this._zoom = 1;
-    this._panHz = 0;
+    this._panLog = null;
+    this._fMin = MIN_LOG_FREQ_HZ;
     this._fMax = 0;
     const handlers = {
       onZoom: (factor, anchor) => this.zoomBy(factor, anchor),
@@ -463,43 +605,53 @@ export class SpectrumArea {
     for (const p of this._plots) p.setVisible(false);
   }
 
-  _viewHz() {
-    return Math.max(1, this._fMax / Math.max(1, this._zoom));
+  _fullLogLo() {
+    return Math.log10(Math.max(MIN_LOG_FREQ_HZ, this._fMin));
+  }
+
+  _fullLogHi() {
+    return Math.log10(Math.max(this._fMin * 1.000001, this._fMax));
+  }
+
+  _viewLogSpan() {
+    return Math.max(1e-12, (this._fullLogHi() - this._fullLogLo()) / Math.max(1, this._zoom));
   }
 
   _clampPan() {
-    const maxStart = Math.max(0, this._fMax - this._viewHz());
-    this._panHz = clamp(this._panHz, 0, maxStart);
+    const fullLo = this._fullLogLo();
+    const maxStart = Math.max(fullLo, this._fullLogHi() - this._viewLogSpan());
+    if (!Number.isFinite(this._panLog)) this._panLog = fullLo;
+    this._panLog = clamp(this._panLog, fullLo, maxStart);
   }
 
   _applyFrequencyWindow() {
     this._clampPan();
-    const lo = this._panHz;
-    const hi = lo + this._viewHz();
+    const lo = 10 ** this._panLog;
+    const hi = 10 ** (this._panLog + this._viewLogSpan());
     for (const p of this._plots) p.setFrequencyRange(lo, hi);
   }
 
   zoomBy(factor, anchorFrac = 0.5) {
-    if (!(this._fMax > 0)) return;
+    if (!(this._fMax > this._fMin)) return;
     const anchor = clamp(anchorFrac, 0, 1);
-    const oldSpan = this._viewHz();
-    const oldLo = this._panHz;
+    const oldSpan = this._viewLogSpan();
+    const oldLo = Number.isFinite(this._panLog) ? this._panLog : this._fullLogLo();
     this._zoom = clamp(this._zoom * factor, 1, 128);
-    const newSpan = this._viewHz();
-    const anchorHz = oldLo + anchor * oldSpan;
-    this._panHz = anchorHz - anchor * newSpan;
+    const newSpan = this._viewLogSpan();
+    const anchorLog = oldLo + anchor * oldSpan;
+    this._panLog = anchorLog - anchor * newSpan;
     this._applyFrequencyWindow();
   }
 
   panByFraction(frac) {
-    if (!(this._fMax > 0)) return;
-    this._panHz += frac * this._viewHz();
+    if (!(this._fMax > this._fMin)) return;
+    this._panLog = (Number.isFinite(this._panLog) ? this._panLog : this._fullLogLo()) + frac * this._viewLogSpan();
     this._applyFrequencyWindow();
   }
 
   resetView() {
     this._zoom = 1;
-    this._panHz = 0;
+    this._panLog = this._fullLogLo();
     this._applyFrequencyWindow();
   }
 
@@ -522,8 +674,10 @@ export class SpectrumArea {
     }
   }
 
-  update(rawBufs, fs, overlayCaptures = []) {
+  update(nodeSources, fs, overlayCaptures = []) {
     this._fMax = fs > 0 ? fs / 2 : 0;
+    this._fMin = this._fMax > 0 ? minPositiveFrequencyForView(nodeSources, overlayCaptures, fs) : MIN_LOG_FREQ_HZ;
+    if (this._zoom === 1 || !Number.isFinite(this._panLog)) this._panLog = this._fullLogLo();
     this._applyFrequencyWindow();
     for (let i = 0; i < this._plots.length; i++) {
       const p = this._plots[i];
@@ -531,10 +685,12 @@ export class SpectrumArea {
       const overlays = [];
       for (const capture of overlayCaptures || []) {
         const node = capture.nodes && capture.nodes[i];
-        if (!node || !node.raw || !node.raw.length) continue;
-        overlays.push({ label: capture.label, color: capture.color, raw: node.raw });
+        if (!node) continue;
+        const sources = node.spectrumSources || (node.raw ? [{ label: 'Cruda', color: capture.color, data: node.raw }] : null);
+        if (!sources || !sources.length) continue;
+        overlays.push({ label: capture.label, color: capture.color, sources });
       }
-      p.setData(rawBufs[i], fs, overlays);
+      p.setData(nodeSources[i], fs, overlays);
       p.draw();
     }
   }

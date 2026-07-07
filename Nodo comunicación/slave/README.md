@@ -20,8 +20,10 @@ WAIT_ARM → ARMED → HOT_WAIT → SAMPLING → STOPPED
 
 ### Modo VER
 
-`CMD_VIEW(N)`: arma el PSoC, levanta SYNC_TO_PSOC con un pequeño retardo, y
-transmite N lotes **en tiempo real** al maestro (sin store-and-forward).
+`CMD_VIEW(N)`: reserva store local, arma el PSoC, entra en HOT_WAIT silencioso,
+levanta `SYNC_TO_PSOC` con un pequeno retardo y guarda N lotes. Cuando el store
+esta completo envia `CMD_VIEW ok=2`; el maestro recupera los lotes con
+`CMD_REQ_BATCH`. Es store-and-forward, no transmision en tiempo real.
 
 ## Enlace con el PSoC (`psoc_uart.*`)
 
@@ -39,7 +41,17 @@ y el esclavo entra en HOT_WAIT normalmente.
 
 ## Comandos USB de laboratorio
 
-Por el monitor serial del ESP, baud 115200:
+El firmware final esta silencioso por USB:
+
+```ini
+-DSLAVE_LOGS_ENABLE=0
+-DDBG_HUMAN=0
+-DDBG_MACHINE=0
+-DSLAVE_USB_CMD_ENABLE=0
+```
+
+Para banco, compilar temporalmente con `SLAVE_USB_CMD_ENABLE=1`. Por el monitor
+serial del ESP, baud 115200, quedan disponibles:
 
 ```
 help
@@ -63,6 +75,10 @@ pgavdac N
 `cap N` hace `pre N` y luego `sync`. `clear` libera el buffer store-and-forward
 despues de una prueba USB para poder repetir capturas sin esperar un dump del
 maestro. `stop` tambien libera ese buffer y baja `SYNC_TO_PSOC`.
+
+Con `SLAVE_LAB_TOOLS_ENABLE=1` se agregan comandos de diagnostico mas
+intrusivos: `diag`, `pins`, `quiet N MS`, `capwait N`, `startwait N`,
+`rawcap N` y `fircap N`. Dejarlos apagados en firmware final.
 
 ## Tipo de hardware (GEO/HAMMER)
 
@@ -95,7 +111,8 @@ BLINK_LED_PIN = 2
 BLINK_LED_ACTIVE_LOW = 0   ; GPIO2 en ESP32-DevKitC es activo-ALTO
 ```
 
-Habilitar logging para diagnóstico:
+El firmware final usa logs y comandos USB apagados. Habilitar logging para
+diagnostico solo de forma temporal:
 ```ini
 -DSLAVE_LOGS_ENABLE=1 -DDBG_HUMAN=1
 ```
@@ -106,6 +123,18 @@ Auto-calibración al arrancar:
 -DPSOC_AUTO_CAL_DELAY_MS=500
 -DPSOC_AUTO_CAL_RETRY_MS=3000
 ```
+
+## Validacion 2026-07-02
+
+- `slave2` subido a `COM12` con logs/comandos USB apagados.
+- Master web `192.168.4.1/health`: `200 OK`, `littlefs=ok`.
+- WebSocket `ws_capture_test.py --node 2 --batches 2 --stream 1`: 60 paquetes
+  DATA, `RUNNING -> DUMPING`, una conexion.
+- WebSocket `ws_capture_test.py --node 2 --batches 2 --stream 0`: 60 paquetes
+  DATA, `RUNNING -> DUMPING`, una conexion.
+- Antes de apagar comandos USB, `quiet 2 2000` confirmo HOT_WAIT sin bytes,
+  pings ni diagnosticos periodicos durante la ventana (`winBytes=0`,
+  `winPing=0`, `winDiag=0`).
 
 ## Logging típico de boot normal
 

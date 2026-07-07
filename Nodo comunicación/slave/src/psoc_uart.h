@@ -54,6 +54,7 @@
 #define PSOC_CMD_SELECT_STREAM 0xB7
 #define PSOC_CMD_ADC_SNAPSHOT 0xB8
 #define PSOC_CMD_BLINK_LED    0xB9   /* Titilar el LED del PSoC para identificar el nodo */
+#define PSOC_CMD_ADC_CONFIG   0xBA   /* 1=±2.5 V, 2=±0.512 V; ambos 1020 Hz */
 
 /* Control PSoC -> ESP */
 #define PSOC_CTRL_PING      0xC0
@@ -160,6 +161,7 @@ public:
     void calibrate();
     void saveEeprom();
     void selectStream(uint8_t mode);
+    void setAdcConfig(uint8_t cfg);
     void adcSnapshot();
     void blinkLed();             /* pide al PSoC titilar su LED (identificación) */
     void debugRamp(bool en);

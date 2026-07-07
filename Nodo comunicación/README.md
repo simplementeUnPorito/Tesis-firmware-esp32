@@ -78,7 +78,7 @@ Equivalentes JSON para WebSocket:
 
 ## Interfaz web (master/data/)
 
-SPA servida desde LittleFS del maestro. Versión actual del cache: `field-study-10`.
+SPA servida desde LittleFS del maestro. Versión actual del cache: `field-study-17`.
 
 ### Endpoints HTTP
 
@@ -88,7 +88,7 @@ SPA servida desde LittleFS del maestro. Versión actual del cache: `field-study-
 | `/health` | Estado: `ok`, `ap_ip`, `littlefs`, `used/total bytes` |
 | `/ws` | WebSocket — telemetría binaria + comandos JSON |
 | `/ws-reset` | Fuerza cierre de conexiones WS activas |
-| `/sim/hello` | Dummy esclavo: `?node=N&type=hammer|geo&fs=2929&psoc=1` |
+| `/sim/hello` | Dummy esclavo: `?node=N&type=hammer|geo&fs=1020&psoc=1` |
 
 ### Módulos JS
 
@@ -114,7 +114,8 @@ SPA servida desde LittleFS del maestro. Versión actual del cache: `field-study-
 - **Captura MASW**: ARM N → START → dump de N lotes por nodo.
 - **Visualización**: cruda, filtrada (`filtFilt`), `Env cruda`, `Env filtrada` (Hilbert bilateral).
 - **Sin offset DC**: checkbox global quita el DC a cruda y filtrada.
-- **Espectro**: toggle — reemplaza el plot de tiempo con FFT.
+- **Espectro**: toggle — reemplaza el plot de tiempo con FFT de cruda, filtrada y/o envolventes.
+- **Sin ruido de línea**: cancelación post-procesada por mínimos cuadrados de armónicos de 50 Hz sobre la curva filtrada.
 - **Invertir señal**: por canal.
 - **Preservados**: capturas guardadas con Offset X (muestras) e Y (mV) ajustables.
 - **VDAC en stats**: heartbeat muestra `VDAC: <byte> (<pct>%)` en el panel de cada esclavo.

@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-10';
+import * as cfg from './config.js?v=field-study-17';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-10';
+import { effectiveFs } from './data_store.js?v=field-study-17';
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -58,6 +58,29 @@ function sampleOffset(value) {
 
 function gainValue(code) {
   return (code >= 0 && code < cfg.GAIN_CODES.length) ? cfg.GAIN_CODES[code] : null;
+}
+
+function adcConfigForCode(code) {
+  return cfg.ADC_CONFIGS.find((item) => item.code === code) || cfg.ADC_CONFIGS[0];
+}
+
+function adcConfigCodeForNode(node) {
+  const code = node?.adcConfigCode ?? node?.adc_config ?? 1;
+  return adcConfigForCode(code).code;
+}
+
+function adcCountsPerVoltForNode(node) {
+  const explicit = node?.countsPerVolt ?? node?.adc_counts_per_volt;
+  return Number.isFinite(explicit) && explicit > 0
+    ? explicit
+    : adcConfigForCode(adcConfigCodeForNode(node)).countsPerVolt;
+}
+
+function adcRangeVForNode(node) {
+  const explicit = node?.adc_range_v;
+  return Number.isFinite(explicit) && explicit > 0
+    ? explicit
+    : adcConfigForCode(adcConfigCodeForNode(node)).rangeV;
 }
 
 function calVdacsForNode(node) {
@@ -233,6 +256,10 @@ function nodeMetadata(nd, index, paths, connected) {
     total_samples: nd.totalSamples,
     pga_code: nd.pgaCode,
     pga_gain: gainValue(nd.pgaCode),
+    adc_config: adcConfigCodeForNode(nd),
+    adc_config_label: adcConfigForCode(adcConfigCodeForNode(nd)).label,
+    adc_range_v: adcRangeVForNode(nd),
+    adc_counts_per_volt: adcCountsPerVoltForNode(nd),
     vdac_byte: nd.vdacByte,
     cal_vdacs: calVdacsForNode(nd),
     cal_vdac_details: calVdacDetailsForNode(nd),
@@ -249,6 +276,8 @@ function nodeMetadata(nd, index, paths, connected) {
     visible: !!nd.visible,
     fir_cmd: nd.filtCmd || '',
     dc_remove: !!nd.dcRemove,
+    notch_enabled: !!nd.notchEnabled,
+    notch_harm: nd.notchHarm | 0,
     invert_signal: !!nd.invertSignal,
     display_y_offset_v: nd.yOffsetV || 0,
     drift_hist: nd.driftHist.slice(),
@@ -292,6 +321,10 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     total_samples: node?.total_samples ?? raw.length,
     pga_code: node?.pga_code ?? 0,
     pga_gain: node?.pga_gain ?? gainValue(node?.pga_code ?? 0),
+    adc_config: adcConfigCodeForNode(node),
+    adc_config_label: adcConfigForCode(adcConfigCodeForNode(node)).label,
+    adc_range_v: adcRangeVForNode(node),
+    adc_counts_per_volt: adcCountsPerVoltForNode(node),
     vdac_byte: node?.vdac_byte ?? 128,
     cal_vdacs: calVdacsForNode(node),
     cal_vdac_details: calVdacDetailsForNode(node),
@@ -310,6 +343,8 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     filt_trim_samples: node?.filt_trim_samples ?? 0,
     dc_remove: !!node?.dc_remove,
     dc_removed_on_preserve: !!node?.dc_removed_on_preserve,
+    notch_enabled: !!node?.notch_enabled,
+    notch_harm: node?.notch_harm ?? 0,
     raw_dc_v: node?.raw_dc_v ?? null,
     filt_dc_v: node?.filt_dc_v ?? null,
     invert_signal: !!node?.invert_signal,
@@ -348,6 +383,9 @@ function buildCombinedSignalsCsv(captures) {
     'aligned_sample',
     'aligned_time_s',
     'fs_hz',
+    'adc_config',
+    'adc_range_v',
+    'adc_counts_per_volt',
     'hammer_offset_m',
     'position_m',
     'pga_code',
@@ -387,6 +425,9 @@ function buildCombinedSignalsCsv(captures) {
             i + offset,
             fs > 0 ? ((i + offset) / fs).toFixed(9) : '',
             fs || '',
+            adcConfigCodeForNode(node),
+            adcRangeVForNode(node),
+            adcCountsPerVoltForNode(node),
             positionM,
             node.position_m ?? positionM,
             node.pga_code ?? '',
@@ -454,6 +495,9 @@ function buildNodeSummaryCsv(nodes) {
     'fs_hz',
     'fs_known',
     'fs_exact_known',
+    'adc_config',
+    'adc_range_v',
+    'adc_counts_per_volt',
     'hw_class',
     'hw_type',
     'position_m',
@@ -485,6 +529,9 @@ function buildNodeSummaryCsv(nodes) {
       node.fs || '',
       node.fs_known ? 1 : 0,
       node.fs_exact_known ? 1 : 0,
+      adcConfigCodeForNode(node),
+      adcRangeVForNode(node),
+      adcCountsPerVoltForNode(node),
       node.hw_class ?? '',
       node.hw_type || '',
       node.position_m ?? node.hammer_offset_m ?? 0,
@@ -519,6 +566,9 @@ function buildCaptureNodeSummaryCsv(captures) {
     'pcb_id',
     'mac',
     'fs_hz',
+    'adc_config',
+    'adc_range_v',
+    'adc_counts_per_volt',
     'position_m',
     'hammer_offset_m',
     'raw_count',
@@ -550,6 +600,9 @@ function buildCaptureNodeSummaryCsv(captures) {
         node.pcb_id || node.slave_id || '',
         node.mac || '',
         node.fs || '',
+        adcConfigCodeForNode(node),
+        adcRangeVForNode(node),
+        adcCountsPerVoltForNode(node),
         node.position_m ?? node.hammer_offset_m ?? 0,
         node.hammer_offset_m ?? 0,
         node.raw_count ?? 0,
@@ -690,6 +743,7 @@ export function buildCaptureZip(dataStore, options = {}) {
       sample_offset: captureOffset,
       y_offset_mv: capture.y_offset_mv ?? 0,
       dc_removed_on_preserve: !!capture.dc_removed_on_preserve,
+      notch_f0: capture.notch_f0 ?? cfg.LINE_NOTCH_F0,
       active_node_indices: Array.isArray(capture.active_node_indices)
         ? capture.active_node_indices.slice()
         : [],
@@ -721,7 +775,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-10',
+    web_app_version: 'field-study-17',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,
@@ -736,7 +790,9 @@ export function buildCaptureZip(dataStore, options = {}) {
     samples_per_batch: cfg.SAMPLES_PER_BATCH,
     signal_units: 'V',
     adc_counts_per_volt: cfg.ADC_COUNTS_PER_VOLT,
+    adc_configs: cfg.ADC_CONFIGS,
     vdac_step_volts: cfg.VDAC_STEP,
+    notch_f0: cfg.LINE_NOTCH_F0,
     display_secs: options.displaySecs ?? null,
     max_buf_secs: options.maxBufSecs ?? cfg.MAX_BUF_S,
     visible_nodes: visibleNodes,

@@ -308,3 +308,182 @@ export function hilbertEnvelope(buf) {
   for (let i = 0; i < nInput; i++) out[i] = Math.hypot(re[i], im[i]);
   return out;
 }
+
+// ── Notch armónico: cancelación de ruido de línea por mínimos cuadrados ─────
+// Espejo de harmonic_notch() en python/geophone_scope/signal_proc.py.
+//
+// La interferencia de red se modela como f(n) = Σₖ aₖ·cos(ωₖn) + bₖ·sen(ωₖn)
+// con ωₖ = 2π·k·f0/fs, k = 1..nHarmonics. Las amplitudes se ajustan por
+// mínimos cuadrados sobre la ventana COMPLETA (un único solve directo, no un
+// LMS iterativo: sin paso mu, sin transitorio de convergencia) y se devuelve
+// y(n) − f(n). Antes de resolver, estima el pico real alrededor de f0 para no
+// fallar si la red/Fs/binning desplaza el máximo a 49.x/50.x Hz.
+// No es un notch clásico: no vacía bandas completas de 50/100/150 Hz, solo
+// resta la combinación sinusoidal detectada para reducir su energía.
+function sinusoidFitScore(arr, fs, freq, mean) {
+  if (!(freq > 0) || !(freq < fs / 2)) return -Infinity;
+  const w = (2 * Math.PI * freq) / fs;
+  const cw = Math.cos(w);
+  const sw = Math.sin(w);
+  let c = 1;
+  let s = 0;
+  let cc = 0;
+  let ss = 0;
+  let cs = 0;
+  let yc = 0;
+  let ys = 0;
+  for (let i = 0; i < arr.length; i++) {
+    const y = arr[i] - mean;
+    cc += c * c;
+    ss += s * s;
+    cs += c * s;
+    yc += y * c;
+    ys += y * s;
+    const nc = c * cw - s * sw;
+    s = s * cw + c * sw;
+    c = nc;
+  }
+  const det = cc * ss - cs * cs;
+  if (!(det > 1e-12)) return -Infinity;
+  return (ss * yc * yc - 2 * cs * yc * ys + cc * ys * ys) / det;
+}
+
+function lineFrequencyScore(arr, fs, baseFreq, nHarmonics, mean) {
+  let score = 0;
+  let used = 0;
+  for (let k = 1; k <= nHarmonics; k++) {
+    const freq = k * baseFreq;
+    if (freq >= fs / 2) break;
+    const s = sinusoidFitScore(arr, fs, freq, mean);
+    if (Number.isFinite(s)) {
+      score += s;
+      used++;
+    }
+  }
+  return used ? score : -Infinity;
+}
+
+function estimateLineFrequency(arr, fs, f0, searchHz, nHarmonics) {
+  const span = Math.max(0, Number(searchHz) || 0);
+  if (!(span > 0) || arr.length < 8 || !(fs > 0) || !(f0 > 0)) return f0;
+  const nh = Math.max(1, Math.floor(Number(nHarmonics) || 1));
+  let mean = 0;
+  for (let i = 0; i < arr.length; i++) mean += arr[i];
+  mean /= arr.length;
+
+  const nyq = fs / 2;
+  const lo = Math.max(0.1, f0 - span);
+  const hi = Math.min(nyq - 1e-6, f0 + span);
+  if (!(hi > lo)) return f0;
+
+  let bestF = f0;
+  let bestScore = -Infinity;
+  const coarseSteps = 81;
+  for (let i = 0; i < coarseSteps; i++) {
+    const f = lo + ((hi - lo) * i) / (coarseSteps - 1);
+    const score = lineFrequencyScore(arr, fs, f, nh, mean);
+    if (score > bestScore) {
+      bestScore = score;
+      bestF = f;
+    }
+  }
+
+  const coarseStep = (hi - lo) / (coarseSteps - 1);
+  const fineLo = Math.max(lo, bestF - coarseStep);
+  const fineHi = Math.min(hi, bestF + coarseStep);
+  for (let i = 0; i < 21; i++) {
+    const f = fineLo + ((fineHi - fineLo) * i) / 20;
+    const score = lineFrequencyScore(arr, fs, f, nh, mean);
+    if (score > bestScore) {
+      bestScore = score;
+      bestF = f;
+    }
+  }
+  return bestF;
+}
+
+export function harmonicNotch(arr, fs, f0, nHarmonics, searchHz = 0) {
+  const n = arr ? arr.length : 0;
+  const nh = Math.floor(Number(nHarmonics) || 0);
+  if (!n || nh <= 0 || !(fs > 0) || !(f0 > 0)) return arr;
+  const lineF0 = estimateLineFrequency(arr, fs, f0, searchHz, nh);
+
+  // Columnas cos/sen por armónico; los que caen en o sobre Nyquist no son
+  // representables y se descartan.
+  const cols = [];
+  for (let k = 1; k <= nh; k++) {
+    if (k * lineF0 >= fs / 2) break;
+    const w = (2 * Math.PI * k * lineF0) / fs;
+    const cw = Math.cos(w);
+    const sw = Math.sin(w);
+    const c = new Float64Array(n);
+    const s = new Float64Array(n);
+    let cv = 1;
+    let sv = 0;
+    for (let i = 0; i < n; i++) {
+      c[i] = cv;
+      s[i] = sv;
+      const ncv = cv * cw - sv * sw;
+      sv = sv * cw + cv * sw;
+      cv = ncv;
+    }
+    cols.push(c, s);
+  }
+  const m = cols.length;
+  if (!m || n <= m) return arr;
+
+  // Ecuaciones normales G·a = b, con G = HᵀH (m×m, m ≤ 24) y b = Hᵀy.
+  const G = new Float64Array(m * m);
+  const a = new Float64Array(m);
+  for (let p = 0; p < m; p++) {
+    const cp = cols[p];
+    let bp = 0;
+    for (let i = 0; i < n; i++) bp += cp[i] * arr[i];
+    a[p] = bp;
+    for (let q = p; q < m; q++) {
+      const cq = cols[q];
+      let g = 0;
+      for (let i = 0; i < n; i++) g += cp[i] * cq[i];
+      G[p * m + q] = g;
+      G[q * m + p] = g;
+    }
+  }
+
+  // Eliminación gaussiana con pivoteo parcial (resuelve sobre a in-place).
+  for (let col = 0; col < m; col++) {
+    let piv = col;
+    for (let r = col + 1; r < m; r++) {
+      if (Math.abs(G[r * m + col]) > Math.abs(G[piv * m + col])) piv = r;
+    }
+    if (Math.abs(G[piv * m + col]) < 1e-9 * n) return arr; // ventana degenerada
+    if (piv !== col) {
+      for (let cc = col; cc < m; cc++) {
+        const t = G[col * m + cc]; G[col * m + cc] = G[piv * m + cc]; G[piv * m + cc] = t;
+      }
+      const t = a[col]; a[col] = a[piv]; a[piv] = t;
+    }
+    for (let r = col + 1; r < m; r++) {
+      const f = G[r * m + col] / G[col * m + col];
+      if (!f) continue;
+      for (let cc = col; cc < m; cc++) G[r * m + cc] -= f * G[col * m + cc];
+      a[r] -= f * a[col];
+    }
+  }
+  for (let r = m - 1; r >= 0; r--) {
+    let acc = a[r];
+    for (let cc = r + 1; cc < m; cc++) acc -= G[r * m + cc] * a[cc];
+    a[r] = acc / G[r * m + r];
+    if (!Number.isFinite(a[r])) return arr;
+  }
+
+  // y(n) − f(n)
+  const out = new Float64Array(n);
+  out.set(arr);
+  for (let p = 0; p < m; p++) {
+    const cp = cols[p];
+    const ap = a[p];
+    if (!ap) continue;
+    for (let i = 0; i < n; i++) out[i] -= ap * cp[i];
+  }
+  return out;
+}

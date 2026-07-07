@@ -86,7 +86,7 @@ inline bool webServerBegin()
 #if WEB_SIM_ENABLE
     webServer.on("/sim/hello", HTTP_GET, [](AsyncWebServerRequest *request) {
         long nodeArg = 1;
-        long fsArg = 2929;
+        long fsArg = 1020;
         long psocArg = 1;
         webServerArgLong(request, "node", nodeArg);
         webServerArgLong(request, "fs", fsArg);
@@ -101,7 +101,7 @@ inline bool webServerBegin()
         const uint16_t fs = (uint16_t)fsArg;
         const uint8_t hwClass = webServerSimHwClass(type);
         const uint8_t psocOk = psocArg ? 1u : 0u;
-        const uint8_t fsCode = (fs >= 100u) ? (uint8_t)(fs / 100u) : 0u;
+        const uint8_t fsCode = (fs >= 100u) ? (uint8_t)((fs + 50u) / 100u) : 0u;
 
         uint8_t hello[6] = {
             MATLAB_PKT_HEADER, node, 0xFD, 0x01, psocOk, fsCode

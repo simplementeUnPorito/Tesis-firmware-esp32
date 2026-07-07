@@ -200,7 +200,7 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
                                             uint16_t fs, uint8_t hw_class)
 {
     /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
-    uint8_t fs_code = (fs >= 100u) ? (uint8_t)(fs / 100u) : 0u;
+    uint8_t fs_code = (fs >= 100u) ? (uint8_t)((fs + 50u) / 100u) : 0u;
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x01, psoc_ok, fs_code };
     _emit(pkt);
     if (fs > 0u) {

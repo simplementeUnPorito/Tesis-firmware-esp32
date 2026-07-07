@@ -131,8 +131,8 @@ def parse_args():
     parser.add_argument(
         "--fs",
         type=float,
-        default=2929.0,
-        help="Sample rate for --seconds conversion (default: 2929 Hz)",
+        default=1020.0,
+        help="Sample rate for --seconds conversion (default: 1020 Hz)",
     )
     parser.add_argument(
         "--allow-long",
@@ -144,6 +144,19 @@ def parse_args():
         type=int,
         default=TOTAL_S,
         help=f"Total runtime in seconds (default: {TOTAL_S})",
+    )
+    parser.add_argument(
+        "--node",
+        type=int,
+        default=1,
+        help="Slave node id for VER capture (default: 1)",
+    )
+    parser.add_argument(
+        "--stream",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Optionally select PSoC stream before VER: 0=raw, 1=FIR",
     )
     return parser.parse_args()
 
@@ -167,11 +180,13 @@ def main():
             f"--batches {n_batches} may cause long WiFi outage; "
             "use --allow-long only if you accept that risk"
         )
+    if args.node < 1 or args.node > 255:
+        raise SystemExit("--node must be in 1..255")
 
     t0 = time.time()
     log = lambda m: print(f"[{time.time()-t0:7.2f}s] {m}", flush=True)
 
-    sent_arm = sent_reclen = sent_ver = False
+    sent_arm = sent_reclen = sent_stream = sent_ver = False
     n_connects = 0
     n_data = 0
     last_connect_at = None
@@ -209,9 +224,15 @@ def main():
                     else:
                         log(f">>> sent SET_RECLEN={n_batches} for {args.seconds:g}s @ {args.fs:g}Hz")
                     sent_reclen = True
-                elif sent_reclen and not sent_ver and el > 4.5:
-                    send_text(sock, {"cmd": "BD", "node": 1, "sub": "B2", "param": 1})
-                    log(">>> sent VER directed to node 1 (cmd BD sub B2) -- WATCH FOR DISCONNECT")
+                elif sent_reclen and args.stream is not None and not sent_stream and el > 4.0:
+                    send_text(sock, {"cmd": "BD", "node": args.node, "sub": "B7", "param": args.stream})
+                    log(f">>> sent STREAM node {args.node} mode={args.stream} (cmd BD sub B7)")
+                    sent_stream = True
+                elif sent_reclen and not sent_ver and el > (5.0 if args.stream is not None else 4.5):
+                    if args.stream is not None and not sent_stream:
+                        continue
+                    send_text(sock, {"cmd": "BD", "node": args.node, "sub": "B2", "param": 1})
+                    log(f">>> sent VER directed to node {args.node} (cmd BD sub B2) -- WATCH FOR DISCONNECT")
                     sent_ver = True
 
                 try:

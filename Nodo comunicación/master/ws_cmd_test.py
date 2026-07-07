@@ -11,6 +11,7 @@ import struct
 import time
 import sys
 import json
+import argparse
 
 HOST = "192.168.4.1"
 PORT = 80
@@ -23,17 +24,24 @@ PKT_NAMES = {
 }
 MASTER_STATES = ["IDLE", "ARMING", "ARMED", "RUNNING", "STOPPING", "DUMPING", "PRESTART", "SCOPE_MULTI"]
 
-# (label, message dict, settle seconds before next)
-SEQUENCE = [
-    ("STATUS",         {"cmd": "A5", "param": 0},                          1.5),
-    ("ARM n=1",        {"cmd": "A2", "param": 1},                          2.5),
-    ("PGA node1=3",    {"cmd": "BD", "node": 1, "sub": "A6", "param": 3},  1.5),
-    ("VDAC node1=128", {"cmd": "BD", "node": 1, "sub": "AA", "param": 128},1.5),
-    ("PGAVDAC node1",  {"cmd": "BD", "node": 1, "sub": "A9", "param": 0x73}, 1.5),
-    ("LATENCY probe",  {"cmd": "BD", "node": 1, "sub": "AF", "param": 7},  2.5),
-    ("STATUS again",   {"cmd": "A5", "param": 0},                          1.5),
-    ("STOP",           {"cmd": "A4", "param": 0},                          2.0),
-]
+def parse_args():
+    parser = argparse.ArgumentParser(description="WS command/ACK round-trip probe")
+    parser.add_argument("--node", type=int, default=1, help="Slave node id for directed commands")
+    parser.add_argument("--total", type=int, default=TOTAL_S, help=f"Total runtime seconds (default: {TOTAL_S})")
+    return parser.parse_args()
+
+
+def build_sequence(node):
+    return [
+        ("STATUS",          {"cmd": "A5", "param": 0},                              1.5),
+        ("ARM n=1",         {"cmd": "A2", "param": 1},                              2.5),
+        (f"PGA node{node}=3", {"cmd": "BD", "node": node, "sub": "A6", "param": 3}, 1.5),
+        (f"VDAC node{node}=128", {"cmd": "BD", "node": node, "sub": "AA", "param": 128}, 1.5),
+        (f"PGAVDAC node{node}", {"cmd": "BD", "node": node, "sub": "A9", "param": 0x73}, 1.5),
+        (f"LATENCY node{node}", {"cmd": "BD", "node": node, "sub": "AF", "param": 7}, 2.5),
+        ("STATUS again",    {"cmd": "A5", "param": 0},                              1.5),
+        ("STOP",            {"cmd": "A4", "param": 0},                              2.0),
+    ]
 
 
 def b64key():
@@ -113,6 +121,8 @@ def describe(pkt):
 
 
 def main():
+    args = parse_args()
+    sequence = build_sequence(args.node)
     t0 = time.time()
     log = lambda m: print(f"[{time.time()-t0:7.2f}s] {m}", flush=True)
 
@@ -128,11 +138,11 @@ def main():
     states_seen = []
 
     try:
-        while time.time() - t0 < TOTAL_S:
-            if seq_idx < len(SEQUENCE) and time.time() >= next_send_at:
-                label, msg, settle = SEQUENCE[seq_idx]
+        while time.time() - t0 < args.total:
+            if seq_idx < len(sequence) and time.time() >= next_send_at:
+                label, msg, settle = sequence[seq_idx]
                 send_text(sock, msg)
-                log(f">>> [{seq_idx+1}/{len(SEQUENCE)}] sent {label}: {msg}")
+                log(f">>> [{seq_idx+1}/{len(sequence)}] sent {label}: {msg}")
                 next_send_at = time.time() + settle
                 seq_idx += 1
 
@@ -170,7 +180,7 @@ def main():
         log(f"  ACK @ {t:6.2f}s  cmd=0x{cmd:02X} val={val}")
     for t, st in states_seen:
         log(f"  STATE @ {t:6.2f}s -> {st}")
-    sent_labels = [s[0] for s in SEQUENCE[:seq_idx]]
+    sent_labels = [s[0] for s in sequence[:seq_idx]]
     log(f"  commands sent (in order): {sent_labels}")
 
 

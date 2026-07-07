@@ -3,7 +3,7 @@
 // are backed by a fixed-capacity RingBuffer (Float64Array) instead of a
 // maxlen-deque, since JS has no built-in bounded queue with O(1) push+evict.
 
-import * as cfg from './config.js?v=field-study-10';
+import * as cfg from './config.js?v=field-study-17';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -92,8 +92,23 @@ export class NodeData {
     // DC removal
     this.dcRemove = false;
 
+    // Cancelación de ruido de línea: ajuste por mínimos cuadrados de armónicos
+    // de 50 Hz sobre la captura completa, restado del buffer filtrado (espejo
+    // de notch_enabled/notch_harm del scope Python; f0 en cfg.LINE_NOTCH_F0).
+    this.notchEnabled = false;
+    this.notchHarm = cfg.LINE_NOTCH_DEFAULT_HARM;
+
+    // Full-capture filter state. Raw samples may stream/dump incrementally, but
+    // FIR/filtFilt and line-noise LS must run only after the node's raw capture
+    // is complete.
+    this.captureActive = false;
+    this.filterDirty = false;
+    this.filterReady = false;
+
     // Per-node config (updated from heartbeat / ACK packets)
     this.pgaCode = 0;
+    this.adcConfigCode = 1;
+    this.countsPerVolt = cfg.ADC_COUNTS_PER_VOLT;
     this.vdacByte = 128;
     this.calVdacs = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
     this.calVdacDetails = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
@@ -166,6 +181,9 @@ export class NodeData {
     this.totalSamples = 0;
     this.gotFirst = false;
     this.tFirst = 0;
+    this.captureActive = false;
+    this.filterDirty = false;
+    this.filterReady = false;
   }
 
   addDrift(value, maxHist = 50) {

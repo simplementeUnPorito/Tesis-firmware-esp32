@@ -14,6 +14,41 @@ pio run -t uploadfs              # web (LittleFS) → COM8
 
 Verificar que `/health` devuelve `ok`, `littlefs=ok`.
 
+## Scripts de smoke desde PC
+
+Los scripts de prueba aceptan nodo destino explicito:
+
+```bash
+python "src/esp/Nodo comunicación/master/ws_cmd_test.py" --node 2 --total 35
+python "src/esp/Nodo comunicación/master/ws_capture_test.py" --node 2 --batches 2 --stream 0 --total 25
+python "src/esp/Nodo comunicación/master/ws_capture_test.py" --node 2 --batches 2 --stream 1 --total 25
+```
+
+`--stream 0` selecciona RAW y `--stream 1` selecciona FIR antes de enviar VER.
+
+### Interferencia por pestania de UI abierta (takeover del WS)
+
+El master admite UN cliente WS. Una conexion nueva desde la MISMA IP roba el
+socket (takeover, close 1001) y la UI del navegador reconecta sola para
+siempre: si quedo una pestania abierta con `http://192.168.4.1/` en la misma
+PC desde la que corre el script, ambos se roban el socket cada 1-2 s y el
+dump de VER se aborta a mitad (`DUMPING -> ARMED`, `DATA=0` en el probe).
+Sintoma tipico: `ws_capture_test.py` termina con `total connects=5` o mas y
+`DATA pkts received=0` aunque los ACK (`CMD_VIEW ok=2`) lleguen bien.
+
+Mitigaciones (2026-07-02):
+
+1. Lo ideal: cerrar toda pestania con la UI antes de correr scripts de WS.
+   `netstat -ano | findstr 192.168.4.1` delata al proceso dueno del socket.
+2. `GET /ws-reset` cierra todos los clientes WS del master (la UI reconecta
+   ~1 s despues, asi que solo abre una ventana corta).
+3. Si no se puede cerrar la pestania, usar la estrategia del probe
+   `ws_fast_probe.py` (scratchpad de la sesion 2026-07-02, documentada aqui):
+   reconectar al instante tras cada robo (cada re-robo hace crecer el backoff
+   de la UI: ~2.5 -> 5 -> 10 s) y RETRASAR el VER hasta despues de >=2 robos,
+   para que el dump completo caiga dentro de una ventana larga. Con eso se
+   midio `DATA=60/60` en RAW y FIR con una pestania hostil abierta.
+
 ## Smoke test
 
 1. Celular conectado a `GeoNetwork` (pass `geophone2026`).
@@ -28,11 +63,11 @@ Verificar que `/health` devuelve `ok`, `littlefs=ok`.
 3. Cambiar PGA, VDAC, PGAvdac desde el panel de cada esclavo y confirmar ACK.
 4. Verificar que el panel muestra `VDAC: <byte> (<pct>%)` en stats.
 5. Ejecutar **Latency probe** y ver valor en µs.
-6. Ejecutar **Ver** (captura en vivo, VER mode) para cada esclavo.
+6. Ejecutar **Ver** (HOT_WAIT + store-and-forward, VER mode) para cada esclavo.
 
 ## Path de captura
 
-1. ARM → START con duración corta (p.ej. 293 lotes ≈ 3 s a 2929 Hz).
+1. ARM → START con duración corta (p.ej. 102 lotes ≈ 3 s a 1020 Hz).
 2. Confirmar que aparecen trazas crudas y filtradas para cada nodo.
 3. Probar controles de display: `Sin offset DC`, `Espectro`, `Invertir señal`.
 4. Probar envolvente: `Env cruda`, `Env filtrada`.
@@ -56,6 +91,29 @@ Verificar que `/health` devuelve `ok`, `littlefs=ok`.
 2. En PC: `python src/python/geophone_scope/zip_to_mat.py capture.zip`
 3. Abrir `.mat` → verificar `raw`, `filt`, `fs`, `pga_code`, `cal_vdacs`.
 
+## Validacion 2026-07-02
+
+- `/health`: `200 OK`, `littlefs=ok`, `ap_ip=192.168.4.1`.
+- `ws_cmd_test.py --node 2 --total 35`: ACK para ARM, PGA, VDAC, PGAVDAC,
+  LATENCY y STOP; HELLO/STATUS del nodo 2.
+- `ws_capture_test.py --node 2 --batches 2 --stream 1 --total 25`: ACK de
+  stream FIR, VER `ok=1/2`, `RUNNING -> DUMPING`, 60 paquetes DATA.
+- `ws_capture_test.py --node 2 --batches 2 --stream 0 --total 25`: ACK de
+  stream RAW, VER `ok=1/2`, `RUNNING -> DUMPING`, 60 paquetes DATA.
+
+Resultados 2026-07-02 (tarde, PSoC con politica de eventos
+determinismo-primero; ver `docs/psoc_supermaquina_handoff.md`):
+
+- Con una pestania de UI abierta en la PC, `ws_capture_test.py` fallaba con
+  `DATA=0` por el takeover del WS (ver seccion de interferencia arriba).
+- `ws_fast_probe.py 2 2 0 60` (nodo 2, 2 lotes, RAW): `DATA=60/60`,
+  `RUNNING -> DUMPING`, ACK `CMD_VIEW ok=2`.
+- `ws_fast_probe.py 2 2 1 60` (FIR): `DATA=60/60`.
+- Cross-check por el log USB del esclavo (lab build): `cfg B7 ok=1`,
+  `HOT_WAIT`, `START_OK sync 0->1`, `FULL -> STOPPED (2 batches)` en ambos.
+- Repetido con el esclavo ya silenciado (firmware final): RAW `60/60` y
+  FIR `60/60`.
+
 ## Check RF (silencio electromagnético)
 
 Comparar espectros con/sin celular conectado:
@@ -73,7 +131,7 @@ Para validar la UI sin el PSoC Hammer físico:
 
 ```bash
 python "src/esp/Nodo comunicación/simulate_hammer_dummy.py" \
-  --host 192.168.4.1 --node 1 --type hammer --fs 2929 --psoc 1
+  --host 192.168.4.1 --node 1 --type hammer --fs 1020 --psoc 1
 ```
 
 La UI debe mostrar `Hammer (S1)` sin el campo "Offset m".

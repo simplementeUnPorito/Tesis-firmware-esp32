@@ -321,6 +321,21 @@ button:active { background: var(--input-active); }
   align-items: center;
 }
 
+.inline-control-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+  padding: 0.15rem 0.3rem;
+  border: 1px solid var(--filter-border);
+  border-radius: 6px;
+}
+
+input[type="number"].small-number {
+  width: 3.4rem;
+  padding: 0.25rem 0.35rem;
+}
+
 .velocity-readout {
   color: #50dca0;
   font-family: ui-monospace, monospace;

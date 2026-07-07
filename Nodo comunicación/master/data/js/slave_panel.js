@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-study-10';
+import * as cfg from './config.js?v=field-study-17';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -55,8 +55,9 @@ function fmtSignedPct(value) {
 /**
  * Controls for one slave node (channels 1-3, displayed as Esclavo 1-3).
  *
- * Events: 'pga-changed' {code},
+ * Events: 'pga-changed' {code}, 'adc-config-changed' {code},
  *         'fir-apply' {cmd}, 'fir-remove',
+ *         'line-notch-changed' {enabled, nHarm},
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
  *         'send-all-requested', 'calibrate-requested', 'latency-requested',
  *         'offset-changed' {offset}, 'y-offset-changed' {offsetMv}
@@ -113,9 +114,18 @@ export class SlavePanel extends EventTarget {
     this._dotPga = dot('PGA sin confirmar');
     this._lblPgaActual = el('span', null, 'Current: 1x');
     this._btnSendAll = el('button', null, 'resend');
-    this._btnSendAll.title = 'Reenvia la configuracion de PGA al PSoC';
+    this._btnSendAll.title = 'Reenvia la configuracion de PGA y rango ADC al PSoC';
     this._btnSendAll.addEventListener('click', () => this._dispatch('send-all-requested'));
     root.appendChild(row(labeled('PGA', this._ddPga), this._btnSendAll, this._dotPga, this._lblPgaActual));
+
+    this._ddAdcCfg = el('select');
+    for (const adcCfg of cfg.ADC_CONFIGS) {
+      this._ddAdcCfg.appendChild(new Option(adcCfg.label, String(adcCfg.code)));
+    }
+    this._ddAdcCfg.addEventListener('change', () => this._onAdcConfigChanged());
+    this._dotAdcCfg = dot('Rango ADC sin confirmar');
+    this._lblAdcCfgActual = el('span', null, `Current: ${cfg.ADC_CONFIGS[0].label}`);
+    root.appendChild(row(labeled('Rango ADC', this._ddAdcCfg), this._dotAdcCfg, this._lblAdcCfgActual));
 
     this._dotCal = dot('Calibracion sin ejecutar');
     this._btnCalibrate = el('button', null, 'Calibrar');
@@ -164,6 +174,30 @@ export class SlavePanel extends EventTarget {
     ));
 
     firBox.appendChild(row(this._lblFirStatus));
+
+    this._cbLineNotch = el('input');
+    this._cbLineNotch.type = 'checkbox';
+    this._cbLineNotch.title = 'Cancelar ruido de linea por ajuste de armónicos sobre la captura completa';
+    this._notchHarm = el('input');
+    this._notchHarm.type = 'number';
+    this._notchHarm.min = '1';
+    this._notchHarm.max = String(cfg.LINE_NOTCH_MAX_HARM);
+    this._notchHarm.step = '1';
+    this._notchHarm.value = String(cfg.LINE_NOTCH_DEFAULT_HARM);
+    this._notchHarm.className = 'small-number';
+    this._notchHarm.title = 'Cantidad de armonicos 50*N a cancelar';
+    const emitNotchChanged = () => {
+      this._dispatch('line-notch-changed', {
+        enabled: this._cbLineNotch.checked,
+        nHarm: parseInt(this._notchHarm.value, 10) || cfg.LINE_NOTCH_DEFAULT_HARM,
+      });
+    };
+    this._cbLineNotch.addEventListener('change', emitNotchChanged);
+    this._notchHarm.addEventListener('change', emitNotchChanged);
+    firBox.appendChild(row(
+      labeled('Sin ruido de linea', this._cbLineNotch),
+      labeled('N', this._notchHarm),
+    ));
     root.appendChild(firBox);
 
     this._btnTest = el('button', null, 'Test');
@@ -235,6 +269,13 @@ export class SlavePanel extends EventTarget {
     this._dispatch('pga-changed', index);
   }
 
+  _onAdcConfigChanged() {
+    const code = parseInt(this._ddAdcCfg.value, 10) || 1;
+    const adcCfg = cfg.ADC_CONFIGS.find((item) => item.code === code) || cfg.ADC_CONFIGS[0];
+    this._lblAdcCfgActual.textContent = `Current: ${adcCfg.label}`;
+    this._dispatch('adc-config-changed', { code: adcCfg.code });
+  }
+
   _syncFirFields() {
     const type = this._ddFirType.value;
     const needsF2 = type === 'bp' || type === 'bs';
@@ -283,12 +324,15 @@ export class SlavePanel extends EventTarget {
     this._btnVer.disabled = !connected;
     this._btnLatency.disabled = !connected;
     this._btnSendAll.disabled = !connected;
+    this._ddPga.disabled = !connected;
+    this._ddAdcCfg.disabled = !connected;
     this._btnCalibrate.disabled = !connected;
     this._btnSaveEeprom.disabled = !connected;
     this._btnBlinkLed.disabled = !connected;
     this._cbFirHw.disabled = !connected;
     if (!connected) {
       this.setPgaLock(0);
+      this.setAdcConfigLock(0);
       this.setCalibrationLock(0);
     }
   }
@@ -316,6 +360,12 @@ export class SlavePanel extends EventTarget {
 
   setDcValue(_v) {}
 
+  setLineNotch(enabled, nHarm) {
+    this._cbLineNotch.checked = !!enabled;
+    const v = Number.isFinite(nHarm) ? nHarm : cfg.LINE_NOTCH_DEFAULT_HARM;
+    this._notchHarm.value = String(Math.min(cfg.LINE_NOTCH_MAX_HARM, Math.max(1, Math.round(v))));
+  }
+
   setPga(code) {
     if (code < 0 || code >= cfg.GAIN_NAMES.length) return;
     this._ddPga.selectedIndex = code;
@@ -325,6 +375,18 @@ export class SlavePanel extends EventTarget {
   /** state: 0=unknown, 1=locked, 2=pending/fail. */
   setPgaLock(state) {
     setDot(this._dotPga, state, 'PGA confirmado por PSoC', 'PGA pendiente o sin confirmacion', 'PGA sin confirmar');
+  }
+
+  setAdcConfig(code) {
+    const adcCfg = cfg.ADC_CONFIGS.find((item) => item.code === code) || cfg.ADC_CONFIGS[0];
+    this._ddAdcCfg.value = String(adcCfg.code);
+    this._lblAdcCfgActual.textContent = `Current: ${adcCfg.label}`;
+  }
+
+  /** state: 0=unknown, 1=locked, 2=pending/fail. */
+  setAdcConfigLock(state) {
+    setDot(this._dotAdcCfg, state, 'Rango ADC confirmado por PSoC',
+           'Rango ADC pendiente o sin confirmacion', 'Rango ADC sin confirmar');
   }
 
   /** state: 0=unknown, 1=ok, 2=pending/fail, 3=calibrando (en curso). */

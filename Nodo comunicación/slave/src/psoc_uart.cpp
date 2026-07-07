@@ -200,6 +200,7 @@ void PsocUART::setPgavdac(uint8_t code){ _sendCmd1(PSOC_CMD_PGAVDAC, code); }
 void PsocUART::calibrate()             { _sendCmd1(PSOC_CMD_CALIBRATE, 1); }
 void PsocUART::saveEeprom()            { _sendCmd1(PSOC_CMD_SAVE_EEPROM, 0); }
 void PsocUART::selectStream(uint8_t m) { _sendCmd1(PSOC_CMD_SELECT_STREAM, m); }
+void PsocUART::setAdcConfig(uint8_t c) { _sendCmd1(PSOC_CMD_ADC_CONFIG, c); }
 void PsocUART::adcSnapshot()           { _sendCmd1(PSOC_CMD_ADC_SNAPSHOT, 1); }
 void PsocUART::blinkLed()              { _sendCmd1(PSOC_CMD_BLINK_LED, 1); }
 void PsocUART::debugRamp(bool en)      { _sendCmd1(PSOC_CMD_DEBUG, en ? 1 : 0); }

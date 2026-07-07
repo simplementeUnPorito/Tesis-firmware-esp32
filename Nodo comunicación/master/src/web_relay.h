@@ -83,6 +83,13 @@ inline bool webRelayHasActiveClient()
     return (uint32_t)(millis() - g_wsAliveMs) <= WEB_RELAY_ALIVE_MS;
 }
 
+inline bool webRelayOwnerRecentlyAlive()
+{
+    if (g_wsOwnerId == 0) return false;
+    if (g_wsAliveMs == 0) return true;
+    return (uint32_t)(millis() - g_wsAliveMs) <= WEB_RELAY_ALIVE_MS;
+}
+
 /* Cerrar el cliente WS activo a propósito (p. ej. justo antes de
  * beacon_pause(): el STA va a quedar sin beacons ~60 s y la conexión
  * quedaría "zombie" — viva para el servidor, muerta para el cliente — y
@@ -344,15 +351,27 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
 {
     switch (type) {
         case WS_EVT_CONNECT: {
-            /* Un cliente a la vez: el primero que entra queda como dueño. */
+            /* Un cliente a la vez: el primero que entra queda como dueño.
+             * Si otra pestaña de la misma IP intenta conectar mientras el
+             * dueño sigue vivo, no hacemos takeover: dos navegadores con
+             * auto-reconnect pueden robarse el socket en bucle. */
             bool rejected = false;
             for (auto &c : server->getClients()) {
                 if (c.id() == client->id() || c.status() != WS_CONNECTED) continue;
                 if (c.remoteIP() == client->remoteIP()) {
-                    MASTER_LOG_PRINTF("[WEB] WS takeover #%u reemplaza #%u (%s)\n",
+                    if (c.id() == g_wsOwnerId && webRelayOwnerRecentlyAlive()) {
+                        MASTER_LOG_PRINTF("[WEB] WS rechazado #%u (dueño #%u activo misma IP %s)\n",
+                                          client->id(), c.id(),
+                                          c.remoteIP().toString().c_str());
+                        client->text("{\"type\":\"busy\",\"reason\":\"ws_owner_alive\"}");
+                        client->close(1008, "busy");
+                        rejected = true;
+                        break;
+                    }
+                    MASTER_LOG_PRINTF("[WEB] WS takeover stale #%u reemplaza #%u (%s)\n",
                                       client->id(), c.id(),
                                       client->remoteIP().toString().c_str());
-                    c.close(1001, "takeover");
+                    c.close(1001, "takeover_stale");
                     continue;
                 }
                 MASTER_LOG_PRINTF("[WEB] WS rechazado #%u (lock: dueño #%u %s)\n",

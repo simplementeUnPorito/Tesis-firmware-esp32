@@ -4,13 +4,9 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-study-10';
-import { hilbertEnvelope } from './signal_proc.js?v=field-study-10';
+import * as cfg from './config.js?v=field-study-17';
+import { hilbertEnvelope } from './signal_proc.js?v=field-study-17';
 
-const RAW_COLOR = 'rgb(80, 140, 255)';
-const FILT_COLOR = 'rgb(255, 80, 80)';
-const ENV_RAW_COLOR  = 'rgba(242, 130, 13, 0.86)';
-const ENV_FILT_COLOR = 'rgba(255, 190, 80, 0.86)';
 const CURSOR_STYLES = [
   { label: 'C1', line: 'rgba(255,230,80,0.9)', stroke: 'rgba(255,230,80,0.65)', text: '#ffe980' },
   { label: 'C2', line: 'rgba(80,220,255,0.9)', stroke: 'rgba(80,220,255,0.65)', text: '#80eaff' },
@@ -495,13 +491,13 @@ class ChannelPlot {
       if (this._showFiltEnvelope) drawEnvBilateral(overlay.envFilt, withAlpha(color, 0.58), xStart, oYOff);
     }
 
-    if (this._showRaw) drawCurve(raw, RAW_COLOR, 0);
+    if (this._showRaw) drawCurve(raw, cfg.RAW_COLOR, 0);
     // Linear-phase FIR of length N has constant group delay (N-1)/2: its
     // first (N-1)/2 outputs are pure startup transient. Discard them so the
     // rest aligns index-for-index with raw, and the transient never appears.
-    if (this._showFilt) drawCurve(filt, FILT_COLOR, this._filtTrimSamp);
-    if (this._showRawEnvelope) drawEnvBilateral(envRaw, ENV_RAW_COLOR);
-    if (this._showFiltEnvelope) drawEnvBilateral(envFilt, ENV_FILT_COLOR);
+    if (this._showFilt) drawCurve(filt, cfg.FILT_COLOR, this._filtTrimSamp);
+    if (this._showRawEnvelope) drawEnvBilateral(envRaw, cfg.ENV_RAW_COLOR);
+    if (this._showFiltEnvelope) drawEnvBilateral(envFilt, cfg.ENV_FILT_COLOR);
     ctx.restore();
 
     // Cursors - vertical dashed lines + readout boxes.
@@ -596,16 +592,16 @@ class ChannelPlot {
       drawLegendItem('Preservados', withAlpha(overlays[0].color || 'rgba(20,184,166,0.7)', 0.86));
     }
     if (this._showFiltEnvelope && envFilt) {
-      drawLegendItem('Env filtrada', ENV_FILT_COLOR);
+      drawLegendItem('Env filtrada', cfg.ENV_FILT_COLOR);
     }
     if (this._showRawEnvelope && envRaw) {
-      drawLegendItem('Env cruda', ENV_RAW_COLOR);
+      drawLegendItem('Env cruda', cfg.ENV_RAW_COLOR);
     }
     if (filt && this._showFilt) {
-      drawLegendItem('Filtrada', FILT_COLOR);
+      drawLegendItem('Filtrada', cfg.FILT_COLOR);
     }
     if (this._showRaw) {
-      drawLegendItem('Cruda', RAW_COLOR);
+      drawLegendItem('Cruda', cfg.RAW_COLOR);
     }
 
     // Y-axis unit label (rotated)

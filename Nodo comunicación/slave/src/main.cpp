@@ -53,7 +53,7 @@
   #define DEBUG_HW_START_US SCOPE_START_PULSE_US
 #endif
 #ifndef PSOC_CAPTURE_MAX_BATCHES
-  #define PSOC_CAPTURE_MAX_BATCHES 512
+  #define PSOC_CAPTURE_MAX_BATCHES 360
 #endif
 /* Logging (humano + máquina) en debug_log.h, gateado por DBG_ENABLE.
  * Estos defines limpian el monitor USB: por defecto queda solo lo accionable
@@ -82,6 +82,9 @@
 #ifndef SLAVE_USB_CMD_ENABLE
   #define SLAVE_USB_CMD_ENABLE 1
 #endif
+#ifndef SLAVE_LAB_TOOLS_ENABLE
+  #define SLAVE_LAB_TOOLS_ENABLE 0
+#endif
 #ifndef PSOC_AUTO_CAL_ON_READY
   #define PSOC_AUTO_CAL_ON_READY 1
 #endif
@@ -90,12 +93,6 @@
 #endif
 #ifndef PSOC_AUTO_CAL_RETRY_MS
   #define PSOC_AUTO_CAL_RETRY_MS 3000u
-#endif
-#ifndef PSOC_NOMINAL_SAMPLE_RATE_HZ
-  #define PSOC_NOMINAL_SAMPLE_RATE_HZ 3000u
-#endif
-#ifndef PSOC_EFFECTIVE_SAMPLE_RATE_HZ
-  #define PSOC_EFFECTIVE_SAMPLE_RATE_HZ 2929u
 #endif
 #ifndef WIFI_TX_POWER_QDBM
   #define WIFI_TX_POWER_QDBM 78
@@ -342,6 +339,7 @@ static void sendCfgAck(uint8_t sub_cmd, uint8_t ok);
 static void allocStore(uint16_t n_batches);
 static void enterHotWait(uint16_t n_batches);
 static uint16_t clampPsocCaptureBatches(uint16_t n);
+static uint32_t expectedCaptureMs(uint16_t n_batches);
 static bool storeReadyForHotWait();
 static void debugEspSetRamp(bool enable);
 
@@ -1076,6 +1074,11 @@ static bool isGainCode(uint8_t code)
     return code <= 8u;
 }
 
+static bool isAdcConfigCode(uint8_t code)
+{
+    return code == 1u || code == 2u;
+}
+
 static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
 {
     switch (sub_cmd) {
@@ -1393,6 +1396,189 @@ static bool usbParseU16Param(const char *cmd, const char *word, uint16_t &value)
     return true;
 }
 
+#if SLAVE_LAB_TOOLS_ENABLE
+static void requestPrestartFromUsb(uint16_t n);
+static void requestStartNowFromUsb(uint16_t n);
+static void requestCaptureFromUsb(uint16_t n);
+
+static bool usbParseTwoU16Params(const char *cmd, const char *word,
+                                 uint16_t &first, uint16_t &second)
+{
+    uint32_t values[2] = {0u, 0u};
+    uint8_t index = 0u;
+
+    if (!usbCommandStartsWithWord(cmd, word)) {
+        return false;
+    }
+    while (*cmd != '\0' && *cmd != ' ' && *cmd != '=' && *cmd != ':') {
+        cmd++;
+    }
+    while (*cmd != '\0' && index < 2u) {
+        while (*cmd == ' ' || *cmd == '=' || *cmd == ':') {
+            cmd++;
+        }
+        if (*cmd < '0' || *cmd > '9') {
+            return false;
+        }
+        uint32_t acc = 0u;
+        while (*cmd >= '0' && *cmd <= '9') {
+            acc = (acc * 10u) + (uint32_t)(*cmd - '0');
+            if (acc > 65535u) {
+                return false;
+            }
+            cmd++;
+        }
+        values[index++] = acc;
+        while (*cmd == ' ') {
+            cmd++;
+        }
+    }
+    if (index != 2u || *cmd != '\0') {
+        return false;
+    }
+    first = (uint16_t)values[0];
+    second = (uint16_t)values[1];
+    return true;
+}
+
+static uint32_t usbCaptureTimeoutMs(uint16_t n)
+{
+    uint32_t timeoutMs = expectedCaptureMs(n) + 2000u;
+    return (timeoutMs < 3000u) ? 3000u : timeoutMs;
+}
+
+static void serviceLabWaitSlice()
+{
+    psoc.poll();
+    servicePsocConfigAck();
+    delay(1);
+}
+
+static void waitForLabCaptureDone(const char *tag, uint16_t requestedBatches)
+{
+    const uint32_t timeoutMs = usbCaptureTimeoutMs(requestedBatches);
+    const uint32_t startMs = millis();
+    const uint32_t startOk = psoc.batchesOK();
+    const uint32_t startBad = psoc.batchesBad();
+    const uint32_t startBytes = psoc.bytesRx();
+
+    while (g_state == SAMPLING &&
+           (uint32_t)(millis() - startMs) < timeoutMs) {
+        serviceLabWaitSlice();
+    }
+
+    const uint32_t elapsedMs = millis() - startMs;
+    const bool full = (g_rec_n_batches > 0u &&
+                       g_store_fill >= g_rec_n_batches &&
+                       g_state == STOPPED);
+    const bool timeout = (g_state == SAMPLING);
+    SLAVE_LOG_PRINTF("[LAB] %s done=%u timeout=%u ms=%lu/%lu state=%d fill=%u/%u dOK=%lu dBad=%lu dBytes=%lu sync=%d\n",
+                     tag, (unsigned)full, (unsigned)timeout,
+                     (unsigned long)elapsedMs, (unsigned long)timeoutMs,
+                     (int)g_state, (unsigned)g_store_fill,
+                     (unsigned)g_rec_n_batches,
+                     (unsigned long)(psoc.batchesOK() - startOk),
+                     (unsigned long)(psoc.batchesBad() - startBad),
+                     (unsigned long)(psoc.bytesRx() - startBytes),
+                     digitalRead(SYNC_TO_PSOC_PIN));
+    logPsocUartDiag(tag);
+}
+
+static void requestLabDiagFromUsb()
+{
+    SLAVE_LOG_PRINTF("[LAB] diag state=%d psoc=%u streamPga=%u pgavdac=%u vdac=%u syncOut=%d syncIn=%d\n",
+                     (int)g_state, (unsigned)g_psocConnected,
+                     (unsigned)g_pga_code, (unsigned)g_pgavdac,
+                     (unsigned)g_vdac_byte, digitalRead(SYNC_TO_PSOC_PIN),
+                     digitalRead(SYNC_IN_PIN));
+    logPsocUartDiag("LAB_DIAG");
+}
+
+static void requestLabPinsFromUsb()
+{
+    uint32_t rxEdges;
+    uint8_t rxEdgeLevel;
+    noInterrupts();
+    rxEdges = g_psoc_rx_edges;
+    rxEdgeLevel = g_psoc_rx_last_level;
+    interrupts();
+    SLAVE_LOG_PRINTF("[LAB] pins syncOut=%d syncIn=%d psocRx=%d rxEdges=%lu rxEdgeLevel=%u\n",
+                     digitalRead(SYNC_TO_PSOC_PIN), digitalRead(SYNC_IN_PIN),
+                     digitalRead(PSOC_UART_RX), (unsigned long)rxEdges,
+                     (unsigned)rxEdgeLevel);
+}
+
+static void requestQuietWindowFromUsb(uint16_t n, uint16_t ms)
+{
+    const uint32_t preBytes = psoc.bytesRx();
+    const uint32_t prePing = psoc.pingsRx();
+    const uint32_t preDiag = psoc.diagEventsRx();
+    const uint32_t preOk = psoc.batchesOK();
+    const uint32_t preBad = psoc.batchesBad();
+
+    requestPrestartFromUsb(n);
+
+    const uint32_t settleMs = millis();
+    while (g_state == HOT_WAIT &&
+           (uint32_t)(millis() - settleMs) < 25u) {
+        psoc.poll();
+        delay(1);
+    }
+
+    const uint32_t startBytes = psoc.bytesRx();
+    const uint32_t startPing = psoc.pingsRx();
+    const uint32_t startDiag = psoc.diagEventsRx();
+    const uint32_t startOk = psoc.batchesOK();
+    const uint32_t startBad = psoc.batchesBad();
+    const uint32_t startMs = millis();
+
+    while (g_state == HOT_WAIT &&
+           (uint32_t)(millis() - startMs) < (uint32_t)ms) {
+        psoc.poll();
+        delay(1);
+    }
+
+    SLAVE_LOG_PRINTF("[LAB] quiet n=%u ms=%u state=%d settleBytes=%lu settlePing=%lu settleDiag=%lu winBytes=%lu winPing=%lu winDiag=%lu winOK=%lu winBad=%lu sync=%d\n",
+                     (unsigned)n, (unsigned)ms, (int)g_state,
+                     (unsigned long)(startBytes - preBytes),
+                     (unsigned long)(startPing - prePing),
+                     (unsigned long)(startDiag - preDiag),
+                     (unsigned long)(psoc.bytesRx() - startBytes),
+                     (unsigned long)(psoc.pingsRx() - startPing),
+                     (unsigned long)(psoc.diagEventsRx() - startDiag),
+                     (unsigned long)(psoc.batchesOK() - startOk),
+                     (unsigned long)(psoc.batchesBad() - startBad),
+                     digitalRead(SYNC_TO_PSOC_PIN));
+    logPsocUartDiag("LAB_QUIET");
+}
+
+static void waitForLabStreamAck(uint8_t streamMode)
+{
+    const uint32_t startMs = millis();
+    servicePsocConfigAck();
+    if (g_cfg_waiting) {
+        SLAVE_LOG_PRINTF("[LAB] stream ack skipped pending=0x%02X\n", g_cfg_sub_cmd);
+        return;
+    }
+    psoc.selectStream(streamMode);
+    waitForPsocConfigAck(PSOC_CMD_SELECT_STREAM, streamMode);
+    while (g_cfg_waiting && (uint32_t)(millis() - startMs) < 1000u) {
+        serviceLabWaitSlice();
+    }
+    if (g_cfg_waiting) {
+        SLAVE_LOG_PRINTF("[LAB] stream %u ack timeout guard\n", (unsigned)streamMode);
+        g_cfg_waiting = false;
+    }
+}
+
+static void requestLabCaptureFromUsb(uint8_t streamMode, uint16_t n, const char *tag)
+{
+    waitForLabStreamAck(streamMode);
+    requestCaptureFromUsb(n);
+    waitForLabCaptureDone(tag, n);
+}
+#endif
+
 static void requestCalibrationFromUsb()
 {
     const bool sent = requestPsocCalibration("USB");
@@ -1602,6 +1788,7 @@ static void handleUsbCommand(const char *cmd)
 {
     uint8_t value = 0u;
     uint16_t value16 = 0u;
+    uint16_t value16b = 0u;
     if (cmd[0] == '\0') {
         return;
     }
@@ -1646,8 +1833,30 @@ static void handleUsbCommand(const char *cmd)
         (void)requestPsocGainFromUsb(PSOC_CMD_PGA, value, "pga");
     } else if (usbParseGainParam(cmd, "pgavdac", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
+#if SLAVE_LAB_TOOLS_ENABLE
+    } else if (usbCommandEquals(cmd, "diag")) {
+        requestLabDiagFromUsb();
+    } else if (usbCommandEquals(cmd, "pins")) {
+        requestLabPinsFromUsb();
+    } else if (usbParseTwoU16Params(cmd, "quiet", value16, value16b)) {
+        requestQuietWindowFromUsb(value16, value16b);
+    } else if (usbParseU16Param(cmd, "capwait", value16)) {
+        requestCaptureFromUsb(value16);
+        waitForLabCaptureDone("LAB_CAPWAIT", value16);
+    } else if (usbParseU16Param(cmd, "startwait", value16)) {
+        requestStartNowFromUsb(value16);
+        waitForLabCaptureDone("LAB_STARTWAIT", value16);
+    } else if (usbParseU16Param(cmd, "rawcap", value16)) {
+        requestLabCaptureFromUsb(0u, value16, "LAB_RAWCAP");
+    } else if (usbParseU16Param(cmd, "fircap", value16)) {
+        requestLabCaptureFromUsb(1u, value16, "LAB_FIRCAP");
+#endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
+#if SLAVE_LAB_TOOLS_ENABLE
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N\n");
+#else
         SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N\n");
+#endif
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
         SLAVE_LOG_PRINTF("[USB] unknown command '%s' (use: help)\n", cmd);
@@ -1692,11 +1901,7 @@ static bool storeReadyForHotWait()
 
 static uint16_t effectivePsocSampleRateHz()
 {
-    uint16_t fs = psoc.sampleRate();
-    if (fs == (uint16_t)PSOC_NOMINAL_SAMPLE_RATE_HZ) {
-        return (uint16_t)PSOC_EFFECTIVE_SAMPLE_RATE_HZ;
-    }
-    return fs;
+    return psoc.sampleRate();
 }
 
 static uint16_t clampPsocCaptureBatches(uint16_t n)
@@ -1710,7 +1915,7 @@ static uint16_t clampPsocCaptureBatches(uint16_t n)
 static uint32_t expectedCaptureMs(uint16_t n_batches)
 {
     uint32_t fs = effectivePsocSampleRateHz();
-    if (fs == 0) fs = 2929u;
+    if (fs == 0) fs = 1020u;
     uint32_t ms = ((uint32_t)n_batches * (uint32_t)SPI_BATCH_SAMPLES * 1000u + fs - 1u) / fs;
     return ms + PSOC_START_FALLBACK_EXTRA_MS;
 }
@@ -1821,6 +2026,13 @@ static void handleSetConfig(const MsgSetConfig *cfg)
         case PSOC_CMD_SELECT_STREAM:        /* 0xB7: 0=crudo, 1=FIR hardware */
             waitAck = true;
             break;
+        case PSOC_CMD_ADC_CONFIG:           /* 0xBA: 1=±2.5 V, 2=±0.512 V */
+            if (!isAdcConfigCode(param)) {
+                ok = 0;
+            } else {
+                waitAck = true;
+            }
+            break;
         default:
             ok = 0;
             break;
@@ -1848,6 +2060,9 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                     break;
                 case PSOC_CMD_SELECT_STREAM:
                     psoc.selectStream(param);
+                    break;
+                case PSOC_CMD_ADC_CONFIG:
+                    psoc.setAdcConfig(param);
                     break;
                 default:
                     ok = 0;
