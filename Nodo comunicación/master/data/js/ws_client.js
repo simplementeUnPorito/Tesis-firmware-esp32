@@ -176,6 +176,8 @@ export class WsClient extends EventTarget {
               this._log('WS: contraseña incorrecta');
               this.dispatchEvent(new CustomEvent('auth-required', { detail: { reason: 'wrong_password' } }));
             }
+          } else if (msg?.type === 'link') {
+            this.dispatchEvent(new CustomEvent('link-rssi', { detail: msg }));
           }
         } catch (_) {}
         return;

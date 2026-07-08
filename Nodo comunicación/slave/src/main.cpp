@@ -1076,7 +1076,7 @@ static bool isGainCode(uint8_t code)
 
 static bool isAdcConfigCode(uint8_t code)
 {
-    return code == 1u || code == 2u;
+    return code >= 1u && code <= 4u;
 }
 
 static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
@@ -1784,6 +1784,31 @@ static bool requestPsocGainFromUsb(uint8_t subCmd, uint8_t param, const char *na
     return sent;
 }
 
+/* "range N" — banco de pruebas: selecciona la config de rango del ADC
+ * (1=CF_2V5, 2=CF_0V512, 3=CF_1V024, 4=CF_0V625) sin pasar por el maestro. */
+static bool requestAdcConfigFromUsb(uint8_t cfg)
+{
+    bool sent = false;
+    if (!isAdcConfigCode(cfg)) {
+        LOGM("USB_CMD", "cmd=range,ok=0,reason=bad_range,value=%u", (unsigned)cfg);
+        return false;
+    }
+    servicePsocConfigAck();
+    if (g_cfg_waiting) {
+        LOGM("USB_CMD", "cmd=range,ok=0,reason=cfg_busy,pending=0x%02X", g_cfg_sub_cmd);
+        return false;
+    }
+    if (ensurePsocReadyForConfig()) {
+        psoc.setAdcConfig(cfg);
+        waitForPsocConfigAck(PSOC_CMD_ADC_CONFIG, cfg);
+        sent = true;
+    }
+    SLAVE_LOG_PRINTF("[USB] range %u -> PSoC CMD 0x%02X\n", (unsigned)cfg, PSOC_CMD_ADC_CONFIG);
+    LOGM("USB_CMD", "cmd=range,ok=%u,sub=0x%02X,value=%u",
+         (unsigned)sent, PSOC_CMD_ADC_CONFIG, (unsigned)cfg);
+    return sent;
+}
+
 static void handleUsbCommand(const char *cmd)
 {
     uint8_t value = 0u;
@@ -1833,6 +1858,8 @@ static void handleUsbCommand(const char *cmd)
         (void)requestPsocGainFromUsb(PSOC_CMD_PGA, value, "pga");
     } else if (usbParseGainParam(cmd, "pgavdac", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
+    } else if (usbParseGainParam(cmd, "range", value)) {
+        (void)requestAdcConfigFromUsb(value);
 #if SLAVE_LAB_TOOLS_ENABLE
     } else if (usbCommandEquals(cmd, "diag")) {
         requestLabDiagFromUsb();
@@ -1853,9 +1880,9 @@ static void handleUsbCommand(const char *cmd)
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, range N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N\n");
 #else
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, range N\n");
 #endif
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
@@ -2026,7 +2053,7 @@ static void handleSetConfig(const MsgSetConfig *cfg)
         case PSOC_CMD_SELECT_STREAM:        /* 0xB7: 0=crudo, 1=FIR hardware */
             waitAck = true;
             break;
-        case PSOC_CMD_ADC_CONFIG:           /* 0xBA: 1=±2.5 V, 2=±0.512 V */
+        case PSOC_CMD_ADC_CONFIG:           /* 0xBA: 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V */
             if (!isAdcConfigCode(param)) {
                 ok = 0;
             } else {

@@ -24,6 +24,10 @@ const pgaLockTimers = new Map();
 const adcConfigLockTimers = new Map();
 const testTimers = new Map();
 const preservedCaptures = [];
+// Firmas de capturas ya incluidas en un ZIP exportado con exito — usado por
+// el guard de beforeunload para avisar solo si hay datos NUEVOS sin bajar
+// (no cada vez que hay algo en preservedCaptures, que se mantiene tras exportar).
+const exportedCaptureSignatures = new Set();
 const PRESERVE_COLORS = [
   'rgba(20, 184, 166, 0.72)',
   'rgba(245, 158, 11, 0.72)',
@@ -442,6 +446,17 @@ function captureSampleCount(capture, signal = 'raw') {
 
 function captureHasSamples(capture) {
   return captureSampleCount(capture, 'raw') > 0 || captureSampleCount(capture, 'filt') > 0;
+}
+
+/* true si hay una captura preservada o el buffer en vivo con muestras cuya
+ * firma todavia no forma parte de un ZIP exportado con exito. Se recalcula
+ * al vuelo (no es un flag manual) para no desincronizarse de preservedCaptures. */
+function hasUnexportedData() {
+  for (const capture of preservedCaptures) {
+    if (!exportedCaptureSignatures.has(capture.signature)) return true;
+  }
+  const liveCapture = makeCaptureSnapshot('Actual', { source: 'live', visible: false });
+  return captureHasSamples(liveCapture) && !exportedCaptureSignatures.has(liveCapture.signature);
 }
 
 function findPreservedCaptureIndexBySignature(signature) {
@@ -1463,17 +1478,33 @@ function onTestRequested(chIndex) {
 
 function onSendAll(chIndex) {
   const nd = data.nodes[chIndex];
+  const panel = panelFor(chIndex);
+
   sendDirected(chIndex, cfg.SUBCMD_PGA, nd.pgaCode);
   nd.pending.set(cfg.SUBCMD_PGA, { param: nd.pgaCode, sendTime: performance.now(), retries: 0 });
-  sendDirected(chIndex, cfg.SUBCMD_ADC_CONFIG, nd.adcConfigCode);
-  nd.pending.set(cfg.SUBCMD_ADC_CONFIG, { param: nd.adcConfigCode, sendTime: performance.now(), retries: 0 });
-  const panel = panelFor(chIndex);
-  if (panel) {
-    panel.setPgaLock(2);
-    panel.setAdcConfigLock(2);
-  }
+  if (panel) panel.setPgaLock(2);
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
-  scheduleAdcConfigLockTimeout(chIndex, nd.adcConfigCode);
+
+  // El esclavo solo atiende un config del PSoC a la vez (g_cfg_waiting en
+  // main.cpp): si el rango ADC se manda mientras el PGA todavia espera su
+  // ACK, el esclavo lo rechaza en el acto (cfg busy, ok=0) y el ADC nunca
+  // llega a aplicarse. Encadenar: esperar a que el pending de PGA se resuelva
+  // (ack u timeout, lo que pase primero) antes de mandar el rango ADC.
+  const waitStartMs = performance.now();
+  const sendAdcConfigWhenPgaSettles = () => {
+    const pgaSettled = !nd.pending.has(cfg.SUBCMD_PGA);
+    const waitedTooLong = performance.now() - waitStartMs > cfg.RETRY_SEC * 1000;
+    if (!pgaSettled && !waitedTooLong) {
+      setTimeout(sendAdcConfigWhenPgaSettles, 50);
+      return;
+    }
+    sendDirected(chIndex, cfg.SUBCMD_ADC_CONFIG, nd.adcConfigCode);
+    nd.pending.set(cfg.SUBCMD_ADC_CONFIG, { param: nd.adcConfigCode, sendTime: performance.now(), retries: 0 });
+    if (panel) panel.setAdcConfigLock(2);
+    scheduleAdcConfigLockTimeout(chIndex, nd.adcConfigCode);
+  };
+  sendAdcConfigWhenPgaSettles();
+
   appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}, ADC ${adcConfigForCode(nd.adcConfigCode).label}`);
 }
 
@@ -1538,6 +1569,8 @@ function onExportRequested() {
       liveCapture: captureHasSamples(liveCapture) ? liveCapture : null,
     });
     downloadBlob(blob, filename);
+    for (const capture of preservedCaptures) exportedCaptureSignatures.add(capture.signature);
+    if (captureHasSamples(liveCapture)) exportedCaptureSignatures.add(liveCapture.signature);
     const captureCount = metadata.capture_count ?? 1;
     const combined = metadata.combined_csv_file ? ` · ${metadata.combined_csv_file}` : '';
     $('export-status').textContent =
@@ -1614,7 +1647,7 @@ function loadSlavePanelState(chIndex, panel) {
   clearSlaveSetting(chIndex, 'alias');
 
   nd.pgaCode = loadSlaveInt(chIndex, 'pga_code', nd.pgaCode, 0, cfg.GAIN_CODES.length - 1);
-  applyNodeAdcConfig(nd, loadSlaveInt(chIndex, 'adc_config_code', nd.adcConfigCode, 1, 2));
+  applyNodeAdcConfig(nd, loadSlaveInt(chIndex, 'adc_config_code', nd.adcConfigCode, 1, cfg.ADC_CONFIGS.length));
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
 
   panel.setPga(nd.pgaCode);
@@ -2132,6 +2165,23 @@ ws.addEventListener('connection', (ev) => {
 
 ws.addEventListener('log', (ev) => appendLog(ev.detail));
 
+// Intensidad de señal — el maestro solo manda esto fuera de captura (ver
+// link_rssi.h); no hace falta filtrar por estado acá, el último valor
+// mostrado queda "congelado" en la UI mientras dura la adquisición.
+ws.addEventListener('link-rssi', (ev) => {
+  const msg = ev.detail;
+  const wifiEl = $('wifi-rssi');
+  if (wifiEl) {
+    wifiEl.textContent = Number.isFinite(msg.wifi_rssi)
+      ? `${msg.wifi_rssi} dBm (${msg.wifi_clients ?? 0} cliente/s)`
+      : '--';
+  }
+  for (const slave of msg.slaves || []) {
+    const panel = panelFor(slave.node);
+    if (panel) panel.setRssi(Number.isFinite(slave.rssi) ? slave.rssi : null);
+  }
+});
+
 ws.addEventListener('packet', (ev) => {
   const pkt = ev.detail;
   const idx = pkt.nodeId === cfg.MASTER_NODE_ID ? 0 : pkt.nodeId;
@@ -2323,5 +2373,15 @@ $('capture-secs').addEventListener('input', onCaptureDurationEdited);
 $('capture-secs').addEventListener('change', onCaptureDurationEdited);
 $('btn-max-batches').addEventListener('click', setCaptureToMaxBatches);
 syncDisplayWindowToCaptureDuration();
+
+// Avisar antes de cerrar/recargar si hay mediciones capturadas que todavia
+// no se bajaron en un ZIP — perderlas silenciosamente ya causo problemas
+// en campo. El navegador ignora el texto de returnValue y muestra su propio
+// dialogo generico; igual lo seteamos por compatibilidad con motores viejos.
+window.addEventListener('beforeunload', (e) => {
+  if (!hasUnexportedData()) return;
+  e.preventDefault();
+  e.returnValue = 'Hay mediciones capturadas sin exportar. Si salis ahora se pierden.';
+});
 
 ws.start();

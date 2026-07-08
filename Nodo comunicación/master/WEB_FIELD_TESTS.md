@@ -135,3 +135,70 @@ python "src/esp/Nodo comunicación/simulate_hammer_dummy.py" \
 ```
 
 La UI debe mostrar `Hammer (S1)` sin el campo "Offset m".
+
+## Rango ADC — 4 configs (2026-07-07)
+
+El dropdown "Rango ADC" de cada panel de esclavo ahora tiene 4 opciones
+(antes 2): `±2.5 V`, `±0.512 V`, `±1.024 V`, `±0.625 V` — códigos 1..4,
+`cfg.ADC_CONFIGS` en `config.js`. Todas a la misma Fs (1020 Hz), asi que no
+hace falta re-sincronizar nada al cambiar de rango.
+
+Validado sin hardware (servidor estático local sirviendo `data/`, sin
+maestro real): el dropdown lista las 4 opciones correctamente y no hay
+errores de consola. Falta re-validar con el maestro real una vez
+reflasheado (ver "Pendiente de reflash" abajo) — la selección del PSoC ya
+se probó por USB directo en el esclavo, ver `BUILD_PROGRAM_PSOC.md`.
+
+## Intensidad de señal (RSSI) — 2026-07-07
+
+Dos indicadores nuevos:
+
+- **Interfaz <-> maestro**: WiFi RSSI del cliente conectado al AP
+  (`esp_wifi_ap_get_sta_list`), en la barra de estado (`WiFi interfaz: X
+  dBm (N cliente/s)`).
+- **Esclavo <-> maestro**: RSSI de ESP-NOW por nodo (sniffer promiscuo
+  filtrando Action frames por MAC origen — ESP-NOW no expone RSSI en el
+  callback normal de este core), en cada panel de esclavo junto al MAC.
+
+Implementación: `master/src/link_rssi.h`. El maestro reporta por WS (JSON
+`{"type":"link",...}`) cada 3 s **solo con `g_state == IDLE`**: durante
+ARM/PRESTART/SAMPLING/DUMPING el sniffer promiscuo se apaga del todo (no
+solo se silencia el reporte) para no competir por radio/CPU con la ventana
+crítica de captura. La UI se queda con el último valor mostrado hasta
+volver a IDLE.
+
+**Pendiente de validar con hardware real** — requiere reflash del maestro
+(firmware nuevo + `uploadfs`), lo que corta el WiFi del maestro y necesita
+que el usuario esté presente para reconectarse después. Compilación
+verificada (`pio run -e esp32dev`, sin errores); UI verificada sin errores
+de consola en servidor local pero sin datos WS reales.
+
+## Descarga sin bajar — beforeunload (2026-07-07)
+
+Si hay una captura preservada o en el buffer en vivo cuya firma todavía no
+forma parte de un ZIP exportado con éxito, cerrar/recargar la pestaña
+dispara el diálogo nativo de confirmación del navegador (`beforeunload`).
+Implementado en `app.js` (`hasUnexportedData()` + listener al final del
+archivo) — se recalcula al vuelo comparando `preservedCaptures` contra
+`exportedCaptureSignatures` (un `Set` que se llena en `onExportRequested`
+tras un `downloadBlob` exitoso), no es un flag manual que se pueda
+desincronizar.
+
+**Pendiente de validar con hardware real** por el mismo motivo que arriba
+(requiere reflash del maestro). Revisar manualmente: capturar algo, NO
+exportar, intentar cerrar la pestaña → debe aparecer el diálogo; exportar
+y volver a intentar cerrar → no debe aparecer.
+
+## Pendiente de reflash (2026-07-07)
+
+`link_rssi.h`, el dropdown de 4 configs de ADC y el guard de
+`beforeunload` están implementados y compilan, pero **no están
+desplegados en el maestro real** (COM8) todavía: reflashearlo corta el
+WiFi de la interfaz y hace falta que el usuario esté presente para
+reconectarse. Comando cuando esté listo:
+
+```bash
+cd "src/esp/Nodo comunicación/master"
+pio run -e esp32dev -t upload    # firmware → COM8
+pio run -t uploadfs              # web (LittleFS) → COM8
+```

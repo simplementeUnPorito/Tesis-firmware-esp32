@@ -32,7 +32,7 @@ export const SUBCMD_VER = 0xB2;
 export const SUBCMD_CALIBRATE     = 0xB5;
 export const SUBCMD_SAVE_EEPROM   = 0xB6;   /* mismo código que PSOC_CMD_SAVE_EEPROM */
 export const SUBCMD_SELECT_STREAM = 0xB7;   /* mismo código que PSOC_CMD_SELECT_STREAM */
-export const SUBCMD_ADC_CONFIG    = 0xBA;   /* 1=±2.5 V, 2=±0.512 V; ambos 1020 Hz */
+export const SUBCMD_ADC_CONFIG    = 0xBA;   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; las 4 a 1020 Hz */
 export const SUBCMD_BLINK_LED     = 0x70;
 export const SUBCMD_LATENCY       = 0xAF;
 export const SUBCMD_CAL_VDAC_BASE = 0x80;
@@ -80,10 +80,12 @@ export const VDAC_MAX = 255;
 export const VDAC_FULL_SCALE_V = VDAC_MAX * VDAC_STEP;
 export const VDAC_MV_PER_CODE = VDAC_STEP * 1000;
 
-// ADC scaling — configs expuestas del PSoC. Ambas usan la misma Fs efectiva.
+// ADC scaling — configs expuestas del PSoC. Las 4 usan la misma Fs efectiva.
 export const ADC_CONFIGS = [
   { code: 1, label: '±2.5 V', rangeV: 2.5, fsHz: 1020, countsPerVolt: 131072 / 2.5 },
   { code: 2, label: '±0.512 V', rangeV: 0.512, fsHz: 1020, countsPerVolt: 131072 / 0.512 },
+  { code: 3, label: '±1.024 V', rangeV: 1.024, fsHz: 1020, countsPerVolt: 131072 / 1.024 },
+  { code: 4, label: '±0.625 V', rangeV: 0.625, fsHz: 1020, countsPerVolt: 131072 / 0.625 },
 ];
 export const ADC_COUNTS_PER_VOLT = ADC_CONFIGS[0].countsPerVolt;
 

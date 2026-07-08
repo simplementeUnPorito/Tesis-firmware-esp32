@@ -83,7 +83,9 @@ export class SlavePanel extends EventTarget {
 
     this._slaveKind = 'unknown';
     this._lblMac = el('span', 'mac-label', 'MAC: --');
-    root.appendChild(row(this._lblMac));
+    this._lblRssi = el('span', 'rssi-label', 'RSSI: --');
+    this._lblRssi.title = 'Intensidad de señal ESP-NOW esclavo <-> maestro (se pausa durante captura)';
+    root.appendChild(row(this._lblMac, this._lblRssi));
 
     this._inpOffset = el('input');
     this._inpOffset.type = 'number';
@@ -381,6 +383,12 @@ export class SlavePanel extends EventTarget {
     const adcCfg = cfg.ADC_CONFIGS.find((item) => item.code === code) || cfg.ADC_CONFIGS[0];
     this._ddAdcCfg.value = String(adcCfg.code);
     this._lblAdcCfgActual.textContent = `Current: ${adcCfg.label}`;
+  }
+
+  /** rssi: dBm (int) o null si no hay dato reciente (esclavo mudo o en captura). */
+  setRssi(rssi) {
+    if (!this._lblRssi) return;
+    this._lblRssi.textContent = Number.isFinite(rssi) ? `RSSI: ${rssi} dBm` : 'RSSI: --';
   }
 
   /** state: 0=unknown, 1=locked, 2=pending/fail. */

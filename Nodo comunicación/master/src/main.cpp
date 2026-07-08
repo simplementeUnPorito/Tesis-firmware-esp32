@@ -247,6 +247,8 @@ static uint32_t g_debugRamp     = 0;   /* (reservado para tests) */
 
 /* Helpers de pulsos GPIO de osciloscopio (módulo aparte). */
 #include "scope_pulse.h"
+/* Intensidad de señal esclavos<->maestro e interfaz<->maestro (módulo aparte). */
+#include "link_rssi.h"
 
 static bool sameMac(const uint8_t a[6], const uint8_t b[6])
 {
@@ -1290,6 +1292,8 @@ void setup()
     /* Pin de scope (solo osciloscopio; gateado por DEBUG_HARDWARE) */
     syncOutBegin();
 
+    linkRssiBegin();
+
     MASTER_LOG_PRINTLN("[MASTER] listo");
     LOGM("BOOT", "slaves=%d,espnow=%u", NUM_SLAVES, (unsigned)g_espnowReady);
 }
@@ -1315,6 +1319,7 @@ void loop()
         handleMatlabCmd(webRelayPopCmd(), true);
     }
     webRelayService();
+    linkRssiLoop();
 
     if (g_webReplayCachedState) {
         g_webReplayCachedState = false;
