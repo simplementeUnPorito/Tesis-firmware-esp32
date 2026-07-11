@@ -185,7 +185,7 @@ static void webRelayDecodeCmd(const String &json)
         r.node_id = (uint8_t)node;
         r.sub_cmd = webRelayHexByte(subStr);
         r.param   = (uint8_t)param;
-    } else if (cmd == 0xA3 || cmd == 0xAE) {     /* set-N de 16 bits */
+    } else if (cmd == 0xA3 || cmd == 0xAD || cmd == 0xAE) { /* set-N de 16 bits */
         long value = 0;
         webRelayJsonInt(json, "value", value);
         r.value = (uint16_t)value;
@@ -354,11 +354,27 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
             /* Un cliente a la vez: el primero que entra queda como dueño.
              * Si otra pestaña de la misma IP intenta conectar mientras el
              * dueño sigue vivo, no hacemos takeover: dos navegadores con
-             * auto-reconnect pueden robarse el socket en bucle. */
+             * auto-reconnect pueden robarse el socket en bucle. El probador
+             * de aceptación puede pedir ?takeover=1; sólo se honra contra un
+             * dueño de la MISMA IP, para automatizar el banco sin expulsar a
+             * un operador conectado desde otro equipo. */
+            AsyncWebServerRequest *request = (AsyncWebServerRequest *)arg;
+            bool forceSameIpTakeover = false;
+            if (request != nullptr && request->hasParam("takeover")) {
+                const AsyncWebParameter *p = request->getParam("takeover");
+                forceSameIpTakeover = (p != nullptr && p->value() == "1");
+            }
             bool rejected = false;
             for (auto &c : server->getClients()) {
                 if (c.id() == client->id() || c.status() != WS_CONNECTED) continue;
                 if (c.remoteIP() == client->remoteIP()) {
+                    if (forceSameIpTakeover) {
+                        MASTER_LOG_PRINTF("[WEB] WS takeover explicito #%u reemplaza #%u (%s)\n",
+                                          client->id(), c.id(),
+                                          client->remoteIP().toString().c_str());
+                        c.close(1001, "takeover_explicit");
+                        continue;
+                    }
                     if (c.id() == g_wsOwnerId && webRelayOwnerRecentlyAlive()) {
                         MASTER_LOG_PRINTF("[WEB] WS rechazado #%u (dueño #%u activo misma IP %s)\n",
                                           client->id(), c.id(),

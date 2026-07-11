@@ -18,7 +18,7 @@ def main() -> int:
     parser.add_argument("--host", default="192.168.4.1")
     parser.add_argument("--node", type=int, default=1)
     parser.add_argument("--type", choices=("hammer", "geo"), default="hammer")
-    parser.add_argument("--fs", type=int, default=1020)
+    parser.add_argument("--fs", type=int, default=2604)
     parser.add_argument("--psoc", type=int, choices=(0, 1), default=1)
     args = parser.parse_args()
 

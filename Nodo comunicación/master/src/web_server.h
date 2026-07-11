@@ -86,7 +86,7 @@ inline bool webServerBegin()
 #if WEB_SIM_ENABLE
     webServer.on("/sim/hello", HTTP_GET, [](AsyncWebServerRequest *request) {
         long nodeArg = 1;
-        long fsArg = 1020;
+        long fsArg = 2604;
         long psocArg = 1;
         webServerArgLong(request, "node", nodeArg);
         webServerArgLong(request, "fs", fsArg);

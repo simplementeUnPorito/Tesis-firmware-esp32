@@ -1,0 +1,86 @@
+{
+  "actual_file_bytes": 450,
+  "batches": 5,
+  "bytes_written": 450,
+  "cleanup_errors": [],
+  "completed_at_utc": "2026-07-11T15:23:29.320963+00:00",
+  "connect_failures": 0,
+  "connections": 1,
+  "decimation_factor": 1,
+  "disconnects": 0,
+  "elapsed_s": 185.703,
+  "error": "PhaseTimeout: VER/captura timeout: muestras=150/150, ACK_B2=[], faltan=[1, 2]",
+  "expected_samples": 150,
+  "extra_samples": 0,
+  "final_cleanup_ok": true,
+  "fs_hz": 2604.0,
+  "hello": {
+    "fs_exact_hz": 2604,
+    "hw_class": 0,
+    "legacy_fs_hz": 2600,
+    "psoc_ok": 1,
+    "sd_present": 1
+  },
+  "host": "192.168.4.1",
+  "initial_cleanup_ok": true,
+  "master_state_history": [
+    {
+      "elapsed_s": 0.036,
+      "name": "IDLE",
+      "state": 0
+    },
+    {
+      "elapsed_s": 0.064,
+      "name": "STOPPING",
+      "state": 4
+    },
+    {
+      "elapsed_s": 0.532,
+      "name": "IDLE",
+      "state": 0
+    },
+    {
+      "elapsed_s": 4.502,
+      "name": "RUNNING",
+      "state": 3
+    },
+    {
+      "elapsed_s": 4.626,
+      "name": "DUMPING",
+      "state": 5
+    },
+    {
+      "elapsed_s": 4.746,
+      "name": "ARMED",
+      "state": 2
+    }
+  ],
+  "node": 1,
+  "other_node_samples": 0,
+  "output_file": "C:\\Github\\Tesis\\src\\esp\\Nodo comunicación\\master\\artifacts\\geo_sd_smoke_5.i24le",
+  "path": "/ws?takeover=1",
+  "phase_seconds": {
+    "arm": 0.035,
+    "configure": 0.031,
+    "final_cleanup": 1.026,
+    "fresh_hello": 2.92,
+    "initial_cleanup": 1.106,
+    "set_reclen": 0.019
+  },
+  "port": 80,
+  "requested_seconds": null,
+  "sample_format": "signed_int24_le_twos_complement",
+  "samples_per_batch": 30,
+  "samples_written": 150,
+  "schema_version": 1,
+  "sd_capture_enabled": true,
+  "sha256": "b48112cf4b0a290fd65b6c307f90680121ac717039fe290bfea5908b4dcaad42",
+  "stale_other_samples_before_capture": 0,
+  "stale_target_samples_before_capture": 0,
+  "started_at_utc": "2026-07-11T15:20:23.617980+00:00",
+  "status": "error",
+  "target_data_packets_seen": 150,
+  "ver_ack_values": [],
+  "ws_packets_received": 1430,
+  "ws_text_messages_received": 62
+}

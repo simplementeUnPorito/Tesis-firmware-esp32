@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-study-17">
+  <link rel="stylesheet" href="/css/style.css?v=field-study-19">
 </head>
 <body>
   <header>
@@ -60,14 +60,14 @@
             <button id="btn-arm">ARM</button>
           </div>
           <div class="row">
-            <label>N (decimación) <input id="capture-decim-n" type="number" min="1" max="100" step="1" value="1" title="Promedia N muestras (1=sin decimar). Fs efectiva = 2929/N. Se aplica a todos los nodos."></label>
+            <label>N (decimación) <input id="capture-decim-n" type="number" min="1" max="100" step="1" value="1" title="Promedia N muestras (1=sin decimar). Fs efectiva = 2604/N. Se aplica a todos los nodos."></label>
             <button id="btn-apply-decim">Aplicar N</button>
-            <span id="decim-fs-preview" class="status-text">2929 Hz</span>
+            <span id="decim-fs-preview" class="status-text">2604 Hz</span>
           </div>
           <div class="row">
-            <label>Duración GEOs <input id="capture-secs" type="number" min="0.1" max="120" step="0.1" value="3.0" title="Duración de captura de los nodos GEO (y de cualquier nodo sin clase conocida)"> s</label>
-            <label>Duración HAMMER <input id="capture-secs-hammer" type="number" min="0" max="120" step="0.1" value="" placeholder="= GEOs" title="Duración propia de los nodos HAMMER. Vacío o 0 = usa la misma que los GEOs"> s</label>
-            <button id="btn-max-batches" title="Fija la captura GEO al máximo RAM-only del conjunto ESP32 + PSoC">Máx (512 lotes)</button>
+            <label>Duración GEOs <input id="capture-secs" type="number" min="0.1" max="3600" step="0.1" value="3.0" title="Duración GEO; la señal completa se guarda en la SD del PSoC"> s</label>
+            <label>Duración HAMMER <input id="capture-secs-hammer" type="number" min="0" max="3600" step="0.1" value="" placeholder="= GEOs" title="HAMMER usa RAM y se limita automáticamente a 512 lotes"> s</label>
+            <button id="btn-max-batches" title="Fija GEO al máximo de la SD del PSoC">Máx SD (60000)</button>
             <button id="btn-start">START</button>
             <button id="btn-preserve">Descontar</button>
             <span id="capture-batches" class="status-text">--</span>
@@ -143,6 +143,6 @@
     </div>
   </div>
 
-  <script type="module" src="/js/app.js?v=field-study-17"></script>
+  <script type="module" src="/js/app.js?v=field-study-19"></script>
 </body>
 </html>

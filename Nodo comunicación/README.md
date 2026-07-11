@@ -21,6 +21,10 @@ El maestro **no muestrea ningún sensor**: coordina ARM/PRESTART/START/STOP y
 reenvía lotes de los esclavos a MATLAB y a la UI web. El martillo es un esclavo
 normal con distinto PSoC.
 
+La Fs nativa vigente es **2604 Hz en los cuatro rangos ADC**. La decimación
+global usa un factor entero `N=1..100` y produce
+`Fs efectiva = floor(2604/N)`; cambiar de rango no cambia la frecuencia.
+
 ## Hardware activo (2026-07-01)
 
 | Dispositivo | Puerto | NODE_ID | MAC | Tipo |
@@ -67,7 +71,7 @@ El pin `SYNC_OUT` del maestro (GPIO15) es **solo marcador de osciloscopio** y
 |-------|---------|---------|
 | 4 | `[0xAB][cmd][param][cs]` | `A1` stream, `A4` stop, `A5` status, `A7` debug, `B0` scope-multi |
 | 5 | `[0xAB][cmd][n_lo][n_hi][cs]` | `A2` ARM (n esclavos), `A3` START (N lotes), `AE` set-reclen |
-| 6 | `[0xAB][0xBD][node][sub][param][cs]` | `A6` PGA, `A9` PGAvdac, `AA` VDAC, `B2` Ver, `B5` calibrar, `B6` EEPROM, `B7` stream, `B9` blink LED |
+| 6 | `[0xAB][0xBD][node][sub][param][cs]` | `A6` PGA, `A9` PGAvdac, `AA` VDAC, `B2` Ver, `B5` calibrar, `B6` EEPROM, `B7` stream, `B9` blink LED, `BA` rango ADC, `BB` decimación |
 
 Equivalentes JSON para WebSocket:
 ```json
@@ -78,7 +82,7 @@ Equivalentes JSON para WebSocket:
 
 ## Interfaz web (master/data/)
 
-SPA servida desde LittleFS del maestro. Versión actual del cache: `field-study-17`.
+SPA servida desde LittleFS del maestro. Versión actual del cache: `field-study-18`.
 
 ### Endpoints HTTP
 
@@ -88,7 +92,7 @@ SPA servida desde LittleFS del maestro. Versión actual del cache: `field-study-
 | `/health` | Estado: `ok`, `ap_ip`, `littlefs`, `used/total bytes` |
 | `/ws` | WebSocket — telemetría binaria + comandos JSON |
 | `/ws-reset` | Fuerza cierre de conexiones WS activas |
-| `/sim/hello` | Dummy esclavo: `?node=N&type=hammer|geo&fs=1020&psoc=1` |
+| `/sim/hello` | Dummy esclavo: `?node=N&type=hammer|geo&fs=2604&psoc=1` |
 
 ### Módulos JS
 

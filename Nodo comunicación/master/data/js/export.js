@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-17';
+import * as cfg from './config.js?v=field-study-19';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-17';
+import { effectiveFs } from './data_store.js?v=field-study-19';
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -794,7 +794,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-17',
+    web_app_version: 'field-study-19',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,

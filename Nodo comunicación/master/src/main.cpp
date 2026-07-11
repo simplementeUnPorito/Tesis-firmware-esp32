@@ -93,7 +93,7 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
   #define ARM_TIMEOUT_MS 3000
 #endif
 #ifndef ADC_SAMPLE_RATE_HZ
-  #define ADC_SAMPLE_RATE_HZ 1020
+  #define ADC_SAMPLE_RATE_HZ 2604
 #endif
 #ifndef STORE_CAPTURE_MARGIN_MS
   #define STORE_CAPTURE_MARGIN_MS 750
@@ -108,11 +108,10 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
   #define DUMP_NACK_RETRY_DELAY_MS 100
 #endif
 #ifndef PSOC_CAPTURE_MAX_BATCHES
-  /* Tope RAM-only de lotes DECIMADOS por captura. Debe coincidir con el del
-   * esclavo y con el buffer PSoC: el esclavo guarda en paginas chicas, no en
-   * un malloc gigante. */
-  #define PSOC_CAPTURE_MAX_BATCHES 512
+  /* GEO persiste en FatFs del PSoC; el maestro solo releva lote por lote. */
+  #define PSOC_CAPTURE_MAX_BATCHES 60000u
 #endif
+#define PSOC_RAM_CAPTURE_MAX_BATCHES 512u
 #ifndef ESPNOW_USE_UNICAST_TO_SLAVES
   #define ESPNOW_USE_UNICAST_TO_SLAVES 0
 #endif
@@ -343,19 +342,24 @@ static uint16_t clampRecordBatches(uint16_t n)
     return n;
 }
 
-/* Largo de captura para un nodo según su hw_class cacheado (HELLO). Con
- * g_rec_n_batches_hammer==0 devuelve SIEMPRE el canónico — invariante:
- * duraciones iguales ⇒ comportamiento idéntico al validado. Nodo sin HELLO
- * (hw_class desconocido) cae al canónico (GEO). */
+static uint16_t clampRamRecordBatches(uint16_t n)
+{
+    return (n > PSOC_RAM_CAPTURE_MAX_BATCHES)
+         ? (uint16_t)PSOC_RAM_CAPTURE_MAX_BATCHES : n;
+}
+
+/* Largo de captura para un nodo según su hw_class cacheado (HELLO).
+ * Un HAMMER nunca puede recibir más de la RAM local (512 lotes): AD=0
+ * significa "sin override explícito", no permiso para desbordar RAM. Un nodo
+ * sin HELLO (hw_class desconocido) cae al canónico (GEO). */
 static uint16_t nBatchesForNode(uint8_t nodeId)
 {
-    if (g_rec_n_batches_hammer == 0) {
-        return g_rec_n_batches;
-    }
     if (nodeId >= 1 && nodeId <= NUM_SLAVES &&
         g_cachedHello[nodeId].valid &&
         g_cachedHello[nodeId].hw_class == SLAVE_HW_HAMMER) {
-        return g_rec_n_batches_hammer;
+        return (g_rec_n_batches_hammer != 0)
+             ? g_rec_n_batches_hammer
+             : clampRamRecordBatches(g_rec_n_batches);
     }
     return g_rec_n_batches;
 }
@@ -435,6 +439,14 @@ static void onSlaveStatus(const MsgStatus &msg)
 
 static void onCfgAck(const MsgCfgAck &msg)
 {
+    /* En VER, reenviar el ACK al cliente antes de cambiar estado, iniciar el
+     * PRESTART o pedir el primer lote. El protocolo ESP-NOW interno usa
+     * CMD_VIEW=0x24, pero la API web/MATLAB que originó la operación usa
+     * SUBCMD_VER=0xB2: devolver 0xB2 conserva la correlación request/ACK. */
+    const bool viewAckForwarded = (msg.sub_cmd == CMD_VIEW);
+    if (viewAckForwarded) {
+        matlab.sendAck(msg.node_id, 0xB2u, msg.ok);
+    }
     if (msg.sub_cmd == CMD_VIEW) {
         /* Diagnóstico: registra cada sub-condición de la rama VER-success
          * para ver cuál falla si "Ver" no avanza a HOTWAIT_QUERY/CMD_START. */
@@ -533,7 +545,9 @@ static void onCfgAck(const MsgCfgAck &msg)
         }
         return;
     }
-    matlab.sendAck(msg.node_id, msg.sub_cmd, msg.ok);
+    if (!viewAckForwarded) {
+        matlab.sendAck(msg.node_id, msg.sub_cmd, msg.ok);
+    }
 }
 
 static const char *slaveHwName(uint8_t hwClass)
@@ -834,8 +848,7 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param, b
 
 /* Duración por tipo: primero el broadcast con el largo canónico (GEO, llega a
  * todos incluso sin HELLO cacheado) y después un unicast que lo pisa SOLO en
- * los nodos HAMMER conocidos. Con g_rec_n_batches_hammer==0 (o igual al
- * canónico, o clear con nBatches==0) el camino es el broadcast de siempre. */
+ * los nodos HAMMER conocidos. AD=0 aplica el límite RAM automático de 512. */
 static void broadcastRecordLength(uint16_t nBatches)
 {
     MsgSetRecLen msg = { CMD_SET_RECLEN, nBatches };
@@ -844,8 +857,7 @@ static void broadcastRecordLength(uint16_t nBatches)
     }
     MASTER_LOG_PRINTF("[MASTER] SET_RECLEN=%u\n", nBatches);
 
-    if (nBatches == 0 || g_rec_n_batches_hammer == 0 ||
-        g_rec_n_batches_hammer == nBatches || !g_espnowReady) {
+    if (nBatches == 0 || !g_espnowReady) {
         return;
     }
     for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
@@ -865,8 +877,7 @@ static void broadcastPrestart(uint16_t nBatches)
     }
     MASTER_LOG_PRINTF("[MASTER] PRESTART sent n=%u\n", nBatches);
 
-    if (nBatches == 0 || g_rec_n_batches_hammer == 0 ||
-        g_rec_n_batches_hammer == nBatches || !g_espnowReady) {
+    if (nBatches == 0 || !g_espnowReady) {
         return;
     }
     for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
@@ -1280,7 +1291,7 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
 
         case 0xAD: {  /* SET_RECORD_LEN_HAMMER: largo propio de nodos HAMMER
                        * (16 bits). 0 = volver al largo único (canónico). */
-            g_rec_n_batches_hammer = clampRecordBatches(rxCmd.value);
+            g_rec_n_batches_hammer = clampRamRecordBatches(rxCmd.value);
             if (g_rec_n_batches > 0) {
                 /* Refrescar los largos ya repartidos con el override nuevo. */
                 broadcastRecordLength(g_rec_n_batches);

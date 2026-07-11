@@ -79,7 +79,7 @@ public:
         uint8_t  param;    /* parámetro del comando estándar (= value & 0xFF) */
         uint8_t  node_id;  /* válido solo cuando cmd == 0xBD */
         uint8_t  sub_cmd;  /* válido solo cuando cmd == 0xBD */
-        uint16_t value;    /* valor 16 bits para 0xA3/0xAE (set N) */
+        uint16_t value;    /* valor 16 bits para 0xA3/0xAD/0xAE (set N) */
         bool     valid;
     };
     /* Drain one command from the queue (returns {valid=false} when empty) */
@@ -135,7 +135,7 @@ inline void MatlabTransport::loop()
         if (_rxIdx == 2) {
             uint8_t c = _rxBuf[1];
             if (c == MATLAB_CMD_DIRECTED)            _rxExpected = 6;
-            else if (c == 0xA3 || c == 0xAE)         _rxExpected = 5; /* set N 16 bits */
+            else if (c == 0xA3 || c == 0xAD || c == 0xAE) _rxExpected = 5; /* set N 16 bits */
             else                                     _rxExpected = 4;
         }
         if (_rxIdx >= _rxExpected) {

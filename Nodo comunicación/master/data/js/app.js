@@ -2,15 +2,15 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-17';
-import { WsClient } from './ws_client.js?v=field-study-17';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-17';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-17';
-import { PlotArea } from './plot.js?v=field-study-17';
-import { SpectrumArea } from './spectrum.js?v=field-study-17';
-import { SlavePanel } from './slave_panel.js?v=field-study-17';
-import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-17';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-17';
+import * as cfg from './config.js?v=field-study-19';
+import { WsClient } from './ws_client.js?v=field-study-19';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-19';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-19';
+import { PlotArea } from './plot.js?v=field-study-19';
+import { SpectrumArea } from './spectrum.js?v=field-study-19';
+import { SlavePanel } from './slave_panel.js?v=field-study-19';
+import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-19';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-19';
 
 const $ = (id) => document.getElementById(id);
 
@@ -48,7 +48,11 @@ let pendingStart = null;
 const START_AUTO_ARM_TIMEOUT_MS = 4500;
 
 const SETTINGS_PREFIX = 'geophone_scope_web.';
-const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz_v3`;
+// Versionar la Fs evita restaurar valores derivados de la antigua base
+// 2929/1020. El factor N se guarda por separado: es la preferencia real del
+// operador y sigue siendo válido aunque cambie la Fs nativa del firmware.
+const GLOBAL_FS_KEY = `${SETTINGS_PREFIX}fs_hz_v4`;
+const GLOBAL_DECIMATION_KEY = `${SETTINGS_PREFIX}decimation_factor_v1`;
 const SHOW_RAW_KEY = `${SETTINGS_PREFIX}show_raw`;
 const SHOW_FILT_KEY = `${SETTINGS_PREFIX}show_filt`;
 const SHOW_ENV_RAW_KEY = `${SETTINGS_PREFIX}show_env_raw`;
@@ -167,6 +171,12 @@ function saveGlobalFs(fsHz) {
   } catch (_) {
     // localStorage can be disabled on some phone browser/privacy modes.
   }
+}
+
+function saveGlobalDecimation(factor) {
+  const n = clamp(parseInt(factor, 10) || 1, 1, 100);
+  saveSetting(GLOBAL_DECIMATION_KEY, n);
+  return n;
 }
 
 function anySlaveFsKnown() {
@@ -727,7 +737,7 @@ function captureSeconds() {
   const el = $('capture-secs');
   const parsed = el ? parseFloat(el.value) : NaN;
   const secs = Number.isFinite(parsed) ? parsed : 3.0;
-  return clamp(secs, 0.1, 120);
+  return clamp(secs, 0.1, cfg.MAX_CAPTURE_SECONDS);
 }
 
 /* Duración propia de los nodos HAMMER. null = campo vacío/0 ⇒ usar la misma
@@ -736,12 +746,17 @@ function hammerCaptureSeconds() {
   const el = $('capture-secs-hammer');
   const parsed = el ? parseFloat(el.value) : NaN;
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
-  return clamp(parsed, 0.1, 120);
+  return clamp(parsed, 0.1, cfg.MAX_CAPTURE_SECONDS);
 }
 
 function hammerCaptureBatches() {
   const secs = hammerCaptureSeconds();
-  return secs === null ? 0 : batchesForSeconds(secs);
+  if (secs === null) {
+    const geoBatches = captureBatches();
+    return geoBatches > cfg.PSOC_RAM_CAPTURE_MAX_BATCHES
+      ? cfg.PSOC_RAM_CAPTURE_MAX_BATCHES : 0;
+  }
+  return Math.min(batchesForSeconds(secs), cfg.PSOC_RAM_CAPTURE_MAX_BATCHES);
 }
 
 /* Manda al maestro el largo HAMMER (0xAD) antes de cualquier RECLEN/START.
@@ -1013,6 +1028,7 @@ function makeStartRequestInfo() {
 function runStartCapture(req, source = '') {
   clearPendingStart();
   currentCaptureSignature = '';
+  resizePresentCaptureBuffers(req.n);
   data.clearAll();
   plotArea.clearAll();
   spectrumArea.clearAll();
@@ -1159,13 +1175,21 @@ function applyDisplayWindow() {
 function syncDataBufferForFs() {
   const fs = currentFsHz();
   if (!fs) return;   // wait for the real Fs — never size buffers off a guess
-  const maxCaptureSamples = cfg.PSOC_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH;
   const maxSamples = Math.max(
     cfg.SAMPLES_PER_BATCH,
     Math.round(cfg.MAX_BUF_S * fs),
-    maxCaptureSamples,
   );
   data.resizeAll(maxSamples);
+}
+
+function resizePresentCaptureBuffers(nBatches, preferredIndex = 0) {
+  const fs = currentFsHz();
+  const base = Math.max(cfg.SAMPLES_PER_BATCH, Math.round(cfg.MAX_BUF_S * (fs || 1)));
+  const requested = Math.max(base, nBatches * cfg.SAMPLES_PER_BATCH);
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    const active = i === preferredIndex || nodeHasPresence(i);
+    data.nodes[i].resizeBuf(active ? requested : base);
+  }
 }
 
 function renderNodeRow(i) {
@@ -1363,8 +1387,8 @@ function applyGlobalFs(fsHz, logMessage = '') {
       changed = true;
     }
   }
-  // Reflejar la N derivada de la Fs efectiva en el control de captura
-  // (Fs = 2929/N). Reemplaza el viejo campo "Fs manual".
+  // Reflejar y persistir la N derivada de la Fs efectiva en el control de
+  // captura (Fs = 2604/N). Reemplaza el viejo campo "Fs manual".
   syncDecimFieldFromFs(fsHz);
   if (!changed && wasKnown) return;
 
@@ -1400,6 +1424,17 @@ function updateNodeExactFsFromHello(chIndex, fsHz) {
 }
 
 function restoreFsFromLocalCache() {
+  const rawN = loadSetting(GLOBAL_DECIMATION_KEY);
+  const parsedN = rawN === null ? NaN : parseInt(rawN, 10);
+  if (Number.isFinite(parsedN) && parsedN >= 1 && parsedN <= 100) {
+    const n = saveGlobalDecimation(parsedN);
+    const inp = $('capture-decim-n');
+    if (inp) inp.value = String(n);
+    const fsHz = Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n);
+    updateDecimPreview();
+    applyGlobalFs(fsHz, `N=${n} restaurado de cache local (Fs ${fsHz} Hz)`);
+    return;
+  }
   const raw = loadSetting(GLOBAL_FS_KEY);
   const fsHz = raw === null ? NaN : parseFloat(raw);
   if (!(fsHz > 0)) return;
@@ -1518,7 +1553,7 @@ function onDecimationChanged(chIndex, factor) {
   sendDirected(chIndex, cfg.SUBCMD_DECIMATION, f);
   scheduleDecimationLockTimeout(chIndex, f);
   renderNodeRow(chIndex);
-  appendLog(`S${chIndex} decimacion -> ${f} (${Math.floor(2929 / f)} Hz)`);
+  appendLog(`S${chIndex} decimacion -> ${f} (${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f)} Hz)`);
 }
 
 function onSdEnabledChanged(chIndex, enabled) {
@@ -1546,6 +1581,7 @@ function onVerRequested(chIndex) {
   }
   const n = captureBatches();
   const secs = secondsForBatches(n);
+  resizePresentCaptureBuffers(n, chIndex);
   prepareNodeCapture(chIndex);
   sendHammerRecLen();
   sendStd16(cfg.CMD_SET_RECLEN, n);
@@ -2003,7 +2039,7 @@ function handleAck(pkt, idx) {
         panel.setDecimationLock(1);
       }
       renderNodeRow(idx);
-      appendLog(`S${idx} decimacion confirmada: ${f} (${Math.floor(2929 / f)} Hz)`);
+      appendLog(`S${idx} decimacion confirmada: ${f} (${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f)} Hz)`);
     } else {
       if (panel) panel.setDecimationLock(2);
       appendLog(`S${idx} decimacion sin lock: ${expected}`);
@@ -2175,7 +2211,7 @@ function handleStatus(pkt, idx) {
     const present = !!pkt.helloSdPresent;
     if (nd.sdPresent !== present) {
       nd.sdPresent = present;
-      if (!present) nd.sdEnabled = false;
+      nd.sdEnabled = present; /* firmware GEO auto-habilita SD al montar FAT */
       const panel = panelFor(idx);
       if (panel) panel.setSdPresent(present, nd.sdEnabled);
       appendLog(`HELLO slave=${idx} sd_present=${present ? 1 : 0}`);
@@ -2430,8 +2466,8 @@ $('btn-arm').addEventListener('click', () => {
 });
 
 // N (decimación) global — reemplaza el viejo "Fs manual". El ADC del PSoC corre
-// siempre a 2929 Hz nativos; la Fs efectiva se deriva del factor de decimación
-// N (Fs = 2929/N, promediando N muestras). El operador fija N y se aplica a
+// siempre a 2604 Hz nativos; la Fs efectiva se deriva del factor de decimación
+// N (Fs = 2604/N, promediando N muestras). El operador fija N y se aplica a
 // todos los nodos conectados (mismo camino que el control por-esclavo:
 // SUBCMD_DECIMATION con ACK/lock), además de alimentar el badge de Fs global.
 function captureDecimN() {
@@ -2447,12 +2483,18 @@ function updateDecimPreview() {
 }
 
 // Mantener el campo N y su preview en sync cuando la Fs efectiva cambia por
-// HELLO/cache (Fs = 2929/N ⇒ N = round(2929/Fs)).
+// HELLO/cache (Fs = 2604/N ⇒ N = round(2604/Fs)). Si el operador ya aplicó
+// una N global, conservar esa preferencia en el control hasta que la cambie:
+// un HELLO de arranque no debe destruir el valor persistido en localStorage.
 function syncDecimFieldFromFs(fsHz) {
   if (!(fsHz > 0)) return;
   const inp = $('capture-decim-n');
   if (!inp) return;
-  const n = clamp(Math.round(cfg.DEFAULT_SAMPLE_RATE_HZ / fsHz), 1, 100);
+  const rawSaved = loadSetting(GLOBAL_DECIMATION_KEY);
+  const saved = rawSaved === null ? NaN : parseInt(rawSaved, 10);
+  const n = Number.isFinite(saved) && saved >= 1 && saved <= 100
+    ? saved
+    : clamp(Math.round(cfg.DEFAULT_SAMPLE_RATE_HZ / fsHz), 1, 100);
   inp.value = String(n);
   const span = $('decim-fs-preview');
   if (span) span.textContent = `${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n)} Hz`;
@@ -2463,6 +2505,7 @@ function applyGlobalDecimation() {
   const inp = $('capture-decim-n');
   if (inp) inp.value = String(n);
   const fsHz = Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n);
+  saveGlobalDecimation(n);
   saveGlobalFs(fsHz);
   applyGlobalFs(fsHz, `N=${n} → Fs ${fsHz} Hz`);
   let sent = 0;

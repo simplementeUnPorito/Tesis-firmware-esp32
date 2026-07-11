@@ -3,7 +3,7 @@
 // are backed by a fixed-capacity RingBuffer (Float64Array) instead of a
 // maxlen-deque, since JS has no built-in bounded queue with O(1) push+evict.
 
-import * as cfg from './config.js?v=field-study-17';
+import * as cfg from './config.js?v=field-study-19';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -109,7 +109,7 @@ export class NodeData {
     this.pgaCode = 0;
     this.adcConfigCode = 1;
     this.countsPerVolt = cfg.ADC_COUNTS_PER_VOLT;
-    this.decimationFactor = 1;   // 1=sin decimar; Fs efectiva = 2929/factor (ver [[project_geophone_testbench]] plan_2929_decimation_sd.md)
+    this.decimationFactor = 1;   // 1=sin decimar; Fs efectiva = 2604/factor
     this.vdacByte = 128;
     this.calVdacs = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
     this.calVdacDetails = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
@@ -117,7 +117,7 @@ export class NodeData {
     this.psocOk = null;   // null until first HELLO
     this.mac = '';
     this.hwClass = 0xFF;  // 0=GEO, 1=HAMMER, 0xFF=unknown (reported by PSoC)
-    this.sdPresent = false; // módulo SD detectado en el ESP32 (solo esclavos GEO, ver plan_2929_decimation_sd.md H5)
+    this.sdPresent = false; // FAT/SD detectada por el PSoC (solo esclavos GEO, ver plan_2929_decimation_sd.md)
     this.sdEnabled = false; // estado del toggle SD confirmado por ACK (0xC0)
 
     // ADC sample rate — depends on the analog front-end / PSoC programming

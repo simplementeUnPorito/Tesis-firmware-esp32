@@ -205,6 +205,7 @@ void PsocUART::setDecimation(uint8_t factor) { _sendCmd1(PSOC_CMD_SET_DECIMATION
 void PsocUART::sdStatus(uint8_t reinit) { _sendCmd1(PSOC_CMD_SD_STATUS, reinit); }
 void PsocUART::sdTest()                { _sendCmd1(PSOC_CMD_SD_TEST, 0); }
 void PsocUART::sdCapture(uint8_t en)   { _sendCmd1(PSOC_CMD_SD_CAPTURE, en ? 1 : 0); }
+void PsocUART::sdReadBatch(uint16_t index) { _sendCmd2(PSOC_CMD_SD_READ_BATCH, (uint8_t)(index & 0xFFu), (uint8_t)(index >> 8)); }
 void PsocUART::adcSnapshot()           { _sendCmd1(PSOC_CMD_ADC_SNAPSHOT, 1); }
 void PsocUART::blinkLed()              { _sendCmd1(PSOC_CMD_BLINK_LED, 1); }
 void PsocUART::debugRamp(bool en)      { _sendCmd1(PSOC_CMD_DEBUG, en ? 1 : 0); }

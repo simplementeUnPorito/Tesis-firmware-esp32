@@ -57,8 +57,11 @@
   /* Tope RAM-only de lotes DECIMADOS por captura. El PSoC guarda hasta 512
    * lotes decimados y el ESP32 usa paginas chicas en vez de un malloc gigante,
    * asi el limite ya no depende del bloque contiguo maximo con WiFi arriba.
-   * Duracion real = n*decim*30/2929. */
+   * Duracion real = n*decim*30/2604. */
   #define PSOC_CAPTURE_MAX_BATCHES 512
+#endif
+#ifndef PSOC_SD_CAPTURE_MAX_BATCHES
+  #define PSOC_SD_CAPTURE_MAX_BATCHES 60000u
 #endif
 /* Logging (humano + máquina) en debug_log.h, gateado por DBG_ENABLE.
  * Estos defines limpian el monitor USB: por defecto queda solo lo accionable
@@ -177,11 +180,14 @@ static          uint32_t   g_auto_cal_due_ms = 0;
 /* ── Store-and-forward ───────────────────────────────────────────────────── */
 static uint16_t    g_rec_n_batches = 0;          /* 0 = modo streaming clásico */
 static uint16_t    g_store_fill    = 0;
-static bool         g_sd_spill_active = false;   /* true: esta captura vive ENTERA en SD
-                                                    * (n_batches > PSOC_CAPTURE_MAX_BATCHES,
-                                                    * solo posible con SD habilitada+presente
-                                                    * — ver sd_storage.h y H5 en
-                                                    * docs/plan_2929_decimation_sd.md) */
+static bool         g_psoc_sd_capture_enabled = false; /* ACK confirmado de 0xBE */
+static bool         g_psoc_sd_store_active = false;    /* captura actual vive en GEOLAST.BIN */
+static bool         g_psoc_sd_session_complete = false;
+static bool         g_psoc_sd_capture_error = false;
+static bool         g_psoc_sd_read_pending = false;
+static uint16_t     g_psoc_sd_read_seq = 0;
+static uint32_t     g_psoc_sd_read_started_ms = 0;
+#define PSOC_SD_READ_TIMEOUT_MS 250u
 
 #ifndef STORE_PAGE_BATCHES
 #define STORE_PAGE_BATCHES 32u
@@ -201,6 +207,7 @@ static volatile bool     g_start_store_active = false;
 static volatile uint8_t  g_psoc_last_setn_value = 0;
 static volatile uint32_t g_psoc_last_setn_ms = 0;
 static volatile uint32_t g_psoc_setn_seq = 0;
+static volatile bool     g_psoc_arm_ready = false;
 
 #define PSOC_CFG_ACK_TIMEOUT_MS 750u
 #define PSOC_SETN_ACK_TIMEOUT_MS 500u
@@ -365,6 +372,7 @@ static esp_err_t sendToMaster(const uint8_t *data, size_t len)
 }
 
 static void sendCfgAck(uint8_t sub_cmd, uint8_t ok);
+static void sendCompletionAckWithRetry(uint8_t sub_cmd);
 static void allocStore(uint16_t n_batches);
 static void enterHotWait(uint16_t n_batches);
 static uint16_t clampPsocCaptureBatches(uint16_t n);
@@ -499,7 +507,7 @@ static uint8_t g_psoc_hw_class = 0xFFu;
  * TopDesign), NO en el ESP32 — sd_storage.* queda obsoleto/stub. El PSoC
  * reporta PSOC_EVT_SD_STATUS en boot y ante PSOC_CMD_SD_STATUS; con firmware
  * PSoC viejo (sin 0xBC) no llega nunca → sd_present=0. */
-static uint8_t g_psoc_sd_status = 0u;   /* bit0 presente, bits1-2 tipo, bit3 self-test */
+static uint8_t g_psoc_sd_status = 0u;   /* +bit4 FAT montado, bit5 sesión COMPLETE */
 static bool    g_psoc_sd_known  = false;
 
 static uint8_t psocSdPresent() { return (uint8_t)(g_psoc_sd_status & 0x01u); }
@@ -589,11 +597,46 @@ static void onPsocDiag(const PsocDiagEvent &event)
     static uint16_t calPointIndex = 0;
     g_psocConnected = true;
 
-    if (g_state == SAMPLING && event.event != PSOC_EVT_DUMP_DONE) {
+    if (g_state == SAMPLING &&
+        event.event != PSOC_EVT_DUMP_DONE &&
+        event.event != PSOC_EVT_CAPTURE_DONE &&
+        event.event != PSOC_EVT_SD_SESSION &&
+        event.event != PSOC_EVT_SD_ERROR) {
         return;
     }
 
-    if (event.event == PSOC_EVT_DUMP_DONE && (g_view_store_active || g_start_store_active) &&
+    if (g_psoc_sd_store_active && g_state == SAMPLING) {
+        if (event.event == PSOC_EVT_SD_ERROR) {
+            g_psoc_sd_capture_error = true;
+        } else if (event.event == PSOC_EVT_SD_SESSION) {
+            g_psoc_sd_session_complete = (event.value == 1u);
+            if (!g_psoc_sd_session_complete) g_psoc_sd_capture_error = true;
+        } else if (event.event == PSOC_EVT_DUMP_DONE &&
+                   (g_view_store_active || g_start_store_active)) {
+            const bool wasView = g_view_store_active;
+            const uint8_t doneSubCmd = wasView ? CMD_VIEW : CMD_START;
+            const bool ok = g_psoc_sd_session_complete && !g_psoc_sd_capture_error;
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+            g_view_store_active = false;
+            g_start_store_active = false;
+            g_store_fill = ok ? g_rec_n_batches : 0u;
+            g_state = STOPPED;
+            if (ok) sendCompletionAckWithRetry(doneSubCmd);
+            else sendCfgAck(doneSubCmd, 0u);
+            SLAVE_LOG_PRINTF("[SLAVE] %s SD complete=%u err=%u fill=%u/%u\n",
+                             wasView ? "VIEW" : "START",
+                             (unsigned)g_psoc_sd_session_complete,
+                             (unsigned)g_psoc_sd_capture_error,
+                             (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+            LOGM("CAPTURE_SD_DONE", "mode=%s,ok=%u,fill=%u,n=%u",
+                 wasView ? "VIEW" : "START", (unsigned)ok,
+                 (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+            return;
+        }
+    }
+
+    if (!g_psoc_sd_store_active && event.event == PSOC_EVT_DUMP_DONE &&
+        (g_view_store_active || g_start_store_active) &&
         g_state == SAMPLING && g_store_fill < g_rec_n_batches) {
         const bool wasView = g_view_store_active;
         const uint8_t doneSubCmd = wasView ? CMD_VIEW : CMD_START;
@@ -627,6 +670,7 @@ static void onPsocDiag(const PsocDiagEvent &event)
     if (event.event == PSOC_EVT_SD_STATUS) {
         g_psoc_sd_status = event.value;
         g_psoc_sd_known = true;
+        g_psoc_sd_capture_enabled = (event.value & 0x40u) != 0u;
         SLAVE_LOG_PRINTF("[PSoC] SD status=0x%02X present=%u type=%u selftest=%u\n",
                          event.value, (unsigned)(event.value & 1u),
                          (unsigned)((event.value >> 1) & 3u),
@@ -656,6 +700,9 @@ static void onPsocDiag(const PsocDiagEvent &event)
                          psocDiagName(event.event), event.value,
                          event.psoc_state, psocStateName(event.psoc_state),
                          (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+    }
+    if (event.event == PSOC_EVT_ARMED) {
+        g_psoc_arm_ready = true;
     }
 
     if (event.event == PSOC_EVT_CAL_START) {
@@ -1201,6 +1248,9 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
         case 0xAA:
             g_vdac_byte = value;
             break;
+        case PSOC_CMD_SD_CAPTURE:
+            g_psoc_sd_capture_enabled = (value != 0u);
+            break;
         default:
             break;
     }
@@ -1261,6 +1311,14 @@ static void servicePsocConfigAck()
     uint8_t ackVal = 0;
     while (psoc.takeConfigAck(ackCmd, ackVal)) {
         g_psocConnected = true;
+        if (ackCmd == PSOC_CMD_SD_READ_BATCH && g_psoc_sd_read_pending) {
+            MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
+            sendToMaster((const uint8_t *)&nack, sizeof(nack));
+            g_psoc_sd_read_pending = false;
+            SLAVE_LOG_PRINTF("[SLAVE] PSoC SD_READ NACK seq=%u val=%u\n",
+                             (unsigned)g_psoc_sd_read_seq, (unsigned)ackVal);
+            continue;
+        }
         if (g_cfg_waiting && ackCmd == g_cfg_sub_cmd) {
             const uint8_t expected = expectedPsocAckValue(g_cfg_sub_cmd, g_cfg_param);
             const uint8_t ok = (ackVal == expected) ? 1u : 0u;
@@ -2134,8 +2192,15 @@ static SampleBytes *storeBatchPtr(uint16_t seq)
 static bool storeReadyForHotWait()
 {
     if (g_rec_n_batches == 0) return true;
-    if (g_sd_spill_active) return true;
+    if (!g_psoc_arm_ready) return false;
+    if (g_psoc_sd_store_active) return true;
     return storeRamReady();
+}
+
+static bool storeAllocated()
+{
+    if (g_rec_n_batches == 0) return true;
+    return g_psoc_sd_store_active || storeRamReady();
 }
 
 static uint16_t effectivePsocSampleRateHz()
@@ -2145,17 +2210,12 @@ static uint16_t effectivePsocSampleRateHz()
 
 static uint16_t clampPsocCaptureBatches(uint16_t n)
 {
+    if (n > PSOC_SD_CAPTURE_MAX_BATCHES) {
+        n = PSOC_SD_CAPTURE_MAX_BATCHES;
+    }
     if (n > PSOC_CAPTURE_MAX_BATCHES) {
-        /* Solo esclavos GEO con SD habilitada+presente pueden pedir más que el
-         * límite de RAM (PSOC_CAPTURE_MAX_BATCHES); ver H5 en
-         * docs/plan_2929_decimation_sd.md. En HAMMER (SD_SPI_CS_PIN no
-         * definido) sdStorageEnabled() siempre es false, así que esta rama
-         * nunca se toma — comportamiento idéntico al de antes de esta feature. */
-        if (sdStorageEnabled()) {
-            uint32_t sdMax = sdStorageMaxBatches();
-            if (sdMax > (uint32_t)PSOC_CAPTURE_MAX_BATCHES) {
-                return ((uint32_t)n > sdMax) ? (uint16_t)sdMax : n;
-            }
+        if (g_psoc_sd_capture_enabled && psocSdPresent()) {
+            return n;
         }
         return (uint16_t)PSOC_CAPTURE_MAX_BATCHES;
     }
@@ -2165,7 +2225,7 @@ static uint16_t clampPsocCaptureBatches(uint16_t n)
 static uint32_t expectedCaptureMs(uint16_t n_batches)
 {
     uint32_t fs = effectivePsocSampleRateHz();
-    if (fs == 0) fs = 1020u;
+    if (fs == 0) fs = PSOC_NATIVE_SAMPLE_RATE_HZ;
     uint32_t ms = ((uint32_t)n_batches * (uint32_t)SPI_BATCH_SAMPLES * 1000u + fs - 1u) / fs;
     return ms + PSOC_START_FALLBACK_EXTRA_MS;
 }
@@ -2185,6 +2245,7 @@ static void enterHotWait(uint16_t n_batches)
     g_debug_count    = 0;
     g_debug_last_us  = (uint32_t)micros();
     g_start_fallback_sent = false;
+    g_psoc_arm_ready = false;
     /* Armar el PSoC por UART: set N y pre-start (queda esperando flanco SYNC). */
     psocReady = sendAndConfirmPsocSetN(n_batches);
     if (!psocReady) {
@@ -2385,7 +2446,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     if (len < 1) return;
     learnMasterMac(mac);
     uint8_t cmd = data[0];
-    if (g_state == SAMPLING && cmd != CMD_STOP) {
+    if (g_state == SAMPLING && cmd != CMD_STOP && cmd != CMD_ARM) {
         /* En debug/test, VER puede interrumpir para evitar race condition */
         if (g_debug_mode && cmd == CMD_VIEW) {
             g_debug_mode = false;
@@ -2400,6 +2461,9 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         (g_state == WAIT_ARM || g_state == ARMED || g_state == HOT_WAIT ||
          g_state == STOPPED || g_state == SAMPLING)) {
         g_debug_mode = false;   /* detener debug stream si estaba activo */
+        g_psoc_arm_ready = false;
+        g_psoc_sd_read_pending = false;
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_state = ARMED;
         scheduleAutoCalibration(0u);
         MsgArmAck ack = { CMD_ARM_ACK, NODE_ID, 0 };
@@ -2506,6 +2570,8 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_view_store_active = false;
         g_start_store_active = false;
         g_start_fallback_sent = false;
+        g_psoc_arm_ready = false;
+        g_psoc_sd_read_pending = false;
         g_state = STOPPED;
         SLAVE_LOG_PRINTLN("[SLAVE] STOP");
     }
@@ -2541,7 +2607,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         psoc.debugRamp(false);
         enterHotWait(n);
         g_start_store_active = false;
-        uint8_t ok = storeReadyForHotWait() ? 1u : 0u;
+        uint8_t ok = (g_state == HOT_WAIT && storeAllocated()) ? 1u : 0u;
         if (ok) {
             g_view_store_active = true;
         } else {
@@ -2566,7 +2632,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         allocStore(msg->n_batches);
         /* Confirmar al maestro que el buffer está listo */
         MsgCfgAck ack = { CMD_CFG_ACK, NODE_ID, CMD_SET_RECLEN,
-                          (uint8_t)((msg->n_batches == 0 || storeReadyForHotWait()) ? 1 : 0) };
+                          (uint8_t)((msg->n_batches == 0 || storeAllocated()) ? 1 : 0) };
         sendToMaster((const uint8_t *)&ack, sizeof(ack));
     }
     else if (cmd == CMD_REQ_BATCH && len >= (int)sizeof(MsgReqBatch)) {
@@ -2595,16 +2661,14 @@ static void allocStore(uint16_t n_batches)
     freeStoreRam();
     g_store_fill   = 0;
     g_rec_n_batches= n_batches;
-    sdStorageEndSession();
-    g_sd_spill_active = false;
+    g_psoc_sd_store_active =
+        (n_batches > 0u && g_psoc_sd_capture_enabled && psocSdPresent());
+    g_psoc_sd_session_complete = false;
+    g_psoc_sd_capture_error = false;
+    g_psoc_sd_read_pending = false;
     if (n_batches == 0) return;
-    if (n_batches > PSOC_CAPTURE_MAX_BATCHES) {
-        /* clampPsocCaptureBatches() solo deja pasar n>límite RAM cuando la SD
-         * está habilitada+presente (ver arriba) — la captura entera vive en
-         * la SD, sin arena RAM. */
-        g_sd_spill_active = sdStorageBeginSession(n_batches);
-        SLAVE_LOG_PRINTF("[SLAVE] store SD n=%u session=%s\n",
-                         n_batches, g_sd_spill_active ? "OK" : "FAIL");
+    if (g_psoc_sd_store_active) {
+        SLAVE_LOG_PRINTF("[SLAVE] store PSoC-SD n=%u\n", n_batches);
         return;
     }
 
@@ -2649,24 +2713,26 @@ static void handleReqBatch(const MsgReqBatch *msg)
                          seq, g_store_fill, g_rec_n_batches, (int)g_state);
         return;
     }
-    if (seq >= g_store_fill || (!storeRamReady() && !g_sd_spill_active)) {
+    if (seq >= g_store_fill || (!storeRamReady() && !g_psoc_sd_store_active)) {
         /* Batch fuera de rango: notificar al master para que avance sin esperar timeout */
         MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
         sendToMaster((const uint8_t *)&nack, sizeof(nack));
         SLAVE_LOG_PRINTF("[SLAVE] REQ_BATCH NACK seq=%u fill=%u\n", seq, g_store_fill);
         return;
     }
-    if (g_sd_spill_active) {
-        SampleBytes sbuf[SPI_BATCH_SAMPLES];
-        uint32_t    tsRel = 0;
-        if (!sdStorageReadBatch(seq, sbuf, &tsRel)) {
+    if (g_psoc_sd_store_active) {
+        if (g_psoc_sd_read_pending) {
+            if (seq == g_psoc_sd_read_seq) {
+                return; /* el PSoC ya está atendiendo exactamente este retry */
+            }
             MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
             sendToMaster((const uint8_t *)&nack, sizeof(nack));
-            SLAVE_LOG_PRINTF("[SLAVE] REQ_BATCH SD read fail seq=%u\n", seq);
             return;
         }
-        uint64_t ts = g_t_start_us + (uint64_t)tsRel;
-        transport.sendStoredBatch(sbuf, seq, ts, NODE_ID);
+        g_psoc_sd_read_pending = true;
+        g_psoc_sd_read_seq = seq;
+        g_psoc_sd_read_started_ms = millis();
+        psoc.sdReadBatch(seq);
         return;
     }
     const SampleBytes *s = storeBatchPtr(seq);
@@ -2680,45 +2746,75 @@ static void handleReqBatch(const MsgReqBatch *msg)
     transport.sendStoredBatch(s, seq, ts, NODE_ID);
 }
 
+static void servicePsocSdReadTimeout()
+{
+    if (!g_psoc_sd_read_pending ||
+        (uint32_t)(millis() - g_psoc_sd_read_started_ms) < PSOC_SD_READ_TIMEOUT_MS) {
+        return;
+    }
+    MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
+    sendToMaster((const uint8_t *)&nack, sizeof(nack));
+    SLAVE_LOG_PRINTF("[SLAVE] PSoC SD_READ timeout seq=%u\n",
+                     (unsigned)g_psoc_sd_read_seq);
+    g_psoc_sd_read_pending = false;
+}
+
 /* ── Callback PSoC — batch recibido ─────────────────────────────────────── */
+
+static void psocBatchToStored(const PsocBatch &batch, SampleBytes *dst)
+{
+    for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+        const PsocSample &s = batch.samples[i];
+        dst[i].raw_lo = (uint8_t)(s.raw_input & 0xFF);
+        dst[i].raw_hi = (uint8_t)((s.raw_input >> 8) & 0xFF);
+        dst[i].alog0 = (uint8_t)(s.post_analog & 0xFF);
+        dst[i].alog1 = (uint8_t)((s.post_analog >> 8) & 0xFF);
+        dst[i].alog2 = (uint8_t)((s.post_analog >> 16) & 0xFF);
+        dst[i].digi0 = (uint8_t)(s.post_digital & 0xFF);
+        dst[i].digi1 = (uint8_t)((s.post_digital >> 8) & 0xFF);
+        dst[i].digi2 = (uint8_t)((s.post_digital >> 16) & 0xFF);
+        dst[i].gain = s.gain_byte;
+        dst[i].flags = s.sample_flags;
+    }
+}
 
 static void onBatch(const PsocBatch &batch)
 {
-    if (g_state != SAMPLING) return;
     g_psocConnected = true;
+
+    if (g_psoc_sd_read_pending) {
+        if (batch.seq != g_psoc_sd_read_seq) {
+            SLAVE_LOG_PRINTF("[SLAVE] SD batch seq=%u, esperado=%u: ignorado\n",
+                             (unsigned)batch.seq, (unsigned)g_psoc_sd_read_seq);
+            return;
+        }
+        SampleBytes stored[SPI_BATCH_SAMPLES];
+        const uint16_t seq = g_psoc_sd_read_seq;
+        uint32_t fs = effectivePsocSampleRateHz();
+        if (fs == 0u) fs = PSOC_NATIVE_SAMPLE_RATE_HZ;
+        psocBatchToStored(batch, stored);
+        g_psoc_sd_read_pending = false;
+        const uint64_t ts = g_t_start_us +
+            ((uint64_t)seq * SPI_BATCH_SAMPLES * 1000000ULL) / fs;
+        transport.sendStoredBatch(stored, seq, ts, NODE_ID);
+        return;
+    }
+
+    if (g_state != SAMPLING || g_psoc_sd_store_active) return;
 
     if (g_view_remaining > 0) {
         g_view_remaining = 0;   /* fail-safe: VIEW live no debe transmitir mientras muestrea */
     }
 
-    /* Routing normal: si hay store activo (RAM o SD) → acumula; si no → en vivo. */
-    if ((storeRamReady() || g_sd_spill_active) && g_store_fill < g_rec_n_batches) {
-        /* Store-and-forward: acumular en RAM (o escribir a SD si g_sd_spill_active), sin RF */
-        SampleBytes localBatch[SPI_BATCH_SAMPLES];
-        SampleBytes *dst = g_sd_spill_active ? localBatch
-                                              : storeBatchPtr(g_store_fill);
+    /* Store-and-forward RAM: el camino SD no llega aquí; se lee por 0xBF. */
+    if (storeRamReady() && g_store_fill < g_rec_n_batches) {
+        SampleBytes *dst = storeBatchPtr(g_store_fill);
         if (!dst) {
             return;
         }
-        for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
-            const PsocSample &s = batch.samples[i];
-            dst[i].raw_lo = (uint8_t)( s.raw_input         & 0xFF);
-            dst[i].raw_hi = (uint8_t)((s.raw_input  >> 8)  & 0xFF);
-            dst[i].alog0  = (uint8_t)( s.post_analog        & 0xFF);
-            dst[i].alog1  = (uint8_t)((s.post_analog >>  8) & 0xFF);
-            dst[i].alog2  = (uint8_t)((s.post_analog >> 16) & 0xFF);
-            dst[i].digi0  = (uint8_t)( s.post_digital        & 0xFF);
-            dst[i].digi1  = (uint8_t)((s.post_digital >>  8) & 0xFF);
-            dst[i].digi2  = (uint8_t)((s.post_digital >> 16) & 0xFF);
-            dst[i].gain   = s.gain_byte;
-            dst[i].flags  = s.sample_flags;
-        }
+        psocBatchToStored(batch, dst);
         uint32_t tsRel = (uint32_t)batch.timestamp_us;
-        if (g_sd_spill_active) {
-            sdStorageWriteBatch(g_store_fill, dst, tsRel);
-        } else {
-            g_store_ts_us[g_store_fill] = tsRel;
-        }
+        g_store_ts_us[g_store_fill] = tsRel;
         g_store_fill++;
         if (g_store_fill >= g_rec_n_batches) {
             g_state = STOPPED;
@@ -2859,10 +2955,14 @@ void loop()
 
     /* Drenar siempre la UART del PSoC (onBatch ignora si no está SAMPLING). */
     if (g_state == SAMPLING && g_debug_mode) {
-        /* debug ESP: generar batch falso a 29412 µs (30 muestras @ 1020 Hz) */
+        /* Debug ESP: un lote falso cada 30/2604 s. La expresión redondeada
+         * mantiene esta ruta de laboratorio ligada a la Fs nativa canónica. */
+        static const uint32_t DEBUG_BATCH_PERIOD_US =
+            (SPI_BATCH_SAMPLES * 1000000UL + PSOC_NATIVE_SAMPLE_RATE_HZ / 2UL) /
+            PSOC_NATIVE_SAMPLE_RATE_HZ;
         uint32_t nowUs = (uint32_t)micros();
-        if ((uint32_t)(nowUs - g_debug_last_us) >= 29412) {
-            g_debug_last_us += 29412;
+        if ((uint32_t)(nowUs - g_debug_last_us) >= DEBUG_BATCH_PERIOD_US) {
+            g_debug_last_us += DEBUG_BATCH_PERIOD_US;
             PsocBatch fake = {};
             fake.seq         = (uint16_t)(g_debug_count / SPI_BATCH_SAMPLES);
             fake.n_samples   = SPI_BATCH_SAMPLES;
@@ -2879,6 +2979,7 @@ void loop()
         psoc.poll();
     }
     servicePsocConfigAck();
+    servicePsocSdReadTimeout();
     serviceUsbCommands();
     serviceAutoCalibration();
     serviceCompletionAckRetry();
@@ -2958,12 +3059,10 @@ void loop()
      * tras algunos intentos se asume sin SD (sd_present=0, que ya es el
      * default). */
     static uint32_t lastSdQueryMs = 0;
-    static uint8_t sdQueryTries = 0;
-    if (g_psocConnected && !g_psoc_sd_known && sdQueryTries < 5 &&
+    if (g_psocConnected && !g_psoc_sd_known &&
         g_state != SAMPLING && g_state != HOT_WAIT && g_view_remaining == 0 &&
-        (millis() - lastSdQueryMs) >= 3000) {
+        (millis() - lastSdQueryMs) >= 5000) {
         lastSdQueryMs = millis();
-        sdQueryTries++;
         psoc.sdStatus(0);
     }
 

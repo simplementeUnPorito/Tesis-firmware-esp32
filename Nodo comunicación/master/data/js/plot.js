@@ -4,8 +4,8 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-study-17';
-import { hilbertEnvelope } from './signal_proc.js?v=field-study-17';
+import * as cfg from './config.js?v=field-study-19';
+import { hilbertEnvelope } from './signal_proc.js?v=field-study-19';
 
 const CURSOR_STYLES = [
   { label: 'C1', line: 'rgba(255,230,80,0.9)', stroke: 'rgba(255,230,80,0.65)', text: '#ffe980' },

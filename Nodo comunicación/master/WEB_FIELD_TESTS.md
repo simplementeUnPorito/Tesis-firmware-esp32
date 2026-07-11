@@ -67,7 +67,7 @@ Mitigaciones (2026-07-02):
 
 ## Path de captura
 
-1. ARM → START con duración corta (p.ej. 102 lotes ≈ 3 s a 1020 Hz).
+1. ARM → START con duración corta (p.ej. 102 lotes ≈ 1.18 s a 2604 Hz).
 2. Confirmar que aparecen trazas crudas y filtradas para cada nodo.
 3. Probar controles de display: `Sin offset DC`, `Espectro`, `Invertir señal`.
 4. Probar envolvente: `Env cruda`, `Env filtrada`.
@@ -131,7 +131,7 @@ Para validar la UI sin el PSoC Hammer físico:
 
 ```bash
 python "src/esp/Nodo comunicación/simulate_hammer_dummy.py" \
-  --host 192.168.4.1 --node 1 --type hammer --fs 1020 --psoc 1
+  --host 192.168.4.1 --node 1 --type hammer --fs 2604 --psoc 1
 ```
 
 La UI debe mostrar `Hammer (S1)` sin el campo "Offset m".
@@ -140,7 +140,7 @@ La UI debe mostrar `Hammer (S1)` sin el campo "Offset m".
 
 El dropdown "Rango ADC" de cada panel de esclavo ahora tiene 4 opciones
 (antes 2): `±2.5 V`, `±0.512 V`, `±1.024 V`, `±0.625 V` — códigos 1..4,
-`cfg.ADC_CONFIGS` en `config.js`. Todas a la misma Fs (1020 Hz), asi que no
+`cfg.ADC_CONFIGS` en `config.js`. Todas a la misma Fs (2604 Hz), asi que no
 hace falta re-sincronizar nada al cambiar de rango.
 
 Validado sin hardware (servidor estático local sirviendo `data/`, sin

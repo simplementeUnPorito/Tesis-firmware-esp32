@@ -2,7 +2,7 @@
 // commands as the flat JSON the firmware's web_relay.h expects.
 // Mirrors python/geophone_scope/protocol.py — keep field names/semantics in sync.
 
-import * as cfg from './config.js?v=field-study-17';
+import * as cfg from './config.js?v=field-study-19';
 
 /** Parsed 6-byte packet from the master (0x56 header). Mirrors protocol.Packet. */
 export class Packet {
@@ -47,7 +47,7 @@ export class Packet {
   get helloFsHz() { return this.b0 * 100; }
   get helloFsExactHz() { return ((this.b1 << 8) | this.b0) >>> 0; }
   get helloHwClass() { return this.b1; }
-  /** sub 0x07: 1=módulo SD detectado en el ESP32 del esclavo (solo GEO), 0=sin SD. */
+  /** sub 0x07: 1=FAT/SD detectada por el PSoC del esclavo GEO, 0=sin SD. */
   get helloSdPresent() { return this.b1; }
   get helloMacSub() { return this.b2; }
   get helloMacHi() { return this.b1; }
