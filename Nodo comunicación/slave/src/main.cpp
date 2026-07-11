@@ -217,6 +217,14 @@ static volatile bool     g_psoc_arm_ready = false;
 #define PSOC_CFG_READY_STALE_MS 5000u
 #define COMPLETION_ACK_RETRY_PERIOD_MS 250u
 #define COMPLETION_ACK_RETRY_COUNT 24u
+/* Watchdog de HOT_WAIT: si el PSoC no confirma ARMED se reintenta preStart y,
+ * si sigue mudo, se aborta con NACK en vez de quedar colgado hasta un power
+ * cycle (bug de campo 2026-07-11: "START funciona una vez y nunca más"). */
+#define HOTWAIT_READY_TIMEOUT_MS 700u
+#define HOTWAIT_REARM_MAX 2u
+#define HOTWAIT_ABORT_MS 5000u
+#define HOTWAIT_ARMED_ABORT_MS 300000u
+#define HOTWAIT_STATUS_AFTER_MS 2000u
 #ifndef PSOC_START_FALLBACK_EXTRA_MS
   #ifdef PSOC_VIEW_START_FALLBACK_EXTRA_MS
     #define PSOC_START_FALLBACK_EXTRA_MS PSOC_VIEW_START_FALLBACK_EXTRA_MS
@@ -228,6 +236,9 @@ static volatile bool     g_psoc_arm_ready = false;
 static uint32_t g_sampling_start_ms = 0;
 static uint32_t g_sampling_start_psoc_bytes = 0;
 static uint32_t g_sampling_start_batches_ok = 0;
+static uint32_t g_hotwait_enter_ms = 0;
+static uint8_t  g_hotwait_rearm_count = 0;
+static volatile bool g_sync_edge_started = false; /* flanco GPIO: bookkeeping en loop() */
 static bool     g_start_fallback_sent = false;
 static uint8_t  g_completion_ack_sub_cmd = 0;
 static uint8_t  g_completion_ack_ok = 0;
@@ -378,6 +389,7 @@ static void enterHotWait(uint16_t n_batches);
 static uint16_t clampPsocCaptureBatches(uint16_t n);
 static uint32_t expectedCaptureMs(uint16_t n_batches);
 static bool storeReadyForHotWait();
+static void serviceHotWaitWatchdog();
 static void debugEspSetRamp(bool enable);
 
 static void IRAM_ATTR onPsocRxEdge()
@@ -1170,6 +1182,7 @@ void IRAM_ATTR onSyncEdge()
         g_store_fill    = 0;
         g_debug_count   = 0;
         g_debug_last_us = nowUs;
+        g_sync_edge_started = true; /* loop() completa el bookkeeping fuera del ISR */
         g_state = SAMPLING;
     } else if (level == LOW && g_state == SAMPLING) {
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
@@ -1182,6 +1195,7 @@ void IRAM_ATTR onSyncEdge()
 /* ── Forward declarations ────────────────────────────────────────────────── */
 static void allocStore(uint16_t n_batches);
 static void handleReqBatch(const MsgReqBatch *msg);
+static void sendHotWaitAck();
 
 /* ── Callbacks ESP-NOW ───────────────────────────────────────────────────── */
 
@@ -1919,6 +1933,21 @@ static void requestStartNowFromUsb(uint16_t n)
 static void requestCaptureFromUsb(uint16_t n)
 {
     requestPrestartFromUsb(n);
+    /* El PSoC confirma ARMED (PSOC_EVT_ARMED -> g_psoc_arm_ready) de forma
+     * asíncrona ~100-300 ms después del preStart. Sin esta espera el sync se
+     * disparaba antes de ARMED y quedaba ignorado (ready=0), dejando la captura
+     * colgada en HOT_WAIT con fill=0/N. Esto era la falsa "regresión de banco"
+     * no-monotónica (cap chico ✓, cap grande ✗): dependía de la latencia del
+     * ACK ARMED, no de pérdida de frames UART. El path real maestro->esclavo no
+     * sufre esto porque PRESTART y START llegan separados por radio. */
+    if (g_state == HOT_WAIT) {
+        uint32_t deadline = millis() + 800u;   /* margen holgado para el ACK ARMED */
+        while (!storeReadyForHotWait() && (int32_t)(millis() - deadline) < 0) {
+            psoc.poll();
+            servicePsocConfigAck();
+            serviceHotWaitWatchdog();   /* re-arma preStart si ARMED no llega */
+        }
+    }
     requestUsbStartFromHotWait();
 }
 
@@ -2251,12 +2280,15 @@ static void enterHotWait(uint16_t n_batches)
     if (!psocReady) {
         allocStore(0);
         g_state = STOPPED;
+        sendHotWaitAck();   /* NACK explícito: el maestro no debe esperar READY */
         SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT aborted n=%u: PSoC SETN no confirmado\n",
                          (unsigned)n_batches);
         LOGM("HOTWAIT_ABORT", "n=%u,reason=setn_timeout", (unsigned)n_batches);
         return;
     }
     psoc.preStart();
+    g_hotwait_enter_ms = millis();
+    g_hotwait_rearm_count = 0;
     g_state = HOT_WAIT;
     SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT n=%u ready=%u\n",
                      n_batches, (unsigned)storeReadyForHotWait());
@@ -2274,6 +2306,51 @@ static void sendHotWaitAck()
     sendToMaster((const uint8_t *)&ack, sizeof(ack));
     SLAVE_LOG_PRINTF("[SLAVE] HOTWAIT_ACK ok=%u state=%u n=%u\n",
                      ok, (unsigned)g_state, g_rec_n_batches);
+}
+
+static void abortHotWait(const char *reason)
+{
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    g_view_store_active = false;
+    g_start_store_active = false;
+    g_start_fallback_sent = false;
+    allocStore(0);
+    g_state = STOPPED;
+    sendHotWaitAck();   /* ok=0 con state: NACK explícito hacia el maestro */
+    SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT watchdog abort: %s\n", reason);
+    LOGM("HOTWAIT_ABORT", "reason=%s", reason);
+}
+
+/* Watchdog de HOT_WAIT (desde loop()): si el PSoC nunca confirma ARMED
+ * (p.ej. sd_session_begin falló y psoc_arm() salió sin armar), reintenta
+ * preStart() hasta HOTWAIT_REARM_MAX veces y después aborta con NACK. Un
+ * HOT_WAIT armado que el maestro nunca arranca también expira (caso maestro
+ * reiniciado). Antes de esto el esclavo quedaba mudo hasta un power cycle. */
+static void serviceHotWaitWatchdog()
+{
+    if (g_state != HOT_WAIT) {
+        g_hotwait_rearm_count = 0;
+        return;
+    }
+    uint32_t elapsed = millis() - g_hotwait_enter_ms;
+    if (!g_psoc_arm_ready) {
+        if (elapsed >= HOTWAIT_ABORT_MS) {
+            abortHotWait("psoc_no_armed");
+        } else if (g_hotwait_rearm_count < HOTWAIT_REARM_MAX &&
+                   elapsed >= HOTWAIT_READY_TIMEOUT_MS *
+                              (uint32_t)(g_hotwait_rearm_count + 1u)) {
+            g_hotwait_rearm_count++;
+            psoc.preStart();
+            SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT re-arm #%u (sin PSOC_EVT_ARMED tras %lu ms)\n",
+                             (unsigned)g_hotwait_rearm_count, (unsigned long)elapsed);
+            LOGM("HOTWAIT_REARM", "try=%u,ms=%lu",
+                 (unsigned)g_hotwait_rearm_count, (unsigned long)elapsed);
+        }
+        return;
+    }
+    if (elapsed >= HOTWAIT_ARMED_ABORT_MS) {
+        abortHotWait("start_never_came");
+    }
 }
 
 static void debugEspSetRamp(bool enable)
@@ -2463,6 +2540,14 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_debug_mode = false;   /* detener debug stream si estaba activo */
         g_psoc_arm_ready = false;
         g_psoc_sd_read_pending = false;
+        /* Pizarra limpia: ARM es el fin explícito de cualquier captura/dump
+         * anterior. Sin esto, flags viejos (store activo, retry de ACK de
+         * completado, arena con n_batches previo) contaminaban el ciclo
+         * siguiente y START dejaba de funcionar hasta un power cycle. */
+        g_view_store_active = false;
+        g_start_store_active = false;
+        g_start_fallback_sent = false;
+        allocStore(0);
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_state = ARMED;
         scheduleAutoCalibration(0u);
@@ -2983,6 +3068,21 @@ void loop()
     serviceUsbCommands();
     serviceAutoCalibration();
     serviceCompletionAckRetry();
+    serviceHotWaitWatchdog();
+
+    /* Arranque por flanco GPIO (onSyncEdge): completar fuera del ISR el mismo
+     * bookkeeping que hace el handler de CMD_START, para que la captura por
+     * sync de hardware también emita el ACK de completado y el fallback. */
+    if (g_sync_edge_started) {
+        g_sync_edge_started = false;
+        g_sampling_start_ms = millis();
+        g_sampling_start_psoc_bytes = psoc.bytesRx();
+        g_sampling_start_batches_ok = psoc.batchesOK();
+        g_start_fallback_sent = false;
+        if (!g_view_store_active) {
+            g_start_store_active = (g_rec_n_batches > 0 && storeAllocated());
+        }
+    }
 
     /* (El parpadeo de identificación lo hace ahora el PSoC con su Timer; el ESP
      * solo reenvía CMD_BLINK_LED por UART en onDataRecv.) */
@@ -3090,9 +3190,13 @@ void loop()
 #endif
     }
 
-    /* Informe de estado cada 10 s */
+    /* Informe de estado cada 10 s. En HOT_WAIT normal (dura <1 s) sigue en
+     * silencio RF; pero si HOT_WAIT se estira (>2 s, algo anda mal) volvemos
+     * a emitir STATUS para que el maestro no dé el nodo por muerto. */
     static uint32_t last_status = 0;
-    if (g_state != HOT_WAIT && g_state != SAMPLING &&
+    bool hotwaitVisible = (g_state == HOT_WAIT &&
+                           (millis() - g_hotwait_enter_ms) >= HOTWAIT_STATUS_AFTER_MS);
+    if ((g_state != HOT_WAIT || hotwaitVisible) && g_state != SAMPLING &&
         millis() - last_status > 10000) {
         last_status = millis();
         MsgStatus st = {
