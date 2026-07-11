@@ -108,7 +108,10 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
   #define DUMP_NACK_RETRY_DELAY_MS 100
 #endif
 #ifndef PSOC_CAPTURE_MAX_BATCHES
-  #define PSOC_CAPTURE_MAX_BATCHES 360
+  /* Tope RAM-only de lotes DECIMADOS por captura. Debe coincidir con el del
+   * esclavo y con el buffer PSoC: el esclavo guarda en paginas chicas, no en
+   * un malloc gigante. */
+  #define PSOC_CAPTURE_MAX_BATCHES 512
 #endif
 #ifndef ESPNOW_USE_UNICAST_TO_SLAVES
   #define ESPNOW_USE_UNICAST_TO_SLAVES 0
@@ -187,7 +190,11 @@ static StartProbePending g_startProbePending[START_PROBE_PENDING_SLOTS] = {};
 static uint8_t g_startProbePendingNext = 0;
 
 /* ── Store-and-forward (dump request/response) ───────────────────────────── */
-static uint16_t g_rec_n_batches   = 0;   /* batches a grabar por slave */
+static uint16_t g_rec_n_batches   = 0;   /* batches a grabar por slave (canónico = GEO) */
+/* Duración por tipo de nodo (H4, 2026-07-11): largo propio para HAMMER.
+ * 0 = no configurado → todos los nodos usan g_rec_n_batches (camino legado
+ * byte-idéntico al validado). Se setea con el comando web 0xAD. */
+static uint16_t g_rec_n_batches_hammer = 0;
 static uint8_t  g_dumpSlaveIdx    = 0;   /* esclavo siendo dumpeado (1-N) */
 static uint16_t g_dumpBatchSeq    = 0;   /* batch actual siendo pedido */
 static volatile bool     g_dumpBatchRx        = false;
@@ -233,6 +240,7 @@ struct CachedHello {
     uint8_t psoc_ok = 0;
     uint16_t sample_rate = 0;
     uint8_t hw_class = SLAVE_HW_UNKNOWN;
+    uint8_t sd_present = 0;
     uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
 };
 static CachedHello g_cachedHello[NUM_SLAVES + 1];
@@ -335,6 +343,23 @@ static uint16_t clampRecordBatches(uint16_t n)
     return n;
 }
 
+/* Largo de captura para un nodo según su hw_class cacheado (HELLO). Con
+ * g_rec_n_batches_hammer==0 devuelve SIEMPRE el canónico — invariante:
+ * duraciones iguales ⇒ comportamiento idéntico al validado. Nodo sin HELLO
+ * (hw_class desconocido) cae al canónico (GEO). */
+static uint16_t nBatchesForNode(uint8_t nodeId)
+{
+    if (g_rec_n_batches_hammer == 0) {
+        return g_rec_n_batches;
+    }
+    if (nodeId >= 1 && nodeId <= NUM_SLAVES &&
+        g_cachedHello[nodeId].valid &&
+        g_cachedHello[nodeId].hw_class == SLAVE_HW_HAMMER) {
+        return g_rec_n_batches_hammer;
+    }
+    return g_rec_n_batches;
+}
+
 static void requestWebCachedStateReplay()
 {
     g_webReplayCachedState = true;
@@ -347,7 +372,7 @@ static void sendCachedStateToWeb()
     for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
         const CachedHello &h = g_cachedHello[node];
         if (h.valid) {
-            matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate, h.hw_class);
+            matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate, h.hw_class, h.sd_present);
         }
     }
     MASTER_LOG_PRINTLN("[WEB] cached READY/HELLO replay sent");
@@ -502,7 +527,7 @@ static void onCfgAck(const MsgCfgAck &msg)
         } else {
             MASTER_LOG_PRINTF("[MASTER] DUMP NACK max retries slave=%d -> next\n",
                               g_dumpSlaveIdx);
-            g_dumpBatchSeq = g_rec_n_batches;
+            g_dumpBatchSeq = nBatchesForNode(g_dumpSlaveIdx);
             g_dumpBatchRx  = true;
             dumpDeliveryGuardReset();
         }
@@ -531,10 +556,11 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
         h.psoc_ok = msg.psoc_ok;
         h.sample_rate = msg.sample_rate;
         h.hw_class = msg.hw_class;
+        h.sd_present = msg.sd_present;
         memcpy(h.mac, senderMac, 6);
         if (isUsableUnicastMac(h.mac)) addPeerIfNeeded(h.mac);
     }
-    matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate, msg.hw_class);
+    matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate, msg.hw_class, msg.sd_present);
 }
 
 static void onStartAck(const MsgStartAck &msg)
@@ -638,20 +664,38 @@ static void beacon_resume(void)
 #endif
 }
 
+static void scheduleCaptureDumpTimeout(uint16_t nBatches, const char *reason)
+{
+    if (nBatches == 0) {
+        g_captureDumpDueMs = 0;
+        return;
+    }
+    /* captureDurationMs = tiempo ideal de muestreo (sin huecos). Con captura
+     * encadenada el tiempo de pared agrega el volcado UART de cada trozo entre
+     * corridas; ×3 da holgura de sobra. Igual el camino primario de cierre es
+     * el ACK START-done del esclavo, no este timeout (solo rescate si se pierde
+     * ese ACK). */
+    /* Con duración por tipo, el rescate debe cubrir al nodo MÁS largo. */
+    if (g_rec_n_batches_hammer > nBatches) {
+        nBatches = g_rec_n_batches_hammer;
+    }
+    uint32_t durationMs = captureDurationMs(nBatches);
+    uint32_t waitMs = durationMs * 3u + STORE_CAPTURE_MARGIN_MS;
+    if (waitMs < STORE_CAPTURE_TIMEOUT_MIN_MS) waitMs = STORE_CAPTURE_TIMEOUT_MIN_MS;
+    g_captureDumpDueMs = millis() + waitMs;
+    MASTER_LOG_PRINTF("[MASTER] DUMP safety timeout in %u ms (n=%u, %s)\n",
+                      (unsigned)waitMs, (unsigned)nBatches, reason);
+    LOGM("DUMP_SAFETY_TIMEOUT", "reason=%s,n=%u,duration_ms=%u,wait_ms=%u",
+         reason, nBatches, (unsigned)durationMs, (unsigned)waitMs);
+}
+
 static void scheduleStoreDump(uint16_t nBatches)
 {
     if (nBatches == 0 || g_viewDump || g_armedCount == 0) {
         g_captureDumpDueMs = 0;
         return;
     }
-    uint32_t durationMs = captureDurationMs(nBatches);
-    uint32_t waitMs = durationMs * 2u + STORE_CAPTURE_MARGIN_MS;
-    if (waitMs < STORE_CAPTURE_TIMEOUT_MIN_MS) waitMs = STORE_CAPTURE_TIMEOUT_MIN_MS;
-    g_captureDumpDueMs = millis() + waitMs;
-    MASTER_LOG_PRINTF("[MASTER] DUMP safety timeout in %u ms (n=%u)\n",
-                      (unsigned)waitMs, (unsigned)nBatches);
-    LOGM("DUMP_SAFETY_TIMEOUT", "n=%u,duration_ms=%u,wait_ms=%u",
-         nBatches, (unsigned)durationMs, (unsigned)waitMs);
+    scheduleCaptureDumpTimeout(nBatches, "start");
 }
 
 static void beginDump(const char *reason)
@@ -747,7 +791,8 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param, b
     } else if (sub_cmd == 0xB2) {
         /* "Ver": captura única de N lotes. El esclavo guarda en RAM (sin RF durante
          * el muestreo) y luego el maestro hace dump vía REQ_BATCH. */
-        uint16_t n = g_rec_n_batches ? g_rec_n_batches : (uint16_t)1;
+        uint16_t n = nBatchesForNode(node_id);
+        if (n == 0) n = 1;
         g_state = RUNNING;
         g_streaming = true;
         g_viewNode = node_id;
@@ -787,6 +832,10 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param, b
 
 /* ── Broadcast ESP-NOW a todos los esclavos ──────────────────────────────── */
 
+/* Duración por tipo: primero el broadcast con el largo canónico (GEO, llega a
+ * todos incluso sin HELLO cacheado) y después un unicast que lo pisa SOLO en
+ * los nodos HAMMER conocidos. Con g_rec_n_batches_hammer==0 (o igual al
+ * canónico, o clear con nBatches==0) el camino es el broadcast de siempre. */
 static void broadcastRecordLength(uint16_t nBatches)
 {
     MsgSetRecLen msg = { CMD_SET_RECLEN, nBatches };
@@ -794,6 +843,18 @@ static void broadcastRecordLength(uint16_t nBatches)
         esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] SET_RECLEN=%u\n", nBatches);
+
+    if (nBatches == 0 || g_rec_n_batches_hammer == 0 ||
+        g_rec_n_batches_hammer == nBatches || !g_espnowReady) {
+        return;
+    }
+    for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
+        uint16_t n = nBatchesForNode(node);
+        if (n == nBatches) continue;
+        MsgSetRecLen m = { CMD_SET_RECLEN, n };
+        esp_now_send(espnowDstForSlave(node), (uint8_t *)&m, sizeof(m));
+        MASTER_LOG_PRINTF("[MASTER] SET_RECLEN node=%u n=%u (hammer)\n", node, n);
+    }
 }
 
 static void broadcastPrestart(uint16_t nBatches)
@@ -803,6 +864,18 @@ static void broadcastPrestart(uint16_t nBatches)
         esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] PRESTART sent n=%u\n", nBatches);
+
+    if (nBatches == 0 || g_rec_n_batches_hammer == 0 ||
+        g_rec_n_batches_hammer == nBatches || !g_espnowReady) {
+        return;
+    }
+    for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
+        uint16_t n = nBatchesForNode(node);
+        if (n == nBatches) continue;
+        MsgPrestart m = { CMD_PRESTART, n };
+        esp_now_send(espnowDstForSlave(node), (uint8_t *)&m, sizeof(m));
+        MASTER_LOG_PRINTF("[MASTER] PRESTART node=%u n=%u (hammer)\n", node, n);
+    }
 }
 
 static void sendHotWaitQuery(uint8_t nodeId)
@@ -956,7 +1029,7 @@ static void finishPrestartAction()
                 esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
             }
         }
-        g_captureDumpDueMs = 0;   /* dump al recibir VIEW_DONE del esclavo */
+        scheduleCaptureDumpTimeout(g_rec_n_batches, "view");
         g_captureDoneMask = 0;
         g_state = RUNNING;
         matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
@@ -1202,6 +1275,18 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
             g_rec_n_batches = clampRecordBatches(rxCmd.value);
             broadcastRecordLength(g_rec_n_batches);
             matlab.sendAck(0xFF, 0xAE, (uint8_t)(g_rec_n_batches & 0xFF));
+            break;
+        }
+
+        case 0xAD: {  /* SET_RECORD_LEN_HAMMER: largo propio de nodos HAMMER
+                       * (16 bits). 0 = volver al largo único (canónico). */
+            g_rec_n_batches_hammer = clampRecordBatches(rxCmd.value);
+            if (g_rec_n_batches > 0) {
+                /* Refrescar los largos ya repartidos con el override nuevo. */
+                broadcastRecordLength(g_rec_n_batches);
+            }
+            matlab.sendAck(0xFF, 0xAD, (uint8_t)(g_rec_n_batches_hammer & 0xFF));
+            MASTER_LOG_PRINTF("[MASTER] SET_RECLEN_HAMMER=%u\n", g_rec_n_batches_hammer);
             break;
         }
 
@@ -1463,17 +1548,25 @@ void loop()
         }
     }
 
-    /* Store-and-forward: timeout de seguridad. El camino normal es START ok=2
-     * desde todos los slaves armados; esto solo rescata ACKs perdidos. */
-    if (g_state == RUNNING && !g_viewDump && g_rec_n_batches > 0 && g_captureDumpDueMs != 0 &&
+    /* Store-and-forward: timeout de seguridad. El camino normal es ok=2
+     * desde el/los slaves; esto solo rescata ACKs perdidos. */
+    if (g_state == RUNNING && g_rec_n_batches > 0 && g_captureDumpDueMs != 0 &&
         (int32_t)(millis() - g_captureDumpDueMs) >= 0) {
         syncOutWrite(LOW);
-        MASTER_LOG_PRINTF("[MASTER] START done ACK timeout mask=0x%08lX armed=0x%08lX -> DUMP\n",
-                          (unsigned long)g_captureDoneMask,
-                          (unsigned long)g_armAckMask);
-        LOGM("START_DONE_TIMEOUT", "done=0x%08lX,armed=0x%08lX",
-             (unsigned long)g_captureDoneMask, (unsigned long)g_armAckMask);
-        beginDump("capture_timeout");
+        if (g_viewDump) {
+            MASTER_LOG_PRINTF("[MASTER] VIEW done ACK timeout node=%d -> DUMP\n",
+                              g_viewNode);
+            LOGM("VIEW_DONE_TIMEOUT", "node=%u,n=%u",
+                 g_viewNode, g_rec_n_batches);
+            beginDump("view_timeout");
+        } else {
+            MASTER_LOG_PRINTF("[MASTER] START done ACK timeout mask=0x%08lX armed=0x%08lX -> DUMP\n",
+                              (unsigned long)g_captureDoneMask,
+                              (unsigned long)g_armAckMask);
+            LOGM("START_DONE_TIMEOUT", "done=0x%08lX,armed=0x%08lX",
+                 (unsigned long)g_captureDoneMask, (unsigned long)g_armAckMask);
+            beginDump("capture_timeout");
+        }
     }
 
     /* Transición STOPPING → DUMPING (store-and-forward) o → IDLE (clásico) */
@@ -1545,7 +1638,10 @@ void loop()
         if (advance) {
             g_dumpBatchSeq++;
             dumpDeliveryGuardReset();
-            if (g_dumpBatchSeq >= g_rec_n_batches) {
+            /* Corte por nodo: cada esclavo se dumpea hasta SU largo (HAMMER
+             * puede tener menos lotes que GEO). Con duraciones iguales esto
+             * es exactamente g_rec_n_batches, igual que siempre. */
+            if (g_dumpBatchSeq >= nBatchesForNode(g_dumpSlaveIdx)) {
                 g_dumpBatchSeq = 0;
                 g_dumpSlaveIdx++;
                 /* VIEW dump: solo un nodo; dump normal: saltar nodos no armados */

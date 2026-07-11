@@ -22,6 +22,7 @@ export const CMD_STOP = 0xA4;
 export const CMD_STATUS = 0xA5;
 export const CMD_DEBUG = 0xA7;
 export const CMD_SET_RECLEN = 0xAE;
+export const CMD_SET_RECLEN_HAMMER = 0xAD;  /* largo propio de nodos HAMMER; 0 = mismo que GEO */
 
 // Sub-commands (directed to slave)
 export const SUBCMD_PGA = 0xA6;
@@ -32,7 +33,10 @@ export const SUBCMD_VER = 0xB2;
 export const SUBCMD_CALIBRATE     = 0xB5;
 export const SUBCMD_SAVE_EEPROM   = 0xB6;   /* mismo código que PSOC_CMD_SAVE_EEPROM */
 export const SUBCMD_SELECT_STREAM = 0xB7;   /* mismo código que PSOC_CMD_SELECT_STREAM */
-export const SUBCMD_ADC_CONFIG    = 0xBA;   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; las 4 a 1020 Hz */
+export const SUBCMD_ADC_CONFIG    = 0xBA;   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; las 4 a 2929 Hz nativos */
+export const SUBCMD_DECIMATION    = 0xBB;   /* factor 1..100 (1=sin decimar); Fs efectiva = 2929/factor */
+export const SUBCMD_SD_CAPTURE    = 0xBE;   /* 0/1: captura a SD del PSoC (solo nodos con sd_present=1). Viaja web→maestro→esclavo→PSoC como cualquier sub_cmd */
+export const SUBCMD_SD_ENABLE     = 0xC0;   /* OBSOLETO (era SD-en-ESP32, purgada 2026-07-11): el esclavo lo rechaza siempre; usar SUBCMD_SD_CAPTURE */
 export const SUBCMD_BLINK_LED     = 0x70;
 export const SUBCMD_LATENCY       = 0xAF;
 export const SUBCMD_CAL_VDAC_BASE = 0x80;
@@ -48,14 +52,17 @@ export const CAL_VDAC_STAGE_COUNT = 4;
 // reconfigured at any time, so Fs must ALWAYS come from the slave's HELLO
 // (see effectiveFs() in data_store.js) — never a guessed fallback.
 export const SAMPLES_PER_BATCH = 30;
-export const PSOC_CAPTURE_MAX_BATCHES = 360;
+// Tope RAM-only de lotes DECIMADOS por captura. Debe coincidir con
+// PSOC_CAPTURE_MAX_BATCHES de slave/src/main.cpp y master/src/main.cpp.
+// El esclavo guarda en paginas chicas; el PSoC rearma trozos crudos de 512.
+export const PSOC_CAPTURE_MAX_BATCHES = 512;
 export const TEST_DEFAULT_SECONDS = 0.2;
 // Placeholder sample counts for buffer/display sizing before any slave's
 // HELLO reports the real Fs — syncDataBufferForFs()/applyDisplayWindow()
 // (app.js) resize these for real the moment Fs becomes known, so the exact
 // values here only seed startup sizing before HELLO. Use the measured real
 // rate so the initial 3 s / 10 s windows are close even before the first HELLO.
-export const DEFAULT_SAMPLE_RATE_HZ = 1020;
+export const DEFAULT_SAMPLE_RATE_HZ = 2929;
 export const DISP_SAMP = DEFAULT_SAMPLE_RATE_HZ * 3;
 export const MAX_BUF_S = 10;
 export const MAX_BUF = DEFAULT_SAMPLE_RATE_HZ * MAX_BUF_S;
@@ -80,12 +87,14 @@ export const VDAC_MAX = 255;
 export const VDAC_FULL_SCALE_V = VDAC_MAX * VDAC_STEP;
 export const VDAC_MV_PER_CODE = VDAC_STEP * 1000;
 
-// ADC scaling — configs expuestas del PSoC. Las 4 usan la misma Fs efectiva.
+// ADC scaling — configs expuestas del PSoC. Las 4 usan la misma Fs base nativa
+// (2929 Hz); la Fs efectiva real depende además del factor de decimación de
+// cada nodo y SIEMPRE se toma de su HELLO (fsHz acá es solo informativo).
 export const ADC_CONFIGS = [
-  { code: 1, label: '±2.5 V', rangeV: 2.5, fsHz: 1020, countsPerVolt: 131072 / 2.5 },
-  { code: 2, label: '±0.512 V', rangeV: 0.512, fsHz: 1020, countsPerVolt: 131072 / 0.512 },
-  { code: 3, label: '±1.024 V', rangeV: 1.024, fsHz: 1020, countsPerVolt: 131072 / 1.024 },
-  { code: 4, label: '±0.625 V', rangeV: 0.625, fsHz: 1020, countsPerVolt: 131072 / 0.625 },
+  { code: 1, label: '±2.5 V', rangeV: 2.5, fsHz: 2929, countsPerVolt: 131072 / 2.5 },
+  { code: 2, label: '±0.512 V', rangeV: 0.512, fsHz: 2929, countsPerVolt: 131072 / 0.512 },
+  { code: 3, label: '±1.024 V', rangeV: 1.024, fsHz: 2929, countsPerVolt: 131072 / 1.024 },
+  { code: 4, label: '±0.625 V', rangeV: 0.625, fsHz: 2929, countsPerVolt: 131072 / 0.625 },
 ];
 export const ADC_COUNTS_PER_VOLT = ADC_CONFIGS[0].countsPerVolt;
 

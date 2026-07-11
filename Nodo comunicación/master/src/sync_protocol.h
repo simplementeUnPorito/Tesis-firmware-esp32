@@ -40,6 +40,15 @@
 #define SLAVE_HW_HAMMER  1u
 #define SLAVE_HW_UNKNOWN 0xFFu
 
+/* sub_cmd bajo CMD_SET_CONFIG que NO se reenvía al PSoC — vive 100% en el
+ * ESP32 del esclavo (handleSetConfig() lo resuelve local, nunca llega a
+ * psoc_uart). 0=deshabilitar SD, 1=habilitar (solo si sd_present=1, ver
+ * MsgHello). NOTA: el valor numérico 0xC0 coincide con PSOC_CTRL_PING de
+ * psoc_uart.h, pero son espacios de bytes distintos sin colisión real: ese
+ * es un byte de protocolo UART crudo hacia el PSoC, este es un sub_cmd de
+ * radio ESP-NOW que nunca se copia a la UART. */
+#define SLAVE_CMD_SET_SD_ENABLE 0xC0u
+
 #define MSG_HELLO_LEGACY_BYTES 5u
 
 #pragma pack(push, 1)
@@ -128,6 +137,11 @@ struct MsgHello {
     uint8_t  psoc_ok;     /* 1=PSoC detectado en boot, 0=no detectado */
     uint16_t sample_rate; /* ADC sample rate en Hz reportado por PSoC; 0=desconocido */
     uint8_t  hw_class;    /* SLAVE_HW_* reportado por el PSoC (GEO/HAMMER/UNKNOWN) */
+    uint8_t  sd_present;  /* 1=módulo SD detectado en ese ESP32 (solo firmwares GEO
+                            * con pines SD compilados), 0=sin SD/sin detectar. Campo
+                            * agregado al final: HELLO viejos (sin este byte) llegan
+                            * con menos bytes y espnow_rx.h ya tolera eso (memcpy
+                            * parcial sobre un struct zero-init → sd_present=0). */
 };
 
 struct MsgSetRecLen {

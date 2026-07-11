@@ -209,7 +209,10 @@ function minPositiveFrequencyForView(nodeSources, overlayCaptures, fs) {
     for (const node of capture.nodes || []) {
       if (!node) continue;
       const sources = node.spectrumSources || (node.raw ? [{ data: node.raw }] : null);
-      minHz = Math.min(minHz, minPositiveFrequencyFromSources(sources, fs));
+      minHz = Math.min(
+        minHz,
+        minPositiveFrequencyFromSources(sources, Number(node.fs || capture.fs || fs)),
+      );
     }
   }
   if (Number.isFinite(minHz)) return Math.max(MIN_LOG_FREQ_HZ, minHz);
@@ -280,10 +283,11 @@ class SpectrumPlot {
         overlay.label || 'Preservada',
         overlay.color || SPEC_COLOR,
       );
+      const overlayFs = Number(overlay.fs) || fs;
       for (const source of overlaySources) {
         const trace = buildTrace(
           { ...source, color: overlay.color || source.color },
-          fs,
+          overlayFs,
           true,
           overlay.label || '',
         );
@@ -291,6 +295,12 @@ class SpectrumPlot {
       }
     }
     this._fs = fs || 0;
+    for (const trace of [...this._primaryTraces, ...this._overlayTraces]) {
+      const spec = trace.spec;
+      if (spec && spec.df > 0 && spec.n > 0) {
+        this._fs = Math.max(this._fs, spec.df * spec.n);
+      }
+    }
   }
 
   setFrequencyRange(lo, hi) {
@@ -676,6 +686,14 @@ export class SpectrumArea {
 
   update(nodeSources, fs, overlayCaptures = []) {
     this._fMax = fs > 0 ? fs / 2 : 0;
+    for (const capture of overlayCaptures || []) {
+      const captureFs = Number(capture.fs) || 0;
+      if (captureFs > 0) this._fMax = Math.max(this._fMax, captureFs / 2);
+      for (const node of capture.nodes || []) {
+        const nodeFs = Number(node && node.fs) || 0;
+        if (nodeFs > 0) this._fMax = Math.max(this._fMax, nodeFs / 2);
+      }
+    }
     this._fMin = this._fMax > 0 ? minPositiveFrequencyForView(nodeSources, overlayCaptures, fs) : MIN_LOG_FREQ_HZ;
     if (this._zoom === 1 || !Number.isFinite(this._panLog)) this._panLog = this._fullLogLo();
     this._applyFrequencyWindow();
@@ -688,7 +706,7 @@ export class SpectrumArea {
         if (!node) continue;
         const sources = node.spectrumSources || (node.raw ? [{ label: 'Cruda', color: capture.color, data: node.raw }] : null);
         if (!sources || !sources.length) continue;
-        overlays.push({ label: capture.label, color: capture.color, sources });
+        overlays.push({ label: capture.label, color: capture.color, sources, fs: Number(node.fs || capture.fs || fs) });
       }
       p.setData(nodeSources[i], fs, overlays);
       p.draw();

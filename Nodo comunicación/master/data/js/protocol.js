@@ -47,6 +47,8 @@ export class Packet {
   get helloFsHz() { return this.b0 * 100; }
   get helloFsExactHz() { return ((this.b1 << 8) | this.b0) >>> 0; }
   get helloHwClass() { return this.b1; }
+  /** sub 0x07: 1=módulo SD detectado en el ESP32 del esclavo (solo GEO), 0=sin SD. */
+  get helloSdPresent() { return this.b1; }
   get helloMacSub() { return this.b2; }
   get helloMacHi() { return this.b1; }
   get helloMacLo() { return this.b0; }

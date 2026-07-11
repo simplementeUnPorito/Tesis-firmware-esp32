@@ -109,6 +109,7 @@ export class NodeData {
     this.pgaCode = 0;
     this.adcConfigCode = 1;
     this.countsPerVolt = cfg.ADC_COUNTS_PER_VOLT;
+    this.decimationFactor = 1;   // 1=sin decimar; Fs efectiva = 2929/factor (ver [[project_geophone_testbench]] plan_2929_decimation_sd.md)
     this.vdacByte = 128;
     this.calVdacs = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
     this.calVdacDetails = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
@@ -116,6 +117,8 @@ export class NodeData {
     this.psocOk = null;   // null until first HELLO
     this.mac = '';
     this.hwClass = 0xFF;  // 0=GEO, 1=HAMMER, 0xFF=unknown (reported by PSoC)
+    this.sdPresent = false; // módulo SD detectado en el ESP32 (solo esclavos GEO, ver plan_2929_decimation_sd.md H5)
+    this.sdEnabled = false; // estado del toggle SD confirmado por ACK (0xC0)
 
     // ADC sample rate — depends on the analog front-end / PSoC programming
     // (and can be reconfigured), so it must ALWAYS come from the hardware

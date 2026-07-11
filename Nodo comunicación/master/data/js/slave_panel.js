@@ -129,6 +129,29 @@ export class SlavePanel extends EventTarget {
     this._lblAdcCfgActual = el('span', null, `Current: ${cfg.ADC_CONFIGS[0].label}`);
     root.appendChild(row(labeled('Rango ADC', this._ddAdcCfg), this._dotAdcCfg, this._lblAdcCfgActual));
 
+    /* Decimación: control GLOBAL en la barra superior desde 2026-07-11 (un solo
+     * factor para todos los nodos — mezclar Fs entre nodos rompe el análisis).
+     * El dot de confirmación por nodo quedó junto al de Rango ADC arriba. */
+    this._dotDecim = dot('Decimación sin confirmar');
+    const decimRow = row(el('span', null, 'Decimación (global)'), this._dotDecim);
+    root.appendChild(decimRow);
+
+    /* SD (vive en el PSoC, solo GEO): la fila entera queda OCULTA salvo que el
+     * PSoC reporte sd_present=1 — en un HAMMER o sin tarjeta no aparece nada. */
+    this._sdPresent = false;
+    this._cbSdEnable = el('input');
+    this._cbSdEnable.type = 'checkbox';
+    this._cbSdEnable.disabled = true;
+    this._cbSdEnable.title = 'Grabar la captura en la SD del PSoC (permite ventanas más largas que la RAM)';
+    this._cbSdEnable.addEventListener('change', () => {
+      this._dispatch('sd-enable-changed', { enabled: this._cbSdEnable.checked });
+    });
+    this._dotSd = dot('SD no detectada');
+    this._lblSdActual = el('span', null, 'SD: sin detectar');
+    this._rowSd = row(labeled('SD', this._cbSdEnable), this._dotSd, this._lblSdActual);
+    this._rowSd.style.display = 'none';
+    root.appendChild(this._rowSd);
+
     this._dotCal = dot('Calibracion sin ejecutar');
     this._btnCalibrate = el('button', null, 'Calibrar');
     this._btnCalibrate.title = 'Calibrar PSoC';
@@ -328,6 +351,7 @@ export class SlavePanel extends EventTarget {
     this._btnSendAll.disabled = !connected;
     this._ddPga.disabled = !connected;
     this._ddAdcCfg.disabled = !connected;
+    this._cbSdEnable.disabled = !connected || !this._sdPresent;
     this._btnCalibrate.disabled = !connected;
     this._btnSaveEeprom.disabled = !connected;
     this._btnBlinkLed.disabled = !connected;
@@ -335,7 +359,10 @@ export class SlavePanel extends EventTarget {
     if (!connected) {
       this.setPgaLock(0);
       this.setAdcConfigLock(0);
+      this.setDecimationLock(0);
       this.setCalibrationLock(0);
+      this.setSdPresent(false, false);
+      this.setSdLock(0);
     }
   }
 
@@ -395,6 +422,46 @@ export class SlavePanel extends EventTarget {
   setAdcConfigLock(state) {
     setDot(this._dotAdcCfg, state, 'Rango ADC confirmado por PSoC',
            'Rango ADC pendiente o sin confirmacion', 'Rango ADC sin confirmar');
+  }
+
+  setDecimation(_factor) {
+    /* El valor vive en el control global (app.js); acá solo queda el dot. */
+  }
+
+  /** state: 0=unknown, 1=locked, 2=pending/fail. */
+  setDecimationLock(state) {
+    setDot(this._dotDecim, state, 'Decimación confirmada por PSoC',
+           'Decimación pendiente o sin confirmacion', 'Decimación sin confirmar');
+  }
+
+  /** Llamado al recibir HELLO sub 0x07 (sd_present) o al desconectar el nodo.
+   * Sin SD detectada la fila entera desaparece del panel. */
+  setSdPresent(present, enabled) {
+    this._sdPresent = !!present;
+    this._rowSd.style.display = this._sdPresent ? '' : 'none';
+    this._cbSdEnable.disabled = !this._sdPresent || this._btnTest.disabled; /* btnTest.disabled ~= !connected */
+    this._lblSdActual.textContent = this._sdPresent
+      ? `SD: detectada (${enabled ? 'ON' : 'OFF'})`
+      : 'SD: sin detectar';
+    if (!this._sdPresent) {
+      this._cbSdEnable.checked = false;
+      this.setSdLock(0);
+    } else {
+      this._cbSdEnable.checked = !!enabled;
+    }
+  }
+
+  setSdEnabled(enabled) {
+    this._cbSdEnable.checked = !!enabled;
+    this._lblSdActual.textContent = this._sdPresent
+      ? `SD: detectada (${enabled ? 'ON' : 'OFF'})`
+      : 'SD: sin detectar';
+  }
+
+  /** state: 0=unknown, 1=locked, 2=pending/fail. */
+  setSdLock(state) {
+    setDot(this._dotSd, state, 'SD confirmada por el esclavo',
+           'SD pendiente o sin confirmacion', 'SD no detectada');
   }
 
   /** state: 0=unknown, 1=ok, 2=pending/fail, 3=calibrando (en curso). */

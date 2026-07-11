@@ -83,6 +83,19 @@ function adcRangeVForNode(node) {
     : adcConfigForCode(adcConfigCodeForNode(node)).rangeV;
 }
 
+function decimationFactorForNode(node) {
+  const f = node?.decimationFactor ?? node?.decimation_factor ?? 1;
+  return Number.isFinite(f) && f >= 1 ? Math.round(f) : 1;
+}
+
+function sdPresentForNode(node) {
+  return !!(node?.sdPresent ?? node?.sd_present);
+}
+
+function sdEnabledForNode(node) {
+  return !!(node?.sdEnabled ?? node?.sd_enabled);
+}
+
 function calVdacsForNode(node) {
   const src = node?.calVdacs || node?.cal_vdacs;
   if (!Array.isArray(src)) return [];
@@ -260,6 +273,9 @@ function nodeMetadata(nd, index, paths, connected) {
     adc_config_label: adcConfigForCode(adcConfigCodeForNode(nd)).label,
     adc_range_v: adcRangeVForNode(nd),
     adc_counts_per_volt: adcCountsPerVoltForNode(nd),
+    decimation_factor: decimationFactorForNode(nd),
+    sd_present: sdPresentForNode(nd),
+    sd_enabled: sdEnabledForNode(nd),
     vdac_byte: nd.vdacByte,
     cal_vdacs: calVdacsForNode(nd),
     cal_vdac_details: calVdacDetailsForNode(nd),
@@ -325,6 +341,9 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     adc_config_label: adcConfigForCode(adcConfigCodeForNode(node)).label,
     adc_range_v: adcRangeVForNode(node),
     adc_counts_per_volt: adcCountsPerVoltForNode(node),
+    decimation_factor: decimationFactorForNode(node),
+    sd_present: sdPresentForNode(node),
+    sd_enabled: sdEnabledForNode(node),
     vdac_byte: node?.vdac_byte ?? 128,
     cal_vdacs: calVdacsForNode(node),
     cal_vdac_details: calVdacDetailsForNode(node),

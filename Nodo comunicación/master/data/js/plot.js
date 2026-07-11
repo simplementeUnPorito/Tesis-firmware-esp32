@@ -434,8 +434,18 @@ class ChannelPlot {
     ctx.beginPath();
     ctx.rect(m.left, m.top, plotW, plotH);
     ctx.clip();
-    const drawCurve = (data, color, trimSamp, dash = null, xStartSamp = this._xStartSamp) => {
+    const drawCurve = (
+      data,
+      color,
+      trimSamp,
+      dash = null,
+      xStartSamp = this._xStartSamp,
+      curveFs = this._fs,
+      xOffsetS = 0,
+    ) => {
       if (!data || data.length < 2 + trimSamp) return;
+      const fsForCurve = curveFs || this._fs;
+      if (!fsForCurve) return;
       ctx.strokeStyle = color;
       ctx.lineWidth = Math.max(1, dpr);
       ctx.setLineDash(dash || []);
@@ -447,7 +457,7 @@ class ChannelPlot {
         // up with raw[k] (k = i - trimSamp); plot it at raw[k]'s x-position,
         // not at its own raw index, or the curve ends up shifted right by an
         // extra trimSamp samples on top of the filter's own group delay.
-        const px = xTo((xStartSamp + i - trimSamp) / this._fs);
+        const px = xTo(xOffsetS + ((xStartSamp + i - trimSamp) / fsForCurve));
         const py = yTo(data[i]);
         if (!started) { ctx.moveTo(px, py); started = true; }
         else ctx.lineTo(px, py);
@@ -455,8 +465,17 @@ class ChannelPlot {
       ctx.stroke();
       ctx.setLineDash([]);
     };
-    const drawEnvBilateral = (env, color, xStartSamp = this._xStartSamp, yOffset = 0) => {
+    const drawEnvBilateral = (
+      env,
+      color,
+      xStartSamp = this._xStartSamp,
+      yOffset = 0,
+      curveFs = this._fs,
+      xOffsetS = 0,
+    ) => {
       if (!env || !env.values || env.values.length < 2) return;
+      const fsForCurve = curveFs || this._fs;
+      if (!fsForCurve) return;
       ctx.strokeStyle = color;
       ctx.lineWidth = Math.max(1, dpr);
       ctx.setLineDash([]);
@@ -464,7 +483,7 @@ class ChannelPlot {
         ctx.beginPath();
         let started = false;
         for (let i = 0; i < env.values.length; i++) {
-          const px = xTo((xStartSamp + i) / this._fs);
+          const px = xTo(xOffsetS + ((xStartSamp + i) / fsForCurve));
           const py = yTo(sign * env.values[i] + yOffset);
           if (!started) { ctx.moveTo(px, py); started = true; }
           else ctx.lineTo(px, py);
@@ -476,7 +495,11 @@ class ChannelPlot {
     for (const overlay of overlays) {
       const color = overlay.color || 'rgba(20, 184, 166, 0.65)';
       const xStart = Number.isFinite(overlay.xStartSamp) ? overlay.xStartSamp : this._xStartSamp;
-      if (this._showRaw) drawCurve(overlay.raw, withAlpha(color, 0.35), 0, null, xStart);
+      const overlayFs = Number.isFinite(overlay.fs) && overlay.fs > 0 ? overlay.fs : this._fs;
+      const xOffsetS = Number.isFinite(overlay.xOffsetS) ? overlay.xOffsetS : 0;
+      if (this._showRaw) {
+        drawCurve(overlay.raw, withAlpha(color, 0.35), 0, null, xStart, overlayFs, xOffsetS);
+      }
       if (this._showFilt) {
         drawCurve(
           overlay.filt,
@@ -484,11 +507,17 @@ class ChannelPlot {
           overlay.filtTrimSamp,
           [6 * dpr, 3 * dpr],
           xStart,
+          overlayFs,
+          xOffsetS,
         );
       }
       const oYOff = (overlay.y_offset_mv || 0) / 1000;
-      if (this._showRawEnvelope) drawEnvBilateral(overlay.envRaw, withAlpha(color, 0.38), xStart, oYOff);
-      if (this._showFiltEnvelope) drawEnvBilateral(overlay.envFilt, withAlpha(color, 0.58), xStart, oYOff);
+      if (this._showRawEnvelope) {
+        drawEnvBilateral(overlay.envRaw, withAlpha(color, 0.38), xStart, oYOff, overlayFs, xOffsetS);
+      }
+      if (this._showFiltEnvelope) {
+        drawEnvBilateral(overlay.envFilt, withAlpha(color, 0.58), xStart, oYOff, overlayFs, xOffsetS);
+      }
     }
 
     if (this._showRaw) drawCurve(raw, cfg.RAW_COLOR, 0);
@@ -541,7 +570,10 @@ class ChannelPlot {
         lines.push(`filt: ${fmtVolt(filt[filtIdx])} V`);
       if (envFilt && relIdx >= 0 && relIdx < envFilt.values.length)
         lines.push(`env filt: ${fmtVolt(envFilt.values[relIdx])} V`);
-      if (ci === 1 && deltaMs !== null) lines.push(`dt: ${deltaMs.toFixed(2)} ms`);
+      if (ci === 1 && deltaMs !== null) {
+        lines.push(`dt: ${deltaMs.toFixed(2)} ms`);
+        if (Math.abs(deltaMs) > 1e-9) lines.push(`1/dt: ${(1000 / Math.abs(deltaMs)).toFixed(2)} Hz`);
+      }
 
       const lineH = 13 * dpr;
       const pad = 5 * dpr;
@@ -771,7 +803,14 @@ export class PlotArea {
         const oRawLen = node.raw && node.raw.length ? node.raw.length : 0;
         const oFiltLen = node.filt && node.filt.length ? node.filt.length : 0;
         const offset = sampleOffset(capture.sample_offset);
-        this._lastMaxLen = Math.max(this._lastMaxLen, oRawLen + offset, oFiltLen + offset);
+        const overlayFs = Number(node.fs || capture.fs || fs || 0);
+        if (overlayFs > 0 && fs > 0) {
+          const oLen = Math.max(oRawLen, oFiltLen);
+          const oEndS = (offset / overlayFs) + (oLen / overlayFs);
+          this._lastMaxLen = Math.max(this._lastMaxLen, Math.ceil(oEndS * fs));
+        } else {
+          this._lastMaxLen = Math.max(this._lastMaxLen, oRawLen + offset, oFiltLen + offset);
+        }
       }
     }
     const viewSamples = this._viewSamples();
@@ -795,6 +834,8 @@ export class PlotArea {
       const filtEnd = end + filtTrim;
       const filtTail = (filt && filt.length) ? filt.subarray(Math.min(start, filt.length), Math.min(filtEnd, filt.length)) : null;
       const overlays = [];
+      const viewStartS = fs ? (start / fs) : 0;
+      const viewEndS = fs ? (end / fs) : 0;
       for (const capture of overlayCaptures || []) {
         const node = capture.nodes && capture.nodes[i];
         if (!node) continue;
@@ -803,11 +844,19 @@ export class PlotArea {
         if (!nodeRaw && !nodeFilt) continue;
         const oTrim = node.filt_trim_samples || 0;
         const offset = sampleOffset(capture.sample_offset);
-        const rawSrcStart = Math.max(0, start - offset);
-        const rawSrcEnd = Math.max(rawSrcStart, end - offset);
-        const filtSrcStart = Math.max(0, start - offset);
-        const filtSrcEnd = Math.max(filtSrcStart, end + oTrim - offset);
-        const xStartSamp = rawSrcStart + offset;
+        const overlayFs = Number(node.fs || capture.fs || fs || 0);
+        const xOffsetS = overlayFs > 0 ? (offset / overlayFs) : 0;
+        const rawSrcStart = overlayFs > 0
+          ? Math.max(0, Math.floor((viewStartS - xOffsetS) * overlayFs))
+          : Math.max(0, start - offset);
+        const rawSrcEnd = overlayFs > 0
+          ? Math.max(rawSrcStart, Math.ceil((viewEndS - xOffsetS) * overlayFs))
+          : Math.max(rawSrcStart, end - offset);
+        const filtSrcStart = rawSrcStart;
+        const filtSrcEnd = overlayFs > 0
+          ? Math.max(filtSrcStart, Math.ceil((viewEndS - xOffsetS) * overlayFs) + oTrim)
+          : Math.max(filtSrcStart, end + oTrim - offset);
+        const xStartSamp = rawSrcStart;
         overlays.push({
           label: capture.label,
           color: capture.color,
@@ -816,6 +865,8 @@ export class PlotArea {
           filt: nodeFilt ? nodeFilt.subarray(Math.min(filtSrcStart, nodeFilt.length), Math.min(filtSrcEnd, nodeFilt.length)) : null,
           filtTrimSamp: oTrim,
           xStartSamp,
+          fs: overlayFs,
+          xOffsetS,
         });
       }
       // No nominal fallback: fs is 0 until the hardware reports it, and

@@ -22,6 +22,8 @@ const slavePanels = new Array(cfg.MAX_NODES).fill(null);
 const macPartial = new Map();
 const pgaLockTimers = new Map();
 const adcConfigLockTimers = new Map();
+const decimationLockTimers = new Map();
+const sdEnableLockTimers = new Map();
 const testTimers = new Map();
 const preservedCaptures = [];
 // Firmas de capturas ya incluidas en un ZIP exportado con exito — usado por
@@ -222,6 +224,18 @@ function applyNodeAdcConfig(nd, code) {
   return adcCfg;
 }
 
+function applyNodeDecimation(nd, factor) {
+  const f = clamp(parseInt(factor, 10) || 1, 1, 100);
+  nd.decimationFactor = f;
+  return f;
+}
+
+function applyNodeSdEnabled(nd, enabled) {
+  const e = !!enabled;
+  nd.sdEnabled = e;
+  return e;
+}
+
 function emptyCalVdacs() {
   return Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
 }
@@ -403,6 +417,7 @@ function nodeSnapshot(nd, index, options = {}) {
     adc_config_label: adcConfigForCode(nd.adcConfigCode).label,
     adc_range_v: adcConfigForCode(nd.adcConfigCode).rangeV,
     adc_counts_per_volt: nd.countsPerVolt || cfg.ADC_COUNTS_PER_VOLT,
+    decimation_factor: nd.decimationFactor,
     vdac_byte: nd.vdacByte,
     cal_vdacs: Array.isArray(nd.calVdacs) ? nd.calVdacs.slice() : [],
     cal_vdac_details: cloneCalVdacDetails(nd.calVdacDetails),
@@ -715,6 +730,26 @@ function captureSeconds() {
   return clamp(secs, 0.1, 120);
 }
 
+/* Duración propia de los nodos HAMMER. null = campo vacío/0 ⇒ usar la misma
+ * que los GEOs (el maestro recibe 0xAD=0 y vuelve al largo único legado). */
+function hammerCaptureSeconds() {
+  const el = $('capture-secs-hammer');
+  const parsed = el ? parseFloat(el.value) : NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return clamp(parsed, 0.1, 120);
+}
+
+function hammerCaptureBatches() {
+  const secs = hammerCaptureSeconds();
+  return secs === null ? 0 : batchesForSeconds(secs);
+}
+
+/* Manda al maestro el largo HAMMER (0xAD) antes de cualquier RECLEN/START.
+ * Con el campo vacío manda 0 = "mismo largo que GEO" (camino legado). */
+function sendHammerRecLen() {
+  sendStd16(cfg.CMD_SET_RECLEN_HAMMER, hammerCaptureBatches());
+}
+
 // Returns 0 (meaning "cannot compute yet") when Fs is still unknown — the
 // caller must check for that instead of silently capturing with a wrong rate.
 function batchesForSeconds(seconds) {
@@ -756,7 +791,13 @@ function updateCapturePreview() {
   const secs = captureSeconds();
   const info = captureLimitInfo(secs);
   const capped = info.capped ? ` (max; pedido ${secs.toFixed(2)} s)` : '';
-  el.textContent = `${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}`;
+  const hSecs = hammerCaptureSeconds();
+  let hammerTxt = '';
+  if (hSecs !== null) {
+    const hInfo = captureLimitInfo(hSecs);
+    hammerTxt = ` · HAMMER ${hInfo.n} lotes / ${hInfo.actualSecs.toFixed(2)} s`;
+  }
+  el.textContent = `GEO ${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}${hammerTxt}`;
 }
 
 function setCaptureToMaxBatches() {
@@ -975,10 +1016,13 @@ function runStartCapture(req, source = '') {
   data.clearAll();
   plotArea.clearAll();
   spectrumArea.clearAll();
+  sendHammerRecLen();
   sendStd16(cfg.CMD_START, req.n);
   const capped = req.info.capped ? `, max; pedido ${req.requestedSecs.toFixed(2)} s` : '';
   const suffix = source ? ` (${source})` : '';
-  appendLog(`START${suffix}: ${req.n} lotes (~${req.info.actualSecs.toFixed(2)} s real${capped})`);
+  const nHammer = hammerCaptureBatches();
+  const hammerTxt = nHammer ? `, HAMMER ${nHammer} lotes` : '';
+  appendLog(`START${suffix}: ${req.n} lotes GEO (~${req.info.actualSecs.toFixed(2)} s real${capped})${hammerTxt}`);
 }
 
 function queueStartAfterArm(req, armCount) {
@@ -1137,6 +1181,7 @@ function renderNodeRow(i) {
   row.querySelector('.cfg').textContent =
     `pga=${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}` +
     ` adc=${adcConfigForCode(nd.adcConfigCode).label}` +
+    (nd.decimationFactor > 1 ? ` decim=${nd.decimationFactor}` : '') +
     (nd.notchEnabled ? ` notch=N${nd.notchHarm}` : '') +
     (nd.psocOk === null ? '' : ` psoc=${nd.psocOk ? 'ok' : 'no'}`);
 }
@@ -1318,8 +1363,9 @@ function applyGlobalFs(fsHz, logMessage = '') {
       changed = true;
     }
   }
-  const manualInput = $('manual-fs-hz');
-  if (manualInput) manualInput.value = String(Math.round(fsHz));
+  // Reflejar la N derivada de la Fs efectiva en el control de captura
+  // (Fs = 2929/N). Reemplaza el viejo campo "Fs manual".
+  syncDecimFieldFromFs(fsHz);
   if (!changed && wasKnown) return;
 
   syncDataBufferForFs();
@@ -1358,8 +1404,7 @@ function restoreFsFromLocalCache() {
   const fsHz = raw === null ? NaN : parseFloat(raw);
   if (!(fsHz > 0)) return;
   applyGlobalFs(fsHz, `Fs restaurado de cache local: ${fsHz} Hz`);
-  const manualInput = $('manual-fs-hz');
-  if (manualInput) manualInput.value = String(Math.round(fsHz));
+  syncDecimFieldFromFs(fsHz);
 }
 
 function schedulePgaLockTimeout(chIndex, expectedCode) {
@@ -1390,6 +1435,36 @@ function scheduleAdcConfigLockTimeout(chIndex, expectedCode) {
     appendLog(`S${chIndex} rango ADC sin confirmacion: ${adcConfigForCode(expectedCode).label}`);
   }, Math.round(cfg.RETRY_SEC * 1000));
   adcConfigLockTimers.set(chIndex, timer);
+}
+
+function scheduleDecimationLockTimeout(chIndex, expectedFactor) {
+  if (decimationLockTimers.has(chIndex)) clearTimeout(decimationLockTimers.get(chIndex));
+  const timer = setTimeout(() => {
+    decimationLockTimers.delete(chIndex);
+    const nd = data.nodes[chIndex];
+    const pending = nd.pending.get(cfg.SUBCMD_DECIMATION);
+    if (!pending || pending.param !== expectedFactor) return;
+    nd.pending.delete(cfg.SUBCMD_DECIMATION);
+    const panel = panelFor(chIndex);
+    if (panel) panel.setDecimationLock(2);
+    appendLog(`S${chIndex} decimacion sin confirmacion: ${expectedFactor}`);
+  }, Math.round(cfg.RETRY_SEC * 1000));
+  decimationLockTimers.set(chIndex, timer);
+}
+
+function scheduleSdEnableLockTimeout(chIndex, expectedEnabled) {
+  if (sdEnableLockTimers.has(chIndex)) clearTimeout(sdEnableLockTimers.get(chIndex));
+  const timer = setTimeout(() => {
+    sdEnableLockTimers.delete(chIndex);
+    const nd = data.nodes[chIndex];
+    const pending = nd.pending.get(cfg.SUBCMD_SD_CAPTURE);
+    if (!pending || pending.param !== (expectedEnabled ? 1 : 0)) return;
+    nd.pending.delete(cfg.SUBCMD_SD_CAPTURE);
+    const panel = panelFor(chIndex);
+    if (panel) panel.setSdLock(2);
+    appendLog(`S${chIndex} SD sin confirmacion: ${expectedEnabled ? 'ON' : 'OFF'}`);
+  }, Math.round(cfg.RETRY_SEC * 1000));
+  sdEnableLockTimers.set(chIndex, timer);
 }
 
 function prepareNodeCapture(chIndex) {
@@ -1430,6 +1505,40 @@ function onAdcConfigChanged(chIndex, adcCode) {
   appendLog(`S${chIndex} rango ADC -> ${adcCfg.label}`);
 }
 
+function onDecimationChanged(chIndex, factor) {
+  const nd = data.nodes[chIndex];
+  const f = applyNodeDecimation(nd, factor);
+  nd.pending.set(cfg.SUBCMD_DECIMATION, { param: f, sendTime: performance.now(), retries: 0 });
+  saveSlaveSetting(chIndex, 'decimation_factor', f);
+  const panel = panelFor(chIndex);
+  if (panel) {
+    panel.setDecimation(f);
+    panel.setDecimationLock(2);
+  }
+  sendDirected(chIndex, cfg.SUBCMD_DECIMATION, f);
+  scheduleDecimationLockTimeout(chIndex, f);
+  renderNodeRow(chIndex);
+  appendLog(`S${chIndex} decimacion -> ${f} (${Math.floor(2929 / f)} Hz)`);
+}
+
+function onSdEnabledChanged(chIndex, enabled) {
+  const nd = data.nodes[chIndex];
+  if (!nd.sdPresent) {
+    appendLog(`S${chIndex} SD ignorado: nodo sin SD detectada`);
+    return;
+  }
+  const e = applyNodeSdEnabled(nd, enabled);
+  nd.pending.set(cfg.SUBCMD_SD_CAPTURE, { param: e ? 1 : 0, sendTime: performance.now(), retries: 0 });
+  const panel = panelFor(chIndex);
+  if (panel) {
+    panel.setSdEnabled(e);
+    panel.setSdLock(2);
+  }
+  sendDirected(chIndex, cfg.SUBCMD_SD_CAPTURE, e ? 1 : 0);
+  scheduleSdEnableLockTimeout(chIndex, e);
+  appendLog(`S${chIndex} SD -> ${e ? 'ON' : 'OFF'}`);
+}
+
 function onVerRequested(chIndex) {
   if (!currentFsHz()) {
     appendLog(`VER Slave ${chIndex} cancelado: esperando Fs real del esclavo (HELLO no recibido aun)`);
@@ -1438,6 +1547,7 @@ function onVerRequested(chIndex) {
   const n = captureBatches();
   const secs = secondsForBatches(n);
   prepareNodeCapture(chIndex);
+  sendHammerRecLen();
   sendStd16(cfg.CMD_SET_RECLEN, n);
   sendDirected(chIndex, cfg.SUBCMD_VER, 1);
   appendLog(`VER Slave ${chIndex}: ${n} lotes (~${secs.toFixed(2)} s real)`);
@@ -1486,11 +1596,24 @@ function onSendAll(chIndex) {
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
 
   // El esclavo solo atiende un config del PSoC a la vez (g_cfg_waiting en
-  // main.cpp): si el rango ADC se manda mientras el PGA todavia espera su
-  // ACK, el esclavo lo rechaza en el acto (cfg busy, ok=0) y el ADC nunca
-  // llega a aplicarse. Encadenar: esperar a que el pending de PGA se resuelva
-  // (ack u timeout, lo que pase primero) antes de mandar el rango ADC.
+  // main.cpp): si el rango ADC/decimacion se manda mientras el anterior
+  // todavia espera su ACK, el esclavo lo rechaza en el acto (cfg busy, ok=0)
+  // y nunca llega a aplicarse. Encadenar: PGA -> rango ADC -> decimacion,
+  // esperando a que cada pending se resuelva (ack o timeout) antes del
+  // siguiente envio.
   const waitStartMs = performance.now();
+  const sendDecimationWhenAdcSettles = () => {
+    const adcSettled = !nd.pending.has(cfg.SUBCMD_ADC_CONFIG);
+    const waitedTooLong = performance.now() - waitStartMs > cfg.RETRY_SEC * 2000;
+    if (!adcSettled && !waitedTooLong) {
+      setTimeout(sendDecimationWhenAdcSettles, 50);
+      return;
+    }
+    sendDirected(chIndex, cfg.SUBCMD_DECIMATION, nd.decimationFactor);
+    nd.pending.set(cfg.SUBCMD_DECIMATION, { param: nd.decimationFactor, sendTime: performance.now(), retries: 0 });
+    if (panel) panel.setDecimationLock(2);
+    scheduleDecimationLockTimeout(chIndex, nd.decimationFactor);
+  };
   const sendAdcConfigWhenPgaSettles = () => {
     const pgaSettled = !nd.pending.has(cfg.SUBCMD_PGA);
     const waitedTooLong = performance.now() - waitStartMs > cfg.RETRY_SEC * 1000;
@@ -1502,10 +1625,11 @@ function onSendAll(chIndex) {
     nd.pending.set(cfg.SUBCMD_ADC_CONFIG, { param: nd.adcConfigCode, sendTime: performance.now(), retries: 0 });
     if (panel) panel.setAdcConfigLock(2);
     scheduleAdcConfigLockTimeout(chIndex, nd.adcConfigCode);
+    sendDecimationWhenAdcSettles();
   };
   sendAdcConfigWhenPgaSettles();
 
-  appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}, ADC ${adcConfigForCode(nd.adcConfigCode).label}`);
+  appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}, ADC ${adcConfigForCode(nd.adcConfigCode).label}, decim ${nd.decimationFactor}`);
 }
 
 function onCalibrateRequested(chIndex) {
@@ -1648,10 +1772,12 @@ function loadSlavePanelState(chIndex, panel) {
 
   nd.pgaCode = loadSlaveInt(chIndex, 'pga_code', nd.pgaCode, 0, cfg.GAIN_CODES.length - 1);
   applyNodeAdcConfig(nd, loadSlaveInt(chIndex, 'adc_config_code', nd.adcConfigCode, 1, cfg.ADC_CONFIGS.length));
+  applyNodeDecimation(nd, loadSlaveInt(chIndex, 'decimation_factor', nd.decimationFactor, 1, 100));
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
 
   panel.setPga(nd.pgaCode);
   panel.setAdcConfig(nd.adcConfigCode);
+  panel.setDecimation(nd.decimationFactor);
   nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
   if (nd.alias === 'Hammer') {
     nd.hammerOffset = 0;
@@ -1684,6 +1810,8 @@ function loadSlavePanelState(chIndex, panel) {
 function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('pga-changed', (ev) => onPgaChanged(chIndex, ev.detail));
   panel.addEventListener('adc-config-changed', (ev) => onAdcConfigChanged(chIndex, ev.detail.code));
+  panel.addEventListener('decimation-changed', (ev) => onDecimationChanged(chIndex, ev.detail.factor));
+  panel.addEventListener('sd-enable-changed', (ev) => onSdEnabledChanged(chIndex, !!ev.detail.enabled));
   panel.addEventListener('fir-apply', (ev) => onFirApply(chIndex, ev.detail.cmd));
   panel.addEventListener('fir-remove', () => onFirRemove(chIndex));
   panel.addEventListener('dc-remove-toggled', (ev) => onDcRemoveToggled(chIndex, !!ev.detail.enabled));
@@ -1859,6 +1987,52 @@ function handleAck(pkt, idx) {
     return;
   }
 
+  if (ackCmd === cfg.SUBCMD_DECIMATION && idx >= 1 && idx < cfg.MAX_NODES) {
+    const nd = data.nodes[idx];
+    const panel = panelFor(idx);
+    const expected = pending ? pending.param : nd.decimationFactor;
+    if (decimationLockTimers.has(idx)) {
+      clearTimeout(decimationLockTimers.get(idx));
+      decimationLockTimers.delete(idx);
+    }
+    if (ackVal) {
+      const f = applyNodeDecimation(nd, expected);
+      saveSlaveSetting(idx, 'decimation_factor', f);
+      if (panel) {
+        panel.setDecimation(f);
+        panel.setDecimationLock(1);
+      }
+      renderNodeRow(idx);
+      appendLog(`S${idx} decimacion confirmada: ${f} (${Math.floor(2929 / f)} Hz)`);
+    } else {
+      if (panel) panel.setDecimationLock(2);
+      appendLog(`S${idx} decimacion sin lock: ${expected}`);
+    }
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_SD_CAPTURE && idx >= 1 && idx < cfg.MAX_NODES) {
+    const nd = data.nodes[idx];
+    const panel = panelFor(idx);
+    const expected = pending ? !!pending.param : nd.sdEnabled;
+    if (sdEnableLockTimers.has(idx)) {
+      clearTimeout(sdEnableLockTimers.get(idx));
+      sdEnableLockTimers.delete(idx);
+    }
+    if (ackVal) {
+      const e = applyNodeSdEnabled(nd, expected);
+      if (panel) {
+        panel.setSdEnabled(e);
+        panel.setSdLock(1);
+      }
+      appendLog(`S${idx} SD confirmada: ${e ? 'ON' : 'OFF'}`);
+    } else {
+      if (panel) panel.setSdLock(2);
+      appendLog(`S${idx} SD sin lock: ${expected ? 'ON' : 'OFF'}`);
+    }
+    return;
+  }
+
   if (ackCmd >= cfg.SUBCMD_CAL_VDAC_BASE &&
       ackCmd < cfg.SUBCMD_CAL_VDAC_BASE + cfg.CAL_VDAC_STAGE_COUNT &&
       idx >= 1 && idx < cfg.MAX_NODES) {
@@ -1993,6 +2167,19 @@ function handleStatus(pkt, idx) {
     updateSlavePanelStats(idx);
     renderNodeRow(idx);
     appendLog(`HELLO slave=${idx} tipo=${slaveHwClassName(pkt.helloHwClass)}`);
+    return;
+  }
+
+  if (pkt.helloMacSub === 0x07) {
+    const nd = data.nodes[idx];
+    const present = !!pkt.helloSdPresent;
+    if (nd.sdPresent !== present) {
+      nd.sdPresent = present;
+      if (!present) nd.sdEnabled = false;
+      const panel = panelFor(idx);
+      if (panel) panel.setSdPresent(present, nd.sdEnabled);
+      appendLog(`HELLO slave=${idx} sd_present=${present ? 1 : 0}`);
+    }
     return;
   }
 
@@ -2242,19 +2429,55 @@ $('btn-arm').addEventListener('click', () => {
   appendLog(`ARM solicitado n=${n || 'todos'}; esperando READY real`);
 });
 
-// Manual override for when no slave's HELLO carries Fs (e.g. master rebooted
-// while slaves were already armed — HELLO is only beaconed from WAIT_ARM).
-// All slaves share the same hardware Fs, so one operator-entered value covers
-// every node, exactly like a real HELLO would via applyGlobalFs().
-$('btn-manual-fs').addEventListener('click', () => {
-  const fsHz = parseFloat($('manual-fs-hz').value);
-  if (!(fsHz > 0)) {
-    appendLog('Fs manual invalida: ingresa un valor en Hz > 0');
-    return;
-  }
+// N (decimación) global — reemplaza el viejo "Fs manual". El ADC del PSoC corre
+// siempre a 2929 Hz nativos; la Fs efectiva se deriva del factor de decimación
+// N (Fs = 2929/N, promediando N muestras). El operador fija N y se aplica a
+// todos los nodos conectados (mismo camino que el control por-esclavo:
+// SUBCMD_DECIMATION con ACK/lock), además de alimentar el badge de Fs global.
+function captureDecimN() {
+  const inp = $('capture-decim-n');
+  return clamp(parseInt(inp ? inp.value : '1', 10) || 1, 1, 100);
+}
+
+function updateDecimPreview() {
+  const n = captureDecimN();
+  const span = $('decim-fs-preview');
+  if (span) span.textContent = `${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n)} Hz`;
+  return n;
+}
+
+// Mantener el campo N y su preview en sync cuando la Fs efectiva cambia por
+// HELLO/cache (Fs = 2929/N ⇒ N = round(2929/Fs)).
+function syncDecimFieldFromFs(fsHz) {
+  if (!(fsHz > 0)) return;
+  const inp = $('capture-decim-n');
+  if (!inp) return;
+  const n = clamp(Math.round(cfg.DEFAULT_SAMPLE_RATE_HZ / fsHz), 1, 100);
+  inp.value = String(n);
+  const span = $('decim-fs-preview');
+  if (span) span.textContent = `${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n)} Hz`;
+}
+
+function applyGlobalDecimation() {
+  const n = updateDecimPreview();
+  const inp = $('capture-decim-n');
+  if (inp) inp.value = String(n);
+  const fsHz = Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n);
   saveGlobalFs(fsHz);
-  applyGlobalFs(fsHz, `Fs aplicada manualmente: ${fsHz} Hz`);
-});
+  applyGlobalFs(fsHz, `N=${n} → Fs ${fsHz} Hz`);
+  let sent = 0;
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    const nd = data.nodes[i];
+    if (nodeConnectedForCapture(nd, i)) {
+      onDecimationChanged(i, n);
+      sent++;
+    }
+  }
+  appendLog(`N=${n} aplicado a ${sent} nodo(s), Fs ${fsHz} Hz`);
+}
+
+$('capture-decim-n').addEventListener('input', updateDecimPreview);
+$('btn-apply-decim').addEventListener('click', applyGlobalDecimation);
 
 $('btn-start').addEventListener('click', () => {
   if (!currentFsHz()) {
@@ -2367,11 +2590,33 @@ function onCaptureDurationEdited() {
   syncDisplayWindowToCaptureDuration();
 }
 
+const HAMMER_SECS_KEY = `${SETTINGS_PREFIX}hammer_secs_v1`;
+
+function onHammerDurationEdited() {
+  const secs = hammerCaptureSeconds();
+  saveSetting(HAMMER_SECS_KEY, secs === null ? '' : String(secs));
+  updateCapturePreview();
+  /* Sincronizar el largo HAMMER al maestro apenas se edita, así un VER o un
+   * START posterior ya lo encuentran configurado. */
+  sendHammerRecLen();
+}
+
+function restoreHammerDuration() {
+  const raw = loadSetting(HAMMER_SECS_KEY);
+  const el = $('capture-secs-hammer');
+  if (!el) return;
+  const secs = raw === null || raw === '' ? NaN : parseFloat(raw);
+  el.value = Number.isFinite(secs) && secs > 0 ? String(secs) : '';
+}
+
 $('disp-secs').addEventListener('input', applyDisplayWindow);
 $('disp-secs').addEventListener('change', applyDisplayWindow);
 $('capture-secs').addEventListener('input', onCaptureDurationEdited);
 $('capture-secs').addEventListener('change', onCaptureDurationEdited);
+$('capture-secs-hammer').addEventListener('input', updateCapturePreview);
+$('capture-secs-hammer').addEventListener('change', onHammerDurationEdited);
 $('btn-max-batches').addEventListener('click', setCaptureToMaxBatches);
+restoreHammerDuration();
 syncDisplayWindowToCaptureDuration();
 
 // Avisar antes de cerrar/recargar si hay mediciones capturadas que todavia

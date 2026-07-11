@@ -54,7 +54,11 @@
 #define PSOC_CMD_SELECT_STREAM 0xB7
 #define PSOC_CMD_ADC_SNAPSHOT 0xB8
 #define PSOC_CMD_BLINK_LED    0xB9   /* Titilar el LED del PSoC para identificar el nodo */
-#define PSOC_CMD_ADC_CONFIG   0xBA   /* 1=±2.5 V, 2=±0.512 V; ambos 1020 Hz */
+#define PSOC_CMD_ADC_CONFIG   0xBA   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; las 4 a 2929 Hz nativos */
+#define PSOC_CMD_SET_DECIMATION 0xBB /* factor 1..100 (1=sin decimar). Fs efectiva = 2929/factor */
+#define PSOC_CMD_SD_STATUS   0xBC    /* p=0 estado cacheado, p=1 re-init. Ack: byte de estado SD */
+#define PSOC_CMD_SD_TEST     0xBD    /* self-test bloque scratch. Ack: 1 OK / 0 fallo */
+#define PSOC_CMD_SD_CAPTURE  0xBE    /* p=1 captura a SD (permite N>512), p=0 RAM-only. Ack 0/1, 0xEE=rechazo */
 
 /* Control PSoC -> ESP */
 #define PSOC_CTRL_PING      0xC0
@@ -118,6 +122,12 @@
 #define PSOC_EVT_CAL_PI_BUCKET32  0x42
 #define PSOC_EVT_CAL_PI_STABLE    0x43
 #define PSOC_EVT_CAL_AMUX_CAP     0x44
+#define PSOC_EVT_CAPTURE_WATCHDOG 0x45
+#define PSOC_EVT_TIMER_STORM      0x46
+#define PSOC_EVT_CHAIN_NEXT       0x47  /* trozo encadenado listo; el PSoC re-arma la próxima corrida. El ESP lo ignora durante SAMPLING (solo DUMP_DONE cierra la captura). */
+#define PSOC_EVT_SD_STATUS        0x48  /* value: bit0 SD presente, bits1-2 tipo, bit3 self-test OK. Emitido en boot y ante 0xBC. */
+#define PSOC_EVT_SD_SESSION       0x49  /* value: bloques escritos en la sesión SD (sat. 255) */
+#define PSOC_EVT_SD_ERROR         0x4A  /* value: bit0 write fail, bit1 overrun, bit2 dir/header, bit3 read fail dump */
 
 struct PsocSample {
     int16_t  raw_input;
@@ -162,6 +172,10 @@ public:
     void saveEeprom();
     void selectStream(uint8_t mode);
     void setAdcConfig(uint8_t cfg);
+    void setDecimation(uint8_t factor);
+    void sdStatus(uint8_t reinit);   /* consulta/re-init de la SD del PSoC (0xBC) */
+    void sdTest();                   /* self-test de bloque en la SD del PSoC (0xBD) */
+    void sdCapture(uint8_t enable);  /* modo captura a SD del PSoC (0xBE) */
     void adcSnapshot();
     void blinkLed();             /* pide al PSoC titilar su LED (identificación) */
     void debugRamp(bool en);
