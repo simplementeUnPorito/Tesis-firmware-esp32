@@ -394,7 +394,6 @@ static uint32_t expectedCaptureMs(uint16_t n_batches);
 static bool storeReadyForHotWait();
 static void serviceHotWaitWatchdog();
 static void debugEspSetRamp(bool enable);
-static void psocSyncDisarmPulse(const char *reason);
 
 static void IRAM_ATTR onPsocRxEdge()
 {
@@ -2609,7 +2608,23 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
             g_auto_cal_due_ms = 0u;
         }
         const MsgPrestart *msg = (const MsgPrestart *)data;
-        enterHotWait(msg->n_batches);
+        const uint16_t requested = clampPsocCaptureBatches(msg->n_batches);
+        if (g_state == HOT_WAIT && requested == g_rec_n_batches &&
+            storeReadyForHotWait()) {
+            /* PRESTART duplicado/redundante (retry del maestro, reenvio ESP-NOW):
+             * este nodo ya esta armado y listo para el mismo N. Responder el ACK
+             * directo en vez de repetir enterHotWait(): una vez que el PSoC llega
+             * a PSOC_ARMED se queda mudo por UART a proposito (ventana de
+             * muestreo), asi que un segundo SETN nunca se ackea, vence a los
+             * 500 ms y el aborto por timeout libera el store dejando al PSoC
+             * fisicamente armado pero sordo — roto hasta un reset fisico. */
+            sendHotWaitAck();
+            SLAVE_LOG_PRINTF("[SLAVE] PRESTART duplicado n=%u ignorado (ya HOT_WAIT ready)\n",
+                              (unsigned)requested);
+            LOGM("PRESTART_DUP", "n=%u", (unsigned)requested);
+        } else {
+            enterHotWait(msg->n_batches);
+        }
     }
     else if (cmd == CMD_HOTWAIT_QUERY && len >= (int)sizeof(MsgHotWaitQuery)) {
         const MsgHotWaitQuery *msg = (const MsgHotWaitQuery *)data;

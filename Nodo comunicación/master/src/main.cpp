@@ -1622,7 +1622,16 @@ void loop()
                            millis() - g_hotWaitQueryMs > HOTWAIT_QUERY_TIMEOUT_MS) {
                     if (g_hotWaitRetries < HOTWAIT_QUERY_RETRIES) {
                         g_hotWaitRetries++;
-                        broadcastPrestart(g_rec_n_batches);
+                        /* Solo re-consultar, NUNCA re-broadcastear PRESTART aca: el
+                         * esclavo puede ya estar HOT_WAIT/armado (el PSoC real tarda
+                         * ~130 ms en confirmar EVT_ARMED, mas que este timeout de
+                         * 120 ms, asi que el primer query casi siempre le gana de
+                         * mano). Un broadcastPrestart redundante fuerza al esclavo a
+                         * reenviar SETN a un PSoC que ya entro en silencio UART total
+                         * en PSOC_ARMED -> SETN nunca ackea -> el esclavo aborta,
+                         * libera el store y el PSoC queda armado y sordo para
+                         * siempre (roto hasta reset fisico). VER nunca tuvo este bug
+                         * porque su retry (mas abajo) tampoco re-arma. */
                         sendHotWaitQuery(g_hotWaitQueryNode);
                         g_hotWaitQueryMs = millis();
                     } else {

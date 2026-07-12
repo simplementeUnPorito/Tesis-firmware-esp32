@@ -1,0 +1,42 @@
+{
+  "completed_at_utc": "2026-07-12T22:07:27.936459+00:00",
+  "error": null,
+  "host": "192.168.4.1",
+  "node": 1,
+  "scenarios": [
+    {
+      "batches": 261,
+      "complete": true,
+      "data_count": 7830,
+      "expected_samples": 7830,
+      "hb_transitions": [
+        "ARMED",
+        "ARMING",
+        "RUNNING",
+        "DUMPING",
+        "ARMED"
+      ],
+      "name": "small_ram_261",
+      "reached_dumping": true
+    },
+    {
+      "batches": 600,
+      "complete": true,
+      "data_count": 18000,
+      "expected_samples": 18000,
+      "hb_transitions": [
+        "ARMED",
+        "ARMING",
+        "RUNNING",
+        "DUMPING",
+        "ARMED"
+      ],
+      "name": "chained_sd_600",
+      "reached_dumping": true
+    }
+  ],
+  "schema_version": 1,
+  "started_at_utc": "2026-07-12T22:05:07.448860+00:00",
+  "status": "ok",
+  "test": "F9_START_FLOW_REGRESSION"
+}
