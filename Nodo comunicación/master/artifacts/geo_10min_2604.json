@@ -1,0 +1,90 @@
+{
+  "actual_file_bytes": 0,
+  "batches": 52080,
+  "bytes_written": 0,
+  "cleanup_errors": [
+    "ProbeError: final_cleanup/STOP no confirmado: final_cleanup/STOP: falta ACK 0xA4=0"
+  ],
+  "completed_at_utc": "2026-07-11T16:28:02.513351+00:00",
+  "connect_failures": 0,
+  "connections": 16,
+  "decimation_factor": 1,
+  "disconnects": 15,
+  "elapsed_s": 3420.626,
+  "error": "PhaseTimeout: VER/captura timeout: muestras=0/1562400, ACK_B2=[1, 2], faltan=[]; cleanup: ProbeError: final_cleanup/STOP no confirmado: final_cleanup/STOP: falta ACK 0xA4=0",
+  "expected_samples": 1562400,
+  "extra_samples": 0,
+  "final_cleanup_ok": false,
+  "fs_hz": 2604.0,
+  "hello": {
+    "fs_exact_hz": 868,
+    "hw_class": 0,
+    "legacy_fs_hz": 900,
+    "psoc_ok": 1,
+    "sd_present": 1
+  },
+  "host": "192.168.4.1",
+  "initial_cleanup_ok": true,
+  "master_state_history": [
+    {
+      "elapsed_s": 0.063,
+      "name": "ARMED",
+      "state": 2
+    },
+    {
+      "elapsed_s": 0.491,
+      "name": "STOPPING",
+      "state": 4
+    },
+    {
+      "elapsed_s": 0.559,
+      "name": "ARMED",
+      "state": 2
+    },
+    {
+      "elapsed_s": 3.011,
+      "name": "RUNNING",
+      "state": 3
+    },
+    {
+      "elapsed_s": 606.603,
+      "name": "DUMPING",
+      "state": 5
+    },
+    {
+      "elapsed_s": 612.799,
+      "name": "ARMED",
+      "state": 2
+    }
+  ],
+  "node": 1,
+  "other_node_samples": 0,
+  "output_file": "C:\\Github\\Tesis\\src\\esp\\Nodo comunicación\\master\\artifacts\\geo_10min_2604.i24le",
+  "path": "/ws?takeover=1",
+  "phase_seconds": {
+    "arm": 0.028,
+    "configure": 0.029,
+    "fresh_hello": 1.196,
+    "initial_cleanup": 1.133,
+    "set_reclen": 0.008
+  },
+  "port": 80,
+  "requested_seconds": 600.0,
+  "sample_format": "signed_int24_le_twos_complement",
+  "samples_per_batch": 30,
+  "samples_written": 0,
+  "schema_version": 1,
+  "sd_capture_enabled": true,
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "stale_other_samples_before_capture": 0,
+  "stale_target_samples_before_capture": 0,
+  "started_at_utc": "2026-07-11T15:31:01.887121+00:00",
+  "status": "error",
+  "target_data_packets_seen": 0,
+  "ver_ack_values": [
+    1,
+    2
+  ],
+  "ws_packets_received": 2728,
+  "ws_text_messages_received": 115
+}
