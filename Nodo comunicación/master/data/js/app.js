@@ -815,6 +815,22 @@ function updateCapturePreview() {
   el.textContent = `GEO ${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}${hammerTxt}`;
 }
 
+/* W1 (auditoría 2026-07-11): fija Duración GEOs al techo de RAM (512 lotes)
+ * — capturas sin SD o cuando se quiere evitar el dump largo de la SD. */
+function setCaptureToMaxRamBatches() {
+  const fs = currentFsHz();
+  if (!fs) {
+    appendLog('Max RAM cancelado: esperando Fs del esclavo');
+    return;
+  }
+  const secs = (cfg.PSOC_RAM_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fs;
+  const el = $('capture-secs');
+  if (el) el.value = (Math.ceil(secs * 100) / 100).toFixed(2);
+  updateCapturePreview();
+  syncDisplayWindowToCaptureDuration();
+  appendLog(`Duracion fijada al maximo RAM: ${cfg.PSOC_RAM_CAPTURE_MAX_BATCHES} lotes (~${secs.toFixed(2)} s)`);
+}
+
 function setCaptureToMaxBatches() {
   const fs = currentFsHz();
   if (!fs) {
@@ -1025,9 +1041,24 @@ function makeStartRequestInfo() {
   return { requestedSecs, info, n: info.n };
 }
 
+// Aviso de recorte: pedir mas de 512 lotes sin la SD del PSoC activa hace que
+// el esclavo recorte en silencio a 512 (limite RAM conjunto ESP+PSoC). Avisar
+// ANTES de capturar para que el usuario active SD o baje la duracion.
+function warnIfRamClamp(n, chIndex) {
+  if (n <= cfg.PSOC_RAM_CAPTURE_MAX_BATCHES) return;
+  const nd = data.nodes[chIndex];
+  if (nd && nd.sdPresent && nd.sdEnabled) return;
+  appendLog(`AVISO S${chIndex}: ${n} lotes supera la RAM (${cfg.PSOC_RAM_CAPTURE_MAX_BATCHES}); ` +
+            'sin "SD" activa en el panel del nodo la captura se recorta a ' +
+            `${cfg.PSOC_RAM_CAPTURE_MAX_BATCHES} lotes`);
+}
+
 function runStartCapture(req, source = '') {
   clearPendingStart();
   currentCaptureSignature = '';
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (nodeConnectedForCapture(data.nodes[i], i)) warnIfRamClamp(req.n, i);
+  }
   resizePresentCaptureBuffers(req.n);
   data.clearAll();
   plotArea.clearAll();
@@ -1542,18 +1573,42 @@ function onAdcConfigChanged(chIndex, adcCode) {
 
 function onDecimationChanged(chIndex, factor) {
   const nd = data.nodes[chIndex];
-  const f = applyNodeDecimation(nd, factor);
-  nd.pending.set(cfg.SUBCMD_DECIMATION, { param: f, sendTime: performance.now(), retries: 0 });
-  saveSlaveSetting(chIndex, 'decimation_factor', f);
   const panel = panelFor(chIndex);
-  if (panel) {
-    panel.setDecimation(f);
-    panel.setDecimationLock(2);
+  const f = clamp(parseInt(factor, 10) || 1, 1, 100);
+  // El esclavo descarta configs en silencio durante captura/volcado: rechazar
+  // ya en la UI y volver al valor confirmado, en vez de fingir que aplico.
+  if (masterBusyForStart()) {
+    if (panel) {
+      panel.setDecimation(nd.decimationFactor);
+      panel.setDecimationLock(2);
+    }
+    appendLog(`S${chIndex} decimacion rechazada: master ${masterStateName()} (reintentar en reposo)`);
+    return;
   }
-  sendDirected(chIndex, cfg.SUBCMD_DECIMATION, f);
-  scheduleDecimationLockTimeout(chIndex, f);
-  renderNodeRow(chIndex);
-  appendLog(`S${chIndex} decimacion -> ${f} (${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f)} Hz)`);
+  // nd.decimationFactor NO se toca aca: se confirma solo con el ACK ok=1
+  // (handleAck), que es cuando el PSoC realmente cambio de Fs.
+  const sendIt = () => {
+    nd.pending.set(cfg.SUBCMD_DECIMATION, { param: f, sendTime: performance.now(), retries: 0 });
+    if (panel) panel.setDecimationLock(2);
+    sendDirected(chIndex, cfg.SUBCMD_DECIMATION, f);
+    scheduleDecimationLockTimeout(chIndex, f);
+    appendLog(`S${chIndex} decimacion -> ${f} (${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f)} Hz)`);
+  };
+  // Serializar detras de cualquier config pendiente: el esclavo atiende un
+  // config del PSoC a la vez (g_cfg_waiting) y rechazaba este 0xBB con ok=0.
+  const waitStartMs = performance.now();
+  const waitSettle = () => {
+    const busy = nd.pending.has(cfg.SUBCMD_PGA) ||
+                 nd.pending.has(cfg.SUBCMD_ADC_CONFIG) ||
+                 nd.pending.has(cfg.SUBCMD_DECIMATION) ||
+                 nd.pending.has(cfg.SUBCMD_SD_CAPTURE);
+    if (busy && performance.now() - waitStartMs < cfg.RETRY_SEC * 2000) {
+      setTimeout(waitSettle, 50);
+      return;
+    }
+    sendIt();
+  };
+  waitSettle();
 }
 
 function onSdEnabledChanged(chIndex, enabled) {
@@ -1581,6 +1636,7 @@ function onVerRequested(chIndex) {
   }
   const n = captureBatches();
   const secs = secondsForBatches(n);
+  warnIfRamClamp(n, chIndex);
   resizePresentCaptureBuffers(n, chIndex);
   prepareNodeCapture(chIndex);
   sendHammerRecLen();
@@ -2040,9 +2096,23 @@ function handleAck(pkt, idx) {
       }
       renderNodeRow(idx);
       appendLog(`S${idx} decimacion confirmada: ${f} (${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f)} Hz)`);
-    } else {
+    } else if (pending && (pending.retries ?? 0) < 1) {
+      // ok=0 tipico: el esclavo estaba ocupado con otro config o el PSoC no
+      // estaba IDLE todavia. Un unico reintento diferido suele alcanzar.
+      const retry = { param: pending.param, sendTime: performance.now(), retries: 1 };
+      nd.pending.set(cfg.SUBCMD_DECIMATION, retry);
       if (panel) panel.setDecimationLock(2);
-      appendLog(`S${idx} decimacion sin lock: ${expected}`);
+      scheduleDecimationLockTimeout(idx, retry.param);
+      setTimeout(() => sendDirected(idx, cfg.SUBCMD_DECIMATION, retry.param), 400);
+      appendLog(`S${idx} decimacion ocupada, reintentando: ${retry.param}`);
+    } else {
+      // Rechazo definitivo: volver al valor CONFIRMADO para que la UI no
+      // muestre una Fs que el PSoC nunca aplico.
+      if (panel) {
+        panel.setDecimation(nd.decimationFactor);
+        panel.setDecimationLock(2);
+      }
+      appendLog(`S${idx} decimacion rechazada, se mantiene ${nd.decimationFactor}`);
     }
     return;
   }
@@ -2659,6 +2729,7 @@ $('capture-secs').addEventListener('change', onCaptureDurationEdited);
 $('capture-secs-hammer').addEventListener('input', updateCapturePreview);
 $('capture-secs-hammer').addEventListener('change', onHammerDurationEdited);
 $('btn-max-batches').addEventListener('click', setCaptureToMaxBatches);
+$('btn-max-ram').addEventListener('click', setCaptureToMaxRamBatches);
 restoreHammerDuration();
 syncDisplayWindowToCaptureDuration();
 

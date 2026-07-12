@@ -169,6 +169,9 @@ static uint16_t          g_scopeStartSent = 0;
 static uint32_t          g_scopeStartNextMs = 0;
 static uint8_t           g_prestartProbeNode = 0;
 static uint32_t          g_hotWaitAckMask = 0;
+/* N efectivo (post-clamp del esclavo) reportado en el último HOTWAIT_ACK.
+ * 0 = sin dato (usar el largo configurado). Ver dumpBatchesForNode(). */
+static uint16_t          g_effNBatches[NUM_SLAVES + 1] = {0};
 static uint8_t           g_hotWaitQueryNode = 1;
 static uint8_t           g_hotWaitRetries = 0;
 static uint8_t           g_hotWaitReadyCount = 0;
@@ -246,6 +249,7 @@ static CachedHello g_cachedHello[NUM_SLAVES + 1];
 static volatile bool g_webReplayCachedState = false;
 
 static void beginDump(const char *reason);
+static void abortCaptureToArmed(uint8_t nodeId, const char *reason);
 static void beginPrestart(PrestartAction action);
 static void beacon_pause(void);
 static void beacon_resume(void);
@@ -364,6 +368,21 @@ static uint16_t nBatchesForNode(uint8_t nodeId)
     return g_rec_n_batches;
 }
 
+/* Largo REAL a dumpear por nodo: el HOTWAIT_ACK del esclavo trae el N
+ * efectivo después de su clamp (512 lotes si la vía SD del PSoC no está
+ * activa). Pedir seq que no existen generaba una tormenta de NACKs de
+ * 30 reintentos × 100 ms por lote faltante. Con duraciones dentro del
+ * límite, eff==n y el camino queda idéntico al de siempre. */
+static uint16_t dumpBatchesForNode(uint8_t nodeId)
+{
+    uint16_t n = nBatchesForNode(nodeId);
+    if (nodeId >= 1 && nodeId <= NUM_SLAVES) {
+        uint16_t eff = g_effNBatches[nodeId];
+        if (eff != 0 && eff < n) return eff;
+    }
+    return n;
+}
+
 static void requestWebCachedStateReplay()
 {
     g_webReplayCachedState = true;
@@ -445,7 +464,13 @@ static void onCfgAck(const MsgCfgAck &msg)
      * SUBCMD_VER=0xB2: devolver 0xB2 conserva la correlación request/ACK. */
     const bool viewAckForwarded = (msg.sub_cmd == CMD_VIEW);
     if (viewAckForwarded) {
-        matlab.sendAck(msg.node_id, 0xB2u, msg.ok);
+        /* Dedup de completado: el esclavo reenvía ok=2 hasta 24 veces por RF
+         * (por si se pierde); a la web solo va la primera copia (la que llega
+         * con la captura todavía en RUNNING). */
+        bool dupCompletion = (msg.ok == 2 && g_state != RUNNING);
+        if (!dupCompletion) {
+            matlab.sendAck(msg.node_id, 0xB2u, msg.ok);
+        }
     }
     if (msg.sub_cmd == CMD_VIEW) {
         /* Diagnóstico: registra cada sub-condición de la rama VER-success
@@ -480,6 +505,7 @@ static void onCfgAck(const MsgCfgAck &msg)
         MASTER_LOG_PRINTF("[MASTER] VIEW HOT_WAIT ready node=%d -> VER PRESTART\n", msg.node_id);
         LOGM("VIEW_HOTWAIT_READY", "node=%d", msg.node_id);
         g_hotWaitAckMask        = 0;
+        memset(g_effNBatches, 0, sizeof(g_effNBatches));
         g_hotWaitQueryNode      = g_viewNode;
         g_hotWaitRetries        = 0;
         g_hotWaitReadyCount     = 0;
@@ -499,12 +525,23 @@ static void onCfgAck(const MsgCfgAck &msg)
     }
 
     /* START ok=2: captura normal completa en el slave. Este es el camino
-     * principal; el timer queda solo como seguridad si algún ACK se pierde. */
+     * principal; el timer queda solo como seguridad si algún ACK se pierde.
+     * Dedup: solo la PRIMERA copia del ok=2 de cada nodo se releva a la web
+     * (el esclavo lo repite hasta 24 veces por RF y la web lograba 24 líneas
+     * de "START captura completa" por captura). */
+    bool suppressForward = false;
+    if (msg.sub_cmd == CMD_START && msg.ok == 2 && g_viewDump) {
+        suppressForward = true;   /* copia tardía durante un flujo VER */
+    }
     if (msg.sub_cmd == CMD_START && !g_viewDump) {
+        if (msg.ok == 2 && g_state != RUNNING) {
+            suppressForward = true;   /* retry tardío: ya estamos en DUMPING/ARMED */
+        }
         if (msg.node_id > 0 && msg.node_id <= NUM_SLAVES &&
             msg.ok == 2 && g_state == RUNNING) {
             uint32_t bit = (1UL << msg.node_id);
             if (g_armAckMask & bit) {
+                suppressForward = (g_captureDoneMask & bit) != 0;
                 g_captureDoneMask |= bit;
                 uint8_t doneCount = countArmAcks(g_captureDoneMask & g_armAckMask);
                 MASTER_LOG_PRINTF("[MASTER] START capture done node=%d (%u/%u)\n",
@@ -539,13 +576,13 @@ static void onCfgAck(const MsgCfgAck &msg)
         } else {
             MASTER_LOG_PRINTF("[MASTER] DUMP NACK max retries slave=%d -> next\n",
                               g_dumpSlaveIdx);
-            g_dumpBatchSeq = nBatchesForNode(g_dumpSlaveIdx);
+            g_dumpBatchSeq = dumpBatchesForNode(g_dumpSlaveIdx);
             g_dumpBatchRx  = true;
             dumpDeliveryGuardReset();
         }
         return;
     }
-    if (!viewAckForwarded) {
+    if (!viewAckForwarded && !suppressForward) {
         matlab.sendAck(msg.node_id, msg.sub_cmd, msg.ok);
     }
 }
@@ -605,6 +642,11 @@ static void onStartAck(const MsgStartAck &msg)
     }
     MASTER_LOG_PRINTF("[MASTER] START_ACK node=%d status=%d rtt=%u us tof~=%u us\n",
                       msg.node_id, msg.status, (unsigned)rttUs, (unsigned)tofUs);
+    /* Un esclavo rechazó el START real (no estaba en HOT_WAIT listo): abortar
+     * ya, en vez de esperar el timeout de rescate y dumpear lotes vacíos. */
+    if (msg.status == 0 && g_state == RUNNING) {
+        abortCaptureToArmed(msg.node_id, "start_refused");
+    }
 }
 
 static void onHotWaitAck(const MsgHotWaitAck &msg)
@@ -612,10 +654,18 @@ static void onHotWaitAck(const MsgHotWaitAck &msg)
     if (msg.node_id == 0 || msg.node_id > NUM_SLAVES) return;
     if (msg.ok && msg.node_id <= NUM_SLAVES) {
         g_hotWaitAckMask |= (1UL << msg.node_id);
+        /* N efectivo tras el clamp del esclavo (512 si la vía SD no está
+         * activa): es el techo real del dump para este nodo. */
+        g_effNBatches[msg.node_id] = msg.n_batches;
     }
     MASTER_LOG_PRINTF("[MASTER] HOTWAIT_ACK node=%d ok=%d state=%d n=%u mask=0x%08X\n",
                       msg.node_id, msg.ok, msg.state, msg.n_batches,
                       (unsigned)g_hotWaitAckMask);
+    /* NACK espontáneo del watchdog HOT_WAIT del esclavo con captura en curso:
+     * ese nodo ya no va a capturar nada, abortar limpio. */
+    if (!msg.ok && g_state == RUNNING) {
+        abortCaptureToArmed(msg.node_id, "hotwait_abort");
+    }
 }
 
 static void requestBatch(uint8_t nodeId, uint16_t seq)
@@ -785,6 +835,16 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param, b
     }
     if (!g_espnowReady) {
         matlab.sendAck(node_id, sub_cmd, 0);
+        return;
+    }
+    /* Captura en curso: el esclavo descartará el comando en silencio (RF
+     * quieto durante muestreo) y la web quedaba esperando un ACK que nunca
+     * llegaba. NACK inmediato para que la UI lo muestre y pueda reintentar. */
+    if (g_state == RUNNING || g_state == PRESTART) {
+        matlab.sendAck(node_id, sub_cmd, 0);
+        MASTER_LOG_PRINTF("[MASTER] directed 0x%02X rechazado: captura en curso (state=%d)\n",
+                          sub_cmd, (int)g_state);
+        LOGM("DIRECTED_BUSY", "sub=0x%02X,state=%d", sub_cmd, (int)g_state);
         return;
     }
 
@@ -958,6 +1018,33 @@ static void broadcastStop()
     MASTER_LOG_PRINTLN("[MASTER] STOP enviado");
 }
 
+/* Abort limpio de una captura en curso cuando un esclavo la rechaza (START
+ * status=0 o HOTWAIT_ACK ok=0 del watchdog del esclavo). Antes el maestro
+ * quedaba en RUNNING hasta el timeout de rescate y después intentaba dumpear
+ * lotes inexistentes. Vuelve a ARMED/IDLE y avisa a la web con CMD_START ok=0
+ * (la UI ya imprime "START falló"). */
+static void abortCaptureToArmed(uint8_t nodeId, const char *reason)
+{
+    if (g_state != RUNNING && g_state != PRESTART) return;
+    MASTER_LOG_PRINTF("[MASTER] capture abort node=%d: %s\n", nodeId, reason);
+    LOGM("CAPTURE_ABORT", "node=%d,reason=%s", nodeId, reason);
+    beacon_resume();
+    broadcastStop();          /* SYNC low + STOP a los esclavos */
+    g_streaming = false;
+    g_captureDumpDueMs = 0;
+    g_captureDoneMask = 0;
+    g_dumpRetryPaused = false;
+    g_dumpRequiresWebClient = false;
+    g_dumpWaitingForWeb = false;
+    g_viewDump = false;
+    g_viewNode = 0;
+    dumpDeliveryGuardReset();
+    g_state = armedOrIdleState();
+    matlab.sendAck(nodeId, CMD_START, 0);
+    matlab.sendReady(g_armedCount);
+    matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+}
+
 static void beginPrestart(PrestartAction action)
 {
     beacon_pause();   /* pausar beacon al inicio de PRESTART — toma efecto antes del START */
@@ -970,6 +1057,7 @@ static void beginPrestart(PrestartAction action)
         actionName = "START_PROBE";
     }
     g_hotWaitAckMask = 0;
+    memset(g_effNBatches, 0, sizeof(g_effNBatches));
     g_hotWaitQueryNode = 1;
     g_hotWaitRetries = 0;
     g_hotWaitReadyCount = 0;
@@ -1650,9 +1738,10 @@ void loop()
             g_dumpBatchSeq++;
             dumpDeliveryGuardReset();
             /* Corte por nodo: cada esclavo se dumpea hasta SU largo (HAMMER
-             * puede tener menos lotes que GEO). Con duraciones iguales esto
-             * es exactamente g_rec_n_batches, igual que siempre. */
-            if (g_dumpBatchSeq >= nBatchesForNode(g_dumpSlaveIdx)) {
+             * puede tener menos lotes que GEO), acotado por el N efectivo que
+             * el esclavo confirmó en HOTWAIT_ACK (clamp de 512 sin SD). Con
+             * duraciones dentro del límite es g_rec_n_batches, como siempre. */
+            if (g_dumpBatchSeq >= dumpBatchesForNode(g_dumpSlaveIdx)) {
                 g_dumpBatchSeq = 0;
                 g_dumpSlaveIdx++;
                 /* VIEW dump: solo un nodo; dump normal: saltar nodos no armados */
