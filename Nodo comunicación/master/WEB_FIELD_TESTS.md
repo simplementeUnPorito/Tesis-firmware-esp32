@@ -3,28 +3,51 @@
 Validación de la interfaz web del maestro ESP32. Requiere hardware real:
 maestro en COM8, AP `GeoNetwork`, celular o PC conectado a `192.168.4.1`.
 
+Estado vigente del banco y veredictos: `docs/plan_pruebas_precampo.md` (matriz
+fina) y `docs/HANDOFF_SESION_2026-07-12.md` (operativa y estado al cierre).
+Esos dos documentos prevalecen ante cualquier nota histórica fechada de este
+checklist; una prueba descrita aquí no implica que ya haya sido ejecutada.
+
 ## Flash previo
 
 ```bash
 cd "src/esp/Nodo comunicación/master"
-pio run -e esp32dev          # compilar
-pio run -e esp32dev -t upload    # firmware → COM8
-pio run -t uploadfs              # web (LittleFS) → COM8
+pio run -e esp32dev                                      # compilar
+pio run -e esp32dev -t upload --upload-port COM8        # firmware → COM8
+pio run -e esp32dev -t uploadfs --upload-port COM8      # web (LittleFS) → COM8
 ```
 
 Verificar que `/health` devuelve `ok`, `littlefs=ok`.
+
+En el banco vigente, el GEO físico de COM12 usa el firmware lógico
+`slave1`/`NODE_ID=1`:
+
+```bash
+cd "src/esp/Nodo comunicación/slave"
+pio run -e slave1 -t upload --upload-port COM12
+```
+
+El `upload_port` predeterminado de `slave1` en `platformio.ini` es otro; por
+eso el override `--upload-port COM12` es obligatorio para este banco. Después
+del reflash aplicar `ToggleReset` al PSoC y esperar la auto-calibración, según
+el handoff vigente.
 
 ## Scripts de smoke desde PC
 
 Los scripts de prueba aceptan nodo destino explicito:
 
 ```bash
-python "src/esp/Nodo comunicación/master/ws_cmd_test.py" --node 2 --total 35
-python "src/esp/Nodo comunicación/master/ws_capture_test.py" --node 2 --batches 2 --stream 0 --total 25
-python "src/esp/Nodo comunicación/master/ws_capture_test.py" --node 2 --batches 2 --stream 1 --total 25
+python "src/esp/Nodo comunicación/master/ws_cmd_test.py" --node 1 --total 35
+python "src/esp/Nodo comunicación/master/ws_capture_test.py" --self-test
+python "src/esp/Nodo comunicación/master/ws_capture_test.py" --node 1 --batches 2 --fs 2604 --output smoke_geo_2b.i24le --force
 ```
 
-`--stream 0` selecciona RAW y `--stream 1` selecciona FIR antes de enviar VER.
+La CLI actual de `ws_capture_test.py` no tiene opciones `--stream` ni
+`--total`: es un probe GEO estricto que fuerza decimación 1 y SD habilitada,
+exige HELLO fresco GEO+PSoC+SD y genera el binario más un JSON de evidencia.
+Para dos lotes, el criterio esperado es 60 muestras exactas. La selección
+RAW/FIR se prueba desde la UI o con un driver WS dirigido; no se debe intentar
+repetirla pasando flags de la CLI antigua a este script.
 
 ### Interferencia por pestania de UI abierta (takeover del WS)
 
@@ -96,10 +119,13 @@ Mitigaciones (2026-07-02):
 - `/health`: `200 OK`, `littlefs=ok`, `ap_ip=192.168.4.1`.
 - `ws_cmd_test.py --node 2 --total 35`: ACK para ARM, PGA, VDAC, PGAVDAC,
   LATENCY y STOP; HELLO/STATUS del nodo 2.
-- `ws_capture_test.py --node 2 --batches 2 --stream 1 --total 25`: ACK de
-  stream FIR, VER `ok=1/2`, `RUNNING -> DUMPING`, 60 paquetes DATA.
-- `ws_capture_test.py --node 2 --batches 2 --stream 0 --total 25`: ACK de
-  stream RAW, VER `ok=1/2`, `RUNNING -> DUMPING`, 60 paquetes DATA.
+- El probe heredado de captura FIR del nodo 2 obtuvo ACK de stream, VER
+  `ok=1/2`, `RUNNING -> DUMPING` y 60 paquetes DATA.
+- El probe heredado de captura RAW del nodo 2 obtuvo ACK de stream, VER
+  `ok=1/2`, `RUNNING -> DUMPING` y 60 paquetes DATA.
+
+Estos dos resultados son evidencia histórica de 2026-07-02, no comandos para
+la CLI actual ni pruebas nuevas de la configuración vigente.
 
 Resultados 2026-07-02 (tarde, PSoC con politica de eventos
 determinismo-primero; ver `docs/psoc_supermaquina_handoff.md`):
@@ -143,11 +169,13 @@ El dropdown "Rango ADC" de cada panel de esclavo ahora tiene 4 opciones
 `cfg.ADC_CONFIGS` en `config.js`. Todas a la misma Fs (2604 Hz), asi que no
 hace falta re-sincronizar nada al cambiar de rango.
 
-Validado sin hardware (servidor estático local sirviendo `data/`, sin
-maestro real): el dropdown lista las 4 opciones correctamente y no hay
-errores de consola. Falta re-validar con el maestro real una vez
-reflasheado (ver "Pendiente de reflash" abajo) — la selección del PSoC ya
-se probó por USB directo en el esclavo, ver `BUILD_PROGRAM_PSOC.md`.
+Evidencia registrada el 2026-07-07: el servidor estático local mostró las
+cuatro opciones sin errores de consola y la selección del PSoC se probó por
+USB directo en el esclavo (ver `BUILD_PROGRAM_PSOC.md`). La publicación final
+de LittleFS y la UI real de E10 están cerradas en la matriz, pero esa fila no
+registra una prueba dedicada de las cuatro transiciones navegador→maestro→
+PSoC. Ejecutar el checklist manual de "Path de control" antes de atribuirle
+un PASS E2E propio.
 
 ## Intensidad de señal (RSSI) — 2026-07-07
 
@@ -167,11 +195,12 @@ solo se silencia el reporte) para no competir por radio/CPU con la ventana
 crítica de captura. La UI se queda con el último valor mostrado hasta
 volver a IDLE.
 
-**Pendiente de validar con hardware real** — requiere reflash del maestro
-(firmware nuevo + `uploadfs`), lo que corta el WiFi del maestro y necesita
-que el usuario esté presente para reconectarse después. Compilación
-verificada (`pio run -e esp32dev`, sin errores); UI verificada sin errores
-de consola en servidor local pero sin datos WS reales.
+La deuda genérica "pendiente de reflash" de 2026-07-07 quedó superada por el
+estado de cierre documentado en la matriz/handoff (firmware del branch en el
+banco, builds finales y LittleFS publicado). Eso no constituye una aceptación
+dedicada de RSSI: E10/E11 no registran valores de RSSI ni la transición
+IDLE→captura→IDLE. Mantener pendiente esa comprobación manual y no declararla
+PASS a partir del build o del upload.
 
 ## Descarga sin bajar — beforeunload (2026-07-07)
 
@@ -184,21 +213,31 @@ archivo) — se recalcula al vuelo comparando `preservedCaptures` contra
 tras un `downloadBlob` exitoso), no es un flag manual que se pueda
 desincronizar.
 
-**Pendiente de validar con hardware real** por el mismo motivo que arriba
-(requiere reflash del maestro). Revisar manualmente: capturar algo, NO
-exportar, intentar cerrar la pestaña → debe aparecer el diálogo; exportar
-y volver a intentar cerrar → no debe aparecer.
+El JavaScript final fue publicado junto con LittleFS, según E10, pero la
+matriz no registra la secuencia manual específica de este guard. Sigue
+pendiente como prueba dedicada: capturar algo, NO exportar, intentar cerrar
+la pestaña → debe aparecer el diálogo; exportar y volver a intentar cerrar
+→ no debe aparecer. No inferir PASS solamente de que la UI cargue sin
+errores.
 
-## Pendiente de reflash (2026-07-07)
+## Estado frente al cierre pre-campo (2026-07-12)
 
-`link_rssi.h`, el dropdown de 4 configs de ADC y el guard de
-`beforeunload` están implementados y compilan, pero **no están
-desplegados en el maestro real** (COM8) todavía: reflashearlo corta el
-WiFi de la interfaz y hace falta que el usuario esté presente para
-reconectarse. Comando cuando esté listo:
+La afirmación histórica de que estas tres funciones aún esperaban un reflash
+ya no describe el banco cerrado. La matriz vigente registra firmware/web del
+branch, builds finales y publicación LittleFS en COM8. También delimita qué se
+validó: no contiene un PASS dedicado para las cuatro transiciones ADC, los
+indicadores RSSI ni el diálogo `beforeunload`. Esas comprobaciones permanecen
+como pasos manuales de este checklist, no como bloqueantes retroactivos del
+gate E5c ni como resultados ya obtenidos.
+
+Si una prueba futura vuelve a cargar firmware o web, usar puertos explícitos:
 
 ```bash
 cd "src/esp/Nodo comunicación/master"
-pio run -e esp32dev -t upload    # firmware → COM8
-pio run -t uploadfs              # web (LittleFS) → COM8
+pio run -e esp32dev -t upload --upload-port COM8
+pio run -e esp32dev -t uploadfs --upload-port COM8
 ```
+
+Luego recuperar `GeoNetwork` con
+`python reconnect_geonetwork.py --timeout 120` (WlanConnect por ctypes) y
+verificar `/health`; la receta completa está en el handoff.

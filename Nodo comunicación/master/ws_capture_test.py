@@ -30,6 +30,7 @@ from pathlib import Path
 import socket
 import struct
 import sys
+from tempfile import TemporaryDirectory
 import time
 from typing import BinaryIO, Callable, Iterable
 
@@ -68,6 +69,9 @@ MASTER_STATES = [
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_WS_FRAME_BYTES = 16 * 1024 * 1024
 DUMP_SILENCE_RECONNECT_S = 20.0
+CONFIG_MAX_ATTEMPTS = 2
+CONFIG_ACK_TIMEOUT_S = 2.0
+CONFIG_RETRY_POLL_S = 0.25
 
 
 class ProbeError(RuntimeError):
@@ -123,6 +127,23 @@ def metadata_path_for(output_path: Path) -> Path:
     if output_path.suffix:
         return output_path.with_suffix(".json")
     return output_path.with_name(output_path.name + ".json")
+
+
+def open_capture_output(
+    output_path: Path,
+    metadata_path: Path,
+    *,
+    force: bool,
+    unlink_metadata: Callable[[Path], None] | None = None,
+) -> BinaryIO:
+    """Invalidate stale metadata before creating or truncating the binary."""
+
+    if force:
+        if unlink_metadata is None:
+            metadata_path.unlink(missing_ok=True)
+        else:
+            unlink_metadata(metadata_path)
+    return output_path.open("wb")
 
 
 def build_client_frame(
@@ -324,6 +345,8 @@ class CaptureRunner:
         self.last_progress_at = self.started_monotonic
 
         self.phase_seconds: dict[str, float] = {}
+        self.config_retry_count = 0
+        self.config_attempts: list[dict[str, object]] = []
         self.initial_cleanup_ok = False
         self.final_cleanup_ok = False
         self.cleanup_errors: list[str] = []
@@ -521,6 +544,12 @@ class CaptureRunner:
             return
         except (ConnectionError, BrokenPipeError, ConnectionResetError, OSError) as exc:
             self._drop_socket(str(exc))
+
+    def _poll_until(self, deadline: float) -> None:
+        """Drain frames until a short deadline, including unrelated traffic."""
+
+        while time.monotonic() < deadline:
+            self.poll_once(deadline)
 
     def _record_hello(self, name: str, value: int, now: float) -> None:
         previous = self.hello.get(name)
@@ -738,45 +767,82 @@ class CaptureRunner:
             self.poll_once(settle_deadline)
         self.phase_seconds[label] = round(time.monotonic() - started, 3)
 
+    def _configure_directed_subcommand(
+        self,
+        subcommand: int,
+        label: str,
+        deadline: float,
+    ) -> None:
+        command = {
+            "cmd": "BD",
+            "node": self.args.node,
+            "sub": hex2(subcommand),
+            "param": 1,
+        }
+        for attempt in range(1, CONFIG_MAX_ATTEMPTS + 1):
+            attempt_label = f"{label} intento {attempt}/{CONFIG_MAX_ATTEMPTS}"
+            sent_at = self._send(command, deadline, attempt_label)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PhaseTimeout(f"{label}: deadline agotado tras el envio")
+            try:
+                self.wait_ack(
+                    self.args.node,
+                    subcommand,
+                    1,
+                    sent_at,
+                    min(CONFIG_ACK_TIMEOUT_S, remaining),
+                    attempt_label,
+                )
+            except (PhaseTimeout, ProbeError) as exc:
+                self.config_attempts.append(
+                    {
+                        "node": self.args.node,
+                        "subcommand": f"0x{subcommand:02X}",
+                        "attempt": attempt,
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                if attempt == CONFIG_MAX_ATTEMPTS:
+                    self.log(f"{label}: fallo persistente tras {attempt} intentos: {exc}")
+                    raise
+                self.config_retry_count += 1
+                self.log(
+                    f"{label}: intento {attempt} no confirmado ({exc}); "
+                    f"reintentando una vez"
+                )
+                poll_deadline = min(
+                    deadline,
+                    time.monotonic() + CONFIG_RETRY_POLL_S,
+                )
+                if time.monotonic() < poll_deadline:
+                    # Drena un ACK tardio del intento anterior. El siguiente
+                    # wait_ack usa el nuevo sent_at y no puede aceptarlo.
+                    self._poll_until(poll_deadline)
+                continue
+            self.config_attempts.append(
+                {
+                    "node": self.args.node,
+                    "subcommand": f"0x{subcommand:02X}",
+                    "attempt": attempt,
+                    "status": "ok",
+                }
+            )
+            return
+
     def configure_slave(self) -> None:
         started = time.monotonic()
         deadline = started + self.args.phase_timeout
-        sent = self._send(
-            {
-                "cmd": "BD",
-                "node": self.args.node,
-                "sub": hex2(SUBCMD_DECIMATION),
-                "param": 1,
-            },
-            deadline,
-            f"S{self.args.node} decim BB=1",
-        )
-        self.wait_ack(
-            self.args.node,
+        self._configure_directed_subcommand(
             SUBCMD_DECIMATION,
-            1,
-            sent,
-            max(0.1, deadline - time.monotonic()),
-            "config decimacion",
-        )
-
-        sent = self._send(
-            {
-                "cmd": "BD",
-                "node": self.args.node,
-                "sub": hex2(SUBCMD_SD_CAPTURE),
-                "param": 1,
-            },
+            f"S{self.args.node} decim BB=1",
             deadline,
-            f"S{self.args.node} SD BE=1",
         )
-        self.wait_ack(
-            self.args.node,
+        self._configure_directed_subcommand(
             SUBCMD_SD_CAPTURE,
-            1,
-            sent,
-            max(0.1, deadline - time.monotonic()),
-            "config SD",
+            f"S{self.args.node} SD BE=1",
+            deadline,
         )
         self.phase_seconds["configure"] = round(time.monotonic() - started, 3)
 
@@ -1008,6 +1074,8 @@ class CaptureRunner:
             "initial_cleanup_ok": self.initial_cleanup_ok,
             "final_cleanup_ok": self.final_cleanup_ok,
             "cleanup_errors": self.cleanup_errors,
+            "config_retry_count": self.config_retry_count,
+            "config_attempts": self.config_attempts,
             "phase_seconds": self.phase_seconds,
         }
 
@@ -1170,6 +1238,128 @@ def run_self_tests() -> None:
     assert metadata_path_for(Path("capture.i24le")) == Path("capture.json")
     assert metadata_path_for(Path("capture")) == Path("capture.json")
 
+    with TemporaryDirectory() as temporary_directory:
+        root = Path(temporary_directory)
+        output_path = root / "capture.i24le"
+        metadata_path = metadata_path_for(output_path)
+        output_path.write_bytes(b"stale-binary-payload")
+        metadata_path.write_text('{"success":true}\n', encoding="utf-8")
+        with open_capture_output(
+            output_path,
+            metadata_path,
+            force=True,
+        ) as output_stream:
+            assert not metadata_path.exists()
+            assert output_path.stat().st_size == 0
+            output_stream.write(b"new")
+        assert output_path.read_bytes() == b"new"
+
+        original_binary = b"must-remain-untouched"
+        original_metadata = '{"success":false}\n'
+        output_path.write_bytes(original_binary)
+        metadata_path.write_text(original_metadata, encoding="utf-8")
+        unlink_calls: list[Path] = []
+
+        def reject_metadata_unlink(path: Path) -> None:
+            unlink_calls.append(path)
+            raise PermissionError("simulated metadata unlink failure")
+
+        try:
+            open_capture_output(
+                output_path,
+                metadata_path,
+                force=True,
+                unlink_metadata=reject_metadata_unlink,
+            )
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("metadata unlink failure must abort before output open")
+        assert unlink_calls == [metadata_path]
+        assert output_path.read_bytes() == original_binary
+        assert metadata_path.read_text(encoding="utf-8") == original_metadata
+
+    def fake_config_runner(
+        outcomes: list[int | Exception],
+    ) -> tuple[
+        CaptureRunner,
+        list[dict[str, object]],
+        list[float],
+        list[float],
+    ]:
+        runner = CaptureRunner(argparse.Namespace(node=1), 1, io.BytesIO())
+        runner.log = lambda _message: None  # type: ignore[method-assign]
+        send_calls: list[dict[str, object]] = []
+        wait_since: list[float] = []
+        poll_deadlines: list[float] = []
+        pending = deque(outcomes)
+
+        def fake_send(command: dict[str, object], _deadline: float, label: str) -> float:
+            send_calls.append({"command": dict(command), "label": label})
+            return 100.0 + len(send_calls)
+
+        def fake_wait_ack(
+            node: int,
+            command: int,
+            expected_value: int,
+            since: float,
+            _timeout: float,
+            _label: str,
+        ) -> int:
+            assert node == 1 and command == SUBCMD_DECIMATION and expected_value == 1
+            wait_since.append(since)
+            outcome = pending.popleft()
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        runner._send = fake_send  # type: ignore[method-assign]
+        runner.wait_ack = fake_wait_ack  # type: ignore[method-assign]
+        runner._poll_until = poll_deadlines.append  # type: ignore[method-assign]
+        return runner, send_calls, wait_since, poll_deadlines
+
+    # Regresion F6: ACK=0 transitorio se drena y cada intento acepta solamente
+    # ACK posteriores a su propio envio.
+    retry_runner, retry_sends, retry_since, retry_polls = fake_config_runner(
+        [ProbeError("ACK BB=0 transitorio"), 1]
+    )
+    retry_runner._configure_directed_subcommand(
+        SUBCMD_DECIMATION,
+        "test BB=1",
+        time.monotonic() + 10.0,
+    )
+    assert len(retry_sends) == 2 and retry_since == [101.0, 102.0]
+    assert len(retry_polls) == 1 and retry_runner.config_retry_count == 1
+    assert [item["status"] for item in retry_runner.config_attempts] == ["error", "ok"]
+
+    persistent_timeout = PhaseTimeout("segundo ACK ausente")
+    fail_runner, fail_sends, fail_since, fail_polls = fake_config_runner(
+        [ProbeError("primer ACK BB=0"), persistent_timeout]
+    )
+    try:
+        fail_runner._configure_directed_subcommand(
+            SUBCMD_DECIMATION,
+            "test BB=1 persistente",
+            time.monotonic() + 10.0,
+        )
+    except PhaseTimeout as exc:
+        assert exc is persistent_timeout
+    else:
+        raise AssertionError("dos fallos de configuracion deben propagarse")
+    assert len(fail_sends) == 2 and fail_since == [101.0, 102.0]
+    assert len(fail_polls) == 1 and fail_runner.config_retry_count == 1
+    assert [item["status"] for item in fail_runner.config_attempts] == ["error", "error"]
+
+    ok_runner, ok_sends, ok_since, ok_polls = fake_config_runner([1])
+    ok_runner._configure_directed_subcommand(
+        SUBCMD_DECIMATION,
+        "test BB=1 directo",
+        time.monotonic() + 10.0,
+    )
+    assert len(ok_sends) == 1 and ok_since == [101.0]
+    assert not ok_polls and ok_runner.config_retry_count == 0
+    assert [item["status"] for item in ok_runner.config_attempts] == ["ok"]
+
     # Regresión F5: B2=2 activa el reloj aun antes del primer DATA. Este es
     # exactamente el estado que antes quedaba esperando todo el dump_timeout.
     watchdog_runner = CaptureRunner(argparse.Namespace(node=1), 1, io.BytesIO())
@@ -1207,7 +1397,8 @@ def run_self_tests() -> None:
 
     print(
         "self-test OK: 52080 batches, max=60000, WS lengths, grouped packets, "
-        "int24-le, pre-DATA dump watchdog"
+        "int24-le, force metadata ordering, bounded config retry, "
+        "pre-DATA dump watchdog"
     )
 
 
@@ -1237,7 +1428,11 @@ def main(argv: list[str] | None = None) -> int:
     error: str | None = None
     cleanup_error: str | None = None
     try:
-        with output_path.open("wb") as output_stream:
+        with open_capture_output(
+            output_path,
+            metadata_path,
+            force=args.force,
+        ) as output_stream:
             runner = CaptureRunner(args, n_batches, output_stream)
             runner.log(
                 f"inicio: node={args.node}, batches={n_batches}, "
