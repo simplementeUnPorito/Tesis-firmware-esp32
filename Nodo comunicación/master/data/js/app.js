@@ -825,7 +825,9 @@ function setCaptureToMaxRamBatches() {
   }
   const secs = (cfg.PSOC_RAM_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fs;
   const el = $('capture-secs');
-  if (el) el.value = (Math.ceil(secs * 100) / 100).toFixed(2);
+  // floor: con ceil el redondeo (5.90 s) recomputaba 513 lotes y el esclavo
+  // clampaba a 512 — cosmético pero confuso (W6, visto en E10).
+  if (el) el.value = (Math.floor(secs * 100) / 100).toFixed(2);
   updateCapturePreview();
   syncDisplayWindowToCaptureDuration();
   appendLog(`Duracion fijada al maximo RAM: ${cfg.PSOC_RAM_CAPTURE_MAX_BATCHES} lotes (~${secs.toFixed(2)} s)`);
