@@ -1,0 +1,354 @@
+{
+  "baud": 115200,
+  "checks": [
+    {
+      "detail": "0 bytes",
+      "name": "drain inicial acotado",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "preflight probe psoc=1",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "preflight PSoC IDLE",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "preflight status USB parseable",
+      "passed": true
+    },
+    {
+      "detail": "fs=2604",
+      "name": "preflight Fs nativa",
+      "passed": true
+    },
+    {
+      "detail": "bBad=0",
+      "name": "preflight UART sin lotes malos",
+      "passed": true
+    },
+    {
+      "detail": "state=0",
+      "name": "preflight ESP fuera de captura",
+      "passed": true
+    },
+    {
+      "detail": "status=0x37",
+      "name": "preflight SD presente y FAT montado",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBE val=0 attempts=1 retry_used=no",
+      "name": "ACK 0xBE SD=off (E16)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xB7 val=0 attempts=2 retry_used=yes",
+      "name": "ACK 0xB7 stream=RAW (E16)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=1 attempts=1 retry_used=no",
+      "name": "ACK 0xBB decim=1 (baseline)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=1 attempts=1 retry_used=no",
+      "name": "ACK 0xBA range=1 (baseline)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=2604 bBad=0",
+      "name": "baseline RAM 4 lotes r1 d1",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=2 attempts=1 retry_used=no",
+      "name": "ACK 0xBA transicion r1->r2 (0V512)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=2604 bBad=0",
+      "name": "RAM 4 lotes tras r1->r2 (0V512)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=4 attempts=1 retry_used=no",
+      "name": "ACK 0xBA transicion r2->r4 (0V625)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=2604 bBad=0",
+      "name": "RAM 4 lotes tras r2->r4 (0V625)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=3 attempts=1 retry_used=no",
+      "name": "ACK 0xBA transicion r4->r3 (1V024)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=2 retry_used=yes fill=4/4 fs=2604 bBad=0",
+      "name": "RAM 4 lotes tras r4->r3 (1V024)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=1 attempts=1 retry_used=no",
+      "name": "ACK 0xBA transicion r3->r1 (2V5)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=2604 bBad=0",
+      "name": "RAM 4 lotes tras r3->r1 (2V5)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=2 attempts=1 retry_used=no",
+      "name": "ACK 0xBB transicion d1->d2 (fs=1302)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=1302 bBad=0",
+      "name": "RAM 4 lotes tras d1->d2 (fs=1302)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=6 attempts=1 retry_used=no",
+      "name": "ACK 0xBB transicion d2->d6 (fs=434)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=434 bBad=0",
+      "name": "RAM 4 lotes tras d2->d6 (fs=434)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=3 attempts=1 retry_used=no",
+      "name": "ACK 0xBB transicion d6->d3 (fs=868)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=868 bBad=0",
+      "name": "RAM 4 lotes tras d6->d3 (fs=868)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=4 attempts=1 retry_used=no",
+      "name": "ACK 0xBB transicion d3->d4 (fs=651)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=651 bBad=0",
+      "name": "RAM 4 lotes tras d3->d4 (fs=651)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=1 attempts=1 retry_used=no",
+      "name": "ACK 0xBB transicion d4->d1 (fs=2604)",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=2604 bBad=0",
+      "name": "RAM 4 lotes tras d4->d1 (fs=2604)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=4 attempts=1 retry_used=no",
+      "name": "ACK 0xBA combo range=4",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=3 attempts=1 retry_used=no",
+      "name": "ACK 0xBB combo decim=3",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=868 bBad=0",
+      "name": "RAM 4 lotes combo r4 d3",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=0",
+      "name": "'range 0' rechazado localmente",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=5",
+      "name": "'range 5' rechazado localmente",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=0",
+      "name": "'decim 0' rechazado localmente",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=101",
+      "name": "'decim 101' rechazado localmente",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=868 bBad=0",
+      "name": "RAM 4 lotes post-rechazos (config previa intacta)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=1 attempts=1 retry_used=no",
+      "name": "ACK 0xBA restore range=1",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=1 attempts=1 retry_used=no",
+      "name": "ACK 0xBB restore decim=1",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 retry_used=no fill=4/4 fs=2604 bBad=0",
+      "name": "RAM 4 lotes post-restore r1 d1",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBA val=1",
+      "name": "cleanup ACK range default",
+      "passed": true
+    },
+    {
+      "detail": "[USB] stop",
+      "name": "cleanup stop",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBE val=0 attempts=1 retry_used=no",
+      "name": "cleanup ACK sdcap 0",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xB7 val=0 attempts=1 retry_used=no",
+      "name": "cleanup ACK stream 0",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=1 attempts=1 retry_used=no",
+      "name": "cleanup ACK decim 1",
+      "passed": true
+    },
+    {
+      "detail": "[USB] clear",
+      "name": "cleanup clear",
+      "passed": true
+    },
+    {
+      "detail": "psoc=1 pstate=IDLE fs=2604 fill=0/0 bBad=0",
+      "name": "estado final limpio",
+      "passed": true
+    }
+  ],
+  "completed_at_utc": "2026-07-12T17:36:39.985273+00:00",
+  "cross": {
+    "decim": 3,
+    "range": 4
+  },
+  "decim_path": [
+    2,
+    6,
+    3,
+    4,
+    1
+  ],
+  "dtr": false,
+  "error": null,
+  "port": "COM12",
+  "range_path": [
+    2,
+    4,
+    3,
+    1
+  ],
+  "rts": false,
+  "schema_version": 1,
+  "started_at_utc": "2026-07-12T17:35:47.389100+00:00",
+  "status": "ok",
+  "steps": [
+    {
+      "decim": 1,
+      "range": 1,
+      "step": "baseline"
+    },
+    {
+      "from": 1,
+      "step": "range",
+      "to": 2
+    },
+    {
+      "from": 2,
+      "step": "range",
+      "to": 4
+    },
+    {
+      "from": 4,
+      "step": "range",
+      "to": 3
+    },
+    {
+      "from": 3,
+      "step": "range",
+      "to": 1
+    },
+    {
+      "from": 1,
+      "step": "decim",
+      "to": 2
+    },
+    {
+      "from": 2,
+      "step": "decim",
+      "to": 6
+    },
+    {
+      "from": 6,
+      "step": "decim",
+      "to": 3
+    },
+    {
+      "from": 3,
+      "step": "decim",
+      "to": 4
+    },
+    {
+      "from": 4,
+      "step": "decim",
+      "to": 1
+    },
+    {
+      "decim": 3,
+      "range": 4,
+      "step": "cross"
+    },
+    {
+      "command": "range 0",
+      "step": "invalid"
+    },
+    {
+      "command": "range 5",
+      "step": "invalid"
+    },
+    {
+      "command": "decim 0",
+      "step": "invalid"
+    },
+    {
+      "command": "decim 101",
+      "step": "invalid"
+    },
+    {
+      "decim": 1,
+      "range": 1,
+      "step": "restore"
+    }
+  ],
+  "test": "E16_ADC_DECIM_TRANSITIONS"
+}

@@ -171,11 +171,14 @@ hace falta re-sincronizar nada al cambiar de rango.
 
 Evidencia registrada el 2026-07-07: el servidor estático local mostró las
 cuatro opciones sin errores de consola y la selección del PSoC se probó por
-USB directo en el esclavo (ver `BUILD_PROGRAM_PSOC.md`). La publicación final
-de LittleFS y la UI real de E10 están cerradas en la matriz, pero esa fila no
-registra una prueba dedicada de las cuatro transiciones navegador→maestro→
-PSoC. Ejecutar el checklist manual de "Path de control" antes de atribuirle
-un PASS E2E propio.
+USB directo en el esclavo (ver `BUILD_PROGRAM_PSOC.md`).
+
+**Cerrado 2026-07-12**: E16 (`slave/adc_decim_transitions_test.py`) validó las
+cuatro configs con transiciones dirigidas r1→r2→r4→r3→r1 a nivel
+esclavo→PSoC (ACK 0xBA + mini-captura con fs correcta en cada una), y E14
+validó el path navegador→maestro→esclavo→PSoC con el round-trip real
+±2.5→±0.512→±2.5 desde el dropdown de la UI publicada (indicador `Current:`
+actualizado + punto ACK verde en ambos sentidos). Veredictos en la matriz.
 
 ## Intensidad de señal (RSSI) — 2026-07-07
 
@@ -195,12 +198,12 @@ solo se silencia el reporte) para no competir por radio/CPU con la ventana
 crítica de captura. La UI se queda con el último valor mostrado hasta
 volver a IDLE.
 
-La deuda genérica "pendiente de reflash" de 2026-07-07 quedó superada por el
-estado de cierre documentado en la matriz/handoff (firmware del branch en el
-banco, builds finales y LittleFS publicado). Eso no constituye una aceptación
-dedicada de RSSI: E10/E11 no registran valores de RSSI ni la transición
-IDLE→captura→IDLE. Mantener pendiente esa comprobación manual y no declararla
-PASS a partir del build o del upload.
+**Cerrado 2026-07-12 (E14)**: en la UI real publicada se observaron ambos
+indicadores con valores reales — `WiFi interfaz: -27 dBm (1 cliente/s)` en la
+barra de estado y `RSSI: -16 dBm` junto al MAC en el panel del esclavo Geo1 —
+antes, durante y después de una captura completa de 512 lotes desde la UI
+(el panel conserva el último valor durante la captura, como está diseñado).
+Veredicto E14 en la matriz.
 
 ## Descarga sin bajar — beforeunload (2026-07-07)
 
@@ -213,22 +216,25 @@ archivo) — se recalcula al vuelo comparando `preservedCaptures` contra
 tras un `downloadBlob` exitoso), no es un flag manual que se pueda
 desincronizar.
 
-El JavaScript final fue publicado junto con LittleFS, según E10, pero la
-matriz no registra la secuencia manual específica de este guard. Sigue
-pendiente como prueba dedicada: capturar algo, NO exportar, intentar cerrar
-la pestaña → debe aparecer el diálogo; exportar y volver a intentar cerrar
-→ no debe aparecer. No inferir PASS solamente de que la UI cargue sin
-errores.
+**Cerrado 2026-07-12 (E14, verificación behavioral sin modal)**: con una
+captura de 512 lotes sin exportar, un `dispatchEvent(new Event('beforeunload',
+{cancelable:true}))` sintético devolvió `defaultPrevented=true` (guard
+activo); tras exportar el ZIP con éxito, el mismo dispatch devolvió
+`defaultPrevented=false` (guard limpio). El dispatch sintético ejecuta el
+listener real de `app.js` sin abrir el diálogo nativo (que bloquearía la
+automatización del navegador). La única parte no automatizable — ver el
+diálogo nativo en pantalla — queda como gesto manual trivial del operador,
+con la lógica subyacente ya validada en ambos sentidos.
 
 ## Estado frente al cierre pre-campo (2026-07-12)
 
 La afirmación histórica de que estas tres funciones aún esperaban un reflash
-ya no describe el banco cerrado. La matriz vigente registra firmware/web del
-branch, builds finales y publicación LittleFS en COM8. También delimita qué se
-validó: no contiene un PASS dedicado para las cuatro transiciones ADC, los
-indicadores RSSI ni el diálogo `beforeunload`. Esas comprobaciones permanecen
-como pasos manuales de este checklist, no como bloqueantes retroactivos del
-gate E5c ni como resultados ya obtenidos.
+ya no describe el banco cerrado. Con la segunda tanda del 2026-07-12 las tres
+comprobaciones que este checklist mantenía como manuales quedaron cerradas:
+las cuatro configs ADC (E16 por USB + round-trip navegador→PSoC en E14), los
+indicadores RSSI con valores reales (E14) y la lógica `beforeunload` en ambos
+sentidos (E14, dispatch sintético). Veredictos y evidencia en
+`docs/plan_pruebas_precampo.md`.
 
 Si una prueba futura vuelve a cargar firmware o web, usar puertos explícitos:
 

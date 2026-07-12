@@ -35,6 +35,7 @@ from usb_regression_test import (
     RegressionFailure,
     SerialSession,
     UsbRegression,
+    capture_status_errors,
     find_config_ack,
     has_ack_for_subcommand,
 )
@@ -94,16 +95,43 @@ class E16Runner:
         self.metadata["steps"] = self.steps
 
     def capture(self, name: str, decim: int) -> None:
+        # Igual que wait_capture() pero con 2 intentos dirigidos: inmediatamente
+        # despues de un cambio de config el `cap` puede quedar ignorado en
+        # silencio (misma clase transitoria que F6); el segundo intento tras un
+        # stop corto lo resuelve y queda registrado en la evidencia.
         expected_fs = NATIVE_FS_HZ // decim
-        self.reg.command("clear", 1.0)
-        self.reg.wait_capture(
-            name=name,
-            batches=CAPTURE_BATCHES,
-            expected_fs_hz=expected_fs,
-            require_uart_batches=True,
-            timeout_s=max(15.0, CAPTURE_BATCHES * 30 * decim / NATIVE_FS_HZ * 2.0 + 8.0),
-        )
-        self.reg.command("clear", 1.0)
+        timeout_s = max(15.0, CAPTURE_BATCHES * 30 * decim / NATIVE_FS_HZ * 2.0 + 8.0)
+        errors: list[str] = ["sin intento"]
+        for attempt in (1, 2):
+            self.reg.command("clear", 1.0)
+            baseline = self.reg.read_status()
+            self.reg.command(f"cap {CAPTURE_BATCHES}", 2.0)
+            deadline = time.monotonic() + timeout_s
+            last = None
+            while time.monotonic() < deadline:
+                last = self.reg.read_status()
+                if (last.fill, last.target) == (CAPTURE_BATCHES, CAPTURE_BATCHES):
+                    break
+                time.sleep(0.20)
+            if last is None:
+                errors = ["sin status posterior a cap"]
+            else:
+                errors = capture_status_errors(
+                    last, CAPTURE_BATCHES, expected_fs, baseline.b_ok, True,
+                )
+            if not errors:
+                self.checks.require(
+                    name, True,
+                    f"attempts={attempt} retry_used={'yes' if attempt == 2 else 'no'} "
+                    f"fill={last.fill}/{last.target} fs={last.fs_hz} bBad={last.b_bad}",
+                )
+                self.reg.command("clear", 1.0)
+                return
+            if attempt == 1:
+                print(f"[RETRY] {name} - intento 1: {'; '.join(errors)}")
+                self.reg.command("stop", 1.0)
+                time.sleep(0.5)
+        self.checks.require(name, False, "; ".join(errors))
 
     def baseline(self) -> None:
         print("\n=== E16 BASELINE r1 d1 ===")

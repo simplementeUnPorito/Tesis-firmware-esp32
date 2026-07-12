@@ -55,8 +55,12 @@ PPCLI_DIR_DEFAULT = r"C:\Program Files (x86)\Cypress\Programmer"
 KITPROG_RE = re.compile(r"^<(KitProg[^\r\n]*)$", re.M)
 PPCLI_OK_RE = re.compile(r"^0 OK$", re.M)
 
-SD_COMPLETE_MOUNTED = 0x31   # present + FAT + sesion COMPLETE, capture off
+SD_COMPLETE_MOUNTED = 0x31   # present + FAT + sesion COMPLETE
 SD_CAPTURE_BIT = 0x40
+# Al boot con SD presente y FAT montado el PSoC habilita g_sd_cap_en=1 por
+# diseno (main.c sd_session_recover: default field-safe tras power-cycle),
+# asi que post-reset el bit 0x40 debe venir ENCENDIDO.
+SD_BOOT_RECOVERED = SD_COMPLETE_MOUNTED | SD_CAPTURE_BIT  # 0x71
 
 AUTOCAL_DEADLINE_S = 150.0
 AUTOCAL_POLL_S = 5.0
@@ -203,8 +207,8 @@ class E17Runner:
         print("\n=== E17 RECOVERY POST-RESET ===")
         status = self.sdinfo_status("post-reset", timeout_s=6.0)
         self.checks.require(
-            "post-reset GEOLAST COMPLETE recuperado",
-            status & SD_COMPLETE_MOUNTED == SD_COMPLETE_MOUNTED and not status & SD_CAPTURE_BIT,
+            "post-reset GEOLAST COMPLETE recuperado y capture re-armado (boot default)",
+            status & SD_BOOT_RECOVERED == SD_BOOT_RECOVERED,
             f"status=0x{status:02X}",
         )
         self.metadata["post_reset"] = {"sd_status": status}
@@ -271,10 +275,15 @@ def run_self_test() -> int:
     check("veredicto reset sin ToggleReset", not reset_ok("0 OK\n"))
 
     check(
-        "criterio SD COMPLETE montada",
-        (0x31 & SD_COMPLETE_MOUNTED == SD_COMPLETE_MOUNTED and not 0x31 & SD_CAPTURE_BIT)
-        and not (0x71 & SD_COMPLETE_MOUNTED == SD_COMPLETE_MOUNTED and not 0x71 & SD_CAPTURE_BIT)
+        "criterio pre-reset (COMPLETE + capture off)",
+        (0x37 & SD_COMPLETE_MOUNTED == SD_COMPLETE_MOUNTED and not 0x37 & SD_CAPTURE_BIT)
         and not (0x11 & SD_COMPLETE_MOUNTED == SD_COMPLETE_MOUNTED),
+    )
+    check(
+        "criterio post-boot (COMPLETE + capture re-armado)",
+        (0x77 & SD_BOOT_RECOVERED == SD_BOOT_RECOVERED)
+        and not (0x37 & SD_BOOT_RECOVERED == SD_BOOT_RECOVERED)
+        and not (0x5F & SD_BOOT_RECOVERED == SD_BOOT_RECOVERED),
     )
     check(
         "parser sdinfo reutilizado",
