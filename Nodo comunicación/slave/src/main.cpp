@@ -188,7 +188,9 @@ static bool         g_psoc_sd_read_pending = false;
 static bool         g_psoc_sd_read_usb = false;    /* banco: sdread N imprime por USB en vez de ESP-NOW */
 static uint16_t     g_psoc_sd_read_seq = 0;
 static uint32_t     g_psoc_sd_read_started_ms = 0;
-#define PSOC_SD_READ_TIMEOUT_MS 250u
+#define PSOC_SD_READ_TIMEOUT_MS 450u  /* H3 auditoría 2026-07-11: ~3.6% de lecturas 0xBF
+                                        * superan 250 ms (pico periódico); 450 ms absorbe casi
+                                        * todas sin NACK y el maestro re-pide el mismo seq igual */
 
 #ifndef STORE_PAGE_BATCHES
 #define STORE_PAGE_BATCHES 32u
@@ -3164,10 +3166,21 @@ void loop()
         uint32_t fallbackMs = expectedCaptureMs(g_rec_n_batches);
         uint32_t bytesNow = psoc.bytesRx();
         uint32_t batchesNow = psoc.batchesOK();
+        const bool sdCapture = g_psoc_sd_store_active;
+        if (sdCapture) {
+            /* F1 (aceptación 10 min, 2026-07-11): en captura a SD NO llegan
+             * lotes UART durante el muestreo (fill/bOK congelados por diseño)
+             * y el cierre de GEOLAST.BIN crece con el tamaño (~3.3 s a 52080
+             * lotes). Con el margen fijo, este watchdog declaraba stall justo
+             * antes del SD_SESSION y el START_NOW fantasma re-armaba el PSoC
+             * pisando la sesión recién terminada (SD_ERROR 0x08 + NACK eterno
+             * al dump del maestro). Margen extra proporcional al largo. */
+            fallbackMs += 15000u + (uint32_t)(g_rec_n_batches / 2u);
+        }
         if (elapsedMs >= fallbackMs && batchesNow == g_sampling_start_batches_ok) {
             const char *mode = g_view_store_active ? "VIEW" : "START";
             g_start_fallback_sent = true;
-            SLAVE_LOG_PRINTF("[SLAVE] %s_SYNC_STALL elapsed=%lu/%lu sync=%d bytes=%lu->%lu bOK=%lu->%lu fill=%u/%u -> START_NOW UART\n",
+            SLAVE_LOG_PRINTF("[SLAVE] %s_SYNC_STALL elapsed=%lu/%lu sync=%d bytes=%lu->%lu bOK=%lu->%lu fill=%u/%u sd=%u -> %s\n",
                              mode,
                              (unsigned long)elapsedMs, (unsigned long)fallbackMs,
                              digitalRead(SYNC_TO_PSOC_PIN),
@@ -3175,8 +3188,10 @@ void loop()
                              (unsigned long)bytesNow,
                              (unsigned long)g_sampling_start_batches_ok,
                               (unsigned long)batchesNow,
-                              (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
-            LOGM("CAPTURE_SYNC_STALL", "mode=%s,ms=%lu/%lu,sync=%d,bytes=%lu->%lu,bOK=%lu->%lu,fill=%u/%u",
+                              (unsigned)g_store_fill, (unsigned)g_rec_n_batches,
+                              (unsigned)sdCapture,
+                              sdCapture ? "ABORT (sin START_NOW)" : "START_NOW UART");
+            LOGM("CAPTURE_SYNC_STALL", "mode=%s,ms=%lu/%lu,sync=%d,bytes=%lu->%lu,bOK=%lu->%lu,fill=%u/%u,sd=%u",
                  mode,
                  (unsigned long)elapsedMs, (unsigned long)fallbackMs,
                  digitalRead(SYNC_TO_PSOC_PIN),
@@ -3184,8 +3199,21 @@ void loop()
                  (unsigned long)bytesNow,
                  (unsigned long)g_sampling_start_batches_ok,
                  (unsigned long)batchesNow,
-                 (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
-            psoc.startNow();
+                 (unsigned)g_store_fill, (unsigned)g_rec_n_batches,
+                 (unsigned)sdCapture);
+            if (sdCapture) {
+                /* NUNCA re-arrancar el PSoC en modo SD: si la captura estaba
+                 * por cerrar, START_NOW la destruye. Abort limpio: NACK al
+                 * maestro y a esperar; los datos (si los hay) siguen en la SD. */
+                const bool wasView = g_view_store_active;
+                digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+                g_view_store_active = false;
+                g_start_store_active = false;
+                g_state = STOPPED;
+                sendCfgAck(wasView ? CMD_VIEW : CMD_START, 0);
+            } else {
+                psoc.startNow();
+            }
         }
     }
 
