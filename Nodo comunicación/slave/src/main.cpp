@@ -185,6 +185,7 @@ static bool         g_psoc_sd_store_active = false;    /* captura actual vive en
 static bool         g_psoc_sd_session_complete = false;
 static bool         g_psoc_sd_capture_error = false;
 static bool         g_psoc_sd_read_pending = false;
+static bool         g_psoc_sd_read_usb = false;    /* banco: sdread N imprime por USB en vez de ESP-NOW */
 static uint16_t     g_psoc_sd_read_seq = 0;
 static uint32_t     g_psoc_sd_read_started_ms = 0;
 #define PSOC_SD_READ_TIMEOUT_MS 250u
@@ -1329,6 +1330,7 @@ static void servicePsocConfigAck()
             MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
             sendToMaster((const uint8_t *)&nack, sizeof(nack));
             g_psoc_sd_read_pending = false;
+            g_psoc_sd_read_usb = false;
             SLAVE_LOG_PRINTF("[SLAVE] PSoC SD_READ NACK seq=%u val=%u\n",
                              (unsigned)g_psoc_sd_read_seq, (unsigned)ackVal);
             continue;
@@ -1788,6 +1790,34 @@ static void requestLabCaptureFromUsb(uint8_t streamMode, uint16_t n, const char 
     requestCaptureFromUsb(n);
     waitForLabCaptureDone(tag, n);
 }
+
+/* Banco: leer un lote de GEOLAST.BIN (SD del PSoC) por 0xBF y volcarlo por USB
+ * — mismo camino que usa handleReqBatch() para el maestro, pero verificable
+ * sin radio. Requiere una captura SD previa completa (g_psoc_sd_store_active). */
+static void requestSdReadFromUsb(uint16_t seq)
+{
+    if (!g_psoc_sd_store_active || g_store_fill == 0u) {
+        SLAVE_LOG_PRINTF("[USB] sdread ignored: sin captura SD (fill=%u sd=%u)\n",
+                         (unsigned)g_store_fill, (unsigned)g_psoc_sd_store_active);
+        return;
+    }
+    if (seq >= g_store_fill) {
+        SLAVE_LOG_PRINTF("[USB] sdread ignored: seq=%u fuera de rango (fill=%u)\n",
+                         (unsigned)seq, (unsigned)g_store_fill);
+        return;
+    }
+    if (g_psoc_sd_read_pending) {
+        SLAVE_LOG_PRINTF("[USB] sdread ignored: lectura pendiente seq=%u\n",
+                         (unsigned)g_psoc_sd_read_seq);
+        return;
+    }
+    g_psoc_sd_read_pending = true;
+    g_psoc_sd_read_usb = true;
+    g_psoc_sd_read_seq = seq;
+    g_psoc_sd_read_started_ms = millis();
+    psoc.sdReadBatch(seq);
+    LOGM("USB_CMD", "cmd=sdread,seq=%u", (unsigned)seq);
+}
 #endif
 
 static void requestCalibrationFromUsb()
@@ -2141,10 +2171,12 @@ static void handleUsbCommand(const char *cmd)
         requestLabCaptureFromUsb(0u, value16, "LAB_RAWCAP");
     } else if (usbParseU16Param(cmd, "fircap", value16)) {
         requestLabCaptureFromUsb(1u, value16, "LAB_FIRCAP");
+    } else if (usbParseU16Param(cmd, "sdread", value16)) {
+        requestSdReadFromUsb(value16);
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
 #else
         SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, range N, decim N\n");
 #endif
@@ -2540,6 +2572,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_debug_mode = false;   /* detener debug stream si estaba activo */
         g_psoc_arm_ready = false;
         g_psoc_sd_read_pending = false;
+        g_psoc_sd_read_usb = false;
         /* Pizarra limpia: ARM es el fin explícito de cualquier captura/dump
          * anterior. Sin esto, flags viejos (store activo, retry de ACK de
          * completado, arena con n_batches previo) contaminaban el ciclo
@@ -2657,6 +2690,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_start_fallback_sent = false;
         g_psoc_arm_ready = false;
         g_psoc_sd_read_pending = false;
+        g_psoc_sd_read_usb = false;
         g_state = STOPPED;
         SLAVE_LOG_PRINTLN("[SLAVE] STOP");
     }
@@ -2751,6 +2785,7 @@ static void allocStore(uint16_t n_batches)
     g_psoc_sd_session_complete = false;
     g_psoc_sd_capture_error = false;
     g_psoc_sd_read_pending = false;
+    g_psoc_sd_read_usb = false;
     if (n_batches == 0) return;
     if (g_psoc_sd_store_active) {
         SLAVE_LOG_PRINTF("[SLAVE] store PSoC-SD n=%u\n", n_batches);
@@ -2837,11 +2872,14 @@ static void servicePsocSdReadTimeout()
         (uint32_t)(millis() - g_psoc_sd_read_started_ms) < PSOC_SD_READ_TIMEOUT_MS) {
         return;
     }
-    MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
-    sendToMaster((const uint8_t *)&nack, sizeof(nack));
-    SLAVE_LOG_PRINTF("[SLAVE] PSoC SD_READ timeout seq=%u\n",
-                     (unsigned)g_psoc_sd_read_seq);
+    if (!g_psoc_sd_read_usb) {
+        MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
+        sendToMaster((const uint8_t *)&nack, sizeof(nack));
+    }
+    SLAVE_LOG_PRINTF("[SLAVE] PSoC SD_READ timeout seq=%u usb=%u\n",
+                     (unsigned)g_psoc_sd_read_seq, (unsigned)g_psoc_sd_read_usb);
     g_psoc_sd_read_pending = false;
+    g_psoc_sd_read_usb = false;
 }
 
 /* ── Callback PSoC — batch recibido ─────────────────────────────────────── */
@@ -2879,6 +2917,26 @@ static void onBatch(const PsocBatch &batch)
         if (fs == 0u) fs = PSOC_NATIVE_SAMPLE_RATE_HZ;
         psocBatchToStored(batch, stored);
         g_psoc_sd_read_pending = false;
+        if (g_psoc_sd_read_usb) {
+            /* Banco (sdread N): volcar resumen por USB en vez de ESP-NOW. */
+            g_psoc_sd_read_usb = false;
+            int32_t sum = 0;
+            for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+                sum += (int32_t)batch.samples[i].raw_input;
+            }
+            SLAVE_LOG_PRINTF("[USB] SDREAD seq=%u raw[0]=%d raw[%d]=%d sumRaw=%ld "
+                             "dig[0]=%ld dig[%d]=%ld flags[0]=0x%02X\n",
+                             (unsigned)seq,
+                             (int)batch.samples[0].raw_input,
+                             SPI_BATCH_SAMPLES - 1,
+                             (int)batch.samples[SPI_BATCH_SAMPLES - 1].raw_input,
+                             (long)sum,
+                             (long)batch.samples[0].post_digital,
+                             SPI_BATCH_SAMPLES - 1,
+                             (long)batch.samples[SPI_BATCH_SAMPLES - 1].post_digital,
+                             (unsigned)batch.samples[0].sample_flags);
+            return;
+        }
         const uint64_t ts = g_t_start_us +
             ((uint64_t)seq * SPI_BATCH_SAMPLES * 1000000ULL) / fs;
         transport.sendStoredBatch(stored, seq, ts, NODE_ID);
