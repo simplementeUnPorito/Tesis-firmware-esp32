@@ -888,6 +888,20 @@ class CaptureRunner:
                     f"faltan ~{max(0.0, capture_deadline - now):.0f}s de deadline"
                 )
             self.poll_once(active_deadline)
+            # Watchdog de silencio (F5, 2026-07-12): un socket medio-muerto
+            # (WiFi drop sin FIN) hace que poll_once devuelva timeout limpio
+            # para siempre y el tool esperaba TODO el dump_timeout (46 min a
+            # 52080 lotes) sin reconectar, mientras el maestro pausaba el dump
+            # por falta de cliente. Si estamos en fase dump y no llega DATA
+            # por >20 s, tirar el socket: ensure_connected re-hace el takeover
+            # y el maestro reanuda el dump donde quedó.
+            if (self.first_data_at is not None
+                    and self.last_data_at is not None
+                    and self.sock is not None
+                    and self.samples_written < self.expected_samples
+                    and time.monotonic() - self.last_data_at > 20.0):
+                self.last_data_at = time.monotonic()
+                self._drop_socket("sin DATA >20s durante dump; forzando reconexion")
 
         self.log(
             f"conteo exacto alcanzado ({self.samples_written}); drenando "
