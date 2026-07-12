@@ -1,0 +1,95 @@
+{
+  "actual_file_bytes": 4687200,
+  "batches": 52080,
+  "bytes_written": 4687200,
+  "cleanup_errors": [],
+  "completed_at_utc": "2026-07-12T05:04:16.463068+00:00",
+  "connect_failures": 0,
+  "connections": 1,
+  "decimation_factor": 1,
+  "disconnects": 0,
+  "elapsed_s": 2626.472,
+  "error": null,
+  "expected_samples": 1562400,
+  "extra_samples": 0,
+  "final_cleanup_ok": true,
+  "fs_hz": 2604.0,
+  "hello": {
+    "fs_exact_hz": 2604,
+    "hw_class": 0,
+    "legacy_fs_hz": 2600,
+    "psoc_ok": 1,
+    "sd_present": 1
+  },
+  "host": "192.168.4.1",
+  "initial_cleanup_ok": true,
+  "master_state_history": [
+    {
+      "elapsed_s": 0.036,
+      "name": "IDLE",
+      "state": 0
+    },
+    {
+      "elapsed_s": 0.13,
+      "name": "STOPPING",
+      "state": 4
+    },
+    {
+      "elapsed_s": 0.554,
+      "name": "IDLE",
+      "state": 0
+    },
+    {
+      "elapsed_s": 4.139,
+      "name": "ARMED",
+      "state": 2
+    },
+    {
+      "elapsed_s": 4.53,
+      "name": "RUNNING",
+      "state": 3
+    },
+    {
+      "elapsed_s": 608.132,
+      "name": "DUMPING",
+      "state": 5
+    },
+    {
+      "elapsed_s": 2622.397,
+      "name": "ARMED",
+      "state": 2
+    }
+  ],
+  "node": 1,
+  "other_node_samples": 0,
+  "output_file": "C:\\Github\\Tesis\\src\\esp\\Nodo comunicación\\master\\e5c.i24le",
+  "path": "/ws?takeover=1",
+  "phase_seconds": {
+    "arm": 0.034,
+    "capture_and_dump": 2621.257,
+    "configure": 0.028,
+    "final_cleanup": 1.077,
+    "fresh_hello": 2.922,
+    "initial_cleanup": 1.131,
+    "set_reclen": 0.018
+  },
+  "port": 80,
+  "requested_seconds": 600.0,
+  "sample_format": "signed_int24_le_twos_complement",
+  "samples_per_batch": 30,
+  "samples_written": 1562400,
+  "schema_version": 1,
+  "sd_capture_enabled": true,
+  "sha256": "6332b571f9f688ef828b23906d51cdc0d82c1e5b294a3f522a34cacfeedd64db",
+  "stale_other_samples_before_capture": 0,
+  "stale_target_samples_before_capture": 0,
+  "started_at_utc": "2026-07-12T04:20:29.990726+00:00",
+  "status": "ok",
+  "target_data_packets_seen": 1562400,
+  "ver_ack_values": [
+    1,
+    2
+  ],
+  "ws_packets_received": 1562510,
+  "ws_text_messages_received": 4
+}

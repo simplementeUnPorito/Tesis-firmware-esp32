@@ -5,10 +5,10 @@ Reprogramar el ESP maestro tira el WiFi/AP y Windows suele quedarse colgado de
 otra red. Este script deja la PC de vuelta en GeoNetwork y verifica que el
 maestro responda, sin pasos manuales:
 
-  1. Espera a que el SSID vuelva a ser visible (el maestro tarda unos segundos
-     en levantar el AP después del flasheo).
-  2. `netsh wlan connect name=GeoNetwork` (requiere el perfil ya guardado, que
-     esta PC tiene).
+  1. Solicita el perfil guardado GeoNetwork mediante WlanConnect por ``ctypes``,
+     sin escanear SSIDs (``dot11_BSS_type_any=3``).
+  2. Reintenta mientras el maestro vuelve a levantar el AP y Windows obtiene
+     conectividad.
   3. Verifica HTTP contra http://192.168.4.1/health hasta que conteste.
 
 Uso:

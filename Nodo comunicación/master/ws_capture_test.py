@@ -22,6 +22,7 @@ import base64
 from collections import deque
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import math
 import os
@@ -66,6 +67,7 @@ MASTER_STATES = [
 ]
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_WS_FRAME_BYTES = 16 * 1024 * 1024
+DUMP_SILENCE_RECONNECT_S = 20.0
 
 
 class ProbeError(RuntimeError):
@@ -104,6 +106,15 @@ def resolve_batches(batches: int, seconds: float | None, fs_hz: float) -> int:
     if batches < 1 or batches > MAX_BATCHES:
         raise ValueError(f"batches must be in 1..{MAX_BATCHES}")
     return int(batches)
+
+
+def dump_silence_reconnect_due(silence_since: float | None, now: float) -> bool:
+    """Return whether an active dump has been silent long enough to reconnect."""
+
+    return (
+        silence_since is not None
+        and now - silence_since >= DUMP_SILENCE_RECONNECT_S
+    )
 
 
 def metadata_path_for(output_path: Path) -> Path:
@@ -307,6 +318,7 @@ class CaptureRunner:
         self.stale_other_samples = 0
         self.first_data_at: float | None = None
         self.last_data_at: float | None = None
+        self.dump_silence_since: float | None = None
         self.next_progress_sample = max(1, self.expected_samples // 100)
         self.progress_step = max(1, self.expected_samples // 100)
         self.last_progress_at = self.started_monotonic
@@ -336,6 +348,24 @@ class CaptureRunner:
                 self.disconnects += 1
                 self.last_disconnect_at = time.monotonic()
                 self.log(f"WS desconectado: {reason}")
+
+    def _reconnect_if_dump_silent(self, now: float) -> bool:
+        """Drop a connected half-open socket after the dump silence limit."""
+
+        if (
+            self.sock is None
+            or self.samples_written >= self.expected_samples
+            or not dump_silence_reconnect_due(self.dump_silence_since, now)
+        ):
+            return False
+        # Dar a la nueva conexión una ventana completa. No adulterar
+        # last_data_at: debe seguir representando DATA real.
+        self.dump_silence_since = now
+        self._drop_socket(
+            f"sin DATA >={DUMP_SILENCE_RECONNECT_S:g}s durante dump; "
+            "forzando reconexion"
+        )
+        return True
 
     def close(self) -> None:
         self._drop_socket("cierre local", count_disconnect=False)
@@ -526,6 +556,7 @@ class CaptureRunner:
                     self.first_data_at = now
                     self.log("comenzo el dump DATA del nodo objetivo")
                 self.last_data_at = now
+                self.dump_silence_since = now
                 self._report_progress(now)
             else:
                 if self.capture_accepting:
@@ -547,10 +578,15 @@ class CaptureRunner:
                 self.capture_accepting
                 and node == self.args.node
                 and b2 == SUBCMD_VER
-                and b1 == 0
                 and now >= self.ver_sent_at
             ):
-                raise ProbeError("VER fue rechazado por el esclavo (ACK B2=0)")
+                if b1 == 0:
+                    raise ProbeError("VER fue rechazado por el esclavo (ACK B2=0)")
+                if b1 == 2 and self.dump_silence_since is None:
+                    # B2=2 confirma que el maestro entró a dump. El watchdog
+                    # debe correr desde este instante aunque todavía no haya
+                    # llegado el primer DATA por este socket.
+                    self.dump_silence_since = now
             return
 
         if ptype == PTYPE_READY:
@@ -892,16 +928,11 @@ class CaptureRunner:
             # (WiFi drop sin FIN) hace que poll_once devuelva timeout limpio
             # para siempre y el tool esperaba TODO el dump_timeout (46 min a
             # 52080 lotes) sin reconectar, mientras el maestro pausaba el dump
-            # por falta de cliente. Si estamos en fase dump y no llega DATA
-            # por >20 s, tirar el socket: ensure_connected re-hace el takeover
-            # y el maestro reanuda el dump donde quedó.
-            if (self.first_data_at is not None
-                    and self.last_data_at is not None
-                    and self.sock is not None
-                    and self.samples_written < self.expected_samples
-                    and time.monotonic() - self.last_data_at > 20.0):
-                self.last_data_at = time.monotonic()
-                self._drop_socket("sin DATA >20s durante dump; forzando reconexion")
+            # por falta de cliente. El reloj arranca con ACK B2=2 (o con el
+            # primer DATA, si llega antes), de modo que también cubre el hueco
+            # half-open entre entrar a dump y recibir la primera muestra.
+            watchdog_now = time.monotonic()
+            self._reconnect_if_dump_silent(watchdog_now)
 
         self.log(
             f"conteo exacto alcanzado ({self.samples_written}); drenando "
@@ -1138,7 +1169,46 @@ def run_self_tests() -> None:
         raise AssertionError("misaligned grouped payload must fail")
     assert metadata_path_for(Path("capture.i24le")) == Path("capture.json")
     assert metadata_path_for(Path("capture")) == Path("capture.json")
-    print("self-test OK: 52080 batches, max=60000, WS lengths, grouped packets, int24-le")
+
+    # Regresión F5: B2=2 activa el reloj aun antes del primer DATA. Este es
+    # exactamente el estado que antes quedaba esperando todo el dump_timeout.
+    watchdog_runner = CaptureRunner(argparse.Namespace(node=1), 1, io.BytesIO())
+    watchdog_runner.log = lambda _message: None  # type: ignore[method-assign]
+    watchdog_runner.capture_accepting = True
+    watchdog_runner.ver_sent_at = 0.0
+    watchdog_runner._process_packet(
+        bytes((PKT_HEADER, 1, PTYPE_ACK, SUBCMD_VER, 2, 0))
+    )
+    assert watchdog_runner.first_data_at is None
+    assert watchdog_runner.last_data_at is None
+    silence_since = watchdog_runner.dump_silence_since
+    assert silence_since is not None
+
+    class HalfOpenSocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    half_open = HalfOpenSocket()
+    watchdog_runner.sock = half_open  # type: ignore[assignment]
+    assert not watchdog_runner._reconnect_if_dump_silent(
+        silence_since + DUMP_SILENCE_RECONNECT_S - 0.001
+    )
+    assert watchdog_runner.sock is half_open and not half_open.closed
+    reconnect_at = silence_since + DUMP_SILENCE_RECONNECT_S
+    assert watchdog_runner._reconnect_if_dump_silent(reconnect_at)
+    assert watchdog_runner.sock is None and half_open.closed
+    assert watchdog_runner.disconnects == 1
+    assert watchdog_runner.dump_silence_since == reconnect_at
+    assert watchdog_runner.first_data_at is None
+    assert watchdog_runner.last_data_at is None
+
+    print(
+        "self-test OK: 52080 batches, max=60000, WS lengths, grouped packets, "
+        "int24-le, pre-DATA dump watchdog"
+    )
 
 
 def write_metadata(path: Path, metadata: dict[str, object]) -> None:
