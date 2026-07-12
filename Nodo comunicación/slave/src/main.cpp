@@ -394,6 +394,7 @@ static uint32_t expectedCaptureMs(uint16_t n_batches);
 static bool storeReadyForHotWait();
 static void serviceHotWaitWatchdog();
 static void debugEspSetRamp(bool enable);
+static void psocSyncDisarmPulse(const char *reason);
 
 static void IRAM_ATTR onPsocRxEdge()
 {
