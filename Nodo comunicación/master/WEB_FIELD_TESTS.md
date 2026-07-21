@@ -11,7 +11,7 @@ checklist; una prueba descrita aquí no implica que ya haya sido ejecutada.
 ## Flash previo
 
 ```bash
-cd "src/esp/Nodo comunicación/master"
+cd "firmware/esp32/Nodo comunicación/master"
 pio run -e esp32dev                                      # compilar
 pio run -e esp32dev -t upload --upload-port COM8        # firmware → COM8
 pio run -e esp32dev -t uploadfs --upload-port COM8      # web (LittleFS) → COM8
@@ -23,7 +23,7 @@ En el banco vigente, el GEO físico de COM12 usa el firmware lógico
 `slave1`/`NODE_ID=1`:
 
 ```bash
-cd "src/esp/Nodo comunicación/slave"
+cd "firmware/esp32/Nodo comunicación/slave"
 pio run -e slave1 -t upload --upload-port COM12
 ```
 
@@ -37,9 +37,9 @@ el handoff vigente.
 Los scripts de prueba aceptan nodo destino explicito:
 
 ```bash
-python "src/esp/Nodo comunicación/master/ws_cmd_test.py" --node 1 --total 35
-python "src/esp/Nodo comunicación/master/ws_capture_test.py" --self-test
-python "src/esp/Nodo comunicación/master/ws_capture_test.py" --node 1 --batches 2 --fs 2604 --output smoke_geo_2b.i24le --force
+python "firmware/esp32/Nodo comunicación/master/ws_cmd_test.py" --node 1 --total 35
+python "firmware/esp32/Nodo comunicación/master/ws_capture_test.py" --self-test
+python "firmware/esp32/Nodo comunicación/master/ws_capture_test.py" --node 1 --batches 2 --fs 2604 --output smoke_geo_2b.i24le --force
 ```
 
 La CLI actual de `ws_capture_test.py` no tiene opciones `--stream` ni
@@ -111,7 +111,7 @@ Mitigaciones (2026-07-02):
 ## Path de exportación
 
 1. Tomar una captura y descargar ZIP.
-2. En PC: `python src/python/geophone_scope/zip_to_mat.py capture.zip`
+2. En PC: `python software/python/geophone_scope/zip_to_mat.py capture.zip`
 3. Abrir `.mat` → verificar `raw`, `filt`, `fs`, `pga_code`, `cal_vdacs`.
 
 ## Validacion 2026-07-02
@@ -156,7 +156,7 @@ los datos quedan en el ESP y se recuperan al reconectar.
 Para validar la UI sin el PSoC Hammer físico:
 
 ```bash
-python "src/esp/Nodo comunicación/simulate_hammer_dummy.py" \
+python "firmware/esp32/Nodo comunicación/simulate_hammer_dummy.py" \
   --host 192.168.4.1 --node 1 --type hammer --fs 2604 --psoc 1
 ```
 
@@ -239,7 +239,7 @@ sentidos (E14, dispatch sintético). Veredictos y evidencia en
 Si una prueba futura vuelve a cargar firmware o web, usar puertos explícitos:
 
 ```bash
-cd "src/esp/Nodo comunicación/master"
+cd "firmware/esp32/Nodo comunicación/master"
 pio run -e esp32dev -t upload --upload-port COM8
 pio run -e esp32dev -t uploadfs --upload-port COM8
 ```

@@ -1,0 +1,8 @@
+**/.pio/
+**/.venv/
+**/__pycache__/
+*.py[cod]
+*.log
+.vscode/
+Thumbs.db
+Desktop.ini
