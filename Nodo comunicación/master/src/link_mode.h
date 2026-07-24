@@ -144,6 +144,8 @@ static bool     g_linkQueueOverflow = false;
 static uint32_t g_linkQueueBytes = 0;
 static char     g_linkQueuePath[32] = {0};
 
+inline uint8_t linkCurrentChannel();   /* definida junto a linkStaService() */
+
 static inline bool linkQueueActive() { return g_linkQueueOpen; }
 static inline LinkPhase linkPhase()  { return g_linkPhase; }
 static inline bool linkModeActive()  { return g_linkPhase != LINK_IDLE; }
@@ -585,8 +587,10 @@ inline String linkStatusText()
     s += "\nsite=";        s += g_linkCfg.site;
     s += "\ndistance_mm="; s += String(g_linkCfg.distance_mm);
     s += "\nauto=";        s += g_linkCfg.auto_upload ? "1" : "0";
-    s += "\nip=";          s += (g_linkPhase == LINK_SERVING)
+    s += "\nsta=";         s += (WiFi.status() == WL_CONNECTED) ? "up" : "down";
+    s += "\nip=";          s += (WiFi.status() == WL_CONNECTED)
                                   ? WiFi.localIP().toString() : String("");
+    s += "\nchannel=";     s += String(linkCurrentChannel());
     s += "\nqueue_files="; s += String(linkQueueCount());
     s += "\nqueue_bytes="; s += String(linkQueueBytesPending());
     s += "\nfs_free=";     s += String(linkQueueFreeBytes());
@@ -594,6 +598,76 @@ inline String linkStatusText()
     s += "\nlast_error=";  s += g_linkLastError;
     s += "\n";
     return s;
+}
+
+/* ── Coexistencia permanente (AP + STA a la vez) ─────────────────────────── */
+/* El maestro no "cambia de fase": vive en las dos redes. Se queda en
+ * WIFI_AP_STA con su AP arriba (192.168.4.1 nunca muere, no hace falta redirect
+ * ni buscar la IP nueva) y ademas asociado a la red del cliente.
+ *
+ * La letra chica es la radio: el ESP32 tiene UNA sola. Al asociarse la STA, el
+ * AP es arrastrado al canal del hotspot. ESP-NOW transmite en el canal vigente,
+ * asi que los esclavos tienen que estar en ESE canal, no en uno fijo. Por eso el
+ * esclavo escanea el SSID del maestro y adopta su canal (ver slave). El maestro
+ * publica el canal en /enlace/status para poder diagnosticarlo. */
+
+#ifndef LINK_STA_RETRY_MS
+#define LINK_STA_RETRY_MS  20000u
+#endif
+
+static uint32_t g_linkStaTryMs = 0;
+static bool     g_linkStaWasUp = false;
+
+inline uint8_t linkCurrentChannel()
+{
+    uint8_t ch = 0;
+    wifi_second_chan_t sec;
+    if (esp_wifi_get_channel(&ch, &sec) != ESP_OK) return 0;
+    return ch;
+}
+
+/* Se llama desde loop() en fase CAPTURA. No toca el AP ni ESP-NOW: solo empuja
+ * la STA hacia la red guardada y reporta cuando el estado cambia. */
+inline void linkStaService()
+{
+    if (!linkConfigUsable()) return;
+    if (g_linkPhase != LINK_IDLE) return;   /* la fase ENLACE maneja su propia STA */
+
+    bool up = (WiFi.status() == WL_CONNECTED);
+    if (up != g_linkStaWasUp) {
+        g_linkStaWasUp = up;
+        if (up) {
+            MASTER_LOG_PRINTF("[ENLACE] STA arriba: %s ip=%s canal=%u\n",
+                              g_linkCfg.ssid, WiFi.localIP().toString().c_str(),
+                              linkCurrentChannel());
+            LOGM("STA_UP", "ssid=%s,ip=%s,ch=%u", g_linkCfg.ssid,
+                 WiFi.localIP().toString().c_str(), linkCurrentChannel());
+        } else {
+            MASTER_LOG_PRINTF("[ENLACE] STA caida; AP sigue en canal %u\n",
+                              linkCurrentChannel());
+            LOGM("STA_DOWN", "ch=%u", linkCurrentChannel());
+        }
+    }
+    if (up) return;
+
+    if (g_linkStaTryMs != 0 && (millis() - g_linkStaTryMs) < LINK_STA_RETRY_MS) return;
+    g_linkStaTryMs = millis();
+    /* WiFi.begin sobre WIFI_AP_STA no baja el AP: la SPA sigue servida en
+     * 192.168.4.1 durante todo el intento. */
+    WiFi.begin(g_linkCfg.ssid, g_linkCfg.pass);
+    MASTER_LOG_PRINTF("[ENLACE] STA intentando %s (canal actual %u)\n",
+                      g_linkCfg.ssid, linkCurrentChannel());
+}
+
+/* Fuerza un intento inmediato: lo llama el POST /enlace/config, para que apretar
+ * Guardar se sienta como "conectate ahora" sin que haya un boton aparte. */
+inline void linkStaRetryNow()
+{
+    g_linkStaTryMs = 0;
+    if (linkConfigUsable() && WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(false, false);   /* reasociar con la config nueva */
+        g_linkStaWasUp = false;
+    }
 }
 
 inline void linkModeBegin()

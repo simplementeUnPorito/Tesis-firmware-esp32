@@ -62,9 +62,16 @@ export function initEnlaceTab(log) {
     const kb = (bytes / 1024).toFixed(1);
     const freeKb = (Number(st.fs_free || 0) / 1024).toFixed(0);
 
-    let txt = PHASE_LABEL[phase] || phase;
-    if (files > 0) txt += ` · ${files} captura${files === 1 ? '' : 's'} sin subir (${kb} kB)`;
-    if (st.ip) { txt += ` · IP ${st.ip}`; lastIp = st.ip; }
+    let txt = st.sta === 'up'
+      ? `conectado a ${st.ssid || 'la red'} · IP ${st.ip}`
+      : `sin conectar a ${st.ssid || '(sin red cargada)'}`;
+    // El canal es el dato que decide si el maestro puede estar en las dos redes
+    // a la vez: los esclavos tienen que estar en ESTE canal para que ESP-NOW
+    // siga andando mientras la STA esta asociada.
+    const ch = Number(st.channel || 0);
+    if (ch) txt += ` · canal ${ch}${ch === 1 ? '' : ' (los esclavos deben seguirlo)'}`;
+    if (files > 0) txt += ` · ${files} captura${files === 1 ? '' : 's'} en cola (${kb} kB)`;
+    if (st.ip) lastIp = st.ip;
     if (st.last_error) txt += ` · ${st.last_error}`;
     txt += ` · libre ${freeKb} kB`;
     show(txt);

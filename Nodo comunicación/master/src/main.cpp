@@ -1683,6 +1683,10 @@ void loop()
     }
     webRelayService();
     linkRssiLoop();
+    /* Mantiene la STA asociada a la red del cliente sin bajar el AP ni ESP-NOW:
+     * el maestro habita las dos redes. Ver linkStaService() para la letra chica
+     * del canal compartido. */
+    linkStaService();
 
     if (g_webReplayCachedState) {
         g_webReplayCachedState = false;

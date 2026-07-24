@@ -149,7 +149,13 @@ inline bool webServerBegin()
      * que no aparece — y tiene que estar disponible aunque no se haya hecho
      * `pio run -t uploadfs`. Se sirve sobre el AP propio, que es donde cae el
      * operador cuando el ENLACE no prospera. */
-    webServer.on("/enlace", HTTP_GET, [](AsyncWebServerRequest *request) {
+    /* OJO con el path: en ESPAsyncWebServer un handler registrado en "/x"
+     * tambien matchea "/x/loquesea" (hace url.startsWith(uri + "/")). Cuando
+     * esta pagina estaba en "/enlace" se comia todos los GET de /enlace/status y
+     * /enlace/queue —devolvia el HTML en vez del estado— porque se registra
+     * antes. De ahi el "-setup": un prefijo distinto no puede tapar a los otros.
+     * No renombrar a "/enlace" de nuevo. */
+    webServer.on("/enlace-setup", HTTP_GET, [](AsyncWebServerRequest *request) {
         request->send(200, "text/html",
             "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<title>Enlace - Geophone</title>"
@@ -268,6 +274,7 @@ inline bool webServerBegin()
             cfg.auto_upload = (request->getParam("auto", true)->value().toInt() != 0);
         }
         linkConfigSet(cfg);
+        linkStaRetryNow();   /* Guardar = conectate ahora, sin boton aparte */
         request->send(200, "text/plain", linkStatusText());
     });
 
