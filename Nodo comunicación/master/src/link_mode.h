@@ -68,6 +68,7 @@
  * ==========================================================================*/
 
 #include <Arduino.h>
+#include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -615,6 +616,13 @@ inline String linkStatusText()
 #define LINK_STA_RETRY_MS  20000u
 #endif
 
+/* Una sola direccion para todo, en las dos redes: http://geo.local
+ * Del lado del AP propio tambien resuelve sin mDNS, porque el portal cautivo
+ * contesta cualquier dominio con 192.168.4.1 (ver dnsServer en main.cpp). */
+#ifndef LINK_MDNS_NAME
+#define LINK_MDNS_NAME  "geo"
+#endif
+
 static uint32_t g_linkStaTryMs = 0;
 static bool     g_linkStaWasUp = false;
 
@@ -642,6 +650,16 @@ inline void linkStaService()
                               linkCurrentChannel());
             LOGM("STA_UP", "ssid=%s,ip=%s,ch=%u", g_linkCfg.ssid,
                  WiFi.localIP().toString().c_str(), linkCurrentChannel());
+            /* Re-anunciar mDNS con la interfaz nueva: si no, geo.local sigue
+             * resolviendo solo del lado del AP y en la red del cliente no
+             * aparece. La idea es que geo.local sea la unica direccion que haya
+             * que recordar, en cualquiera de las dos redes. */
+            MDNS.end();
+            if (MDNS.begin(LINK_MDNS_NAME)) {
+                MDNS.addService("http", "tcp", 80);
+                MASTER_LOG_PRINTF("[ENLACE] mDNS re-anunciado: http://%s.local\n",
+                                  LINK_MDNS_NAME);
+            }
         } else {
             MASTER_LOG_PRINTF("[ENLACE] STA caida; AP sigue en canal %u\n",
                               linkCurrentChannel());

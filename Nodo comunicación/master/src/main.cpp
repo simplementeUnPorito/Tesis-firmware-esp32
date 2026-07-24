@@ -1614,9 +1614,9 @@ void setup()
     /* mDNS: el maestro queda alcanzable como http://geo.local desde las dos
      * redes, sin tener que averiguar qué IP le dio el DHCP del celular. En el AP
      * propio sigue estando 192.168.4.1, que no depende de mDNS. */
-    if (MDNS.begin("geo")) {
+    if (MDNS.begin(LINK_MDNS_NAME)) {
         MDNS.addService("http", "tcp", 80);
-        MASTER_LOG_PRINTLN("[MASTER] mDNS: http://geo.local");
+        MASTER_LOG_PRINTF("[MASTER] mDNS: http://%s.local\n", LINK_MDNS_NAME);
     }
 
     /* ESP-NOW (convive con AP mode) */

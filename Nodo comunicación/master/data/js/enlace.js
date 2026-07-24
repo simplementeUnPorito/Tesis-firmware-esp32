@@ -62,9 +62,12 @@ export function initEnlaceTab(log) {
     const kb = (bytes / 1024).toFixed(1);
     const freeKb = (Number(st.fs_free || 0) / 1024).toFixed(0);
 
+    // Siempre se nombra geo.local, en las dos redes: es la unica direccion que
+    // hay que recordar. La IP va como dato de respaldo por si mDNS falla (algunos
+    // Android no resuelven .local de forma confiable).
     let txt = st.sta === 'up'
-      ? `conectado a ${st.ssid || 'la red'} · IP ${st.ip}`
-      : `sin conectar a ${st.ssid || '(sin red cargada)'}`;
+      ? `en las dos redes · http://geo.local (${st.ip} en ${st.ssid || 'la red'})`
+      : `solo en GeoNetwork · http://geo.local — sin conectar a ${st.ssid || '(sin red cargada)'}`;
     // El canal es el dato que decide si el maestro puede estar en las dos redes
     // a la vez: los esclavos tienen que estar en ESTE canal para que ESP-NOW
     // siga andando mientras la STA esta asociada.
