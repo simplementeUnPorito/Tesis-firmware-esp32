@@ -39,19 +39,19 @@ const PHASE_LABEL = {
   volviendo: 'volviendo a captura…',
 };
 
-// La pagina tiene que vivir en geo.local, no en una IP. Motivo: el maestro habita
+// La pagina tiene que vivir en geo-obtain.local, no en una IP. Motivo: el maestro habita
 // dos redes y el cliente se mueve entre ellas; una pagina cargada desde
 // 192.168.4.1 queda con un origen que deja de existir en cuanto el telefono
-// vuelve a su red, y hay que recargar a mano en la IP nueva. geo.local resuelve en
+// vuelve a su red, y hay que recargar a mano en la IP nueva. geo-obtain.local resuelve
 // las dos (mDNS del lado del cliente, portal cautivo del lado del AP), asi que el
 // origen sobrevive el cambio y el WebSocket se reconecta solo.
 function ensureStableOrigin() {
   const h = location.hostname;
-  if (!h || h === 'geo.local' || h === 'geo') return;
+  if (!h || h === 'geo-obtain.local' || h === 'geo-obtain') return;
   // Solo redirigir si estamos en una IP: un nombre cualquiera puede ser un proxy
   // o un tunel que el usuario puso a proposito.
   if (!/^\d+\.\d+\.\d+\.\d+$/.test(h)) return;
-  location.replace(`http://geo.local${location.pathname}${location.search}`);
+  location.replace(`http://geo-obtain.local${location.pathname}${location.search}`);
 }
 
 export function initEnlaceTab(log) {
@@ -78,12 +78,12 @@ export function initEnlaceTab(log) {
     const kb = (bytes / 1024).toFixed(1);
     const freeKb = (Number(st.fs_free || 0) / 1024).toFixed(0);
 
-    // Siempre se nombra geo.local, en las dos redes: es la unica direccion que
+    // Siempre se nombra geo-obtain.local, en las dos redes: es la unica direccion que
     // hay que recordar. La IP va como dato de respaldo por si mDNS falla (algunos
     // Android no resuelven .local de forma confiable).
     let txt = st.sta === 'up'
-      ? `en las dos redes · http://geo.local (${st.ip} en ${st.ssid || 'la red'})`
-      : `solo en GeoNetwork · http://geo.local — sin conectar a ${st.ssid || '(sin red cargada)'}`;
+      ? `en las dos redes · http://geo-obtain.local (${st.ip} en ${st.ssid || 'la red'})`
+      : `solo en GeoNetwork · http://geo-obtain.local — sin conectar a ${st.ssid || '(sin red cargada)'}`;
     // El canal es el dato que decide si el maestro puede estar en las dos redes
     // a la vez: los esclavos tienen que estar en ESTE canal para que ESP-NOW
     // siga andando mientras la STA esta asociada.

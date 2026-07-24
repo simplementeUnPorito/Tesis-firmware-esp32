@@ -616,11 +616,17 @@ inline String linkStatusText()
 #define LINK_STA_RETRY_MS  20000u
 #endif
 
-/* Una sola direccion para todo, en las dos redes: http://geo.local
- * Del lado del AP propio tambien resuelve sin mDNS, porque el portal cautivo
- * contesta cualquier dominio con 192.168.4.1 (ver dnsServer en main.cpp). */
+/* Nombre del equipo de campo: http://geo-obtain.local
+ * Va en par con el servidor de datos (geo-data), para que se distingan de una:
+ * "obtain" adquiere, "data" analiza.
+ *
+ * Por que con guion y con .local, y no "geo.obtain": mDNS resuelve UNA etiqueta
+ * mas el sufijo .local — "geo.obtain" no es resoluble sin montar un DNS propio.
+ * geo-obtain.local es lo mas cerca que se puede llegar y funciona sin
+ * infraestructura. Del lado del AP propio resuelve incluso sin mDNS, porque el
+ * portal cautivo contesta cualquier dominio con 192.168.4.1. */
 #ifndef LINK_MDNS_NAME
-#define LINK_MDNS_NAME  "geo"
+#define LINK_MDNS_NAME  "geo-obtain"
 #endif
 
 static uint32_t g_linkStaTryMs = 0;
