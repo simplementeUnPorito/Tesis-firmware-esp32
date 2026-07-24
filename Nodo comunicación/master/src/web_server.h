@@ -143,6 +143,55 @@ inline bool webServerBegin()
     });
 #endif
 
+    /* Pagina minima de aprovisionamiento del ENLACE. Va embebida en el firmware
+     * (no en LittleFS) a proposito: es la pantalla que se necesita justamente
+     * cuando algo no esta en su lugar — sin red guardada, o con una red guardada
+     * que no aparece — y tiene que estar disponible aunque no se haya hecho
+     * `pio run -t uploadfs`. Se sirve sobre el AP propio, que es donde cae el
+     * operador cuando el ENLACE no prospera. */
+    webServer.on("/enlace", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/html",
+            "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Enlace - Geophone</title>"
+            "<style>"
+            "body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:20px}"
+            "h1{font-size:1.25rem;margin:0 0 4px}"
+            "p.sub{color:#9aa;margin:0 0 20px;font-size:.9rem}"
+            "label{display:block;margin:14px 0 4px;font-size:.85rem;color:#9cf}"
+            "input{width:100%;box-sizing:border-box;padding:11px;font-size:1rem;"
+            "background:#1b1b1b;color:#eee;border:1px solid #333;border-radius:6px}"
+            "button{width:100%;box-sizing:border-box;margin-top:18px;padding:13px;"
+            "font-size:1rem;border:0;border-radius:6px;background:#2a6;color:#fff}"
+            "button.alt{background:#345;margin-top:10px}"
+            "pre{background:#1b1b1b;padding:12px;border-radius:6px;white-space:pre-wrap;"
+            "font-size:.8rem;color:#9aa;overflow-x:auto}"
+            "</style>"
+            "<h1>Red del enlace</h1>"
+            "<p class='sub'>Red con internet a la que se asocia el maestro para "
+            "que el cliente se lleve las capturas.</p>"
+            "<label for='s'>Nombre de la red</label><input id='s' autocapitalize='off'>"
+            "<label for='p'>Contrase&ntilde;a</label><input id='p' type='password'>"
+            "<button onclick='save()'>Guardar</button>"
+            "<button class='alt' onclick='go()'>Conectar ahora</button>"
+            "<pre id='o'>cargando...</pre>"
+            "<script>"
+            "const O=document.getElementById('o');"
+            "function st(t){O.textContent=t;"
+            "  const m=/^ssid=(.*)$/m.exec(t); if(m&&!document.getElementById('s').value)"
+            "    document.getElementById('s').value=m[1];}"
+            "function load(){fetch('/enlace/status').then(r=>r.text()).then(st)"
+            "  .catch(e=>st('error: '+e));}"
+            "function save(){const b=new URLSearchParams();"
+            "  b.append('ssid',document.getElementById('s').value);"
+            "  b.append('pass',document.getElementById('p').value);"
+            "  fetch('/enlace/config',{method:'POST',body:b}).then(r=>r.text()).then(st)"
+            "  .catch(e=>st('error: '+e));}"
+            "function go(){fetch('/enlace/now',{method:'POST'}).then(r=>r.text()).then(st)"
+            "  .catch(e=>st('error: '+e));}"
+            "load();"
+            "</script>");
+    });
+
     /* ── Modo ENLACE ──────────────────────────────────────────────────────
      * La config lleva SSID, password y URL del sink: strings que no entran en
      * el protocolo de 6 bytes que usan el resto de los comandos, asi que va por
@@ -181,6 +230,17 @@ inline bool webServerBegin()
         }
         bool ok = linkQueueAck(request->getParam("name", true)->value());
         request->send(ok ? 200 : 404, "text/plain", ok ? "borrado" : "no existe");
+    });
+
+    /* Disparar ENLACE sin depender de la SPA ni de MATLAB (equivale al cmd
+     * 0xC0 param=1). Se rechaza si el estado no lo permite: nunca a mitad de
+     * captura. */
+    webServer.on("/enlace/now", HTTP_POST, [](AsyncWebServerRequest *request) {
+        const char *why = "";
+        bool ok = linkEnterViaHook(&why);
+        String body = ok ? String("ENLACE pedido\n") : (String("rechazado: ") + why + "\n");
+        body += linkStatusText();
+        request->send(ok ? 200 : 409, "text/plain", body);
     });
 
     /* El cliente avisa que termino: volver a canal 1 sin esperar el idle. */

@@ -1585,6 +1585,7 @@ void setup()
         /* Modo ENLACE: config persistida + cola en el mismo LittleFS que la
          * SPA, por eso va después de webServerBegin() (que hace el mount). */
         linkModeBegin();
+        linkSetEnterHook(requestEnlace);   /* habilita POST /enlace/now */
     }
 
     /* ESP-NOW (convive con AP mode) */

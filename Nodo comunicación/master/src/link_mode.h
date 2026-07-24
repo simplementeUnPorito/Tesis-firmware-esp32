@@ -449,6 +449,19 @@ inline bool linkQueueAck(const String &name)
     return ok;
 }
 
+/* Hook para disparar ENLACE desde un endpoint HTTP. La decision de si el estado
+ * lo permite (solo IDLE/ARMED) vive en main.cpp, que es quien conoce la maquina
+ * de estados del maestro; aca solo se guarda el puntero. */
+typedef bool (*LinkEnterFn)(const char **why);
+static LinkEnterFn g_linkEnterHook = nullptr;
+inline void linkSetEnterHook(LinkEnterFn fn) { g_linkEnterHook = fn; }
+
+inline bool linkEnterViaHook(const char **why)
+{
+    if (!g_linkEnterHook) { if (why) *why = "sin hook"; return false; }
+    return g_linkEnterHook(why);
+}
+
 /* El cliente avisa que termino: volver a CAPTURA sin esperar el idle. */
 inline void linkClientDone()
 {
