@@ -625,6 +625,7 @@ inline String linkStatusText()
 
 static uint32_t g_linkStaTryMs = 0;
 static bool     g_linkStaWasUp = false;
+static bool     g_linkStaRetryPending = false;
 
 inline uint8_t linkCurrentChannel()
 {
@@ -640,6 +641,19 @@ inline void linkStaService()
 {
     if (!linkConfigUsable()) return;
     if (g_linkPhase != LINK_IDLE) return;   /* la fase ENLACE maneja su propia STA */
+
+    /* Reasociacion pedida por /enlace/config, aplicada aca y no dentro del
+     * handler HTTP: desconectar la STA mientras se contesta un pedido que llego
+     * POR esa STA mata la respuesta a medio camino. Paso de verdad — el POST de
+     * guardar no devolvia nada y parecia que habia fallado. */
+    if (g_linkStaRetryPending) {
+        g_linkStaRetryPending = false;
+        g_linkStaTryMs = 0;
+        if (WiFi.status() == WL_CONNECTED) {
+            WiFi.disconnect(false, false);
+            g_linkStaWasUp = false;
+        }
+    }
 
     bool up = (WiFi.status() == WL_CONNECTED);
     if (up != g_linkStaWasUp) {
@@ -660,6 +674,14 @@ inline void linkStaService()
                 MASTER_LOG_PRINTF("[ENLACE] mDNS re-anunciado: http://%s.local\n",
                                   LINK_MDNS_NAME);
             }
+            /* Echar a los clientes del AP: el que acaba de cargar la red ya no
+             * tiene nada que hacer ahi, y mientras siga pegado al AP no ve al
+             * maestro en la red nueva. Al quedar sin AP, el telefono vuelve solo
+             * a su red habitual — donde el maestro ya esta y geo.local resuelve.
+             * Se usa deauth y no softAPdisconnect() porque este ultimo bajaria el
+             * AP entero, y el AP tiene que seguir arriba para el proximo. */
+            esp_wifi_deauth_sta(0);   /* 0 = todas las estaciones */
+            MASTER_LOG_PRINTLN("[ENLACE] clientes del AP echados; buscar geo.local en la red nueva");
         } else {
             MASTER_LOG_PRINTF("[ENLACE] STA caida; AP sigue en canal %u\n",
                               linkCurrentChannel());
@@ -678,14 +700,38 @@ inline void linkStaService()
 }
 
 /* Fuerza un intento inmediato: lo llama el POST /enlace/config, para que apretar
- * Guardar se sienta como "conectate ahora" sin que haya un boton aparte. */
-inline void linkStaRetryNow()
+ * Guardar se sienta como "conectate ahora" sin que haya un boton aparte. Solo
+ * marca la intencion; el trabajo lo hace linkStaService() en el loop (ver ahi
+ * por que no se puede desconectar desde el handler). */
+inline void linkStaRetryNow() { g_linkStaRetryPending = true; }
+
+/* ── Escaneo asincronico ─────────────────────────────────────────────────── */
+/* WiFi.scanNetworks() bloqueante tarda 2-4 s y corre en la task de AsyncTCP:
+ * el stack TCP se atasca y el navegador aborta con "TypeError: Failed to fetch".
+ * Por eso el escaneo se dispara async y el endpoint contesta 202 mientras corre;
+ * el cliente vuelve a preguntar. */
+inline int linkScanPoll(String &out)
 {
-    g_linkStaTryMs = 0;
-    if (linkConfigUsable() && WiFi.status() == WL_CONNECTED) {
-        WiFi.disconnect(false, false);   /* reasociar con la config nueva */
-        g_linkStaWasUp = false;
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) return -1;          /* en curso */
+    if (n == WIFI_SCAN_FAILED) {
+        WiFi.scanNetworks(true, false);             /* arrancar uno nuevo */
+        return -1;
     }
+    out = "";
+    out.reserve(n > 0 ? n * 48 : 32);
+    for (int i = 0; i < n; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) continue;
+        out += String(WiFi.channel(i));
+        out += ' ';
+        out += String(WiFi.RSSI(i));
+        out += ' ';
+        out += ssid;
+        out += '\n';
+    }
+    WiFi.scanDelete();
+    return n;
 }
 
 inline void linkModeBegin()

@@ -210,20 +210,14 @@ inline bool webServerBegin()
      * STA (los esclavos tienen que estar en el canal del hotspot).
      * Formato: "<canal> <rssi> <ssid>" por linea, mas fuerte primero. */
     webServer.on("/enlace/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
-        int n = WiFi.scanNetworks(false /*async*/, false /*hidden*/);
         String body;
-        body.reserve(n > 0 ? n * 48 : 32);
-        for (int i = 0; i < n; i++) {
-            String ssid = WiFi.SSID(i);
-            if (ssid.length() == 0) continue;
-            body += String(WiFi.channel(i));
-            body += ' ';
-            body += String(WiFi.RSSI(i));
-            body += ' ';
-            body += ssid;
-            body += '\n';
+        int n = linkScanPoll(body);
+        if (n < 0) {
+            /* 202 = todavia corriendo; el cliente vuelve a preguntar. Nunca
+             * bloquear aca: esta lambda corre en la task de AsyncTCP. */
+            request->send(202, "text/plain", "escaneando\n");
+            return;
         }
-        WiFi.scanDelete();
         request->send(200, "text/plain", body);
     });
 

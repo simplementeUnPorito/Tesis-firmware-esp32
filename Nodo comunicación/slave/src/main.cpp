@@ -152,6 +152,34 @@ static uint8_t g_masterTxMac[6] = {
 #endif
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
+/* ── Seguimiento del canal del maestro ───────────────────────────────────────
+ * El maestro ya no vive solo en su AP: tambien se asocia a la red del cliente
+ * (hotspot del celular) para que se puedan bajar las capturas. El ESP32 tiene UNA
+ * sola radio, asi que al asociarse su AP es arrastrado al canal de esa red — y
+ * ESP-NOW transmite en el canal vigente. Fijar el canal 1 aca funcionaba solo
+ * mientras el maestro estuviera en canal 1: si el hotspot cae en 6 u 11, el
+ * esclavo se queda sordo sin que nada lo indique.
+ *
+ * La solucion es no fijar nada: buscar el AP del maestro por SSID y adoptar su
+ * canal, y volver a buscarlo si el trafico se corta. Nada de esto toca el
+ * protocolo con el PSoC ni el protocolo ESP-NOW: solo cambia en que canal
+ * escucha la radio. */
+#ifndef MASTER_AP_SSID
+#define MASTER_AP_SSID  "GeoNetwork"
+#endif
+#ifndef MASTER_CH_FALLBACK
+#define MASTER_CH_FALLBACK  1
+#endif
+/* Silencio tolerado antes de sospechar que el maestro cambio de canal. Tiene que
+ * ser MAYOR que la captura mas larga posible: durante SAMPLING el maestro no
+ * habla, y rescanear ahi seria romper la captura. Igual se gatea por estado. */
+#ifndef MASTER_SILENCE_MS
+#define MASTER_SILENCE_MS  (45u * 1000u)
+#endif
+
+static volatile uint32_t g_lastMasterRxMs = 0;
+static uint8_t  g_masterChannel = MASTER_CH_FALLBACK;
+
 enum SlaveState { WAIT_ARM, ARMED, HOT_WAIT, SAMPLING, STOPPED };
 static volatile SlaveState g_state       = WAIT_ARM;
 static bool                g_psocConnected = false;  /* resultado de probe() en setup */
@@ -2556,6 +2584,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
     if (len < 1) return;
     learnMasterMac(mac);
+    g_lastMasterRxMs = millis();   /* para el seguimiento de canal (ver abajo) */
     uint8_t cmd = data[0];
     if (g_state == SAMPLING && cmd != CMD_STOP && cmd != CMD_ARM) {
         /* En debug/test, VER puede interrumpir para evitar race condition */
@@ -3016,6 +3045,59 @@ static void onBatch(const PsocBatch &batch)
     }
 }
 
+/* ── Seguimiento del canal del maestro ───────────────────────────────────── */
+
+#if !defined(ESP8266)
+/* Busca el AP del maestro por SSID y devuelve su canal. Bloquea ~2 s (el escaneo
+ * pasa por los 13 canales); solo se llama en boot o cuando ya no hay trafico, o
+ * sea nunca durante una captura. */
+static uint8_t findMasterChannel(uint8_t fallback)
+{
+    int n = WiFi.scanNetworks(false /*async*/, true /*hidden*/);
+    uint8_t ch = 0;
+    int32_t best = -1000;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) != MASTER_AP_SSID) continue;
+        /* Puede haber más de un maestro al alcance: quedarse con el más fuerte. */
+        if (WiFi.RSSI(i) > best) { best = WiFi.RSSI(i); ch = WiFi.channel(i); }
+    }
+    WiFi.scanDelete();
+    if (ch == 0) {
+        SLAVE_LOG_PRINTF("[SLAVE] AP '%s' no encontrado en %d redes; canal %u\n",
+                         MASTER_AP_SSID, n, fallback);
+        return fallback;
+    }
+    SLAVE_LOG_PRINTF("[SLAVE] AP '%s' en canal %u (%d dBm)\n",
+                     MASTER_AP_SSID, ch, (int)best);
+    return ch;
+}
+
+/* Si el maestro deja de hablar, puede haberse movido de canal (se asocio a la red
+ * del cliente y arrastro su AP). Rescanear y reengancharse.
+ * Se gatea por estado: durante SAMPLING el silencio es normal —el protocolo es
+ * maestro-iniciado— y un escaneo ahi arruinaria la captura. */
+static void masterChannelService()
+{
+    if (g_state == SAMPLING || g_state == HOT_WAIT) return;
+    if (g_lastMasterRxMs == 0) return;      /* nunca hablo: el boot ya escaneo */
+    if ((millis() - g_lastMasterRxMs) < MASTER_SILENCE_MS) return;
+
+    uint8_t ch = findMasterChannel(g_masterChannel);
+    if (ch != g_masterChannel) {
+        SLAVE_LOG_PRINTF("[SLAVE] maestro cambio de canal %u -> %u\n",
+                         g_masterChannel, ch);
+        g_masterChannel = ch;
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    }
+    /* Reiniciar el reloj aunque el canal no haya cambiado: si no, se rescanea en
+     * bucle cada pasada de loop() mientras el maestro siga callado. */
+    g_lastMasterRxMs = millis();
+}
+#else
+static uint8_t findMasterChannel(uint8_t fallback) { return fallback; }
+static void masterChannelService() {}
+#endif
+
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
 void setup()
@@ -3056,11 +3138,12 @@ void setup()
     esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
     WiFi.disconnect();
     delay(100);
-    /* Fijar canal 1 explícitamente para coincidir con el AP del maestro.
-     * Sin esto, STA desconectado puede quedar en canal 0 (indefinido) y los
-     * paquetes ESP-NOW se pierden porque maestro y esclavo están en canales distintos. */
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    SLAVE_LOG_PRINTF("[SLAVE] MAC: %s  ch=%d\n",
+    /* Adoptar el canal del AP del maestro en vez de fijar el 1: el maestro puede
+     * estar arrastrado al canal de la red del cliente. Si no se lo encuentra se
+     * usa el 1, que es donde arranca su AP. Ver el comentario de arriba. */
+    g_masterChannel = findMasterChannel(MASTER_CH_FALLBACK);
+    esp_wifi_set_channel(g_masterChannel, WIFI_SECOND_CHAN_NONE);
+    SLAVE_LOG_PRINTF("[SLAVE] MAC: %s  ch=%d (maestro)\n",
                      WiFi.macAddress().c_str(), WiFi.channel());
     SLAVE_LOG_PRINTF("[SLAVE] WiFi ps=off tx=%d qdBm\n", WIFI_TX_POWER_QDBM);
 #endif
@@ -3112,6 +3195,9 @@ void loop()
 {
     if (g_state != SAMPLING) {
         debugEspHardwareService();
+        /* Reengancharse al canal del maestro si dejo de hablar. No corre durante
+         * SAMPLING/HOT_WAIT: ahi el silencio es parte del protocolo. */
+        masterChannelService();
     }
 
     /* Drenar siempre la UART del PSoC (onBatch ignora si no está SAMPLING). */

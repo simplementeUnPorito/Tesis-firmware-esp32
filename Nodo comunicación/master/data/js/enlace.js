@@ -39,7 +39,23 @@ const PHASE_LABEL = {
   volviendo: 'volviendo a captura…',
 };
 
+// La pagina tiene que vivir en geo.local, no en una IP. Motivo: el maestro habita
+// dos redes y el cliente se mueve entre ellas; una pagina cargada desde
+// 192.168.4.1 queda con un origen que deja de existir en cuanto el telefono
+// vuelve a su red, y hay que recargar a mano en la IP nueva. geo.local resuelve en
+// las dos (mDNS del lado del cliente, portal cautivo del lado del AP), asi que el
+// origen sobrevive el cambio y el WebSocket se reconecta solo.
+function ensureStableOrigin() {
+  const h = location.hostname;
+  if (!h || h === 'geo.local' || h === 'geo') return;
+  // Solo redirigir si estamos en una IP: un nombre cualquiera puede ser un proxy
+  // o un tunel que el usuario puso a proposito.
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(h)) return;
+  location.replace(`http://geo.local${location.pathname}${location.search}`);
+}
+
 export function initEnlaceTab(log) {
+  ensureStableOrigin();
   const statusEl = $('enlace-status');
   if (!statusEl) return;   // tab ausente (firmware viejo / index parcial)
 
@@ -142,12 +158,24 @@ export function initEnlaceTab(log) {
   // Escaneo: dice si el maestro VE la red, que es lo primero a descartar cuando
   // no se asocia. Si la red no aparece aca, no es la contrasena: el ESP32 es solo
   // 2.4 GHz, asi que un hotspot en 5 GHz (o WPA3, o oculto) es invisible para el.
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
   $('btn-enlace-scan').addEventListener('click', async () => {
     show('escaneando…');
     try {
-      const r = await fetch('/enlace/scan', { cache: 'no-store' });
-      if (!r.ok) { show(`el maestro respondió HTTP ${r.status} al escanear`); return; }
-      const txt = (await r.text()).trim();
+      // El maestro contesta 202 mientras el escaneo corre (no puede bloquear la
+      // task de AsyncTCP), asi que hay que volver a preguntar hasta que termine.
+      let txt = '';
+      let listo = false;
+      for (let intento = 0; intento < 8; intento++) {
+        const r = await fetch('/enlace/scan', { cache: 'no-store' });
+        if (r.status === 202) { await sleep(1200); continue; }
+        if (!r.ok) { show(`el maestro respondió HTTP ${r.status} al escanear`); return; }
+        txt = (await r.text()).trim();
+        listo = true;
+        break;
+      }
+      if (!listo) { show('el escaneo no terminó a tiempo'); return; }
       const dl = $('enlace-redes');
       dl.innerHTML = '';
       if (!txt) { show('el maestro no ve ninguna red 2.4 GHz'); return; }
