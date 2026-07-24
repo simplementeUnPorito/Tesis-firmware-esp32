@@ -33,6 +33,7 @@
 #include "master_log.h"
 #include "debug_log.h"
 #include "web_server.h"
+#include "link_mode.h"
 #include "../../scope_measurement.h"
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
@@ -150,7 +151,10 @@ static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
 #endif
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
-enum MasterState { IDLE, ARMING, ARMED, RUNNING, STOPPING, DUMPING, PRESTART, SCOPE_MULTI };
+/* ENLACE: fase de subida. El maestro baja su AP y ESP-NOW y se asocia como STA
+ * a una red con internet para vaciar la cola de capturas. Solo se entra desde
+ * IDLE/ARMED — nunca a mitad de captura (ver PLAN_CONECTIVIDAD_MASTER.md). */
+enum MasterState { IDLE, ARMING, ARMED, RUNNING, STOPPING, DUMPING, PRESTART, SCOPE_MULTI, ENLACE };
 enum PrestartAction { PRESTART_ACTION_START, PRESTART_ACTION_SCOPE_MULTI, PRESTART_ACTION_START_PROBE, PRESTART_ACTION_VER };
 static MasterState g_state       = IDLE;
 static PrestartAction g_prestartAction = PRESTART_ACTION_START;
@@ -249,6 +253,8 @@ static CachedHello g_cachedHello[NUM_SLAVES + 1];
 static volatile bool g_webReplayCachedState = false;
 
 static void beginDump(const char *reason);
+static bool requestEnlace(const char **why);
+static uint8_t collectLinkNodes(LinkNodeInfo *out, uint8_t maxNodes);
 static void abortCaptureToArmed(uint8_t nodeId, const char *reason);
 static void beginPrestart(PrestartAction action);
 static void beacon_pause(void);
@@ -789,6 +795,18 @@ static void beginDump(const char *reason)
         dumpDeliveryGuardReset();
         g_dumpRetries  = 0;
         matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+
+        /* Encolar la sesion en LittleFS ademas de espejarla por WS. Es el
+         * buffer que le falta al maestro para poder subir de noche sin
+         * navegador. Un VIEW dump no se encola: es inspeccion, no sesion. */
+        if (!g_viewDump) {
+            LinkNodeInfo nodes[NUM_SLAVES];
+            uint8_t nodeCount = collectLinkNodes(nodes, NUM_SLAVES);
+            uint32_t expect = 0;
+            for (uint8_t i = 0; i < nodeCount; i++) expect += (uint32_t)nodes[i].n_batches * 102u;
+            linkQueueBegin(g_rec_n_batches, nodes, nodeCount, expect);
+        }
+
         requestBatch(g_dumpSlaveIdx, g_dumpBatchSeq);
         g_dumpReqMs = millis();
         MASTER_LOG_PRINTF("[MASTER] DUMPING (%s) slave %d/%d seq 0/%d\n",
@@ -1211,6 +1229,19 @@ static void onBatchReady(const ReassembledBatch &batch)
 
     /* Durante dump: marcar batch como recibido si es el que esperábamos */
     if (g_state == DUMPING) {
+        /* Tee a la cola de ENLACE: mismo lote crudo que ya fue al WS. Se guarda
+         * empaquetado tal cual vino (3 bytes por muestra); la conversion a f32
+         * y el armado de carpetas los hace el sink en Python, no el firmware. */
+        if (linkQueueActive()) {
+            uint8_t packed[SAMPLES_PER_PART * 2 * 3];
+            for (int i = 0; i < SAMPLES_PER_PART * 2; i++) {
+                packed[i * 3 + 0] = batch.samples[i].digi0;
+                packed[i * 3 + 1] = batch.samples[i].digi1;
+                packed[i * 3 + 2] = batch.samples[i].digi2;
+            }
+            linkQueueBatch(batch.node_id, batch.seq, batch.global_flags,
+                           batch.timestamp_us, packed);
+        }
         g_dumpBatchRx = true;
         g_dumpWaitingForWeb = false;
     } else if (g_viewNode != 0 && batch.node_id == g_viewNode &&
@@ -1389,9 +1420,107 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
             break;
         }
 
+        case 0xC0: {  /* ENLACE: param=1 subir ahora, param=0 auto on/off por value */
+            if (param == 0) {
+                /* Configurar el trigger automatico (por captura) sin tocar el
+                 * resto de la config, que se edita por HTTP. */
+                g_linkCfg.auto_upload = (rxCmd.value != 0);
+                linkConfigSave();
+                MASTER_LOG_PRINTF("[ENLACE] auto=%d\n", g_linkCfg.auto_upload ? 1 : 0);
+                matlab.sendAck(0xFF, 0xC0, g_linkCfg.auto_upload ? 1 : 0);
+            } else {
+                const char *why = "";
+                bool ok = requestEnlace(&why);
+                if (!ok) MASTER_LOG_PRINTF("[ENLACE] rechazado: %s\n", why);
+                matlab.sendAck(0xFF, 0xC0, ok ? 1 : 0);
+            }
+            break;
+        }
+
         default:
             break;
     }
+}
+
+/* ── Radio: bajar/levantar la fase CAPTURA (para el modo ENLACE) ─────────── */
+
+/* Levanta el AP en canal 1 + DNS captivo + ESP-NOW, exactamente como setup().
+ * Se usa al volver de ENLACE. Los esclavos no negocian nada: tienen el canal 1
+ * hardcodeado, asi que apenas el AP vuelve a canal 1 el ESP-NOW retoma solo. */
+static void radioBringUpCapture()
+{
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
+                      IPAddress(192, 168, 4, 1),
+                      IPAddress(255, 255, 255, 0));
+    bool apOk = WiFi.softAP(AP_SSID, AP_PASS, 1);   /* canal 1 fijo */
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+    if (apOk) {
+        dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+    }
+    setApBeaconInterval(AP_BEACON_INTERVAL_TU, "post-enlace");
+
+    g_espnowReady = espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck,
+                                   onHello, onStartAck, onHotWaitAck);
+    if (g_espnowReady) {
+        addPeerIfNeeded(ESPNOW_BROADCAST);
+        for (int i = 0; i < NUM_SLAVES; i++) {
+            if (isConfiguredSlaveMac(SLAVE_MACS[i])) {
+                addPeerIfNeeded(SLAVE_MACS[i]);
+            }
+        }
+    }
+    MASTER_LOG_PRINTF("[MASTER] CAPTURA restaurada ap=%s espnow=%s\n",
+                      apOk ? "OK" : "FAIL", g_espnowReady ? "OK" : "FAIL");
+    LOGM("ENLACE_RESTORE", "ap=%d,espnow=%d", apOk ? 1 : 0, g_espnowReady ? 1 : 0);
+    matlab.sendStatus(g_espnowReady ? 1 : 0, 1);
+}
+
+/* Apaga ESP-NOW antes de irse a otro canal: los peers quedan atados a la
+ * interfaz y al canal actual, y dejarlos vivos mientras la STA se asocia a otra
+ * red solo genera TX fallidos. El AP lo baja link_mode.h. */
+static void radioTearDownCapture()
+{
+    dnsServer.stop();
+    esp_now_deinit();
+    g_espnowReady = false;
+    MASTER_LOG_PRINTLN("[MASTER] CAPTURA abajo (ESP-NOW off, AP off)");
+}
+
+/* Arma la tabla de nodos del .geoq desde el cache de HELLO: rol (GEO/HAMMER),
+ * fs real del PSoC, largo propio del nodo y MAC. Es lo que le permite al sink
+ * escribir el metadata.json sin que haya un navegador conectado. */
+static uint8_t collectLinkNodes(LinkNodeInfo *out, uint8_t maxNodes)
+{
+    uint8_t n = 0;
+    for (uint8_t id = 1; id <= NUM_SLAVES && n < maxNodes; id++) {
+        if (!(g_armAckMask & (1UL << id))) continue;
+        const CachedHello &h = g_cachedHello[id];
+        LinkNodeInfo &e = out[n++];
+        e.node_id     = id;
+        e.hw_class    = h.valid ? h.hw_class : 0;
+        e.sample_rate = h.valid ? h.sample_rate : 0;
+        e.n_batches   = dumpBatchesForNode(id);
+        e.psoc_ok     = h.valid ? (h.psoc_ok != 0) : false;
+        e.sd_present  = h.valid ? (h.sd_present != 0) : false;
+        memcpy(e.mac, h.mac, 6);
+    }
+    return n;
+}
+
+/* Pide entrar en ENLACE. Regla dura del diseño: solo desde IDLE/ARMED. */
+static bool requestEnlace(const char **why)
+{
+    if (g_state != IDLE && g_state != ARMED) {
+        if (why) *why = "solo desde IDLE/ARMED";
+        return false;
+    }
+    if (!linkRequestUpload(why)) return false;
+    g_state = ENLACE;
+    matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+    return true;
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
@@ -1453,6 +1582,9 @@ void setup()
          * hacia los clientes WS — protocol.js decodifica el mismo framing. */
         matlab.setPacketRelay(webRelayPacket);
         webRelaySetClientHook(requestWebCachedStateReplay);
+        /* Modo ENLACE: config persistida + cola en el mismo LittleFS que la
+         * SPA, por eso va después de webServerBegin() (que hace el mount). */
+        linkModeBegin();
     }
 
     /* ESP-NOW (convive con AP mode) */
@@ -1487,6 +1619,20 @@ void setup()
 void loop()
 {
     debugEspHardwareService();
+
+    /* Fase ENLACE: el AP y ESP-NOW estan abajo, asi que no hay nada que
+     * despachar de la SPA ni de los esclavos. Se bombea solo el runner de la
+     * subida hasta que restaure la fase CAPTURA. */
+    if (g_state == ENLACE) {
+        if (!linkService(radioTearDownCapture, radioBringUpCapture)) {
+            g_state = armedOrIdleState();
+            matlab.sendReady(g_armedCount);
+            matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+        }
+        matlab.loop();   /* el USB hacia MATLAB sigue vivo durante ENLACE */
+        return;
+    }
+
     dnsServer.processNextRequest();
 
     /* Gestionar conexión TCP de MATLAB */
@@ -1778,10 +1924,21 @@ void loop()
                     g_dumpRequiresWebClient = false;
                     g_dumpWaitingForWeb = false;
                     dumpDeliveryGuardReset();
+                    linkQueueEnd(true);   /* sesion completa: queda en la cola */
                     matlab.sendReady(g_armedCount);
                     matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
                     MASTER_LOG_PRINTF("[MASTER] DUMP completo -> %s\n",
                                       g_state == ARMED ? "ARMED" : "IDLE");
+
+                    /* Trigger de ENLACE: por captura, si esta configurado en
+                     * auto. Recien aca es seguro cambiar de fase — el dump ya
+                     * termino y no hay nada en vuelo con los esclavos. */
+                    if (g_linkCfg.auto_upload) {
+                        const char *why = "";
+                        if (!requestEnlace(&why)) {
+                            MASTER_LOG_PRINTF("[ENLACE] auto omitido: %s\n", why);
+                        }
+                    }
                 } else {
                     MASTER_LOG_PRINTF("[MASTER] DUMP slave %d/%d seq 0/%d\n",
                                       g_dumpSlaveIdx, dumpLimit, g_rec_n_batches);

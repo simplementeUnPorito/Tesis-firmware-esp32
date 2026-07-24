@@ -17,6 +17,7 @@
 #include "sync_protocol.h"
 #include "master_log.h"
 #include "web_relay.h"
+#include "link_mode.h"   /* endpoints /enlace/* — ver modo ENLACE */
 
 static AsyncWebServer webServer(80);
 
@@ -141,6 +142,37 @@ inline bool webServerBegin()
         request->send(200, "text/plain", body);
     });
 #endif
+
+    /* ── Modo ENLACE ──────────────────────────────────────────────────────
+     * La config lleva SSID, password y URL del sink: strings que no entran en
+     * el protocolo de 6 bytes que usan el resto de los comandos, asi que va por
+     * HTTP. El disparo de la subida sí tiene comando (0xC0) para que MATLAB y
+     * la SPA lo puedan mandar por el mismo camino que todo lo demas. */
+    webServer.on("/enlace/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", linkStatusText());
+    });
+
+    webServer.on("/enlace/config", HTTP_POST, [](AsyncWebServerRequest *request) {
+        LinkConfig cfg = linkConfig();
+        auto grab = [&](const char *name, char *dst, size_t cap) {
+            if (!request->hasParam(name, true)) return;
+            const String &v = request->getParam(name, true)->value();
+            strncpy(dst, v.c_str(), cap - 1);
+            dst[cap - 1] = '\0';
+        };
+        grab("ssid", cfg.ssid, sizeof(cfg.ssid));
+        grab("pass", cfg.pass, sizeof(cfg.pass));
+        grab("url",  cfg.url,  sizeof(cfg.url));
+        grab("site", cfg.site, sizeof(cfg.site));
+        if (request->hasParam("distance_mm", true)) {
+            cfg.distance_mm = (uint32_t)request->getParam("distance_mm", true)->value().toInt();
+        }
+        if (request->hasParam("auto", true)) {
+            cfg.auto_upload = (request->getParam("auto", true)->value().toInt() != 0);
+        }
+        linkConfigSet(cfg);
+        request->send(200, "text/plain", linkStatusText());
+    });
 
     webServer.on("/", HTTP_GET, [fsOk](AsyncWebServerRequest *request) {
         if (fsOk && LittleFS.exists("/index.html")) {
