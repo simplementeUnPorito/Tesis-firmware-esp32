@@ -1620,16 +1620,26 @@ void loop()
 {
     debugEspHardwareService();
 
-    /* Fase ENLACE: el AP y ESP-NOW estan abajo, asi que no hay nada que
-     * despachar de la SPA ni de los esclavos. Se bombea solo el runner de la
-     * subida hasta que restaure la fase CAPTURA. */
+    /* Fase ENLACE: ESP-NOW esta abajo (no hay esclavos que atender) pero la SPA
+     * y los endpoints /enlace/* siguen vivos sobre la red del cliente — es toda
+     * la razon de estar aca. AsyncWebServer atiende en su propia task; lo que
+     * hay que sostener a mano es el WS (si no, el navegador corta la conexion
+     * "inactiva") y el USB hacia MATLAB. */
     if (g_state == ENLACE) {
         if (!linkService(radioTearDownCapture, radioBringUpCapture)) {
             g_state = armedOrIdleState();
             matlab.sendReady(g_armedCount);
             matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         }
-        matlab.loop();   /* el USB hacia MATLAB sigue vivo durante ENLACE */
+        matlab.loop();
+        webRelayService();
+        static uint32_t lastEnlaceHbMs = 0;
+        if (millis() - lastEnlaceHbMs > 1000) {
+            lastEnlaceHbMs = millis();
+            if (matlab.connected() || ws.count() > 0) {
+                matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+            }
+        }
         return;
     }
 

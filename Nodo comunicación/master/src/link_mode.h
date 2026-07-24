@@ -7,9 +7,18 @@
  *
  *    CAPTURA : modo normal. AP propio en canal 1, ESP-NOW con los esclavos,
  *              SPA local. Sin cambios respecto del firmware historico.
- *    ENLACE  : el maestro baja su AP, apaga ESP-NOW y se asocia como STA a la
- *              red con salida a internet (hotspot del celular en campo, WiFi de
- *              casa de noche). Sube la cola por HTTP POST y vuelve a CAPTURA.
+ *    ENLACE  : el maestro baja su AP, apaga ESP-NOW y se asocia como STA al
+ *              hotspot del cliente adquisidor (celular) o a un router. Ahi sigue
+ *              sirviendo la SPA y ademas expone la cola para que el cliente se
+ *              la lleve. Cuando el cliente confirma, vuelve a CAPTURA.
+ *
+ *  El maestro NO sale a internet ni sube nada: el que atraviesa el tunel hacia
+ *  el server es el cliente adquisidor, que ya tiene Tailscale de verdad. Por eso
+ *  aca no hay cliente HTTP, ni TLS, ni tokens — y el server nunca queda expuesto
+ *  publicamente. El ESP solo tiene que ser alcanzable por IP desde el celular,
+ *  que es justo lo que habilita asociarse a su hotspot: el celular conserva sus
+ *  datos moviles (no los pierde como cuando se conecta al AP del ESP) y al mismo
+ *  tiempo alcanza al maestro.
  *
  *  Esto es seguro porque el protocolo con los esclavos es maestro-iniciado (los
  *  esclavos esperan pasivos) y no escanean canales: tienen hardcodeado
@@ -61,8 +70,6 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 #include <esp_wifi.h>
 
 #include "master_log.h"
@@ -85,8 +92,11 @@
 #define LINK_STA_CONNECT_TIMEOUT_MS  20000u
 #endif
 
-#ifndef LINK_HTTP_TIMEOUT_MS
-#define LINK_HTTP_TIMEOUT_MS  20000u
+/* Cuanto se queda sirviendo la cola sin que el cliente toque nada antes de
+ * volver a CAPTURA. Estar en ENLACE es estar sordo a los esclavos, asi que no
+ * se queda esperando indefinidamente a un cliente que no vino. */
+#ifndef LINK_SERVE_IDLE_MS
+#define LINK_SERVE_IDLE_MS  (3u * 60u * 1000u)
 #endif
 
 /* Cuanto puede durar toda la fase ENLACE antes de volver a CAPTURA igual.
@@ -96,9 +106,8 @@
 #endif
 
 struct LinkConfig {
-    char ssid[33]  = {0};
+    char ssid[33]  = {0};   /* red con internet a la que asociarse (hotspot/router) */
     char pass[65]  = {0};
-    char url[129]  = {0};   /* endpoint del sink, ej https://pc.tailnet.ts.net/ingest */
     char site[17]  = {0};   /* nombre del punto -> carpeta del dataset */
     uint32_t distance_mm = 0;
     bool auto_upload = false;  /* entrar en ENLACE solo al terminar el dump */
@@ -112,15 +121,15 @@ enum LinkPhase {
     LINK_IDLE = 0,      /* fase CAPTURA: el modulo solo encola */
     LINK_REQUESTED,     /* pedido aceptado, se entra en el proximo loop() */
     LINK_CONNECTING,    /* AP abajo, ESP-NOW abajo, asociando como STA */
-    LINK_UPLOADING,     /* asociado, subiendo la cola */
+    LINK_SERVING,       /* asociado: la SPA y la cola quedan expuestas al cliente */
     LINK_RESTORING      /* volviendo a AP canal 1 + ESP-NOW */
 };
 
 static LinkPhase g_linkPhase = LINK_IDLE;
 static uint32_t  g_linkPhaseStartMs = 0;
 static uint32_t  g_linkConnectStartMs = 0;
-static uint16_t  g_linkUploadedOk = 0;
-static uint16_t  g_linkUploadedFail = 0;
+static uint32_t  g_linkLastClientMs = 0;   /* ultima actividad del adquisidor */
+static uint16_t  g_linkServedFiles = 0;    /* archivos que el cliente confirmo */
 static char      g_linkLastError[64] = {0};
 
 /* Escritor de la cola */
@@ -156,7 +165,6 @@ inline void linkConfigLoad()
         String v = line.substring(eq + 1);
         if      (k == "ssid") linkCfgCopy(g_linkCfg.ssid, sizeof(g_linkCfg.ssid), v);
         else if (k == "pass") linkCfgCopy(g_linkCfg.pass, sizeof(g_linkCfg.pass), v);
-        else if (k == "url")  linkCfgCopy(g_linkCfg.url,  sizeof(g_linkCfg.url),  v);
         else if (k == "site") linkCfgCopy(g_linkCfg.site, sizeof(g_linkCfg.site), v);
         else if (k == "distance_mm") g_linkCfg.distance_mm = (uint32_t)v.toInt();
         else if (k == "auto") g_linkCfg.auto_upload = (v.toInt() != 0);
@@ -170,7 +178,6 @@ inline bool linkConfigSave()
     if (!f) return false;
     f.printf("ssid=%s\n", g_linkCfg.ssid);
     f.printf("pass=%s\n", g_linkCfg.pass);
-    f.printf("url=%s\n",  g_linkCfg.url);
     f.printf("site=%s\n", g_linkCfg.site);
     f.printf("distance_mm=%u\n", (unsigned)g_linkCfg.distance_mm);
     f.printf("auto=%d\n", g_linkCfg.auto_upload ? 1 : 0);
@@ -183,8 +190,8 @@ inline void linkConfigSet(const LinkConfig &cfg)
 {
     g_linkCfg = cfg;
     linkConfigSave();
-    MASTER_LOG_PRINTF("[ENLACE] cfg ssid=%s url=%s site=%s dist=%u mm auto=%d\n",
-                      g_linkCfg.ssid, g_linkCfg.url, g_linkCfg.site,
+    MASTER_LOG_PRINTF("[ENLACE] cfg ssid=%s site=%s dist=%u mm auto=%d\n",
+                      g_linkCfg.ssid, g_linkCfg.site,
                       (unsigned)g_linkCfg.distance_mm,
                       g_linkCfg.auto_upload ? 1 : 0);
 }
@@ -255,8 +262,8 @@ inline bool linkQueueBegin(uint16_t nBatches,
     if (g_linkQueueOpen) return false;
     if (nodeCount == 0)  return false;
 
-    /* Sin endpoint configurado no tiene sentido llenar el FS. */
-    if (g_linkCfg.url[0] == '\0') return false;
+    /* Se encola siempre que haya lugar: el dato es lo caro. Si no hay sitio
+     * configurado igual se guarda y el server le pide el nombre al usuario. */
 
     uint32_t need = 48u + (uint32_t)nodeCount * 14u + expectedBytes;
     if (need > linkQueueFreeBytes()) {
@@ -367,18 +374,17 @@ inline void linkQueueEnd(bool ok)
  * mitad de captura). Este modulo solo valida su propia configuracion. */
 inline bool linkConfigUsable()
 {
-    return g_linkCfg.ssid[0] != '\0' && g_linkCfg.url[0] != '\0';
+    return g_linkCfg.ssid[0] != '\0';
 }
 
 inline bool linkRequestUpload(const char **why)
 {
     if (g_linkPhase != LINK_IDLE) { if (why) *why = "ya en ENLACE"; return false; }
-    if (!linkConfigUsable())      { if (why) *why = "falta ssid/url"; return false; }
-    if (linkQueueCount() == 0)    { if (why) *why = "cola vacia";     return false; }
+    if (!linkConfigUsable())      { if (why) *why = "falta ssid";   return false; }
+    if (linkQueueCount() == 0)    { if (why) *why = "cola vacia";   return false; }
     g_linkPhase = LINK_REQUESTED;
     g_linkPhaseStartMs = millis();
-    g_linkUploadedOk = 0;
-    g_linkUploadedFail = 0;
+    g_linkServedFiles = 0;
     g_linkLastError[0] = '\0';
     MASTER_LOG_PRINTF("[ENLACE] pedido: %u archivos, %u B\n",
                       (unsigned)linkQueueCount(), (unsigned)linkQueueBytesPending());
@@ -387,46 +393,69 @@ inline bool linkRequestUpload(const char **why)
     return true;
 }
 
-/* Sube un archivo de la cola. Devuelve true si el sink lo acepto (2xx). */
-static bool linkUploadOne(const char *path)
+/* ── API para los endpoints que consume el cliente adquisidor ────────────── */
+
+/* Cada request del cliente corre el reloj de inactividad: mientras se este
+ * llevando la cola, el maestro no se vuelve a canal 1 abajo de sus pies. */
+inline void linkNoteClientActivity() { g_linkLastClientMs = millis(); }
+
+/* Listado de la cola en texto plano: "<nombre> <bytes>" por linea. */
+inline String linkQueueListText()
 {
-    File f = LittleFS.open(path, "r");
-    if (!f) return false;
-    size_t sz = f.size();
-
-    WiFiClient plain;
-    HTTPClient http;
-    http.setTimeout(LINK_HTTP_TIMEOUT_MS);
-    http.setConnectTimeout(LINK_HTTP_TIMEOUT_MS);
-    /* Tailscale Funnel expone el sink por HTTPS publico con TLS valido; para
-     * simplificar el firmware se acepta el certificado sin pinning (el control
-     * de acceso real es el token compartido, ver X-Geo-Token). */
-    bool ok = false;
-    if (strncmp(g_linkCfg.url, "https:", 6) == 0) {
-        WiFiClientSecure tls;
-        tls.setInsecure();
-        ok = http.begin(tls, g_linkCfg.url);
-    } else {
-        ok = http.begin(plain, g_linkCfg.url);
+    String s;
+    File dir = LittleFS.open(LINK_QUEUE_DIR);
+    if (!dir || !dir.isDirectory()) return s;
+    File e = dir.openNextFile();
+    while (e) {
+        if (!e.isDirectory()) {
+            s += e.name();
+            s += ' ';
+            s += String((unsigned)e.size());
+            s += '\n';
+        }
+        e = dir.openNextFile();
     }
-    if (!ok) { f.close(); return false; }
+    dir.close();
+    return s;
+}
 
-    http.addHeader("Content-Type", "application/octet-stream");
-    http.addHeader("X-Geo-File", path);
-    http.addHeader("X-Geo-Site", g_linkCfg.site);
-
-    int code = http.sendRequest("POST", &f, sz);
-    http.end();
-    f.close();
-
-    if (code >= 200 && code < 300) {
-        MASTER_LOG_PRINTF("[ENLACE] subido %s (%u B) -> %d\n",
-                          path, (unsigned)sz, code);
-        return true;
+/* Ruta absoluta del archivo pedido, rechazando cualquier cosa con separadores:
+ * el nombre viene de un query param, no se confia en el. */
+inline bool linkQueueResolve(const String &name, char *out, size_t cap)
+{
+    if (name.length() == 0 || name.length() > 24) return false;
+    if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf("..") >= 0) {
+        return false;
     }
-    snprintf(g_linkLastError, sizeof(g_linkLastError), "HTTP %d en %s", code, path);
-    MASTER_LOG_PRINTF("[ENLACE] fallo %s -> %d\n", path, code);
-    return false;
+    snprintf(out, cap, LINK_QUEUE_DIR "/%s", name.c_str());
+    return LittleFS.exists(out);
+}
+
+/* El cliente confirma que ya subio el archivo al server: recien ahi se borra.
+ * Si el cliente nunca confirma, el archivo sobrevive al proximo ENLACE — la
+ * cola es la copia buena hasta que alguien diga lo contrario. */
+inline bool linkQueueAck(const String &name)
+{
+    char path[40];
+    if (!linkQueueResolve(name, path, sizeof(path))) return false;
+    bool ok = LittleFS.remove(path);
+    if (ok) {
+        g_linkServedFiles++;
+        MASTER_LOG_PRINTF("[ENLACE] cliente confirmo %s (quedan %u)\n",
+                          path, (unsigned)linkQueueCount());
+        LOGM("ENLACE_ACK", "file=%s,left=%u", path, (unsigned)linkQueueCount());
+    }
+    linkNoteClientActivity();
+    return ok;
+}
+
+/* El cliente avisa que termino: volver a CAPTURA sin esperar el idle. */
+inline void linkClientDone()
+{
+    if (g_linkPhase == LINK_SERVING || g_linkPhase == LINK_CONNECTING) {
+        MASTER_LOG_PRINTLN("[ENLACE] cliente termino, volviendo a CAPTURA");
+        g_linkPhase = LINK_RESTORING;
+    }
 }
 
 /* Baja AP + ESP-NOW y asocia como STA. main.cpp pasa el teardown de ESP-NOW
@@ -449,10 +478,10 @@ inline void linkRestoreCapture(LinkRadioHook apUp)
 {
     WiFi.disconnect(true, false);
     if (apUp) apUp();   /* main.cpp levanta AP canal 1 + DNS + ESP-NOW */
-    MASTER_LOG_PRINTF("[ENLACE] vuelta a CAPTURA (ok=%u fail=%u, quedan %u)\n",
-                      g_linkUploadedOk, g_linkUploadedFail, (unsigned)linkQueueCount());
-    LOGM("ENLACE_DONE", "ok=%u,fail=%u,left=%u",
-         g_linkUploadedOk, g_linkUploadedFail, (unsigned)linkQueueCount());
+    MASTER_LOG_PRINTF("[ENLACE] vuelta a CAPTURA (entregados=%u, quedan %u)\n",
+                      g_linkServedFiles, (unsigned)linkQueueCount());
+    LOGM("ENLACE_DONE", "served=%u,left=%u",
+         g_linkServedFiles, (unsigned)linkQueueCount());
 }
 
 /* Bombea la maquina de la fase ENLACE. Devuelve true mientras siga en ENLACE.
@@ -470,10 +499,12 @@ inline bool linkService(LinkRadioHook espnowDown, LinkRadioHook apUp)
 
         case LINK_CONNECTING:
             if (WiFi.status() == WL_CONNECTED) {
-                MASTER_LOG_PRINTF("[ENLACE] asociado, IP %s\n",
-                                  WiFi.localIP().toString().c_str());
-                LOGM("ENLACE_UP", "ip=%s", WiFi.localIP().toString().c_str());
-                g_linkPhase = LINK_UPLOADING;
+                MASTER_LOG_PRINTF("[ENLACE] asociado a %s, IP %s — cola expuesta\n",
+                                  g_linkCfg.ssid, WiFi.localIP().toString().c_str());
+                LOGM("ENLACE_UP", "ip=%s,files=%u",
+                     WiFi.localIP().toString().c_str(), (unsigned)linkQueueCount());
+                linkNoteClientActivity();
+                g_linkPhase = LINK_SERVING;
             } else if (millis() - g_linkConnectStartMs > LINK_STA_CONNECT_TIMEOUT_MS) {
                 snprintf(g_linkLastError, sizeof(g_linkLastError),
                          "sin asociar a %s", g_linkCfg.ssid);
@@ -483,46 +514,24 @@ inline bool linkService(LinkRadioHook espnowDown, LinkRadioHook apUp)
             }
             return true;
 
-        case LINK_UPLOADING: {
-            /* Un archivo por pasada de loop(): subir en bloque bloquearia el
-             * watchdog y dejaria la UI muda mas tiempo del necesario. */
-            char path[32] = {0};
-            File dir = LittleFS.open(LINK_QUEUE_DIR);
-            if (dir && dir.isDirectory()) {
-                File e = dir.openNextFile();
-                while (e) {
-                    if (!e.isDirectory()) {
-                        snprintf(path, sizeof(path), LINK_QUEUE_DIR "/%s", e.name());
-                        break;
-                    }
-                    e = dir.openNextFile();
-                }
-                dir.close();
-            }
-
-            if (path[0] == '\0') {           /* cola vacia: listo */
+        case LINK_SERVING:
+            /* No hay nada que bombear: la SPA y los endpoints /enlace/* los
+             * atiende AsyncWebServer en su propia task. Aca solo se vigila que
+             * la fase no se eternice — estar en ENLACE es estar sordo. */
+            if (linkQueueCount() == 0) {
+                MASTER_LOG_PRINTLN("[ENLACE] cola vacia, cliente se llevo todo");
                 g_linkPhase = LINK_RESTORING;
-                return true;
-            }
-            if (millis() - g_linkPhaseStartMs > LINK_PHASE_MAX_MS) {
+            } else if (millis() - g_linkLastClientMs > LINK_SERVE_IDLE_MS) {
+                snprintf(g_linkLastError, sizeof(g_linkLastError), "sin cliente");
+                MASTER_LOG_PRINTF("[ENLACE] nadie vino en %u s, volviendo\n",
+                                  (unsigned)(LINK_SERVE_IDLE_MS / 1000u));
+                g_linkPhase = LINK_RESTORING;
+            } else if (millis() - g_linkPhaseStartMs > LINK_PHASE_MAX_MS) {
                 snprintf(g_linkLastError, sizeof(g_linkLastError), "limite de fase");
                 MASTER_LOG_PRINTLN("[ENLACE] limite de fase, volviendo a CAPTURA");
                 g_linkPhase = LINK_RESTORING;
-                return true;
-            }
-
-            if (linkUploadOne(path)) {
-                LittleFS.remove(path);
-                g_linkUploadedOk++;
-            } else {
-                g_linkUploadedFail++;
-                /* Un fallo deja el archivo en la cola para el proximo ENLACE y
-                 * corta la pasada: si el sink no esta, reintentar en bucle solo
-                 * quema bateria. */
-                g_linkPhase = LINK_RESTORING;
             }
             return true;
-        }
 
         case LINK_RESTORING:
             linkRestoreCapture(apUp);
@@ -542,19 +551,19 @@ inline String linkStatusText()
         case LINK_IDLE:       s += "captura";    break;
         case LINK_REQUESTED:  s += "pedido";     break;
         case LINK_CONNECTING: s += "conectando"; break;
-        case LINK_UPLOADING:  s += "subiendo";   break;
+        case LINK_SERVING:    s += "sirviendo";  break;
         case LINK_RESTORING:  s += "volviendo";  break;
     }
     s += "\nssid=";        s += g_linkCfg.ssid;
-    s += "\nurl=";         s += g_linkCfg.url;
     s += "\nsite=";        s += g_linkCfg.site;
     s += "\ndistance_mm="; s += String(g_linkCfg.distance_mm);
     s += "\nauto=";        s += g_linkCfg.auto_upload ? "1" : "0";
+    s += "\nip=";          s += (g_linkPhase == LINK_SERVING)
+                                  ? WiFi.localIP().toString() : String("");
     s += "\nqueue_files="; s += String(linkQueueCount());
     s += "\nqueue_bytes="; s += String(linkQueueBytesPending());
     s += "\nfs_free=";     s += String(linkQueueFreeBytes());
-    s += "\nup_ok=";       s += String(g_linkUploadedOk);
-    s += "\nup_fail=";     s += String(g_linkUploadedFail);
+    s += "\nserved=";      s += String(g_linkServedFiles);
     s += "\nlast_error=";  s += g_linkLastError;
     s += "\n";
     return s;
@@ -564,8 +573,8 @@ inline void linkModeBegin()
 {
     linkConfigLoad();
     if (!LittleFS.exists(LINK_QUEUE_DIR)) LittleFS.mkdir(LINK_QUEUE_DIR);
-    MASTER_LOG_PRINTF("[ENLACE] cfg ssid=%s url=%s site=%s auto=%d cola=%u (%u B)\n",
-                      g_linkCfg.ssid, g_linkCfg.url, g_linkCfg.site,
+    MASTER_LOG_PRINTF("[ENLACE] cfg ssid=%s site=%s auto=%d cola=%u (%u B)\n",
+                      g_linkCfg.ssid, g_linkCfg.site,
                       g_linkCfg.auto_upload ? 1 : 0,
                       (unsigned)linkQueueCount(), (unsigned)linkQueueBytesPending());
 }

@@ -152,6 +152,43 @@ inline bool webServerBegin()
         request->send(200, "text/plain", linkStatusText());
     });
 
+    /* Cola: el cliente adquisidor lista, descarga y confirma. Recien con el ACK
+     * el maestro borra — la cola es la copia buena hasta que alguien diga que ya
+     * esta en el server. */
+    webServer.on("/enlace/queue", HTTP_GET, [](AsyncWebServerRequest *request) {
+        linkNoteClientActivity();
+        request->send(200, "text/plain", linkQueueListText());
+    });
+
+    webServer.on("/enlace/file", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasParam("name")) {
+            request->send(400, "text/plain", "falta name");
+            return;
+        }
+        char path[40];
+        if (!linkQueueResolve(request->getParam("name")->value(), path, sizeof(path))) {
+            request->send(404, "text/plain", "no existe");
+            return;
+        }
+        linkNoteClientActivity();
+        request->send(LittleFS, path, "application/octet-stream");
+    });
+
+    webServer.on("/enlace/ack", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!request->hasParam("name", true)) {
+            request->send(400, "text/plain", "falta name");
+            return;
+        }
+        bool ok = linkQueueAck(request->getParam("name", true)->value());
+        request->send(ok ? 200 : 404, "text/plain", ok ? "borrado" : "no existe");
+    });
+
+    /* El cliente avisa que termino: volver a canal 1 sin esperar el idle. */
+    webServer.on("/enlace/done", HTTP_POST, [](AsyncWebServerRequest *request) {
+        linkClientDone();
+        request->send(200, "text/plain", linkStatusText());
+    });
+
     webServer.on("/enlace/config", HTTP_POST, [](AsyncWebServerRequest *request) {
         LinkConfig cfg = linkConfig();
         auto grab = [&](const char *name, char *dst, size_t cap) {
@@ -162,7 +199,6 @@ inline bool webServerBegin()
         };
         grab("ssid", cfg.ssid, sizeof(cfg.ssid));
         grab("pass", cfg.pass, sizeof(cfg.pass));
-        grab("url",  cfg.url,  sizeof(cfg.url));
         grab("site", cfg.site, sizeof(cfg.site));
         if (request->hasParam("distance_mm", true)) {
             cfg.distance_mm = (uint32_t)request->getParam("distance_mm", true)->value().toInt();
