@@ -10,7 +10,7 @@ import { PlotArea } from './plot.js?v=field-study-19';
 import { SpectrumArea } from './spectrum.js?v=field-study-19';
 import { SlavePanel } from './slave_panel.js?v=field-study-19';
 import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-19';
-import { initEnlaceTab } from './enlace.js?v=field-study-19';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-19';
 import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-19';
 
 const $ = (id) => document.getElementById(id);
@@ -2649,24 +2649,15 @@ $('btn-export').addEventListener('click', onExportRequested);
 
 // "Subir al server": el mismo ZIP, pero POSTeado al servidor de datos en vez de
 // bajarlo. Ojo con quien hace este pedido: lo hace el NAVEGADOR, no el maestro
-// — el ESP nunca sale a internet. Por eso la URL del servidor es un ajuste del
-// cliente (localStorage) y no de la config del maestro: depende de la tailnet
-// desde donde estes mirando, no del equipo de campo.
-const SERVER_URL_KEY = 'geo.server.url';
-
-function serverUrl(ask) {
-  let url = '';
-  try { url = localStorage.getItem(SERVER_URL_KEY) || ''; } catch (e) { /* modo privado */ }
-  if (!url && ask) {
-    url = (prompt('URL del servidor de datos (ej. http://100.x.y.z:8000/ingest)') || '').trim();
-    if (url) { try { localStorage.setItem(SERVER_URL_KEY, url); } catch (e) { /* ignorar */ } }
-  }
-  return url;
-}
-
+// — el ESP nunca sale a internet. La direccion, eso si, la guarda el maestro
+// (pestana Enlace) para no tener que cargarla en cada cliente que abra la SPA.
 async function onUploadToServer() {
-  const url = serverUrl(true);
-  if (!url) { $('export-status').textContent = 'Subida cancelada: falta la URL del servidor'; return; }
+  const url = getServerUrl();
+  if (!url) {
+    $('export-status').textContent =
+      'Falta la URL del servidor: cargala en la pestaña Enlace y guardá';
+    return;
+  }
   let built;
   try {
     built = buildExportZip();

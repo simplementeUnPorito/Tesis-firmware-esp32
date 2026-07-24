@@ -260,6 +260,7 @@ inline bool webServerBegin()
         grab("ssid", cfg.ssid, sizeof(cfg.ssid));
         grab("pass", cfg.pass, sizeof(cfg.pass));
         grab("site", cfg.site, sizeof(cfg.site));
+        grab("server_url", cfg.server_url, sizeof(cfg.server_url));
         if (request->hasParam("distance_mm", true)) {
             cfg.distance_mm = (uint32_t)request->getParam("distance_mm", true)->value().toInt();
         }

@@ -14,6 +14,12 @@
 
 const $ = (id) => document.getElementById(id);
 
+// URL del servidor tal como la tiene guardada el maestro. La usa el boton
+// "Subir al server" de la pestana Captura: el POST lo hace el navegador, pero la
+// direccion se guarda en el maestro para no tener que cargarla en cada cliente.
+let cachedServerUrl = '';
+export function getServerUrl() { return cachedServerUrl; }
+
 // El status del maestro es texto plano clave=valor (link_mode.h: linkStatusText).
 // No se uso JSON ahi para no sumar ArduinoJson al firmware por cinco campos.
 function parseStatus(text) {
@@ -41,8 +47,16 @@ export function initEnlaceTab(log) {
 
   const show = (msg) => { statusEl.textContent = msg; };
 
-  function render(st) {
-    const phase = st.phase || '?';
+  function render(st, raw) {
+    // Si el maestro contesta 200 pero sin los campos esperados, mostrar lo que
+    // realmente mando: adivinar por que "phase" viene vacio cuesta mas que
+    // leerlo. Paso de verdad y sin esto no habia forma de saber que respondia.
+    if (!st.phase) {
+      show('respuesta inesperada del maestro: ' +
+           (raw ? JSON.stringify(raw.slice(0, 120)) : '(vacía)'));
+      return;
+    }
+    const phase = st.phase;
     const files = Number(st.queue_files || 0);
     const bytes = Number(st.queue_bytes || 0);
     const kb = (bytes / 1024).toFixed(1);
@@ -60,7 +74,8 @@ export function initEnlaceTab(log) {
     try {
       const r = await fetch('/enlace/status', { cache: 'no-store' });
       if (!r.ok) { show(`el maestro respondió HTTP ${r.status} en /enlace/status`); return; }
-      render(parseStatus(await r.text()));
+      const txt = await r.text();
+      render(parseStatus(txt), txt);
     } catch (e) {
       show(lastIp
         ? `sin respuesta — el maestro cambió de red. Probá http://${lastIp}/enlace/status`
@@ -72,38 +87,47 @@ export function initEnlaceTab(log) {
     try {
       const r = await fetch('/enlace/status', { cache: 'no-store' });
       if (!r.ok) { show(`el maestro respondió HTTP ${r.status} en /enlace/status`); return; }
-      const st = parseStatus(await r.text());
-      if (st.ssid && !$('enlace-ssid').value) $('enlace-ssid').value = st.ssid;
-      render(st);
+      const txt = await r.text();
+      const st = parseStatus(txt);
+      // Lo guardado en el maestro manda sobre lo que el navegador haya
+      // autocompletado: si no, un autofill viejo tapa la config real.
+      if (st.ssid) $('enlace-ssid').value = st.ssid;
+      if (st.server_url !== undefined) $('enlace-server').value = st.server_url;
+      if (st.server_url) cachedServerUrl = st.server_url;
+      render(st, txt);
     } catch (e) {
       show('sin respuesta del maestro');
     }
   }
 
-  // Sin boton de guardar: la red se persiste al salir del campo. Es un dato que
-  // se carga una vez y no se vuelve a tocar; un boton "Guardar" solo agrega un
-  // paso que se puede olvidar.
+  // Guardado explicito: el auto-guardado al salir del campo no daba ninguna
+  // senal de haber pasado, y en un formulario que se toca una vez cada tanto eso
+  // se siente como que la pagina ignora lo que escribis.
   async function saveConfig() {
     const ssid = $('enlace-ssid').value.trim();
-    if (!ssid) return;
+    const url = $('enlace-server').value.trim();
+    if (!ssid) { show('falta el nombre de la red'); return; }
     const body = new URLSearchParams();
     body.append('ssid', ssid);
     body.append('pass', $('enlace-pass').value);
+    body.append('server_url', url);
     // site/distance_mm no se mandan: la geometria (offsets martillo-geofono por
     // nodo) la lleva el ZIP que arma la SPA, que es el camino principal hacia el
     // servidor. Pedirla aca de nuevo era configuracion duplicada.
+    show('guardando…');
     try {
       const r = await fetch('/enlace/config', { method: 'POST', body });
+      const txt = await r.text();
       if (!r.ok) { show(`el maestro respondió HTTP ${r.status} al guardar`); return; }
-      render(parseStatus(await r.text()));
-      log && log(`Enlace: red "${ssid}" guardada`);
+      cachedServerUrl = url;
+      render(parseStatus(txt), txt);
+      log && log(`Enlace: guardado (red "${ssid}"${url ? ', servidor ' + url : ''})`);
     } catch (e) {
       show('no se pudo guardar: ' + e);
     }
   }
 
-  $('enlace-ssid').addEventListener('change', saveConfig);
-  $('enlace-pass').addEventListener('change', saveConfig);
+  $('btn-enlace-save').addEventListener('click', saveConfig);
 
   // Refrescar al abrir el tab, no en bucle: en fase CAPTURA el dato no cambia
   // y no tiene sentido meter trafico mientras se esta midiendo.

@@ -108,6 +108,10 @@
 struct LinkConfig {
     char ssid[33]  = {0};   /* red con internet a la que asociarse (hotspot/router) */
     char pass[65]  = {0};
+    /* URL del servidor de datos. El maestro NO la usa: nunca sale a internet.
+     * La guarda para que cualquier cliente que abra la SPA la tenga sin volver
+     * a cargarla — el que hace el POST es el navegador. */
+    char server_url[129] = {0};
     char site[17]  = {0};   /* nombre del punto -> carpeta del dataset */
     uint32_t distance_mm = 0;
     bool auto_upload = false;  /* entrar en ENLACE solo al terminar el dump */
@@ -168,6 +172,8 @@ inline void linkConfigLoad()
     linkCfgCopy(g_linkCfg.ssid, sizeof(g_linkCfg.ssid), g_linkPrefs.getString("ssid", ""));
     linkCfgCopy(g_linkCfg.pass, sizeof(g_linkCfg.pass), g_linkPrefs.getString("pass", ""));
     linkCfgCopy(g_linkCfg.site, sizeof(g_linkCfg.site), g_linkPrefs.getString("site", ""));
+    linkCfgCopy(g_linkCfg.server_url, sizeof(g_linkCfg.server_url),
+                g_linkPrefs.getString("srv_url", ""));
     g_linkCfg.distance_mm = g_linkPrefs.getUInt("dist_mm", 0);
     g_linkCfg.auto_upload = g_linkPrefs.getBool("auto", false);
     g_linkPrefs.end();
@@ -179,6 +185,7 @@ inline bool linkConfigSave()
     g_linkPrefs.putString("ssid", g_linkCfg.ssid);
     g_linkPrefs.putString("pass", g_linkCfg.pass);
     g_linkPrefs.putString("site", g_linkCfg.site);
+    g_linkPrefs.putString("srv_url", g_linkCfg.server_url);
     g_linkPrefs.putUInt("dist_mm", g_linkCfg.distance_mm);
     g_linkPrefs.putBool("auto", g_linkCfg.auto_upload);
     g_linkPrefs.end();
@@ -574,6 +581,7 @@ inline String linkStatusText()
         case LINK_RESTORING:  s += "volviendo";  break;
     }
     s += "\nssid=";        s += g_linkCfg.ssid;
+    s += "\nserver_url=";  s += g_linkCfg.server_url;
     s += "\nsite=";        s += g_linkCfg.site;
     s += "\ndistance_mm="; s += String(g_linkCfg.distance_mm);
     s += "\nauto=";        s += g_linkCfg.auto_upload ? "1" : "0";
