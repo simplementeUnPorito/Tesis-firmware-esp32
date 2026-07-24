@@ -25,6 +25,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "sync_protocol.h"
@@ -1608,6 +1609,14 @@ void setup()
          * SPA, por eso va después de webServerBegin() (que hace el mount). */
         linkModeBegin();
         linkSetEnterHook(requestEnlace);   /* habilita POST /enlace/now */
+    }
+
+    /* mDNS: el maestro queda alcanzable como http://geo.local desde las dos
+     * redes, sin tener que averiguar qué IP le dio el DHCP del celular. En el AP
+     * propio sigue estando 192.168.4.1, que no depende de mDNS. */
+    if (MDNS.begin("geo")) {
+        MDNS.addService("http", "tcp", 80);
+        MASTER_LOG_PRINTLN("[MASTER] mDNS: http://geo.local");
     }
 
     /* ESP-NOW (convive con AP mode) */

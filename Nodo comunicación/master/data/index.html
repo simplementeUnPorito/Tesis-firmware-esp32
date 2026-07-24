@@ -132,7 +132,9 @@
             solo entre los esclavos y esta red; no hay nada que apretar acá.
           </div>
           <div class="row">
-            <label>Red <input id="enlace-ssid" type="text" autocapitalize="off" autocomplete="off" spellcheck="false" title="Nombre de la red con internet (hotspot del celular o router)"></label>
+            <label>Red <input id="enlace-ssid" type="text" list="enlace-redes" autocapitalize="off" autocomplete="off" spellcheck="false" title="Nombre de la red con internet (hotspot del celular o router)"></label>
+            <button id="btn-enlace-scan" title="Lista las redes 2.4 GHz que ve el maestro, con su canal">Buscar</button>
+            <datalist id="enlace-redes"></datalist>
           </div>
           <div class="row">
             <label>Contraseña <input id="enlace-pass" type="password" autocomplete="off"></label>

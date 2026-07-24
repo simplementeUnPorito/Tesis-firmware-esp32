@@ -136,6 +136,47 @@ export function initEnlaceTab(log) {
 
   $('btn-enlace-save').addEventListener('click', saveConfig);
 
+  // Escaneo: dice si el maestro VE la red, que es lo primero a descartar cuando
+  // no se asocia. Si la red no aparece aca, no es la contrasena: el ESP32 es solo
+  // 2.4 GHz, asi que un hotspot en 5 GHz (o WPA3, o oculto) es invisible para el.
+  $('btn-enlace-scan').addEventListener('click', async () => {
+    show('escaneando…');
+    try {
+      const r = await fetch('/enlace/scan', { cache: 'no-store' });
+      if (!r.ok) { show(`el maestro respondió HTTP ${r.status} al escanear`); return; }
+      const txt = (await r.text()).trim();
+      const dl = $('enlace-redes');
+      dl.innerHTML = '';
+      if (!txt) { show('el maestro no ve ninguna red 2.4 GHz'); return; }
+      const rows = txt.split('\n').map((l) => {
+        const [ch, rssi, ...rest] = l.split(' ');
+        return { ch: Number(ch), rssi: Number(rssi), ssid: rest.join(' ') };
+      });
+      for (const row of rows) {
+        const o = document.createElement('option');
+        o.value = row.ssid;
+        o.label = `canal ${row.ch} · ${row.rssi} dBm`;
+        dl.appendChild(o);
+      }
+      const buscada = $('enlace-ssid').value.trim();
+      const hit = rows.find((x) => x.ssid === buscada);
+      if (buscada && hit) {
+        show(`"${buscada}" visible en canal ${hit.ch} (${hit.rssi} dBm) · ` +
+             (hit.ch === 1
+               ? 'mismo canal que los esclavos'
+               : 'los esclavos tendrán que seguir el canal ' + hit.ch));
+      } else if (buscada) {
+        show(`"${buscada}" NO aparece entre ${rows.length} redes. ` +
+             'Si el hotspot está en 5 GHz o WPA3, el ESP32 no lo ve: pasalo a 2.4 GHz/WPA2.');
+      } else {
+        show(`${rows.length} redes visibles — elegí una de la lista`);
+      }
+      log && log(`Enlace: escaneo, ${rows.length} redes`);
+    } catch (e) {
+      show('no se pudo escanear: ' + e);
+    }
+  });
+
   // Refrescar al abrir el tab, no en bucle: en fase CAPTURA el dato no cambia
   // y no tiene sentido meter trafico mientras se esta midiendo.
   const btn = $('tab-btn-enlace');

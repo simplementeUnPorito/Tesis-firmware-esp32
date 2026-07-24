@@ -203,6 +203,30 @@ inline bool webServerBegin()
      * el protocolo de 6 bytes que usan el resto de los comandos, asi que va por
      * HTTP. El disparo de la subida sí tiene comando (0xC0) para que MATLAB y
      * la SPA lo puedan mandar por el mismo camino que todo lo demas. */
+    /* Escaneo de redes: evita tener que tipear el SSID. Paso de verdad que se
+     * guardo "S21" en vez de "S21 Ultra de Elias David" y el maestro se quedo sin
+     * asociar sin que nada dijera por que. De paso el escaneo informa el canal de
+     * cada red, que es justo el dato que decide si ESP-NOW puede convivir con la
+     * STA (los esclavos tienen que estar en el canal del hotspot).
+     * Formato: "<canal> <rssi> <ssid>" por linea, mas fuerte primero. */
+    webServer.on("/enlace/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+        int n = WiFi.scanNetworks(false /*async*/, false /*hidden*/);
+        String body;
+        body.reserve(n > 0 ? n * 48 : 32);
+        for (int i = 0; i < n; i++) {
+            String ssid = WiFi.SSID(i);
+            if (ssid.length() == 0) continue;
+            body += String(WiFi.channel(i));
+            body += ' ';
+            body += String(WiFi.RSSI(i));
+            body += ' ';
+            body += ssid;
+            body += '\n';
+        }
+        WiFi.scanDelete();
+        request->send(200, "text/plain", body);
+    });
+
     webServer.on("/enlace/status", HTTP_GET, [](AsyncWebServerRequest *request) {
         request->send(200, "text/plain", linkStatusText());
     });
