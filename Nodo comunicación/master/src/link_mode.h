@@ -130,6 +130,7 @@ static uint32_t  g_linkPhaseStartMs = 0;
 static uint32_t  g_linkConnectStartMs = 0;
 static uint32_t  g_linkLastClientMs = 0;   /* ultima actividad del adquisidor */
 static uint16_t  g_linkServedFiles = 0;    /* archivos que el cliente confirmo */
+static uint16_t  g_linkStartFiles = 0;     /* cola al entrar en la fase */
 static char      g_linkLastError[64] = {0};
 
 /* Escritor de la cola */
@@ -257,7 +258,7 @@ struct LinkNodeInfo {
  * el dump sigue normal hacia WS/MATLAB, solo que no se encola. */
 inline bool linkQueueBegin(uint16_t nBatches,
                            const LinkNodeInfo *nodes, uint8_t nodeCount,
-                           uint32_t expectedBytes)
+                           uint32_t expectedBytes, bool isView)
 {
     if (g_linkQueueOpen) return false;
     if (nodeCount == 0)  return false;
@@ -298,6 +299,7 @@ inline bool linkQueueBegin(uint16_t nBatches,
     memcpy(hdr + 16, g_linkCfg.site, 16);
     memcpy(hdr + 32, &g_linkCfg.distance_mm, 4);
     /* epoch_s queda en 0: el maestro no tiene RTC. Lo sella el sink al recibir. */
+    hdr[40] = isView ? 0x01 : 0x00;   /* flags: bit0 = dump de VER (un nodo) */
     g_linkQueueFile.write(hdr, sizeof(hdr));
 
     for (uint8_t i = 0; i < nodeCount; i++) {
@@ -381,10 +383,12 @@ inline bool linkRequestUpload(const char **why)
 {
     if (g_linkPhase != LINK_IDLE) { if (why) *why = "ya en ENLACE"; return false; }
     if (!linkConfigUsable())      { if (why) *why = "falta ssid";   return false; }
-    if (linkQueueCount() == 0)    { if (why) *why = "cola vacia";   return false; }
+    /* Con la cola vacia se entra igual: sirve para probar la conexion sin tener
+     * que capturar antes. El idle de la fase lo devuelve a CAPTURA solo. */
     g_linkPhase = LINK_REQUESTED;
     g_linkPhaseStartMs = millis();
     g_linkServedFiles = 0;
+    g_linkStartFiles = linkQueueCount();
     g_linkLastError[0] = '\0';
     MASTER_LOG_PRINTF("[ENLACE] pedido: %u archivos, %u B\n",
                       (unsigned)linkQueueCount(), (unsigned)linkQueueBytesPending());
@@ -531,7 +535,10 @@ inline bool linkService(LinkRadioHook espnowDown, LinkRadioHook apUp)
             /* No hay nada que bombear: la SPA y los endpoints /enlace/* los
              * atiende AsyncWebServer en su propia task. Aca solo se vigila que
              * la fase no se eternice — estar en ENLACE es estar sordo. */
-            if (linkQueueCount() == 0) {
+            /* Solo se corta por cola vacia si habia algo para entregar: si se
+             * entro con la cola vacia (prueba de conexion) hay que quedarse
+             * hasta el idle, o no se llega ni a ver la IP. */
+            if (g_linkStartFiles > 0 && linkQueueCount() == 0) {
                 MASTER_LOG_PRINTLN("[ENLACE] cola vacia, cliente se llevo todo");
                 g_linkPhase = LINK_RESTORING;
             } else if (millis() - g_linkLastClientMs > LINK_SERVE_IDLE_MS) {

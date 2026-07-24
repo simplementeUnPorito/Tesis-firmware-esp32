@@ -10,6 +10,7 @@ import { PlotArea } from './plot.js?v=field-study-19';
 import { SpectrumArea } from './spectrum.js?v=field-study-19';
 import { SlavePanel } from './slave_panel.js?v=field-study-19';
 import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-19';
+import { initEnlaceTab } from './enlace.js?v=field-study-19';
 import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-19';
 
 const $ = (id) => document.getElementById(id);
@@ -2408,6 +2409,7 @@ $('btn-theme').addEventListener('click', () => {
 
 initTheme();
 initTabs();
+initEnlaceTab(appendLog);
 buildNodeRows();
 buildSlavePanels();
 renderPreservedList();

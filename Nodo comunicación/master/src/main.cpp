@@ -255,6 +255,7 @@ static volatile bool g_webReplayCachedState = false;
 static void beginDump(const char *reason);
 static bool requestEnlace(const char **why);
 static uint8_t collectLinkNodes(LinkNodeInfo *out, uint8_t maxNodes);
+static uint8_t collectLinkNodeSingle(LinkNodeInfo *out, uint8_t nodeId);
 static void abortCaptureToArmed(uint8_t nodeId, const char *reason);
 static void beginPrestart(PrestartAction action);
 static void beacon_pause(void);
@@ -796,15 +797,19 @@ static void beginDump(const char *reason)
         g_dumpRetries  = 0;
         matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
 
-        /* Encolar la sesion en LittleFS ademas de espejarla por WS. Es el
-         * buffer que le falta al maestro para poder subir de noche sin
-         * navegador. Un VIEW dump no se encola: es inspeccion, no sesion. */
-        if (!g_viewDump) {
+        /* Encolar el dump en LittleFS ademas de espejarlo por WS. Es el buffer
+         * que le falta al maestro para poder subir sin navegador.
+         * Se encolan tambien los VIEW dumps: con un solo esclavo, VER es la
+         * forma normal de capturar, y el dato es igual de real. El .geoq marca
+         * cual es cual (flags bit0) y el server decide que hacer. */
+        {
             LinkNodeInfo nodes[NUM_SLAVES];
-            uint8_t nodeCount = collectLinkNodes(nodes, NUM_SLAVES);
+            uint8_t nodeCount = g_viewDump
+                              ? collectLinkNodeSingle(nodes, g_viewNode)
+                              : collectLinkNodes(nodes, NUM_SLAVES);
             uint32_t expect = 0;
             for (uint8_t i = 0; i < nodeCount; i++) expect += (uint32_t)nodes[i].n_batches * 102u;
-            linkQueueBegin(g_rec_n_batches, nodes, nodeCount, expect);
+            linkQueueBegin(g_rec_n_batches, nodes, nodeCount, expect, g_viewDump);
         }
 
         requestBatch(g_dumpSlaveIdx, g_dumpBatchSeq);
@@ -1508,6 +1513,23 @@ static uint8_t collectLinkNodes(LinkNodeInfo *out, uint8_t maxNodes)
         memcpy(e.mac, h.mac, 6);
     }
     return n;
+}
+
+/* Igual que collectLinkNodes pero para un VIEW dump: un solo nodo, que puede no
+ * estar en g_armAckMask (VER no requiere ARM). */
+static uint8_t collectLinkNodeSingle(LinkNodeInfo *out, uint8_t nodeId)
+{
+    if (nodeId == 0 || nodeId > NUM_SLAVES) return 0;
+    const CachedHello &h = g_cachedHello[nodeId];
+    LinkNodeInfo &e = out[0];
+    e.node_id     = nodeId;
+    e.hw_class    = h.valid ? h.hw_class : 0;
+    e.sample_rate = h.valid ? h.sample_rate : 0;
+    e.n_batches   = dumpBatchesForNode(nodeId);
+    e.psoc_ok     = h.valid ? (h.psoc_ok != 0) : false;
+    e.sd_present  = h.valid ? (h.sd_present != 0) : false;
+    memcpy(e.mac, h.mac, 6);
+    return 1;
 }
 
 /* Pide entrar en ENLACE. Regla dura del diseño: solo desde IDLE/ARMED. */
