@@ -35,7 +35,6 @@ const PHASE_LABEL = {
 
 export function initEnlaceTab(log) {
   const statusEl = $('enlace-status');
-  const queueEl = $('enlace-queue');
   if (!statusEl) return;   // tab ausente (firmware viejo / index parcial)
 
   let lastIp = '';
@@ -50,25 +49,17 @@ export function initEnlaceTab(log) {
     const freeKb = (Number(st.fs_free || 0) / 1024).toFixed(0);
 
     let txt = PHASE_LABEL[phase] || phase;
-    txt += ` · cola: ${files} archivo${files === 1 ? '' : 's'} (${kb} kB)`;
-    txt += ` · libre: ${freeKb} kB`;
+    if (files > 0) txt += ` · ${files} captura${files === 1 ? '' : 's'} sin subir (${kb} kB)`;
     if (st.ip) { txt += ` · IP ${st.ip}`; lastIp = st.ip; }
-    if (st.served && st.served !== '0') txt += ` · entregados: ${st.served}`;
-    if (st.last_error) txt += ` · último error: ${st.last_error}`;
+    if (st.last_error) txt += ` · ${st.last_error}`;
+    txt += ` · libre ${freeKb} kB`;
     show(txt);
-
-    // Cuando el maestro se fue a la otra red, esta pagina deja de alcanzarlo:
-    // dejar a mano la URL para retomar desde el lado del cliente.
-    if (phase === 'sirviendo' && st.ip) {
-      queueEl.innerHTML =
-        `<div class="status-text">Desde el cliente (misma red que el maestro):<br>` +
-        `<code>http://${st.ip}/enlace/queue</code></div>`;
-    }
   }
 
   async function refresh() {
     try {
       const r = await fetch('/enlace/status', { cache: 'no-store' });
+      if (!r.ok) { show(`el maestro respondió HTTP ${r.status} en /enlace/status`); return; }
       render(parseStatus(await r.text()));
     } catch (e) {
       show(lastIp
@@ -80,61 +71,39 @@ export function initEnlaceTab(log) {
   async function loadInto() {
     try {
       const r = await fetch('/enlace/status', { cache: 'no-store' });
+      if (!r.ok) { show(`el maestro respondió HTTP ${r.status} en /enlace/status`); return; }
       const st = parseStatus(await r.text());
       if (st.ssid && !$('enlace-ssid').value) $('enlace-ssid').value = st.ssid;
-      if (st.site && !$('enlace-site').value) $('enlace-site').value = st.site;
-      const mm = Number(st.distance_mm || 0);
-      if (mm && !$('enlace-dist').value) $('enlace-dist').value = (mm / 1000).toString();
-      $('enlace-auto').checked = st.auto === '1';
       render(st);
     } catch (e) {
       show('sin respuesta del maestro');
     }
   }
 
-  $('btn-enlace-save').addEventListener('click', async () => {
+  // Sin boton de guardar: la red se persiste al salir del campo. Es un dato que
+  // se carga una vez y no se vuelve a tocar; un boton "Guardar" solo agrega un
+  // paso que se puede olvidar.
+  async function saveConfig() {
+    const ssid = $('enlace-ssid').value.trim();
+    if (!ssid) return;
     const body = new URLSearchParams();
-    body.append('ssid', $('enlace-ssid').value.trim());
+    body.append('ssid', ssid);
     body.append('pass', $('enlace-pass').value);
-    body.append('site', $('enlace-site').value.trim());
-    const m = parseFloat($('enlace-dist').value);
-    body.append('distance_mm', Number.isFinite(m) ? Math.round(m * 1000) : 0);
-    body.append('auto', $('enlace-auto').checked ? 1 : 0);
+    // site/distance_mm no se mandan: la geometria (offsets martillo-geofono por
+    // nodo) la lleva el ZIP que arma la SPA, que es el camino principal hacia el
+    // servidor. Pedirla aca de nuevo era configuracion duplicada.
     try {
       const r = await fetch('/enlace/config', { method: 'POST', body });
+      if (!r.ok) { show(`el maestro respondió HTTP ${r.status} al guardar`); return; }
       render(parseStatus(await r.text()));
-      log && log('Enlace: configuración guardada');
+      log && log(`Enlace: red "${ssid}" guardada`);
     } catch (e) {
       show('no se pudo guardar: ' + e);
     }
-  });
+  }
 
-  $('btn-enlace-now').addEventListener('click', async () => {
-    log && log('Enlace: cambiando de fase — el maestro deja de escuchar a los esclavos');
-    try {
-      const r = await fetch('/enlace/now', { method: 'POST' });
-      const txt = await r.text();
-      if (!r.ok) { show('rechazado: ' + txt.split('\n')[0]); return; }
-      render(parseStatus(txt));
-      // El maestro tarda en asociarse y en el camino baja el AP: esta pagina
-      // puede quedarse sin servidor. Se reintenta un par de veces por si el
-      // navegador esta del lado de la red nueva.
-      setTimeout(refresh, 3000);
-      setTimeout(refresh, 9000);
-    } catch (e) {
-      show('sin respuesta (esperable si estabas en el AP del maestro)');
-    }
-  });
-
-  $('btn-enlace-done').addEventListener('click', async () => {
-    try {
-      const r = await fetch('/enlace/done', { method: 'POST' });
-      render(parseStatus(await r.text()));
-      log && log('Enlace: volviendo a captura');
-    } catch (e) {
-      show('sin respuesta del maestro');
-    }
-  });
+  $('enlace-ssid').addEventListener('change', saveConfig);
+  $('enlace-pass').addEventListener('change', saveConfig);
 
   // Refrescar al abrir el tab, no en bucle: en fase CAPTURA el dato no cambia
   // y no tiene sentido meter trafico mientras se esta midiendo.

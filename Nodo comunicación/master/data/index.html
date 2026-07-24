@@ -84,6 +84,7 @@
           <div class="row">
             <label>Nombre <input id="export-name" type="text" value="muestra"></label>
             <button id="btn-export">Guardar CSV/ZIP</button>
+            <button id="btn-upload-server" title="Manda el mismo ZIP al servidor por la red del cliente">Subir al server</button>
           </div>
           <div id="export-status" class="status-text">--</div>
           <div class="subhead capture-subhead">Nodos</div>
@@ -127,9 +128,8 @@
         <section id="tab-enlace" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-enlace">
           <h2>Enlace</h2>
           <div class="status-text">
-            Red con internet a la que se asocia el maestro para que el cliente
-            se lleve las capturas. Durante el enlace el maestro no escucha a los
-            esclavos.
+            Red con internet del cliente. Con esto cargado, el maestro alterna
+            solo entre los esclavos y esta red; no hay nada que apretar acá.
           </div>
           <div class="row">
             <label>Red <input id="enlace-ssid" type="text" autocapitalize="off" autocomplete="off" spellcheck="false" title="Nombre de la red con internet (hotspot del celular o router)"></label>
@@ -137,20 +137,7 @@
           <div class="row">
             <label>Contraseña <input id="enlace-pass" type="password" autocomplete="off"></label>
           </div>
-          <div class="row">
-            <label>Punto <input id="enlace-site" type="text" maxlength="16" autocomplete="off" title="Nombre del punto de medición; el servidor lo usa como carpeta"></label>
-            <label>Distancia <input id="enlace-dist" type="number" step="0.1" min="0" title="Distancia geófono-martillo"> m</label>
-          </div>
-          <div class="row">
-            <label><input id="enlace-auto" type="checkbox" title="Entra en enlace apenas termina el dump de cada captura"> Enlazar solo al terminar cada captura</label>
-          </div>
-          <div class="row">
-            <button id="btn-enlace-save">Guardar</button>
-            <button id="btn-enlace-now">Conectar ahora</button>
-            <button id="btn-enlace-done">Volver a captura</button>
-          </div>
           <div id="enlace-status" class="status-text">sin consultar</div>
-          <div id="enlace-queue" class="preserve-list"></div>
         </section>
 
         <section id="tab-log" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-log">

@@ -69,6 +69,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 
@@ -78,7 +79,6 @@
 /* Archivo de texto plano clave=valor en LittleFS. Se edita por HTTP desde la
  * SPA (/enlace/config) — no se usa ArduinoJson para no sumar dependencia por
  * cinco campos, igual criterio que web_relay.h. */
-#define LINK_CFG_PATH   "/enlace.cfg"
 #define LINK_QUEUE_DIR  "/q"
 #define LINK_SEQ_PATH   "/enlace.seq"
 
@@ -153,36 +153,35 @@ static void linkCfgCopy(char *dst, size_t cap, const String &v)
     dst[cap - 1] = '\0';
 }
 
+/* La config vive en NVS, no en LittleFS, por una razon operativa concreta:
+ * `pio run -t uploadfs` reescribe la particion entera de LittleFS, asi que cada
+ * vez que se sube la SPA se borraria la red guardada. NVS es otra particion y
+ * `uploadfs` no la toca: la red se carga una vez y sobrevive a las
+ * actualizaciones de la interfaz. La cola de capturas sigue en LittleFS porque
+ * es dato a granel, no configuracion. */
+static Preferences g_linkPrefs;
+#define LINK_NVS_NS  "enlace"
+
 inline void linkConfigLoad()
 {
-    File f = LittleFS.open(LINK_CFG_PATH, "r");
-    if (!f) return;
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        int eq = line.indexOf('=');
-        if (eq <= 0) continue;
-        String k = line.substring(0, eq);
-        String v = line.substring(eq + 1);
-        if      (k == "ssid") linkCfgCopy(g_linkCfg.ssid, sizeof(g_linkCfg.ssid), v);
-        else if (k == "pass") linkCfgCopy(g_linkCfg.pass, sizeof(g_linkCfg.pass), v);
-        else if (k == "site") linkCfgCopy(g_linkCfg.site, sizeof(g_linkCfg.site), v);
-        else if (k == "distance_mm") g_linkCfg.distance_mm = (uint32_t)v.toInt();
-        else if (k == "auto") g_linkCfg.auto_upload = (v.toInt() != 0);
-    }
-    f.close();
+    if (!g_linkPrefs.begin(LINK_NVS_NS, true)) return;   /* solo lectura */
+    linkCfgCopy(g_linkCfg.ssid, sizeof(g_linkCfg.ssid), g_linkPrefs.getString("ssid", ""));
+    linkCfgCopy(g_linkCfg.pass, sizeof(g_linkCfg.pass), g_linkPrefs.getString("pass", ""));
+    linkCfgCopy(g_linkCfg.site, sizeof(g_linkCfg.site), g_linkPrefs.getString("site", ""));
+    g_linkCfg.distance_mm = g_linkPrefs.getUInt("dist_mm", 0);
+    g_linkCfg.auto_upload = g_linkPrefs.getBool("auto", false);
+    g_linkPrefs.end();
 }
 
 inline bool linkConfigSave()
 {
-    File f = LittleFS.open(LINK_CFG_PATH, "w");
-    if (!f) return false;
-    f.printf("ssid=%s\n", g_linkCfg.ssid);
-    f.printf("pass=%s\n", g_linkCfg.pass);
-    f.printf("site=%s\n", g_linkCfg.site);
-    f.printf("distance_mm=%u\n", (unsigned)g_linkCfg.distance_mm);
-    f.printf("auto=%d\n", g_linkCfg.auto_upload ? 1 : 0);
-    f.close();
+    if (!g_linkPrefs.begin(LINK_NVS_NS, false)) return false;
+    g_linkPrefs.putString("ssid", g_linkCfg.ssid);
+    g_linkPrefs.putString("pass", g_linkCfg.pass);
+    g_linkPrefs.putString("site", g_linkCfg.site);
+    g_linkPrefs.putUInt("dist_mm", g_linkCfg.distance_mm);
+    g_linkPrefs.putBool("auto", g_linkCfg.auto_upload);
+    g_linkPrefs.end();
     return true;
 }
 

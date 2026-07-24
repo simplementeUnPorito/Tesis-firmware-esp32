@@ -1772,24 +1772,35 @@ function onLatencyRequested(chIndex) {
   appendLog(`Latency probe -> Slave ${chIndex} (${cfg.START_LATENCY_PROBES})`);
 }
 
+// Arma el ZIP de la captura. Lo comparten "Guardar CSV/ZIP" y "Subir al
+// server": es exactamente el mismo paquete, solo cambia el destino.
+function buildExportZip() {
+  const displaySecs = parseInt($('disp-secs').value, 10) || null;
+  const nBatches = captureBatches();
+  const baseName = ($('export-name').value || cfg.DEFAULT_SAVE_NAME).trim() || cfg.DEFAULT_SAVE_NAME;
+  syncZeroPhaseFiltBuffers();
+  const liveCapture = makeCaptureSnapshot('Actual', { source: 'live', visible: false });
+  const built = buildCaptureZip(data, {
+    baseName,
+    nSlaves: visibleSlaveCount(),
+    nBatches,
+    displaySecs,
+    preservedCaptures: preservedCaptures.slice(),
+    liveCapture: captureHasSamples(liveCapture) ? liveCapture : null,
+  });
+  return { ...built, liveCapture };
+}
+
+function markExported(liveCapture) {
+  for (const capture of preservedCaptures) exportedCaptureSignatures.add(capture.signature);
+  if (captureHasSamples(liveCapture)) exportedCaptureSignatures.add(liveCapture.signature);
+}
+
 function onExportRequested() {
   try {
-    const displaySecs = parseInt($('disp-secs').value, 10) || null;
-    const nBatches = captureBatches();
-    const baseName = ($('export-name').value || cfg.DEFAULT_SAVE_NAME).trim() || cfg.DEFAULT_SAVE_NAME;
-    syncZeroPhaseFiltBuffers();
-    const liveCapture = makeCaptureSnapshot('Actual', { source: 'live', visible: false });
-    const { blob, filename, metadata } = buildCaptureZip(data, {
-      baseName,
-      nSlaves: visibleSlaveCount(),
-      nBatches,
-      displaySecs,
-      preservedCaptures: preservedCaptures.slice(),
-      liveCapture: captureHasSamples(liveCapture) ? liveCapture : null,
-    });
+    const { blob, filename, metadata, liveCapture } = buildExportZip();
     downloadBlob(blob, filename);
-    for (const capture of preservedCaptures) exportedCaptureSignatures.add(capture.signature);
-    if (captureHasSamples(liveCapture)) exportedCaptureSignatures.add(liveCapture.signature);
+    markExported(liveCapture);
     const captureCount = metadata.capture_count ?? 1;
     const combined = metadata.combined_csv_file ? ` · ${metadata.combined_csv_file}` : '';
     $('export-status').textContent =
@@ -2635,6 +2646,67 @@ $('btn-cal-all').addEventListener('click', () => {
 });
 
 $('btn-export').addEventListener('click', onExportRequested);
+
+// "Subir al server": el mismo ZIP, pero POSTeado al servidor de datos en vez de
+// bajarlo. Ojo con quien hace este pedido: lo hace el NAVEGADOR, no el maestro
+// — el ESP nunca sale a internet. Por eso la URL del servidor es un ajuste del
+// cliente (localStorage) y no de la config del maestro: depende de la tailnet
+// desde donde estes mirando, no del equipo de campo.
+const SERVER_URL_KEY = 'geo.server.url';
+
+function serverUrl(ask) {
+  let url = '';
+  try { url = localStorage.getItem(SERVER_URL_KEY) || ''; } catch (e) { /* modo privado */ }
+  if (!url && ask) {
+    url = (prompt('URL del servidor de datos (ej. http://100.x.y.z:8000/ingest)') || '').trim();
+    if (url) { try { localStorage.setItem(SERVER_URL_KEY, url); } catch (e) { /* ignorar */ } }
+  }
+  return url;
+}
+
+async function onUploadToServer() {
+  const url = serverUrl(true);
+  if (!url) { $('export-status').textContent = 'Subida cancelada: falta la URL del servidor'; return; }
+  let built;
+  try {
+    built = buildExportZip();
+  } catch (err) {
+    $('export-status').textContent = `Error armando el ZIP: ${err && err.message ? err.message : err}`;
+    return;
+  }
+  const { blob, filename, metadata, liveCapture } = built;
+  const kb = (blob.size / 1024).toFixed(0);
+  $('export-status').textContent = `Subiendo ${filename} (${kb} kB)…`;
+  appendLog(`Subiendo ${filename} (${kb} kB) a ${url}`);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip', 'X-Geo-Filename': filename },
+      body: blob,
+    });
+    const txt = (await r.text()).trim();
+    if (!r.ok) {
+      $('export-status').textContent = `El servidor rechazó la subida (HTTP ${r.status}): ${txt.slice(0, 120)}`;
+      appendLog(`Subida rechazada: HTTP ${r.status}`);
+      return;
+    }
+    // Recien con el 2xx del servidor se marca como exportada: si la subida
+    // fallo, la captura sigue pendiente y no se pierde de vista.
+    markExported(liveCapture);
+    const captureCount = metadata.capture_count ?? 1;
+    $('export-status').textContent = `Subido: ${filename} (${captureCount} capturas) — ${txt.slice(0, 80)}`;
+    appendLog(`Subida OK: ${filename}`);
+  } catch (err) {
+    // Caso tipico: el navegador esta en el AP del maestro, que no tiene salida,
+    // o el maestro esta en fase de captura y el telefono perdio la ruta.
+    $('export-status').textContent =
+      `No se pudo alcanzar el servidor (${err && err.message ? err.message : err}). ` +
+      `¿Estás en la red del cliente, con la VPN levantada?`;
+    appendLog('Subida fallida: servidor inalcanzable');
+  }
+}
+
+$('btn-upload-server').addEventListener('click', onUploadToServer);
 $('btn-preserved-all').addEventListener('click', () => setAllPreservedVisible(true));
 $('btn-preserved-none').addEventListener('click', () => setAllPreservedVisible(false));
 $('btn-preserved-clear').addEventListener('click', clearPreservedCaptures);
