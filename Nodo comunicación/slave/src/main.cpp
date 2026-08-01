@@ -140,7 +140,7 @@ static uint8_t g_masterTxMac[6] = {
   #if defined(ESP8266)
     #define SYNC_IN_PIN 5
   #else
-    #define SYNC_IN_PIN 26
+    #define SYNC_IN_PIN 32
   #endif
 #endif
 #ifndef SYNC_TO_PSOC_PIN

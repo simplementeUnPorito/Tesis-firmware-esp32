@@ -5,9 +5,9 @@
  * Reemplaza al antiguo psoc_spi. El PSoC envía lotes RAW (sin Filter) y el
  * esclavo le manda comandos (set N, PGA, calibracion, pre-start, ver, debug).
  *
- * Cableado (ESP32, Serial2 por defecto):
- *   PSOC_UART_RX (GPIO16) ← TX del PSoC (UART.TX)
- *   PSOC_UART_TX (GPIO17) → RX del PSoC (UART.RX)
+ * Cableado vigente (ESP32-DevKitC V4, Serial2):
+ *   PSOC_UART_RX (GPIO25/J2.9)  ← TX del PSoC (P12[7]/J1.9)
+ *   PSOC_UART_TX (GPIO26/J2.10) → RX del PSoC (P2[0]/J1.1)
  *   Baud: PSOC_UART_BAUD (coincidir con el PSoC).
  *
  * Frame de datos PSoC→ESP (95 bytes):
@@ -25,10 +25,10 @@
 #define PSOC_UART_BAUD 115200UL   /* 460800/921600 no son divisibles exactos a 24 MHz */
 #endif
 #ifndef PSOC_UART_RX
-#define PSOC_UART_RX 16
+#define PSOC_UART_RX 25
 #endif
 #ifndef PSOC_UART_TX
-#define PSOC_UART_TX 17
+#define PSOC_UART_TX 26
 #endif
 #ifndef PSOC_UART_RX_BUFFER_SIZE
 #define PSOC_UART_RX_BUFFER_SIZE 32768

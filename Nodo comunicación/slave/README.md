@@ -14,7 +14,7 @@ WAIT_ARM → ARMED → HOT_WAIT → SAMPLING → STOPPED
 - **ARMED**: envía `CMD_ARM_ACK`, espera `CMD_PRESTART`.
 - **HOT_WAIT**: `CMD_PRESTART(N)` recibido → reserva buffer, arma PSoC
   (`setN` + `preStart`). Solo espera `CMD_START` o queries de maestro.
-- **SAMPLING**: recibe `CMD_START` → levanta `SYNC_TO_PSOC` (GPIO23) → PSoC
+- **SAMPLING**: recibe `CMD_START` → levanta `SYNC_TO_PSOC` (GPIO27) → PSoC
   arranca. Acumula N lotes del PSoC y espera dump (`CMD_REQ_BATCH`).
 - **STOPPED**: vuelve a WAIT_ARM al recibir `CMD_STOP`.
 
@@ -27,9 +27,13 @@ esta completo envia `CMD_VIEW ok=2`; el maestro recupera los lotes con
 
 ## Enlace con el PSoC (`psoc_uart.*`)
 
-- **Serial2** (ESP32): `PSOC_UART_RX=17`, `PSOC_UART_TX=16`, baud=115200.
-- Wiring: ESP GPIO17 → PSoC P1[2] (RX); ESP GPIO16 ← PSoC P1[5] (TX).
-- **Arranque siempre por pin**: GPIO23 (`SYNC_TO_PSOC`) → PSoC `SYNC_IN` (P12[6]).
+- **Serial2** (ESP32): `PSOC_UART_RX=25`, `PSOC_UART_TX=26`, baud=115200.
+- Wiring carrier: ESP GPIO26/J2.10 → PSoC P2[0]/J1.1 (`Rx`);
+  ESP GPIO25/J2.9 ← PSoC P12[7]/J1.9 (`Tx`).
+- `Tx` del PSoC es `OPEN_DRAIN_LO`: la carrier incluye `R1 = 4.7 kOhm`
+  hacia 3.3 V del ESP32.
+- **Arranque siempre por pin**: GPIO27/J2.11 (`SYNC_TO_PSOC`) → PSoC
+  `SYNC_IN` P1[5]/J1.22. GPIO32/J2.7 queda como sincronismo externo opcional.
   El PSoC nunca arranca por comando UART.
 
 ## Auto-calibración
