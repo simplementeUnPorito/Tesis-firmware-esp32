@@ -117,16 +117,39 @@ interno**. Los cuatro pull-ups externos son obligatorios para evitar entradas
 flotantes. El OLED y los botones trabajan a 3.3 V.
 
 `OK` abre el menú; ARRIBA/ABAJO navegan y ATRÁS vuelve a la pantalla de
-estado. Las acciones disponibles son captura local, calibración del PSoC,
-snapshot ADC, identificación del nodo y limpieza de captura. Mantener ATRÁS
-durante 900 ms detiene una captura. Durante `HOT_WAIT` y `SAMPLING` no se
-actualiza el OLED por SPI, para no introducir actividad digital en la ventana
-crítica; solo se leen los botones y se admite la pulsación larga de parada.
+estado. El menú tiene siete entradas:
+
+| Entrada | Qué hace |
+|---|---|
+| `Capturar N lotes` | preStart + sync local, sin pasar por el maestro |
+| `Calibrar PSoC` | dispara la autocalibración |
+| `Snapshot ADC` | pide el reporte de diagnóstico del ADC |
+| `Identificar nodo` | titila el LED del PSoC |
+| `Limpiar captura` | libera el store y vuelve a `STOPPED` |
+| `PGA Nx` | avanza al siguiente código de ganancia (0-8, con vuelta) |
+| `PGAout Nx` | idem para la etapa de salida; **solo aparece en nodos GEO** |
+
+Las dos entradas de ganancia muestran el valor vigente y mandan el cambio al
+PSoC; el valor local recién se actualiza con el ACK, igual que cuando el
+cambio viene de la web. Si el nodo está capturando o hay otro config en vuelo,
+la pantalla avisa y no manda nada.
+
+Mantener ATRÁS durante 900 ms detiene una captura. Durante `HOT_WAIT` y
+`SAMPLING` no se actualiza el OLED por SPI, para no introducir actividad
+digital en la ventana crítica; solo se leen los botones y se admite la
+pulsación larga de parada.
 
 La cantidad de lotes de la captura local se configura con
-`LOCAL_CAPTURE_BATCHES` en `platformio.ini`. Esta interfaz no consume GPIO22 ni
-GPIO25: GPIO25 continúa siendo el RX UART actual hasta migrar la respuesta del
-PSoC al futuro enlace I2C PSoC-maestro/ESP-esclavo.
+`LOCAL_CAPTURE_BATCHES` en `platformio.ini`.
+
+**Esta interfaz es la de campo**, así que sus acciones (`serviceLocalUi` y los
+`request*FromUsb` que usa) se compilan SIEMPRE, fuera del bloque
+`#if SLAVE_USB_CMD_ENABLE`. El firmware de campo apaga esos flags de banco de
+pruebas; si la UI quedara adentro, la placa se quedaría sin ninguna forma de
+manejar la máquina de estados sin la web.
+
+Pines: la UI no toca GPIO21/22 (enlace I2C PSoC→ESP) ni GPIO26/27 (UART de
+comandos y sync hacia el PSoC).
 
 ## Archivos
 

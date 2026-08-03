@@ -1561,6 +1561,216 @@ static void scheduleAutoCalibration(uint32_t) {}
 static void serviceAutoCalibration() {}
 #endif
 
+/* ── Acciones de nodo compartidas por la UI local y los comandos USB ──────
+ * Estas viven FUERA de #if SLAVE_USB_CMD_ENABLE a propósito. El firmware de
+ * campo compila con los flags de banco de pruebas en 0, y la UI local (OLED
+ * + 4 botones) es justamente la interfaz de campo: si quedara dentro del
+ * bloque de USB, la placa se quedaría sin ninguna forma de manejar la
+ * máquina de estados sin la web. El prefijo "FromUsb" es histórico.
+ * ────────────────────────────────────────────────────────────────────── */
+
+static void requestPrestartFromUsb(uint16_t n)
+{
+    if (captureOrDumpBusy()) {
+        SLAVE_LOG_PRINTF("[USB] pre ignored: busy state=%d fill=%u/%u\n",
+                         (int)g_state, (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
+        return;
+    }
+    enterHotWait(n);
+    g_view_store_active = false;
+    g_start_store_active = false;
+    SLAVE_LOG_PRINTF("[USB] pre n=%u state=%d ready=%u\n",
+                     (unsigned)g_rec_n_batches, (int)g_state,
+                     (unsigned)storeReadyForHotWait());
+    LOGM("USB_CMD", "cmd=pre,n=%u,ready=%u",
+         (unsigned)g_rec_n_batches, (unsigned)storeReadyForHotWait());
+}
+
+static void requestUsbStartFromHotWait()
+{
+    if (g_state != HOT_WAIT || !storeReadyForHotWait()) {
+        SLAVE_LOG_PRINTF("[USB] sync ignored state=%d ready=%u\n",
+                         (int)g_state, (unsigned)storeReadyForHotWait());
+        return;
+    }
+    uint32_t nowUs = (uint32_t)micros();
+    int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
+    digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+    int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
+    g_t_start_us = (uint64_t)nowUs;
+    g_store_fill = 0;
+    g_debug_count = 0;
+    g_debug_last_us = nowUs;
+    g_sampling_start_ms = millis();
+    g_sampling_start_psoc_bytes = psoc.bytesRx();
+    g_sampling_start_batches_ok = psoc.batchesOK();
+    g_view_store_active = false;
+    g_start_store_active = (g_rec_n_batches > 0 && storeReadyForHotWait());
+    g_start_fallback_sent = false;
+    g_state = SAMPLING;
+    SLAVE_LOG_PRINTF("[USB] sync start n=%u sync=%d->%d bytes=%lu\n",
+                     (unsigned)g_rec_n_batches, syncBefore, syncAfter,
+                     (unsigned long)g_sampling_start_psoc_bytes);
+    LOGM("USB_CMD", "cmd=sync,n=%u,syncBefore=%d,syncAfter=%d",
+         (unsigned)g_rec_n_batches, syncBefore, syncAfter);
+}
+
+static void requestCaptureFromUsb(uint16_t n)
+{
+    requestPrestartFromUsb(n);
+    /* El PSoC confirma ARMED (PSOC_EVT_ARMED -> g_psoc_arm_ready) de forma
+     * asíncrona ~100-300 ms después del preStart. Sin esta espera el sync se
+     * disparaba antes de ARMED y quedaba ignorado (ready=0), dejando la captura
+     * colgada en HOT_WAIT con fill=0/N. Esto era la falsa "regresión de banco"
+     * no-monotónica (cap chico ✓, cap grande ✗): dependía de la latencia del
+     * ACK ARMED, no de pérdida de frames UART. El path real maestro->esclavo no
+     * sufre esto porque PRESTART y START llegan separados por radio. */
+    if (g_state == HOT_WAIT) {
+        uint32_t deadline = millis() + 800u;   /* margen holgado para el ACK ARMED */
+        while (!storeReadyForHotWait() && (int32_t)(millis() - deadline) < 0) {
+            psoc.poll();
+            servicePsocConfigAck();
+            serviceHotWaitWatchdog();   /* re-arma preStart si ARMED no llega */
+        }
+    }
+    requestUsbStartFromHotWait();
+}
+
+static void requestStopFromUsb()
+{
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    g_debug_mode = false;
+    debugEspSetRamp(false);
+    psoc.debugRamp(false);
+    g_view_store_active = false;
+    g_start_store_active = false;
+    g_start_fallback_sent = false;
+    g_view_remaining = 0;
+    allocStore(0);
+    g_state = STOPPED;
+    SLAVE_LOG_PRINTLN("[USB] stop");
+    LOGM("USB_CMD", "cmd=stop,ok=1");
+}
+
+static void requestClearFromUsb()
+{
+    g_view_store_active = false;
+    g_start_store_active = false;
+    g_start_fallback_sent = false;
+    g_view_remaining = 0;
+    allocStore(0);
+    if (g_state != SAMPLING && g_state != HOT_WAIT) {
+        g_state = STOPPED;
+    }
+    SLAVE_LOG_PRINTLN("[USB] clear");
+    LOGM("USB_CMD", "cmd=clear,ok=1");
+}
+
+/* Avanza al siguiente codigo de ganancia (0-8, con vuelta) y lo manda al PSoC.
+ * El valor local NO se actualiza aca: se confirma con el ACK del PSoC en
+ * applyConfirmedConfig(), igual que cuando el cambio viene de la web. */
+static bool requestLocalGainStep(uint8_t subCmd, uint8_t current, const char *name)
+{
+    char notice[22];
+    const uint8_t next = (uint8_t)((current + 1u) % 9u);
+
+    servicePsocConfigAck();
+    if (!g_psocConnected || captureOrDumpBusy() || g_cfg_waiting) {
+        snprintf(notice, sizeof(notice), "%s ocupado", name);
+        localUiNotify(notice, false);
+        return false;
+    }
+    if (subCmd == PSOC_CMD_PGAOUT) {
+        psoc.setPgaout(next);
+    } else {
+        psoc.setPga(next);
+    }
+    waitForPsocConfigAck(subCmd, next);
+    snprintf(notice, sizeof(notice), "%s -> codigo %u", name, (unsigned)next);
+    localUiNotify(notice, true);
+    return true;
+}
+
+static void serviceLocalUi()
+{
+    const bool critical = (g_state == SAMPLING || g_state == HOT_WAIT);
+    LocalUiStatus status = {
+        NODE_ID,
+        (uint8_t)g_state,
+        g_psocConnected,
+        g_cfg_waiting,
+        psocSdPresent() != 0u,
+        g_masterChannel,
+        psoc.sampleRate(),
+        g_store_fill,
+        g_rec_n_batches,
+        g_pga_code,
+        g_pgaout,
+        /* PGAout solo existe en el pipeline GEO de la placa nueva. Mientras el
+         * PSoC no diga que es GEO se oculta, para no ofrecer un ajuste que el
+         * nodo va a rechazar. */
+        (g_psoc_hw_class == 0u)
+    };
+
+    const LocalUiAction action = localUiService(status, critical);
+    switch (action) {
+        case LOCAL_UI_ACTION_CAPTURE:
+            if (!g_psocConnected || captureOrDumpBusy() || g_cfg_waiting) {
+                localUiNotify("Captura no disponible", false);
+                break;
+            }
+            localUiNotify("Armando captura", true);
+            requestCaptureFromUsb(LOCAL_CAPTURE_BATCHES);
+            if (g_state != SAMPLING) {
+                localUiNotify("No se pudo iniciar", false);
+            }
+            break;
+        case LOCAL_UI_ACTION_CALIBRATE: {
+            const bool ok = requestPsocCalibration("LOCAL_UI");
+            if (ok) {
+                g_auto_cal_requested = true;
+                g_auto_cal_due_ms = 0u;
+            }
+            localUiNotify(ok ? "Calibracion pedida" : "Calibracion ocupada", ok);
+            break;
+        }
+        case LOCAL_UI_ACTION_ADC_SNAPSHOT: {
+            const bool ok = requestPsocAdcSnapshot("LOCAL_UI");
+            localUiNotify(ok ? "Snapshot solicitado" : "Snapshot no disponible", ok);
+            break;
+        }
+        case LOCAL_UI_ACTION_IDENTIFY:
+            if (!g_psocConnected || captureOrDumpBusy()) {
+                localUiNotify("Nodo ocupado", false);
+            } else {
+                psoc.blinkLed();
+                localUiNotify("LED PSoC activo", true);
+            }
+            break;
+        case LOCAL_UI_ACTION_CLEAR:
+            if (critical) {
+                localUiNotify("Captura activa", false);
+            } else {
+                requestClearFromUsb();
+                localUiNotify("Captura limpiada", true);
+            }
+            break;
+        case LOCAL_UI_ACTION_STOP:
+            requestStopFromUsb();
+            localUiNotify("Captura detenida", true);
+            break;
+        case LOCAL_UI_ACTION_PGA_NEXT:
+            (void)requestLocalGainStep(PSOC_CMD_PGA, g_pga_code, "PGA");
+            break;
+        case LOCAL_UI_ACTION_PGAOUT_NEXT:
+            (void)requestLocalGainStep(PSOC_CMD_PGAOUT, g_pgaout, "PGAout");
+            break;
+        case LOCAL_UI_ACTION_NONE:
+        default:
+            break;
+    }
+}
+
 #if SLAVE_USB_CMD_ENABLE
 static bool usbCommandEquals(const char *cmd, const char *word)
 {
@@ -1912,52 +2122,6 @@ static void requestDebugPsocFromUsb(uint16_t enable)
     LOGM("USB_CMD", "cmd=debugpsoc,en=%u", (unsigned)(enable != 0u));
 }
 
-static void requestPrestartFromUsb(uint16_t n)
-{
-    if (captureOrDumpBusy()) {
-        SLAVE_LOG_PRINTF("[USB] pre ignored: busy state=%d fill=%u/%u\n",
-                         (int)g_state, (unsigned)g_store_fill, (unsigned)g_rec_n_batches);
-        return;
-    }
-    enterHotWait(n);
-    g_view_store_active = false;
-    g_start_store_active = false;
-    SLAVE_LOG_PRINTF("[USB] pre n=%u state=%d ready=%u\n",
-                     (unsigned)g_rec_n_batches, (int)g_state,
-                     (unsigned)storeReadyForHotWait());
-    LOGM("USB_CMD", "cmd=pre,n=%u,ready=%u",
-         (unsigned)g_rec_n_batches, (unsigned)storeReadyForHotWait());
-}
-
-static void requestUsbStartFromHotWait()
-{
-    if (g_state != HOT_WAIT || !storeReadyForHotWait()) {
-        SLAVE_LOG_PRINTF("[USB] sync ignored state=%d ready=%u\n",
-                         (int)g_state, (unsigned)storeReadyForHotWait());
-        return;
-    }
-    uint32_t nowUs = (uint32_t)micros();
-    int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
-    digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
-    int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
-    g_t_start_us = (uint64_t)nowUs;
-    g_store_fill = 0;
-    g_debug_count = 0;
-    g_debug_last_us = nowUs;
-    g_sampling_start_ms = millis();
-    g_sampling_start_psoc_bytes = psoc.bytesRx();
-    g_sampling_start_batches_ok = psoc.batchesOK();
-    g_view_store_active = false;
-    g_start_store_active = (g_rec_n_batches > 0 && storeReadyForHotWait());
-    g_start_fallback_sent = false;
-    g_state = SAMPLING;
-    SLAVE_LOG_PRINTF("[USB] sync start n=%u sync=%d->%d bytes=%lu\n",
-                     (unsigned)g_rec_n_batches, syncBefore, syncAfter,
-                     (unsigned long)g_sampling_start_psoc_bytes);
-    LOGM("USB_CMD", "cmd=sync,n=%u,syncBefore=%d,syncAfter=%d",
-         (unsigned)g_rec_n_batches, syncBefore, syncAfter);
-}
-
 static void requestStartNowFromUsb(uint16_t n)
 {
     uint32_t nowUs;
@@ -1989,57 +2153,6 @@ static void requestStartNowFromUsb(uint16_t n)
                      (unsigned)g_start_store_active);
     LOGM("USB_CMD", "cmd=startnow,n=%u,store=%u",
          (unsigned)g_rec_n_batches, (unsigned)g_start_store_active);
-}
-
-static void requestCaptureFromUsb(uint16_t n)
-{
-    requestPrestartFromUsb(n);
-    /* El PSoC confirma ARMED (PSOC_EVT_ARMED -> g_psoc_arm_ready) de forma
-     * asíncrona ~100-300 ms después del preStart. Sin esta espera el sync se
-     * disparaba antes de ARMED y quedaba ignorado (ready=0), dejando la captura
-     * colgada en HOT_WAIT con fill=0/N. Esto era la falsa "regresión de banco"
-     * no-monotónica (cap chico ✓, cap grande ✗): dependía de la latencia del
-     * ACK ARMED, no de pérdida de frames UART. El path real maestro->esclavo no
-     * sufre esto porque PRESTART y START llegan separados por radio. */
-    if (g_state == HOT_WAIT) {
-        uint32_t deadline = millis() + 800u;   /* margen holgado para el ACK ARMED */
-        while (!storeReadyForHotWait() && (int32_t)(millis() - deadline) < 0) {
-            psoc.poll();
-            servicePsocConfigAck();
-            serviceHotWaitWatchdog();   /* re-arma preStart si ARMED no llega */
-        }
-    }
-    requestUsbStartFromHotWait();
-}
-
-static void requestStopFromUsb()
-{
-    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
-    g_debug_mode = false;
-    debugEspSetRamp(false);
-    psoc.debugRamp(false);
-    g_view_store_active = false;
-    g_start_store_active = false;
-    g_start_fallback_sent = false;
-    g_view_remaining = 0;
-    allocStore(0);
-    g_state = STOPPED;
-    SLAVE_LOG_PRINTLN("[USB] stop");
-    LOGM("USB_CMD", "cmd=stop,ok=1");
-}
-
-static void requestClearFromUsb()
-{
-    g_view_store_active = false;
-    g_start_store_active = false;
-    g_start_fallback_sent = false;
-    g_view_remaining = 0;
-    allocStore(0);
-    if (g_state != SAMPLING && g_state != HOT_WAIT) {
-        g_state = STOPPED;
-    }
-    SLAVE_LOG_PRINTLN("[USB] clear");
-    LOGM("USB_CMD", "cmd=clear,ok=1");
 }
 
 static bool requestPsocGainFromUsb(uint8_t subCmd, uint8_t param, const char *name)
@@ -2119,74 +2232,6 @@ static bool requestDecimationFromUsb(uint8_t factor)
     LOGM("USB_CMD", "cmd=decim,ok=%u,sub=0x%02X,value=%u",
          (unsigned)sent, PSOC_CMD_SET_DECIMATION, (unsigned)factor);
     return sent;
-}
-
-static void serviceLocalUi()
-{
-    const bool critical = (g_state == SAMPLING || g_state == HOT_WAIT);
-    LocalUiStatus status = {
-        NODE_ID,
-        (uint8_t)g_state,
-        g_psocConnected,
-        g_cfg_waiting,
-        psocSdPresent() != 0u,
-        g_masterChannel,
-        psoc.sampleRate(),
-        g_store_fill,
-        g_rec_n_batches
-    };
-
-    const LocalUiAction action = localUiService(status, critical);
-    switch (action) {
-        case LOCAL_UI_ACTION_CAPTURE:
-            if (!g_psocConnected || captureOrDumpBusy() || g_cfg_waiting) {
-                localUiNotify("Captura no disponible", false);
-                break;
-            }
-            localUiNotify("Armando captura", true);
-            requestCaptureFromUsb(LOCAL_CAPTURE_BATCHES);
-            if (g_state != SAMPLING) {
-                localUiNotify("No se pudo iniciar", false);
-            }
-            break;
-        case LOCAL_UI_ACTION_CALIBRATE: {
-            const bool ok = requestPsocCalibration("LOCAL_UI");
-            if (ok) {
-                g_auto_cal_requested = true;
-                g_auto_cal_due_ms = 0u;
-            }
-            localUiNotify(ok ? "Calibracion pedida" : "Calibracion ocupada", ok);
-            break;
-        }
-        case LOCAL_UI_ACTION_ADC_SNAPSHOT: {
-            const bool ok = requestPsocAdcSnapshot("LOCAL_UI");
-            localUiNotify(ok ? "Snapshot solicitado" : "Snapshot no disponible", ok);
-            break;
-        }
-        case LOCAL_UI_ACTION_IDENTIFY:
-            if (!g_psocConnected || captureOrDumpBusy()) {
-                localUiNotify("Nodo ocupado", false);
-            } else {
-                psoc.blinkLed();
-                localUiNotify("LED PSoC activo", true);
-            }
-            break;
-        case LOCAL_UI_ACTION_CLEAR:
-            if (critical) {
-                localUiNotify("Captura activa", false);
-            } else {
-                requestClearFromUsb();
-                localUiNotify("Captura limpiada", true);
-            }
-            break;
-        case LOCAL_UI_ACTION_STOP:
-            requestStopFromUsb();
-            localUiNotify("Captura detenida", true);
-            break;
-        case LOCAL_UI_ACTION_NONE:
-        default:
-            break;
-    }
 }
 
 static void handleUsbCommand(const char *cmd)

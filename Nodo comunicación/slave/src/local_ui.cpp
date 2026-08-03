@@ -93,12 +93,16 @@ uint32_t g_notice_until_ms = 0u;
 bool g_notice_ok = false;
 char g_notice[22] = {0};
 
+/* Las entradas 0 (captura), 5 (PGA) y 6 (PGAout) se dibujan a mano porque
+ * llevan el valor actual al lado; el resto usa esta tabla. */
 const char *const MENU_LABELS[] = {
     nullptr,
     "Calibrar PSoC",
     "Snapshot ADC",
     "Identificar nodo",
-    "Limpiar captura"
+    "Limpiar captura",
+    nullptr,
+    nullptr
 };
 
 const LocalUiAction MENU_ACTIONS[] = {
@@ -106,10 +110,23 @@ const LocalUiAction MENU_ACTIONS[] = {
     LOCAL_UI_ACTION_CALIBRATE,
     LOCAL_UI_ACTION_ADC_SNAPSHOT,
     LOCAL_UI_ACTION_IDENTIFY,
-    LOCAL_UI_ACTION_CLEAR
+    LOCAL_UI_ACTION_CLEAR,
+    LOCAL_UI_ACTION_PGA_NEXT,
+    LOCAL_UI_ACTION_PGAOUT_NEXT
 };
 
 constexpr uint8_t MENU_COUNT = sizeof(MENU_ACTIONS) / sizeof(MENU_ACTIONS[0]);
+constexpr uint8_t MENU_ROW_PGA = 5u;
+constexpr uint8_t MENU_ROW_PGAOUT = 6u;
+
+/* Mismos codigos que PGAgain/PGAout del PSoC (PGAgain_GAIN_01..GAIN_50). */
+const uint8_t GAIN_X[] = {1u, 2u, 4u, 8u, 16u, 24u, 32u, 48u, 50u};
+
+/* Copia del ultimo estado dibujado: el menu necesita mostrar la ganancia
+ * vigente y localUiService() ya la recibe en cada vuelta. */
+uint8_t g_pga_code = 0u;
+uint8_t g_pgaout_code = 0u;
+bool g_has_pgaout = false;
 
 const char *stateName(uint8_t state)
 {
@@ -146,6 +163,18 @@ void pollButton(Button &button, uint32_t now)
         button.long_reported = true;
         button.long_event = true;
     }
+}
+
+/* Avanza el cursor saltando la fila de PGAout cuando el nodo no la tiene. */
+uint8_t menuStep(uint8_t index, int8_t delta)
+{
+    for (uint8_t guard = 0u; guard < MENU_COUNT; guard++) {
+        index = (uint8_t)((index + MENU_COUNT + delta) % MENU_COUNT);
+        if (index != MENU_ROW_PGAOUT || g_has_pgaout) {
+            return index;
+        }
+    }
+    return 0u;
 }
 
 void drawNotice()
@@ -190,6 +219,8 @@ void drawStatus(const LocalUiStatus &status)
     g_display.display();
 }
 
+/* 7 filas no entran en 64 px con el alto de linea viejo: se pasa a 8 px por
+ * fila y se arranca justo debajo del titulo. */
 void drawMenu()
 {
     g_display.clearDisplay();
@@ -198,12 +229,23 @@ void drawMenu()
     g_display.setCursor(0, 0);
     g_display.println("MENU LOCAL");
     for (uint8_t row = 0u; row < MENU_COUNT; row++) {
-        g_display.setCursor(0, 12 + row * 10);
+        if (row == MENU_ROW_PGAOUT && !g_has_pgaout) {
+            continue;   /* HAMMER / placa vieja: PGAout no existe */
+        }
+        g_display.setCursor(0, (int16_t)(10 + row * 8));
         g_display.print(row == g_menu_index ? '>' : ' ');
         if (row == 0u) {
             g_display.print("Capturar ");
             g_display.print(LOCAL_CAPTURE_BATCHES);
             g_display.println(" lotes");
+        } else if (row == MENU_ROW_PGA) {
+            g_display.print("PGA ");
+            g_display.print(GAIN_X[g_pga_code % (sizeof(GAIN_X) / sizeof(GAIN_X[0]))]);
+            g_display.println("x");
+        } else if (row == MENU_ROW_PGAOUT) {
+            g_display.print("PGAout ");
+            g_display.print(GAIN_X[g_pgaout_code % (sizeof(GAIN_X) / sizeof(GAIN_X[0]))]);
+            g_display.println("x");
         } else {
             g_display.println(MENU_LABELS[row]);
         }
@@ -250,6 +292,14 @@ LocalUiAction localUiService(const LocalUiStatus &status, bool criticalWindow)
         pollButton(button, now);
     }
 
+    if (status.pga_code != g_pga_code || status.pgaout_code != g_pgaout_code ||
+        status.has_pgaout != g_has_pgaout) {
+        g_pga_code = status.pga_code;
+        g_pgaout_code = status.pgaout_code;
+        g_has_pgaout = status.has_pgaout;
+        g_dirty = true;
+    }
+
     if (criticalWindow) {
         g_was_critical = true;
         if (g_buttons[3].long_event) {
@@ -278,11 +328,11 @@ LocalUiAction localUiService(const LocalUiStatus &status, bool criticalWindow)
         }
     } else {
         if (g_buttons[0].press_event) {
-            g_menu_index = (uint8_t)((g_menu_index + MENU_COUNT - 1u) % MENU_COUNT);
+            g_menu_index = menuStep(g_menu_index, -1);
             g_dirty = true;
         }
         if (g_buttons[1].press_event) {
-            g_menu_index = (uint8_t)((g_menu_index + 1u) % MENU_COUNT);
+            g_menu_index = menuStep(g_menu_index, +1);
             g_dirty = true;
         }
         if (g_buttons[3].press_event) {
