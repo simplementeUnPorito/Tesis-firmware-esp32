@@ -4,6 +4,60 @@
 #include <driver/gpio.h>
 #endif
 
+#if PSOC_I2C_ENABLE
+#include <Wire.h>
+#endif
+
+/* Ring de recepción I2C. Estático porque Wire.onReceive() recibe una función
+ * suelta, sin contexto de instancia. Hay una sola PsocUART por firmware. */
+volatile uint8_t  PsocUART::_i2cRing[PSOC_I2C_RX_RING];
+volatile uint16_t PsocUART::_i2cHead = 0;
+volatile uint16_t PsocUART::_i2cTail = 0;
+volatile uint32_t PsocUART::_i2cOverruns = 0;
+
+#if PSOC_I2C_ENABLE
+void PsocUART::_onI2cReceive(int count)
+{
+    while (count-- > 0 && Wire.available() > 0) {
+        const uint8_t b = (uint8_t)Wire.read();
+        const uint16_t next = (uint16_t)((_i2cHead + 1u) % PSOC_I2C_RX_RING);
+        if (next == _i2cTail) {
+            /* Ring lleno: el consumidor se quedó atrás. Se descarta el byte
+             * nuevo (no el histórico) para no partir un frame ya empezado. */
+            _i2cOverruns++;
+            return;
+        }
+        _i2cRing[_i2cHead] = b;
+        _i2cHead = next;
+    }
+}
+#else
+void PsocUART::_onI2cReceive(int) {}
+#endif
+
+bool PsocUART::_rxAvailable()
+{
+#if PSOC_I2C_ENABLE
+    return _i2cHead != _i2cTail;
+#else
+    return (_ser != nullptr) && (_ser->available() > 0);
+#endif
+}
+
+bool PsocUART::_rxRead(uint8_t &b)
+{
+#if PSOC_I2C_ENABLE
+    if (_i2cHead == _i2cTail) { return false; }
+    b = _i2cRing[_i2cTail];
+    _i2cTail = (uint16_t)((_i2cTail + 1u) % PSOC_I2C_RX_RING);
+    return true;
+#else
+    if (_ser == nullptr || _ser->available() <= 0) { return false; }
+    b = (uint8_t)_ser->read();
+    return true;
+#endif
+}
+
 int32_t PsocUART::_sign24(uint8_t b0, uint8_t b1, uint8_t b2)
 {
     uint32_t val = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16);
@@ -32,6 +86,21 @@ void PsocUART::begin(BatchCallback cb, HardwareSerial *serial)
     gpio_pulldown_dis((gpio_num_t)PSOC_UART_RX);
     gpio_pullup_en((gpio_num_t)PSOC_UART_RX);
 #endif
+
+#if PSOC_I2C_ENABLE
+    /* El ESP entra como ESCLAVO I2C: el PSoC es el maestro y escribe frames
+     * completos. Wire.begin(addr, sda, scl, freq) con freq=0 deja que la
+     * velocidad la imponga el maestro, que es lo correcto para un esclavo. */
+    _i2cHead = 0;
+    _i2cTail = 0;
+    Wire.onReceive(&PsocUART::_onI2cReceive);
+    Wire.begin((uint8_t)PSOC_I2C_ADDR, (int)PSOC_I2C_SDA, (int)PSOC_I2C_SCL, 0);
+    /* Un frame de datos son 95 bytes: el buffer por defecto (32) los partiría
+     * en varias llamadas a onReceive. No es fatal (el ring reensambla), pero
+     * agrandarlo evita perder bytes en ráfaga. */
+    Wire.setBufferSize(256);
+#endif
+
     _idx = 0;
 }
 
@@ -52,8 +121,8 @@ void PsocUART::poll()
 {
     if (_ser == nullptr) { return; }
 
-    while (_ser->available() > 0) {
-        uint8_t b = (uint8_t)_ser->read();
+    uint8_t b;
+    while (_rxRead(b)) {
         _noteRxByte(b);
 
         if (_idx == 0) {
@@ -161,6 +230,8 @@ void PsocUART::_parseConfigAck()
 
     if (cmd == PSOC_CMD_PGA) {
         _confirmedPga = val;
+    } else if (cmd == PSOC_CMD_PGAOUT) {
+        _confirmedPgaout = val;
     } else if (cmd == PSOC_CMD_PGAVDAC) {
         _confirmedPgavdac = val;
     } else if (cmd == PSOC_CMD_VDAC) {
@@ -196,6 +267,7 @@ void PsocUART::preStart()              { _sendCmd1(PSOC_CMD_PRESTART, 0); }
 void PsocUART::startNow()              { _sendCmd1(PSOC_CMD_START_NOW, 0); }
 void PsocUART::setVdac(uint8_t v)      { _sendCmd1(PSOC_CMD_VDAC, v); }
 void PsocUART::setPga(uint8_t code)    { _sendCmd1(PSOC_CMD_PGA, code); }
+void PsocUART::setPgaout(uint8_t code) { _sendCmd1(PSOC_CMD_PGAOUT, code); }
 void PsocUART::setPgavdac(uint8_t code){ _sendCmd1(PSOC_CMD_PGAVDAC, code); }
 void PsocUART::calibrate()             { _sendCmd1(PSOC_CMD_CALIBRATE, 1); }
 void PsocUART::saveEeprom()            { _sendCmd1(PSOC_CMD_SAVE_EEPROM, 0); }
@@ -253,7 +325,7 @@ bool PsocUART::probe(uint32_t timeoutMs)
     const uint32_t startBatches = _batchesOK;
     const uint32_t startDiag = _diagEventsRx;
 
-    while (_ser->available() > 0) {
+    while (_rxAvailable()) {
         poll();   /* no descartar pings pendientes: poll() responde el pong */
     }
     if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {

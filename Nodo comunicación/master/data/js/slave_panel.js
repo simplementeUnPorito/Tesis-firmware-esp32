@@ -55,7 +55,7 @@ function fmtSignedPct(value) {
 /**
  * Controls for one slave node (channels 1-3, displayed as Esclavo 1-3).
  *
- * Events: 'pga-changed' {code}, 'adc-config-changed' {code},
+ * Events: 'pga-changed' {code}, 'pgaout-changed' {code}, 'adc-config-changed' {code},
  *         'fir-apply' {cmd}, 'fir-remove',
  *         'line-notch-changed' {enabled, nHarm},
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
@@ -119,6 +119,18 @@ export class SlavePanel extends EventTarget {
     this._btnSendAll.title = 'Reenvia la configuracion de PGA y rango ADC al PSoC';
     this._btnSendAll.addEventListener('click', () => this._dispatch('send-all-requested'));
     root.appendChild(row(labeled('PGA', this._ddPga), this._btnSendAll, this._dotPga, this._lblPgaActual));
+
+    /* PGAout: etapa de salida agregada al pipeline en la placa nueva. Solo
+     * existe en nodos GEO, asi que la fila arranca oculta y se muestra cuando
+     * el PSoC reporta hw_class=GEO (setPgaoutVisible desde app.js). */
+    this._ddPgaout = el('select');
+    for (const name of cfg.GAIN_NAMES) this._ddPgaout.appendChild(new Option(name, name));
+    this._ddPgaout.addEventListener('change', () => this._onPgaoutChanged());
+    this._dotPgaout = dot('PGAout sin confirmar');
+    this._lblPgaoutActual = el('span', null, 'Current: 1x');
+    this._rowPgaout = row(labeled('PGAout', this._ddPgaout), this._dotPgaout, this._lblPgaoutActual);
+    this._rowPgaout.style.display = 'none';
+    root.appendChild(this._rowPgaout);
 
     this._ddAdcCfg = el('select');
     for (const adcCfg of cfg.ADC_CONFIGS) {
@@ -288,6 +300,12 @@ export class SlavePanel extends EventTarget {
     }
   }
 
+  _onPgaoutChanged() {
+    const index = this._ddPgaout.selectedIndex;
+    this._lblPgaoutActual.textContent = `Current: ${cfg.GAIN_NAMES[index]}`;
+    this._dispatch('pgaout-changed', index);
+  }
+
   _onPgaChanged() {
     const index = this._ddPga.selectedIndex;
     this._lblPgaActual.textContent = `Current: ${cfg.GAIN_NAMES[index]}`;
@@ -350,6 +368,7 @@ export class SlavePanel extends EventTarget {
     this._btnLatency.disabled = !connected;
     this._btnSendAll.disabled = !connected;
     this._ddPga.disabled = !connected;
+    this._ddPgaout.disabled = !connected;
     this._ddAdcCfg.disabled = !connected;
     this._cbSdEnable.disabled = !connected || !this._sdPresent;
     this._btnCalibrate.disabled = !connected;
@@ -358,6 +377,7 @@ export class SlavePanel extends EventTarget {
     this._cbFirHw.disabled = !connected;
     if (!connected) {
       this.setPgaLock(0);
+      this.setPgaoutLock(0);
       this.setAdcConfigLock(0);
       this.setDecimationLock(0);
       this.setCalibrationLock(0);
@@ -404,6 +424,22 @@ export class SlavePanel extends EventTarget {
   /** state: 0=unknown, 1=locked, 2=pending/fail. */
   setPgaLock(state) {
     setDot(this._dotPga, state, 'PGA confirmado por PSoC', 'PGA pendiente o sin confirmacion', 'PGA sin confirmar');
+  }
+
+  /** La fila PGAout solo tiene sentido en nodos GEO con la placa nueva. */
+  setPgaoutVisible(visible) {
+    this._rowPgaout.style.display = visible ? '' : 'none';
+  }
+
+  setPgaout(code) {
+    if (code < 0 || code >= cfg.GAIN_NAMES.length) return;
+    this._ddPgaout.selectedIndex = code;
+    this._lblPgaoutActual.textContent = `Current: ${cfg.GAIN_NAMES[code]}`;
+  }
+
+  /** state: 0=unknown, 1=locked, 2=pending/fail. */
+  setPgaoutLock(state) {
+    setDot(this._dotPgaout, state, 'PGAout confirmado por PSoC', 'PGAout pendiente o sin confirmacion', 'PGAout sin confirmar');
   }
 
   setAdcConfig(code) {

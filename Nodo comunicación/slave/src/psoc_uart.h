@@ -1,14 +1,25 @@
 #pragma once
 /*
- * psoc_uart.h — Enlace UART entre el ESP esclavo y el PSoC 5LP.
+ * psoc_uart.h — Enlace ESP esclavo ↔ PSoC 5LP.
  *
- * Reemplaza al antiguo psoc_spi. El PSoC envía lotes RAW (sin Filter) y el
- * esclavo le manda comandos (set N, PGA, calibracion, pre-start, ver, debug).
+ * El PSoC envía lotes RAW (sin Filter) y el esclavo le manda comandos
+ * (set N, PGA, calibracion, pre-start, ver, debug).
  *
- * Cableado vigente (ESP32-DevKitC V4, Serial2):
- *   PSOC_UART_RX (GPIO25/J2.9)  ← TX del PSoC (P12[7]/J1.9)
- *   PSOC_UART_TX (GPIO26/J2.10) → RX del PSoC (P2[0]/J1.1)
- *   Baud: PSOC_UART_BAUD (coincidir con el PSoC).
+ * Cableado vigente en la placa nueva (2026-08-03) — el enlace es ASIMÉTRICO:
+ *
+ *   ESP → PSoC : UART (Serial2 TX). El PSoC tiene la UART configurada como
+ *                SOLO RX, así que este sentido no cambió.
+ *                PSOC_UART_TX (GPIO26) → RX del PSoC (P2[0])
+ *
+ *   PSoC → ESP : I2C, con el PSoC de MAESTRO y el ESP de ESCLAVO en
+ *                PSOC_I2C_ADDR. Reemplaza al TX de la UART, que a 115200
+ *                era el cuello de botella del stream de muestras.
+ *                SDA=PSOC_I2C_SDA, SCL=PSOC_I2C_SCL.
+ *
+ * Los bytes que llegan por I2C entran a un ring y poll() los consume con el
+ * mismo parser de frames de siempre: el protocolo no cambió, solo el medio.
+ * PSOC_UART_RX queda definido para los diagnósticos de pin, pero ya no llega
+ * ningún dato por ahí.
  *
  * Frame de datos PSoC→ESP (95 bytes):
  *   [0xAB][n=30][seq_lo][seq_hi] + 30×3 bytes (raw LE) + [crc XOR]
@@ -37,6 +48,26 @@
 #define PSOC_NATIVE_SAMPLE_RATE_HZ 2604UL
 #endif
 
+/* ── Enlace de subida PSoC → ESP por I2C (ESP = esclavo) ─────────────────── */
+#ifndef PSOC_I2C_ENABLE
+#define PSOC_I2C_ENABLE 1
+#endif
+/* Debe coincidir con PSOC_LINK_I2C_ADDR del firmware del PSoC. */
+#ifndef PSOC_I2C_ADDR
+#define PSOC_I2C_ADDR 0x42
+#endif
+#ifndef PSOC_I2C_SDA
+#define PSOC_I2C_SDA 21
+#endif
+#ifndef PSOC_I2C_SCL
+#define PSOC_I2C_SCL 22
+#endif
+/* Ring de recepción. Un frame son 95 bytes; con 4 KiB entran ~43 frames sin
+ * que poll() tenga que correr a una cadencia particular. */
+#ifndef PSOC_I2C_RX_RING
+#define PSOC_I2C_RX_RING 4096
+#endif
+
 #define PSOC_FRAME_MARKER 0xAB
 #define SPI_BATCH_SAMPLES 30                              /* muestras por lote */
 #define PSOC_FRAME_BYTES  (4 + SPI_BATCH_SAMPLES * 3 + 1) /* 95 */
@@ -45,6 +76,7 @@
 
 /* Comandos hacia el PSoC */
 #define PSOC_CMD_PGA       0xA6
+#define PSOC_CMD_PGAOUT    0xA8   /* GEO: ganancia de la etapa PGAout (código 0-8) */
 #define PSOC_CMD_PGAVDAC   0xA9
 #define PSOC_CMD_VDAC      0xAA
 #define PSOC_CMD_STATUS    0xA5
@@ -171,6 +203,7 @@ public:
     void startNow();
     void setVdac(uint8_t v);
     void setPga(uint8_t code);
+    void setPgaout(uint8_t code);
     void setPgavdac(uint8_t code);
     void calibrate();
     void saveEeprom();
@@ -206,6 +239,7 @@ public:
     uint8_t  lastByte()   const { return _lastByte; }
     bool     hasLastByte() const { return _lastByteSeen; }
     uint32_t lastByteAgeMs() const { return _lastByteSeen ? (millis() - _lastByteMs) : 0xFFFFFFFFu; }
+    uint32_t i2cOverruns() const { return _i2cOverruns; }
 
 private:
     HardwareSerial *_ser       = nullptr;
@@ -228,11 +262,25 @@ private:
     uint8_t         _cfgAckCmd = 0;
     uint8_t         _cfgAckVal = 0;
     uint8_t         _confirmedPga = 0;
+    uint8_t         _confirmedPgaout = 0;
     uint8_t         _confirmedPgavdac = 0;
     uint8_t         _confirmedVdac = 128;
     uint8_t         _lastByte  = 0;
     uint32_t        _lastByteMs= 0;
     bool            _lastByteSeen = false;
+
+    /* ── Recepción por I2C (ESP esclavo) ──────────────────────────────────
+     * onReceive() de Wire toma un puntero a función suelto, así que el ring
+     * es estático. _rxAvailable()/_rxRead() son la única puerta de entrada de
+     * bytes a poll(); si PSOC_I2C_ENABLE=0 vuelven a leer de la UART. */
+    static volatile uint8_t  _i2cRing[PSOC_I2C_RX_RING];
+    static volatile uint16_t _i2cHead;
+    static volatile uint16_t _i2cTail;
+    static volatile uint32_t _i2cOverruns;
+    static void _onI2cReceive(int count);
+
+    bool _rxAvailable();
+    bool _rxRead(uint8_t &b);
 
     void _parseFrame();
     void _parseConfigAck();

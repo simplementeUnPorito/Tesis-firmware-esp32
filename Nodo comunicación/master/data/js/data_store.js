@@ -107,6 +107,7 @@ export class NodeData {
 
     // Per-node config (updated from heartbeat / ACK packets)
     this.pgaCode = 0;
+    this.pgaoutCode = 0;   // etapa PGAout (solo GEO); 0 si el nodo no la tiene
     this.adcConfigCode = 1;
     this.countsPerVolt = cfg.ADC_COUNTS_PER_VOLT;
     this.decimationFactor = 1;   // 1=sin decimar; Fs efectiva = 2604/factor

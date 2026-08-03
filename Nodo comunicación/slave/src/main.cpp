@@ -137,13 +137,8 @@ static uint8_t g_masterTxMac[6] = {
 
 /* Pines GPIO hardware sync. platformio.ini es la fuente de verdad; estos
  * defaults solo evitan romper builds viejos que no definan las macros. */
-#ifndef SYNC_IN_PIN
-  #if defined(ESP8266)
-    #define SYNC_IN_PIN 5
-  #else
-    #define SYNC_IN_PIN 32
-  #endif
-#endif
+/* (SYNC_IN_PIN eliminado 2026-08-03: no existe sync por cable desde el
+ * maestro. El único pin de sync es la salida SYNC_TO_PSOC_PIN.) */
 #ifndef SYNC_TO_PSOC_PIN
   #if defined(ESP8266)
     #define SYNC_TO_PSOC_PIN 16
@@ -190,6 +185,7 @@ static          uint32_t   g_debug_count = 0;
 static volatile uint32_t   g_debug_last_us = 0;
 /* g_debugHwActive / g_debugHwFallUs viven en scope_pulse.h */
 static          uint8_t    g_pga_code    = 0;
+static          uint8_t    g_pgaout      = 0;   /* GEO: etapa PGAout del pipeline nuevo */
 static          uint8_t    g_pgavdac     = 0;
 static          uint8_t    g_vdac_byte   = 128;
 static volatile bool       g_cfg_waiting = false;
@@ -270,7 +266,6 @@ static uint32_t g_sampling_start_psoc_bytes = 0;
 static uint32_t g_sampling_start_batches_ok = 0;
 static uint32_t g_hotwait_enter_ms = 0;
 static uint8_t  g_hotwait_rearm_count = 0;
-static volatile bool g_sync_edge_started = false; /* flanco GPIO: bookkeeping en loop() */
 static bool     g_start_fallback_sent = false;
 static uint8_t  g_completion_ack_sub_cmd = 0;
 static uint8_t  g_completion_ack_ok = 0;
@@ -322,7 +317,6 @@ static bool rxScanIsReservedPin(uint8_t pin)
     if (pin == (uint8_t)PSOC_UART_RX ||
         pin == (uint8_t)PSOC_UART_TX ||
         pin == (uint8_t)SYNC_TO_PSOC_PIN ||
-        pin == (uint8_t)SYNC_IN_PIN ||
         pin == (uint8_t)DEBUG_HW_START_PIN) {
         return true;
     }
@@ -1219,26 +1213,13 @@ static void onPsocDiag(const PsocDiagEvent &event)
 #endif
 }
 
-/* ── ISR GPIO hardware sync (IRAM para máxima velocidad) ────────────────── */
-void IRAM_ATTR onSyncEdge()
-{
-    int level = digitalRead(SYNC_IN_PIN);
-    if (level == HIGH && g_state == HOT_WAIT) {
-        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
-        uint32_t nowUs = (uint32_t)micros();
-        g_t_start_us    = (uint64_t)nowUs;
-        g_store_fill    = 0;
-        g_debug_count   = 0;
-        g_debug_last_us = nowUs;
-        g_sync_edge_started = true; /* loop() completa el bookkeeping fuera del ISR */
-        g_state = SAMPLING;
-    } else if (level == LOW && g_state == SAMPLING) {
-        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
-        g_state = STOPPED;
-    } else if (g_state != SAMPLING) {
-        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
-    }
-}
+/* ── Sync (2026-08-03) ───────────────────────────────────────────────────────
+ * No hay entrada de sync por cable desde el maestro: el arranque llega SIEMPRE
+ * por ESP-NOW (CMD_START / HOT_WAIT), y este esclavo es el que genera el flanco
+ * hacia el PSoC por SYNC_TO_PSOC_PIN. La vieja ISR onSyncEdge() sobre
+ * SYNC_IN_PIN quedó eliminada junto con el pin: nunca estuvo cableada en campo
+ * y sólo agregaba una entrada más para ruido.
+ * ────────────────────────────────────────────────────────────────────────── */
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
 static void allocStore(uint16_t n_batches);
@@ -1303,6 +1284,9 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
     switch (sub_cmd) {
         case 0xA6:
             g_pga_code = value;
+            break;
+        case PSOC_CMD_PGAOUT:
+            g_pgaout = value;
             break;
         case 0xA9:
             g_pgavdac = value;
@@ -1746,11 +1730,11 @@ static void waitForLabCaptureDone(const char *tag, uint16_t requestedBatches)
 
 static void requestLabDiagFromUsb()
 {
-    SLAVE_LOG_PRINTF("[LAB] diag state=%d psoc=%u streamPga=%u pgavdac=%u vdac=%u syncOut=%d syncIn=%d\n",
+    SLAVE_LOG_PRINTF("[LAB] diag state=%d psoc=%u streamPga=%u pgaout=%u pgavdac=%u vdac=%u syncOut=%d i2cOvr=%lu\n",
                      (int)g_state, (unsigned)g_psocConnected,
-                     (unsigned)g_pga_code, (unsigned)g_pgavdac,
+                     (unsigned)g_pga_code, (unsigned)g_pgaout, (unsigned)g_pgavdac,
                      (unsigned)g_vdac_byte, digitalRead(SYNC_TO_PSOC_PIN),
-                     digitalRead(SYNC_IN_PIN));
+                     (unsigned long)psoc.i2cOverruns());
     logPsocUartDiag("LAB_DIAG");
 }
 
@@ -1762,8 +1746,8 @@ static void requestLabPinsFromUsb()
     rxEdges = g_psoc_rx_edges;
     rxEdgeLevel = g_psoc_rx_last_level;
     interrupts();
-    SLAVE_LOG_PRINTF("[LAB] pins syncOut=%d syncIn=%d psocRx=%d rxEdges=%lu rxEdgeLevel=%u\n",
-                     digitalRead(SYNC_TO_PSOC_PIN), digitalRead(SYNC_IN_PIN),
+    SLAVE_LOG_PRINTF("[LAB] pins syncOut=%d psocRx=%d rxEdges=%lu rxEdgeLevel=%u\n",
+                     digitalRead(SYNC_TO_PSOC_PIN),
                      digitalRead(PSOC_UART_RX), (unsigned long)rxEdges,
                      (unsigned)rxEdgeLevel);
 }
@@ -2252,6 +2236,8 @@ static void handleUsbCommand(const char *cmd)
         requestBlinkFromUsb();
     } else if (usbParseGainParam(cmd, "pga", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGA, value, "pga");
+    } else if (usbParseGainParam(cmd, "pgaout", value)) {
+        (void)requestPsocGainFromUsb(PSOC_CMD_PGAOUT, value, "pgaout");
     } else if (usbParseGainParam(cmd, "pgavdac", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
     } else if (usbParseGainParam(cmd, "range", value)) {
@@ -2291,9 +2277,9 @@ static void handleUsbCommand(const char *cmd)
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
 #else
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgavdac N, range N, decim N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, range N, decim N\n");
 #endif
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
@@ -2552,6 +2538,13 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                 waitAck = true;
             }
             break;
+        case PSOC_CMD_PGAOUT:            /* PGAout (etapa de salida GEO) */
+            if (!isGainCode(param)) {
+                ok = 0;
+            } else {
+                waitAck = true;
+            }
+            break;
         case 0xA9:                       /* PGAvdac */
             if (!isGainCode(param)) {
                 ok = 0;
@@ -2608,6 +2601,9 @@ static void handleSetConfig(const MsgSetConfig *cfg)
             switch (subCmd) {
                 case 0xA6:
                     psoc.setPga(param);
+                    break;
+                case PSOC_CMD_PGAOUT:
+                    psoc.setPgaout(param);
                     break;
                 case 0xA9:
                     psoc.setPgavdac(param);
@@ -3243,11 +3239,10 @@ void setup()
 
     /* (El LED de identificación es el del PSoC; el ESP ya no maneja ningún LED.) */
 
-    /* GPIO hardware sync — pull-down para evitar ISR espurias cuando no hay cable */
-    pinMode(SYNC_IN_PIN,      INPUT_PULLDOWN);
+    /* Salida de sync hacia el PSoC. Es el único pin de sync que queda: el
+     * arranque llega por ESP-NOW y este flanco lo propaga al PSoC. */
     pinMode(SYNC_TO_PSOC_PIN, OUTPUT);
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
-    attachInterrupt(digitalPinToInterrupt(SYNC_IN_PIN), onSyncEdge, CHANGE);
 
     /* UART → PSoC */
     psoc.begin(onBatch);
@@ -3318,20 +3313,6 @@ void loop()
     serviceCompletionAckRetry();
     serviceLocalUi();
     serviceHotWaitWatchdog();
-
-    /* Arranque por flanco GPIO (onSyncEdge): completar fuera del ISR el mismo
-     * bookkeeping que hace el handler de CMD_START, para que la captura por
-     * sync de hardware también emita el ACK de completado y el fallback. */
-    if (g_sync_edge_started) {
-        g_sync_edge_started = false;
-        g_sampling_start_ms = millis();
-        g_sampling_start_psoc_bytes = psoc.bytesRx();
-        g_sampling_start_batches_ok = psoc.batchesOK();
-        g_start_fallback_sent = false;
-        if (!g_view_store_active) {
-            g_start_store_active = (g_rec_n_batches > 0 && storeAllocated());
-        }
-    }
 
     /* (El parpadeo de identificación lo hace ahora el PSoC con su Timer; el ESP
      * solo reenvía CMD_BLINK_LED por UART en onDataRecv.) */

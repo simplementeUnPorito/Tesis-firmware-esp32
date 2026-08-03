@@ -22,6 +22,7 @@ const spectrumArea = new SpectrumArea($('spectra'));
 const slavePanels = new Array(cfg.MAX_NODES).fill(null);
 const macPartial = new Map();
 const pgaLockTimers = new Map();
+const pgaoutLockTimers = new Map();
 const adcConfigLockTimers = new Map();
 const decimationLockTimers = new Map();
 const sdEnableLockTimers = new Map();
@@ -424,6 +425,8 @@ function nodeSnapshot(nd, index, options = {}) {
     total_samples: nd.totalSamples,
     pga_code: nd.pgaCode,
     pga_gain: gainValue(nd.pgaCode),
+    pgaout_code: nd.pgaoutCode,
+    pgaout_gain: gainValue(nd.pgaoutCode),
     adc_config: nd.adcConfigCode,
     adc_config_label: adcConfigForCode(nd.adcConfigCode).label,
     adc_range_v: adcConfigForCode(nd.adcConfigCode).rangeV,
@@ -981,6 +984,9 @@ function applyReportedSlaveType(chIndex, hwClass) {
   const panel = panelFor(chIndex);
   nd.hwClass = hwClass;
 
+  /* PGAout solo existe en el pipeline GEO de la placa nueva. */
+  if (panel) panel.setPgaoutVisible(hwClass === 0);
+
   if (hwClass === 1) {
     nd.alias = 'Hammer';
     nd.hammerOffset = 0;
@@ -1491,6 +1497,21 @@ function schedulePgaLockTimeout(chIndex, expectedCode) {
   pgaLockTimers.set(chIndex, timer);
 }
 
+function schedulePgaoutLockTimeout(chIndex, expectedCode) {
+  if (pgaoutLockTimers.has(chIndex)) clearTimeout(pgaoutLockTimers.get(chIndex));
+  const timer = setTimeout(() => {
+    pgaoutLockTimers.delete(chIndex);
+    const nd = data.nodes[chIndex];
+    const pending = nd.pending.get(cfg.SUBCMD_PGAOUT);
+    if (!pending || pending.param !== expectedCode) return;
+    nd.pending.delete(cfg.SUBCMD_PGAOUT);
+    const panel = panelFor(chIndex);
+    if (panel) panel.setPgaoutLock(2);
+    appendLog(`S${chIndex} PGAout sin confirmacion: ${cfg.GAIN_NAMES[expectedCode] ?? expectedCode}`);
+  }, Math.round(cfg.RETRY_SEC * 1000));
+  pgaoutLockTimers.set(chIndex, timer);
+}
+
 function scheduleAdcConfigLockTimeout(chIndex, expectedCode) {
   if (adcConfigLockTimers.has(chIndex)) clearTimeout(adcConfigLockTimers.get(chIndex));
   const timer = setTimeout(() => {
@@ -1556,6 +1577,18 @@ function onPgaChanged(chIndex, pgaCode) {
   sendDirected(chIndex, cfg.SUBCMD_PGA, nd.pgaCode);
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
   appendLog(`S${chIndex} PGA -> ${cfg.GAIN_NAMES[nd.pgaCode]}`);
+}
+
+function onPgaoutChanged(chIndex, pgaoutCode) {
+  const nd = data.nodes[chIndex];
+  nd.pgaoutCode = clamp(pgaoutCode, 0, cfg.GAIN_CODES.length - 1);
+  nd.pending.set(cfg.SUBCMD_PGAOUT, { param: nd.pgaoutCode, sendTime: performance.now(), retries: 0 });
+  saveSlaveSetting(chIndex, 'pgaout_code', nd.pgaoutCode);
+  const panel = panelFor(chIndex);
+  if (panel) panel.setPgaoutLock(2);
+  sendDirected(chIndex, cfg.SUBCMD_PGAOUT, nd.pgaoutCode);
+  schedulePgaoutLockTimeout(chIndex, nd.pgaoutCode);
+  appendLog(`S${chIndex} PGAout -> ${cfg.GAIN_NAMES[nd.pgaoutCode]}`);
 }
 
 function onAdcConfigChanged(chIndex, adcCode) {
@@ -1689,6 +1722,15 @@ function onSendAll(chIndex) {
   nd.pending.set(cfg.SUBCMD_PGA, { param: nd.pgaCode, sendTime: performance.now(), retries: 0 });
   if (panel) panel.setPgaLock(2);
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
+
+  /* PGAout viaja junto con el PGA en el "resend" — solo tiene sentido en GEO;
+   * en un HAMMER el esclavo lo rechaza y el dot queda en "sin lock". */
+  if (nd.hwClass === 0) {
+    sendDirected(chIndex, cfg.SUBCMD_PGAOUT, nd.pgaoutCode);
+    nd.pending.set(cfg.SUBCMD_PGAOUT, { param: nd.pgaoutCode, sendTime: performance.now(), retries: 0 });
+    if (panel) panel.setPgaoutLock(2);
+    schedulePgaoutLockTimeout(chIndex, nd.pgaoutCode);
+  }
 
   // El esclavo solo atiende un config del PSoC a la vez (g_cfg_waiting en
   // main.cpp): si el rango ADC/decimacion se manda mientras el anterior
@@ -1877,11 +1919,14 @@ function loadSlavePanelState(chIndex, panel) {
   clearSlaveSetting(chIndex, 'alias');
 
   nd.pgaCode = loadSlaveInt(chIndex, 'pga_code', nd.pgaCode, 0, cfg.GAIN_CODES.length - 1);
+  nd.pgaoutCode = loadSlaveInt(chIndex, 'pgaout_code', nd.pgaoutCode, 0, cfg.GAIN_CODES.length - 1);
   applyNodeAdcConfig(nd, loadSlaveInt(chIndex, 'adc_config_code', nd.adcConfigCode, 1, cfg.ADC_CONFIGS.length));
   applyNodeDecimation(nd, loadSlaveInt(chIndex, 'decimation_factor', nd.decimationFactor, 1, 100));
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
 
   panel.setPga(nd.pgaCode);
+  panel.setPgaout(nd.pgaoutCode);
+  panel.setPgaoutVisible(nd.hwClass === 0);
   panel.setAdcConfig(nd.adcConfigCode);
   panel.setDecimation(nd.decimationFactor);
   nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
@@ -1915,6 +1960,7 @@ function loadSlavePanelState(chIndex, panel) {
 
 function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('pga-changed', (ev) => onPgaChanged(chIndex, ev.detail));
+  panel.addEventListener('pgaout-changed', (ev) => onPgaoutChanged(chIndex, ev.detail));
   panel.addEventListener('adc-config-changed', (ev) => onAdcConfigChanged(chIndex, ev.detail.code));
   panel.addEventListener('decimation-changed', (ev) => onDecimationChanged(chIndex, ev.detail.factor));
   panel.addEventListener('sd-enable-changed', (ev) => onSdEnabledChanged(chIndex, !!ev.detail.enabled));
@@ -2066,6 +2112,18 @@ function handleAck(pkt, idx) {
     }
     const expected = pending ? pending.param : data.nodes[idx].pgaCode;
     appendLog(`S${idx} PGA ${ackVal ? 'confirmado' : 'sin lock'}: ${cfg.GAIN_NAMES[expected] ?? expected}`);
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_PGAOUT && idx >= 1 && idx < cfg.MAX_NODES) {
+    const panel = panelFor(idx);
+    if (panel) panel.setPgaoutLock(ackVal ? 1 : 2);
+    if (pgaoutLockTimers.has(idx)) {
+      clearTimeout(pgaoutLockTimers.get(idx));
+      pgaoutLockTimers.delete(idx);
+    }
+    const expected = pending ? pending.param : data.nodes[idx].pgaoutCode;
+    appendLog(`S${idx} PGAout ${ackVal ? 'confirmado' : 'sin lock'}: ${cfg.GAIN_NAMES[expected] ?? expected}`);
     return;
   }
 

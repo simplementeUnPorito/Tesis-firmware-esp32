@@ -24,6 +24,7 @@
  *   Comando dirigido a esclavo (6 bytes):
  *     [0xAB][0xBD][node_id][sub_cmd][param][node_id^sub_cmd^param]
  *     sub_cmd 0xA6: set PGA gain    param: código 0-8
+ *     sub_cmd 0xA8: PGAout (GEO)  param: código 0-8
  *     sub_cmd 0xA9: legacy PGAvdac  param: código 0-8
  *     sub_cmd 0xAA: legacy VDAC     param: 0-255
  *     sub_cmd 0xA7: debug node ESP  param: 0/1

@@ -26,6 +26,7 @@ export const CMD_SET_RECLEN_HAMMER = 0xAD;  /* largo propio de nodos HAMMER; 0 =
 
 // Sub-commands (directed to slave)
 export const SUBCMD_PGA = 0xA6;
+export const SUBCMD_PGAOUT = 0xA8;   /* GEO: etapa PGAout del pipeline nuevo (mismo codigo que PSOC_CMD_PGAOUT) */
 export const SUBCMD_VDAC = 0xAA;
 export const SUBCMD_DEBUG = 0xA7;
 export const SUBCMD_SYNC_START = 0x12;
