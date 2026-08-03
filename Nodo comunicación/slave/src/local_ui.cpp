@@ -46,6 +46,9 @@
 #ifndef LOCAL_CAPTURE_BATCHES
 #define LOCAL_CAPTURE_BATCHES 10
 #endif
+#ifndef NODE_ID
+#define NODE_ID 1
+#endif
 
 namespace {
 
@@ -91,7 +94,7 @@ bool g_notice_ok = false;
 char g_notice[22] = {0};
 
 const char *const MENU_LABELS[] = {
-    "Capturar 10 lotes",
+    nullptr,
     "Calibrar PSoC",
     "Snapshot ADC",
     "Identificar nodo",
@@ -197,7 +200,13 @@ void drawMenu()
     for (uint8_t row = 0u; row < MENU_COUNT; row++) {
         g_display.setCursor(0, 12 + row * 10);
         g_display.print(row == g_menu_index ? '>' : ' ');
-        g_display.println(MENU_LABELS[row]);
+        if (row == 0u) {
+            g_display.print("Capturar ");
+            g_display.print(LOCAL_CAPTURE_BATCHES);
+            g_display.println(" lotes");
+        } else {
+            g_display.println(MENU_LABELS[row]);
+        }
     }
     g_display.display();
 }
@@ -318,4 +327,3 @@ LocalUiAction localUiService(const LocalUiStatus &, bool)
 void localUiNotify(const char *, bool) {}
 
 #endif
-

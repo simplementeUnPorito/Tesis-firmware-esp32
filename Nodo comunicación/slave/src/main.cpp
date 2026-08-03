@@ -22,6 +22,7 @@
 #include "sync_protocol.h"
 #include "debug_log.h"
 #include "sd_storage.h"
+#include "local_ui.h"
 #include "../../scope_measurement.h"
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
@@ -318,11 +319,27 @@ static void (* const g_rx_scan_isr[])(void) = {
 
 static bool rxScanIsReservedPin(uint8_t pin)
 {
-    return pin == (uint8_t)PSOC_UART_RX ||
-           pin == (uint8_t)PSOC_UART_TX ||
-           pin == (uint8_t)SYNC_TO_PSOC_PIN ||
-           pin == (uint8_t)SYNC_IN_PIN ||
-           pin == (uint8_t)DEBUG_HW_START_PIN;
+    if (pin == (uint8_t)PSOC_UART_RX ||
+        pin == (uint8_t)PSOC_UART_TX ||
+        pin == (uint8_t)SYNC_TO_PSOC_PIN ||
+        pin == (uint8_t)SYNC_IN_PIN ||
+        pin == (uint8_t)DEBUG_HW_START_PIN) {
+        return true;
+    }
+#if defined(LOCAL_UI_ENABLE) && LOCAL_UI_ENABLE
+    if (pin == (uint8_t)LOCAL_OLED_SCK_PIN ||
+        pin == (uint8_t)LOCAL_OLED_MOSI_PIN ||
+        pin == (uint8_t)LOCAL_OLED_CS_PIN ||
+        pin == (uint8_t)LOCAL_OLED_DC_PIN ||
+        pin == (uint8_t)LOCAL_OLED_RESET_PIN ||
+        pin == (uint8_t)LOCAL_BTN_UP_PIN ||
+        pin == (uint8_t)LOCAL_BTN_DOWN_PIN ||
+        pin == (uint8_t)LOCAL_BTN_OK_PIN ||
+        pin == (uint8_t)LOCAL_BTN_BACK_PIN) {
+        return true;
+    }
+#endif
+    return false;
 }
 
 static void beginPsocRxScan()
@@ -2120,6 +2137,74 @@ static bool requestDecimationFromUsb(uint8_t factor)
     return sent;
 }
 
+static void serviceLocalUi()
+{
+    const bool critical = (g_state == SAMPLING || g_state == HOT_WAIT);
+    LocalUiStatus status = {
+        NODE_ID,
+        (uint8_t)g_state,
+        g_psocConnected,
+        g_cfg_waiting,
+        psocSdPresent() != 0u,
+        g_masterChannel,
+        psoc.sampleRate(),
+        g_store_fill,
+        g_rec_n_batches
+    };
+
+    const LocalUiAction action = localUiService(status, critical);
+    switch (action) {
+        case LOCAL_UI_ACTION_CAPTURE:
+            if (!g_psocConnected || captureOrDumpBusy() || g_cfg_waiting) {
+                localUiNotify("Captura no disponible", false);
+                break;
+            }
+            localUiNotify("Armando captura", true);
+            requestCaptureFromUsb(LOCAL_CAPTURE_BATCHES);
+            if (g_state != SAMPLING) {
+                localUiNotify("No se pudo iniciar", false);
+            }
+            break;
+        case LOCAL_UI_ACTION_CALIBRATE: {
+            const bool ok = requestPsocCalibration("LOCAL_UI");
+            if (ok) {
+                g_auto_cal_requested = true;
+                g_auto_cal_due_ms = 0u;
+            }
+            localUiNotify(ok ? "Calibracion pedida" : "Calibracion ocupada", ok);
+            break;
+        }
+        case LOCAL_UI_ACTION_ADC_SNAPSHOT: {
+            const bool ok = requestPsocAdcSnapshot("LOCAL_UI");
+            localUiNotify(ok ? "Snapshot solicitado" : "Snapshot no disponible", ok);
+            break;
+        }
+        case LOCAL_UI_ACTION_IDENTIFY:
+            if (!g_psocConnected || captureOrDumpBusy()) {
+                localUiNotify("Nodo ocupado", false);
+            } else {
+                psoc.blinkLed();
+                localUiNotify("LED PSoC activo", true);
+            }
+            break;
+        case LOCAL_UI_ACTION_CLEAR:
+            if (critical) {
+                localUiNotify("Captura activa", false);
+            } else {
+                requestClearFromUsb();
+                localUiNotify("Captura limpiada", true);
+            }
+            break;
+        case LOCAL_UI_ACTION_STOP:
+            requestStopFromUsb();
+            localUiNotify("Captura detenida", true);
+            break;
+        case LOCAL_UI_ACTION_NONE:
+        default:
+            break;
+    }
+}
+
 static void handleUsbCommand(const char *cmd)
 {
     uint8_t value = 0u;
@@ -3114,6 +3199,7 @@ void setup()
                      (unsigned)(ESP.getMaxAllocHeap() / 304u));
     samplePulseBegin();
     debugEspHardwareBegin();
+    localUiBegin();
     SLAVE_LOG_PRINTF("[SCOPE] sample pulse pin=%d idle=%d us=%d\n",
                      SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE, SAMPLE_PULSE_US);
     SLAVE_LOG_PRINTF("[SCOPE] debugHardware=%d start pin=%d idle=%d us=%d\n",
@@ -3230,6 +3316,7 @@ void loop()
     serviceUsbCommands();
     serviceAutoCalibration();
     serviceCompletionAckRetry();
+    serviceLocalUi();
     serviceHotWaitWatchdog();
 
     /* Arranque por flanco GPIO (onSyncEdge): completar fuera del ISR el mismo

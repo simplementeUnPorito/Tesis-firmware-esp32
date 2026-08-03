@@ -95,6 +95,39 @@ El PSoC reporta `PSOC_HW_CLASS` en `PSOC_EVT_BOOT`. El esclavo lo reenvía en
 `CMD_BLINK_LED` → esclavo envía `PSOC_CMD_BLINK_LED (0xB9)` al PSoC por UART.
 El PSoC titila ~8 s a 2.5 Hz (no bloqueante). El LED físico es el del PSoC.
 
+## Interfaz local: OLED SPI y botones
+
+Cada esclavo puede operar localmente con un OLED **SSD1306 SPI de 128x64** y
+cuatro pulsadores. El firmware usa este pinout:
+
+| Señal | GPIO ESP32 | Conexión |
+|---|---:|---|
+| OLED SCK | 18 | CLK/SCK del OLED |
+| OLED MOSI | 23 | DIN/MOSI del OLED |
+| OLED CS | 33 | CS del OLED |
+| OLED DC | 16 | D/C del OLED |
+| OLED RESET | 17 | RST del OLED |
+| Botón ARRIBA | 34 | Pulsador a GND + pull-up 10 kOhm a 3.3 V |
+| Botón ABAJO | 35 | Pulsador a GND + pull-up 10 kOhm a 3.3 V |
+| Botón OK | 36 | Pulsador a GND + pull-up 10 kOhm a 3.3 V |
+| Botón ATRÁS | 39 | Pulsador a GND + pull-up 10 kOhm a 3.3 V |
+
+GPIO34, GPIO35, GPIO36 y GPIO39 son solo entradas y **no poseen pull-up
+interno**. Los cuatro pull-ups externos son obligatorios para evitar entradas
+flotantes. El OLED y los botones trabajan a 3.3 V.
+
+`OK` abre el menú; ARRIBA/ABAJO navegan y ATRÁS vuelve a la pantalla de
+estado. Las acciones disponibles son captura local, calibración del PSoC,
+snapshot ADC, identificación del nodo y limpieza de captura. Mantener ATRÁS
+durante 900 ms detiene una captura. Durante `HOT_WAIT` y `SAMPLING` no se
+actualiza el OLED por SPI, para no introducir actividad digital en la ventana
+crítica; solo se leen los botones y se admite la pulsación larga de parada.
+
+La cantidad de lotes de la captura local se configura con
+`LOCAL_CAPTURE_BATCHES` en `platformio.ini`. Esta interfaz no consume GPIO22 ni
+GPIO25: GPIO25 continúa siendo el RX UART actual hasta migrar la respuesta del
+PSoC al futuro enlace I2C PSoC-maestro/ESP-esclavo.
+
 ## Archivos
 
 | Archivo | Rol |
@@ -104,6 +137,7 @@ El PSoC titila ~8 s a 2.5 Hz (no bloqueante). El LED físico es el del PSoC.
 | `src/espnow_transport.h` | Envío de lotes al maestro (fragmenta en 2× MsgData) |
 | `src/sync_protocol.h` | Structs/IDs ESP-NOW (mismo que maestro) |
 | `src/debug_log.h` | Logging humano + máquina (gateado por `DBG_ENABLE`) |
+| `src/local_ui.h/.cpp` | OLED SPI, botones, menú y acciones locales |
 
 ## Build (`platformio.ini`)
 
