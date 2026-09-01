@@ -33,3 +33,13 @@ void localUiBegin();
 LocalUiAction localUiService(const LocalUiStatus &status, bool criticalWindow);
 void localUiNotify(const char *message, bool ok);
 
+/* Devuelve si el SSD1306 contesto en el bus durante localUiBegin(). El
+ * autotest lo usa como veredicto del item A2: hasta ahora el resultado de
+ * g_display.begin() se descartaba y nadie se enteraba si el OLED no estaba. */
+bool localUiReady();
+
+/* Resumen del autotest en pantalla, para usar la placa en campo sin PC.
+ * firstFail puede ser nullptr. */
+void localUiShowSelfTest(uint16_t nPass, uint16_t nFail, uint16_t nWarn,
+                         uint16_t nSkip, const char *firstFail);
+

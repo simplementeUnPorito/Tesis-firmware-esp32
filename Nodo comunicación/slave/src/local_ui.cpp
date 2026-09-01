@@ -356,6 +356,39 @@ LocalUiAction localUiService(const LocalUiStatus &status, bool criticalWindow)
     return LOCAL_UI_ACTION_NONE;
 }
 
+bool localUiReady()
+{
+    return g_ready;
+}
+
+void localUiShowSelfTest(uint16_t nPass, uint16_t nFail, uint16_t nWarn,
+                         uint16_t nSkip, const char *firstFail)
+{
+    if (!g_ready) {
+        return;
+    }
+    g_display.clearDisplay();
+    g_display.setTextColor(SSD1306_WHITE);
+    g_display.setTextSize(2);
+    g_display.setCursor(0, 0);
+    g_display.println(nFail == 0u ? "APTO" : "NO APTO");
+    g_display.setTextSize(1);
+    g_display.setCursor(0, 22);
+    g_display.print("PASS "); g_display.println(nPass);
+    g_display.print("FAIL "); g_display.println(nFail);
+    g_display.print("WARN "); g_display.print(nWarn);
+    g_display.print("  SKIP "); g_display.println(nSkip);
+    if (nFail != 0u && firstFail != nullptr) {
+        g_display.print("1er fallo: ");
+        g_display.println(firstFail);
+    }
+    g_display.display();
+    /* Se deja fija: el autotest termina y la pantalla queda con el veredicto,
+     * que es justamente lo que se quiere mirar en campo. */
+    g_notice_until_ms = 0u;
+    g_dirty = false;
+}
+
 void localUiNotify(const char *message, bool ok)
 {
     if (!g_ready) {
@@ -375,5 +408,7 @@ LocalUiAction localUiService(const LocalUiStatus &, bool)
     return LOCAL_UI_ACTION_NONE;
 }
 void localUiNotify(const char *, bool) {}
+bool localUiReady() { return false; }
+void localUiShowSelfTest(uint16_t, uint16_t, uint16_t, uint16_t, const char *) {}
 
 #endif

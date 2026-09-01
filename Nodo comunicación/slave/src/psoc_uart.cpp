@@ -151,6 +151,8 @@ void PsocUART::poll()
                 continue;   /* frame corto: [AB][C3][fs_lo][fs_hi][crc] */
             } else if (_buf[1] == PSOC_CTRL_DIAG_EVT) {
                 continue;   /* frame corto: [AB][C4][event][val][state][crc] */
+            } else if (_buf[1] == PSOC_CTRL_ST_RESULT) {
+                continue;   /* autotest: [AB][C5][id][st][v0 x4][v1 x4][crc] */
             } else {
                 _badLen++;
             }
@@ -170,6 +172,11 @@ void PsocUART::poll()
         if (_idx >= PSOC_CTRL_DIAG_BYTES && _buf[1] == PSOC_CTRL_DIAG_EVT) {
             _idx = 0;
             _parseDiagEvent();
+            continue;
+        }
+        if (_idx >= PSOC_ST_RESULT_BYTES && _buf[1] == PSOC_CTRL_ST_RESULT) {
+            _idx = 0;
+            _parseSelfTestResult();
             continue;
         }
         if (_idx >= PSOC_FRAME_BYTES) {
@@ -295,6 +302,35 @@ void PsocUART::_parseFsReport()
     }
     const uint16_t fs = (uint16_t)fs_lo | ((uint16_t)fs_hi << 8);
     if (fs > 0) { _sampleRate = fs; }
+}
+
+void PsocUART::onSelfTest(SelfTestCallback cb)
+{
+    _stCb = cb;
+}
+
+/* Trama de autotest: [AB][C5][id][status][v0 int32 LE][v1 int32 LE][XOR 2..11].
+ * El CRC cubre del byte 2 al 11 inclusive, igual que lo arma el PSoC. */
+void PsocUART::_parseSelfTestResult()
+{
+    uint8_t crc = 0;
+    for (int i = 2; i < PSOC_ST_RESULT_BYTES - 1; i++) { crc ^= _buf[i]; }
+    if (crc != _buf[PSOC_ST_RESULT_BYTES - 1]) {
+        _badLen++;
+        return;
+    }
+
+    PsocSelfTestResult r;
+    r.test_id = _buf[2];
+    r.status  = _buf[3];
+    r.v0 = (int32_t)((uint32_t)_buf[4]  | ((uint32_t)_buf[5]  << 8) |
+                     ((uint32_t)_buf[6]  << 16) | ((uint32_t)_buf[7]  << 24));
+    r.v1 = (int32_t)((uint32_t)_buf[8]  | ((uint32_t)_buf[9]  << 8) |
+                     ((uint32_t)_buf[10] << 16) | ((uint32_t)_buf[11] << 24));
+    r.timestamp_ms = millis();
+
+    _lastOK = true;
+    if (_stCb) { _stCb(r); }
 }
 
 void PsocUART::_parseDiagEvent()

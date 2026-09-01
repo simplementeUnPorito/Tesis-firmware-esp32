@@ -73,6 +73,44 @@
 #define PSOC_FRAME_BYTES  (4 + SPI_BATCH_SAMPLES * 3 + 1) /* 95 */
 #define PSOC_CTRL_ACK_BYTES 5
 #define PSOC_CTRL_DIAG_BYTES 6
+#define PSOC_CTRL_ST_RESULT  0xC5
+#define PSOC_ST_RESULT_BYTES 13
+
+/* Comandos del autotest (ESP -> PSoC). Codigos libres en la tabla del PSoC. */
+#define PSOC_CMD_ST_REPORT   0xA0   /* 1 param: que reporte emitir */
+#define PSOC_CMD_ST_SYNC     0xA1   /* 1 param: 1=armar contador, 0=leer */
+#define PSOC_CMD_ST_SET_IDAC 0xA2   /* 2 params: [etapa][codigo] */
+#define PSOC_CMD_ST_MEAS_DC  0xA4   /* 1 param: [settle_sel<<4 | canal] */
+#define PSOC_CMD_ST_MEAS_AC  0xA7   /* 1 param: [n_sel<<4 | canal] */
+
+/* Reportes de PSOC_CMD_ST_REPORT */
+#define ST_REP_IDENTITY 0
+#define ST_REP_EEPROM   1
+#define ST_REP_CAL      2
+#define ST_REP_ADCCFG   3
+#define ST_REP_IRQ      4
+#define ST_REP_BUTTON   6
+#define ST_REP_SD       5
+
+/* status dentro de la trama 0xC5 */
+#define ST_OK       0
+#define ST_ERR      1
+#define ST_REJECTED 2
+
+/* test_id de la trama 0xC5 (ver psoc_selftest.h del proyecto PSoC de test) */
+#define ST_ID_IDENTITY  0x01
+#define ST_ID_EEPROM    0x02
+#define ST_ID_SYNC      0x03
+#define ST_ID_SD        0x04
+#define ST_ID_ADCCFG    0x05
+#define ST_ID_STAGES    0x06
+#define ST_ID_IRQTRAP   0x07
+#define ST_ID_BUTTON    0x08
+#define ST_ID_CAL_BASE  0x10   /* |etapa */
+#define ST_ID_IDAC_BASE 0x20   /* |etapa */
+#define ST_ID_DC_BASE   0x50   /* |canal */
+#define ST_ID_ACA_BASE  0x60   /* |canal */
+#define ST_ID_ACB_BASE  0x70   /* |canal */
 
 /* Comandos hacia el PSoC */
 #define PSOC_CMD_PGA       0xA6
@@ -102,6 +140,16 @@
 #define PSOC_CTRL_CFG_ACK   0xC2
 #define PSOC_CTRL_FS_REPORT 0xC3  /* PSoC → ESP: frecuencia de muestreo ADC */
 #define PSOC_CTRL_DIAG_EVT  0xC4  /* PSoC → ESP: evento diagnostico */
+
+/* ── Autotest de placa ────────────────────────────────────────────────────
+ * Trama de resultado que emite el firmware de autotest del PSoC
+ * (proyecto AcondicionamientoAnalogicoTest). 13 bytes:
+ *   [0xAB][0xC5][test_id][status][v0 int32 LE][v1 int32 LE][XOR de 2..11]
+ *
+ * El firmware de campo del PSoC NUNCA la manda, asi que reconocerla aca es
+ * inocuo para el build de campo: lo unico que cambia es que un 0xC5 deja de
+ * contar como _badLen. Se deja sin guardar por #if a proposito, para que el
+ * parser sea uno solo y no diverja entre variantes. */  /* PSoC → ESP: evento diagnostico */
 
 #define PSOC_EVT_BOOT             0x01
 #define PSOC_EVT_ANALOG_READY     0x02
@@ -181,6 +229,16 @@ struct PsocBatch {
     uint64_t   timestamp_us;
 };
 
+/* Una medicion o reporte del autotest del PSoC. Los dos int32 significan
+ * cosas distintas segun test_id; la tabla esta en selftest_report.cpp. */
+struct PsocSelfTestResult {
+    uint8_t  test_id;
+    uint8_t  status;     /* ST_OK / ST_ERR / ST_REJECTED */
+    int32_t  v0;
+    int32_t  v1;
+    uint32_t timestamp_ms;
+};
+
 struct PsocDiagEvent {
     uint8_t  event;
     uint8_t  value;
@@ -190,11 +248,22 @@ struct PsocDiagEvent {
 
 typedef void (*BatchCallback)(const PsocBatch &batch);
 typedef void (*DiagCallback)(const PsocDiagEvent &event);
+typedef void (*SelfTestCallback)(const PsocSelfTestResult &result);
 
 class PsocUART {
 public:
     void begin(BatchCallback cb = nullptr, HardwareSerial *serial = nullptr);
     void onDiag(DiagCallback cb);
+    void onSelfTest(SelfTestCallback cb);
+
+    /* Comandos del autotest (ver psoc_selftest.h del proyecto PSoC de test). */
+    void stReport(uint8_t what)              { _sendCmd1(PSOC_CMD_ST_REPORT, what); }
+    void stSync(uint8_t arm)                 { _sendCmd1(PSOC_CMD_ST_SYNC, arm); }
+    void stSetIdac(uint8_t stage, uint8_t c) { _sendCmd2(PSOC_CMD_ST_SET_IDAC, stage, c); }
+    void stMeasDc(uint8_t settleSel, uint8_t ch)
+        { _sendCmd1(PSOC_CMD_ST_MEAS_DC, (uint8_t)(((settleSel & 0x07u) << 4) | (ch & 0x0Fu))); }
+    void stMeasAc(uint8_t nSel, uint8_t ch)
+        { _sendCmd1(PSOC_CMD_ST_MEAS_AC, (uint8_t)(((nSel & 0x07u) << 4) | (ch & 0x0Fu))); }
     void poll();                 /* drena UART y ensambla frames */
 
     /* Comandos hacia el PSoC. START normal y Ver usan SYNC. */
@@ -245,6 +314,7 @@ private:
     HardwareSerial *_ser       = nullptr;
     BatchCallback   _cb        = nullptr;
     DiagCallback    _diagCb    = nullptr;
+    SelfTestCallback _stCb     = nullptr;
     uint8_t         _buf[PSOC_FRAME_BYTES];
     uint16_t        _idx       = 0;
     bool            _lastOK    = false;
@@ -286,6 +356,7 @@ private:
     void _parseConfigAck();
     void _parseFsReport();
     void _parseDiagEvent();
+    void _parseSelfTestResult();
     void _noteRxByte(uint8_t b);
     void _sendCmd1(uint8_t cmd, uint8_t p);
     void _sendCmd2(uint8_t cmd, uint8_t p1, uint8_t p2);
