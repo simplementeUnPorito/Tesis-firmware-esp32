@@ -116,8 +116,8 @@ SD. Los resultados fueron idénticos:
   51928 bytes de SRAM.
 - PSoC Creator, firmware autotest: **Build Succeeded**, 67240 bytes de flash y
   17384 bytes de SRAM.
-- PlatformIO `slave2`: **SUCCESS**, 799201 bytes de flash y 49160 bytes de RAM.
-- PlatformIO `slaveTest`: **SUCCESS**, 823409 bytes de flash y 49564 bytes de RAM.
+- PlatformIO `slave2`: **SUCCESS**, 799633 bytes de flash y 49160 bytes de RAM.
+- PlatformIO `slaveTest`: **SUCCESS**, 823449 bytes de flash y 49564 bytes de RAM.
 - ESP32 programado correctamente por COM8.
 - `autotest_runner.py --self-test`: **28/28 PASS**.
 - `test_autotest_format.py`: **17/17 PASS**.

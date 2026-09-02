@@ -354,6 +354,7 @@ static const char *diagNombre(uint8_t ev)
         case 0x48: return "SD_STATUS";
         case 0x49: return "SD_SESSION";
         case 0x4A: return "SD_ERROR";
+        case 0x4B: return "ARMED_TIMEOUT";
         case 0x7E: return "IRQ_INESPERADA";
         case 0x7F: return "HARDFAULT";
         default:   return nullptr;

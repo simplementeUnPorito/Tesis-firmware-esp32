@@ -656,7 +656,28 @@ static void onPsocDiag(const PsocDiagEvent &event)
         event.event != PSOC_EVT_DUMP_DONE &&
         event.event != PSOC_EVT_CAPTURE_DONE &&
         event.event != PSOC_EVT_SD_SESSION &&
-        event.event != PSOC_EVT_SD_ERROR) {
+        event.event != PSOC_EVT_SD_ERROR &&
+        event.event != PSOC_EVT_ARMED_TIMEOUT) {
+        return;
+    }
+
+    if (event.event == PSOC_EVT_ARMED_TIMEOUT) {
+        const bool hadCapture = g_view_store_active || g_start_store_active;
+        const uint8_t failedSubCmd = g_view_store_active ? CMD_VIEW : CMD_START;
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        g_view_store_active = false;
+        g_start_store_active = false;
+        g_psoc_sd_store_active = false;
+        g_psoc_sd_session_complete = false;
+        g_psoc_sd_capture_error = true;
+        g_store_fill = 0u;
+        g_state = STOPPED;
+        if (hadCapture) {
+            sendCfgAck(failedSubCmd, 0u);
+        }
+        SLAVE_LOG_PRINTLN("[SLAVE] PSoC ARMED timeout -> STOPPED");
+        LOGM("PSOC_ARMED_TIMEOUT", "capture=%u,sub=0x%02X",
+             (unsigned)hadCapture, (unsigned)failedSubCmd);
         return;
     }
 
