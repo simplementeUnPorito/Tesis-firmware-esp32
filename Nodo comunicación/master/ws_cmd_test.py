@@ -110,7 +110,9 @@ def describe(pkt):
         st = MASTER_STATES[b0] if b0 < len(MASTER_STATES) else f"?{b0}"
         extra = f"  [state={st}]"
     elif typ == 0x07:
-        extra = f"  [ack cmd=0x{b2:02X} val={(b1<<8)|b0}]"
+        # ACK usa sólo b1 para status/eco low8; b0 está reservado. No es un
+        # uint16 y, para SET_RECLEN, no contiene la longitud completa.
+        extra = f"  [ack cmd=0x{b2:02X} val={b1}]"
     elif typ == 0xFE:
         extra = f"  [n_slaves={b0}]"
     elif typ == 0xFC:
@@ -156,7 +158,7 @@ def main():
                 if len(payload) == 6 and payload[0] == 0x56:
                     typ, b2, b1, b0 = payload[2], payload[3], payload[4], payload[5]
                     if typ == 0x07:
-                        acks_seen.append((time.time()-t0, b2, (b1 << 8) | b0))
+                        acks_seen.append((time.time()-t0, b2, b1))
                     elif typ == 0x01:
                         st = MASTER_STATES[b0] if b0 < len(MASTER_STATES) else f"?{b0}"
                         if not states_seen or states_seen[-1][1] != st:

@@ -60,7 +60,7 @@ El pin `SYNC_OUT` del maestro (GPIO15) es **solo marcador de osciloscopio** y
 |------|-------------|
 | `0x00` | Muestra ADC (int24 signed, b2:b1:b0) |
 | `0x01` | Heartbeat (b0 = MasterState, b1 = PGA, b2 = VDAC) |
-| `0x07` | ACK (b2 = cmd, b1:b0 = valor) |
+| `0x07` | ACK (`b2=cmd`, `b1=status/eco low8`, `b0` reservado; no lleva un `uint16`) |
 | `0xFC` | Latencia START (µs, 24-bit unsigned) |
 | `0xFD` | Status/HELLO (bloque multi-frame) |
 | `0xFE` | READY (b0 = n_slaves_ready) |

@@ -9,7 +9,7 @@ export const PKT_LEN = 6;
 // Packet types (byte 3 of every PKT_HEADER packet)
 export const PTYPE_DATA = 0x00;
 export const PTYPE_HEARTBEAT = 0x01;
-export const PTYPE_ACK = 0x07;
+export const PTYPE_ACK = 0x07;  // b2=cmd, b1=status/eco low8, b0 reservado
 export const PTYPE_LATENCY = 0xFC;
 export const PTYPE_STATUS = 0xFD;
 export const PTYPE_READY = 0xFE;

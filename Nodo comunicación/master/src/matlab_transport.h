@@ -174,6 +174,8 @@ inline void MatlabTransport::sendHeartbeat(uint8_t nodeId, uint8_t pga,
 
 inline void MatlabTransport::sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val)
 {
+    /* Contrato ACK: b2=cmd, b1=status o eco low8, b0=reservado. No transporta
+     * valores uint16 completos; 0xAD/0xAE reflejan low8(N) sólo como acuse. */
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0x07, cmd, val, 0x00 };
     _emit(pkt);
 }

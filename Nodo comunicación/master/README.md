@@ -35,7 +35,7 @@ Modo adicional: `SCOPE_MULTI` (múltiples starts para caracterizar jitter).
 |------|-------------|
 | `0x00` | Muestra ADC raw |
 | `0x01` | Heartbeat (estado maestro, PGA, VDAC) |
-| `0x07` | ACK (b2=cmd, b1:b0=valor) |
+| `0x07` | ACK (`b2=cmd`, `b1=status/eco low8`, `b0` reservado; no lleva un `uint16`) |
 | `0xFC` | Latencia START µs |
 | `0xFD` | Status/HELLO multiframe |
 | `0xFE` | READY (n_slaves) |
