@@ -3,7 +3,7 @@
   "test": "AUTOTEST_PLACA_NODO_ESCLAVO",
   "status": "failed",
   "error": null,
-  "started_at_utc": "2026-09-02T00:00:43+00:00",
+  "started_at_utc": "2026-09-02T00:51:53+00:00",
   "port": "COM8",
   "baud": 115200,
   "dtr": false,
@@ -26,8 +26,8 @@
     "D2",
     "D8"
   ],
-  "finished_at_utc": "2026-09-02T00:00:59+00:00",
-  "raw_lines": 29,
+  "finished_at_utc": "2026-09-02T00:52:13+00:00",
+  "raw_lines": 32,
   "items": [
     {
       "code": "A1",
@@ -38,8 +38,8 @@
     {
       "code": "A2",
       "name": "OLED SSD1306 por SPI",
-      "verdict": "INFO",
-      "detail": "patron dibujado. El SPI no tiene lectura: confirmalo con la vista y responde 'oled si' u 'oled n"
+      "verdict": "SKIP",
+      "detail": "declarado ausente (hw oled 0)"
     },
     {
       "code": "A3",
@@ -68,94 +68,96 @@
     {
       "code": "B0",
       "name": "Lineas del bus I2C en reposo",
-      "verdict": "FAIL",
-      "detail": "SCL en bajo pero SUBE con el pull-up interno: falta el pull-up EXTERNO de SCL a 3V3 (SDA 50/50,"
+      "verdict": "PASS",
+      "detail": "SDA(21) y SCL(22) en alto: los pull-ups estan"
     },
     {
       "code": "B0c",
       "name": "Pull-ups externos, medidos",
       "verdict": "INFO",
-      "detail": "SDA flotante 50/50 pu 30/30 pd 30/30 | SCL flotante 0/50 pu 30/30 pd 0/30"
+      "detail": "SDA flotante 50/50 pu 30/30 pd 30/30 | SCL flotante 50/50 pu 30/30 pd 30/30"
     },
     {
       "code": "B0d",
       "name": "Pull-up externo de SCL",
-      "verdict": "FAIL",
-      "detail": "SDA aguanta el pull-down interno y SCL no: el PIN GPIO22 del ESP NO esta viendo un pull-up exter"
+      "verdict": "PASS",
+      "detail": "SCL aguanta el pull-down interno: el pull-up externo llega al pin"
     },
     {
       "code": "B0b",
       "name": "Reloj del bus (SCL) al arranque",
-      "verdict": "FAIL",
-      "detail": "0 flancos en 3 s: el PSoC NO transmite. No es el cableado (ver B0): mirar si arranco, si tiene e"
+      "verdict": "PASS",
+      "detail": "40 flancos en 3 s: el PSoC ESTA transmitiendo"
     },
     {
       "code": "B1",
       "name": "Subida I2C PSoC->ESP (0x42)",
-      "verdict": "WARN",
-      "detail": "silencio total en 1.5 s. Revisar, en orden: PSoC programado y alimentado / pull-ups de SDA(21) y"
+      "verdict": "PASS",
+      "detail": "12 B/1.5s, 3 pings, 0 diag, overruns=0"
+    },
+    {
+      "code": "B2a",
+      "name": "El ESP transmite por la UART",
+      "verdict": "PASS",
+      "detail": "131 flancos en GPIO26 al mandar 5 comandos"
     },
     {
       "code": "B2",
-      "name": "Bajada UART ESP->PSoC",
-      "verdict": "SKIP",
-      "detail": "sin enlace de subida: no se puede confirmar la ida"
+      "name": "Bajada UART ESP->PSoC + vuelta por I2",
+      "verdict": "FAIL",
+      "detail": "sin respuesta en 800 ms: revisar GPIO26 -> Rx P15[0]"
     },
     {
       "code": "B3",
       "name": "Linea SYNC GPIO27 -> P0[4]",
-      "verdict": "SKIP",
-      "detail": "sin enlace de subida: el PSoC no puede reportar los flancos"
+      "verdict": "FAIL",
+      "detail": "el PSoC no acepto armar el contador"
     },
     {
-      "code": "C*",
-      "name": "Tests del PSoC",
-      "verdict": "SKIP",
-      "detail": "sin enlace con el PSoC"
+      "code": "C1",
+      "name": "Identidad del PSoC",
+      "verdict": "FAIL",
+      "detail": "el enlace anda pero no contesta 0xA0: el PSoC casi seguro tiene el firmware de CAMPO, no el de a"
     },
     {
       "code": "D*",
       "name": "Tests analogicos",
       "verdict": "SKIP",
-      "detail": "sin enlace con el PSoC"
+      "detail": "el PSoC no tiene el firmware de autotest"
     },
     {
       "code": "B4",
       "name": "Integridad de trama en toda la corrid",
-      "verdict": "SKIP",
-      "detail": "no llego ningun byte del PSoC: nada que verificar"
+      "verdict": "PASS",
+      "detail": "bBad=0 badLen=0 (drop=56 informativo)"
     }
   ],
   "firmware_json": {
     "verdict": "FAIL",
-    "pass": 3,
+    "pass": 9,
     "fail": [
-      "B0",
-      "B0d",
-      "B0b"
+      "B2",
+      "B3",
+      "C1"
     ],
-    "warn": [
-      "B1"
-    ],
-    "skip": 6,
-    "info": 3
+    "warn": [],
+    "skip": 3,
+    "info": 2
   },
   "summary_verdict": "NO APTO",
   "counts": {
-    "PASS": 3,
+    "PASS": 9,
     "FAIL": 3,
-    "WARN": 1,
-    "SKIP": 6,
-    "INFO": 3
+    "WARN": 0,
+    "SKIP": 3,
+    "INFO": 2
   },
   "fails": [
-    "B0",
-    "B0b",
-    "B0d"
+    "B2",
+    "B3",
+    "C1"
   ],
-  "warns": [
-    "B1"
-  ],
+  "warns": [],
   "missing_required": [],
   "problems": [],
   "board_verdict": "NO APTO",

@@ -28,12 +28,12 @@ esta completo envia `CMD_VIEW ok=2`; el maestro recupera los lotes con
 ## Enlace con el PSoC (`psoc_uart.*`)
 
 - **Serial2** (ESP32): `PSOC_UART_RX=25`, `PSOC_UART_TX=26`, baud=115200.
-- Wiring carrier: ESP GPIO26/J2.10 → PSoC P2[0]/J1.1 (`Rx`);
+- Wiring de la placa actual: ESP GPIO26 → PSoC P15[0] (`Rx`);
   ESP GPIO25/J2.9 ← PSoC P12[7]/J1.9 (`Tx`).
 - `Tx` del PSoC es `OPEN_DRAIN_LO`: la carrier incluye `R1 = 4.7 kOhm`
   hacia 3.3 V del ESP32.
-- **Arranque siempre por pin**: GPIO27/J2.11 (`SYNC_TO_PSOC`) → PSoC
-  `SYNC_IN` P1[5]/J1.22. GPIO32/J2.7 queda como sincronismo externo opcional.
+- **Arranque siempre por pin**: GPIO27 (`SYNC_TO_PSOC`) → PSoC
+  `SYNC_IN` P0[4]. GPIO32 queda como sincronismo externo opcional.
   El PSoC nunca arranca por comando UART.
 
 ## Auto-calibración
@@ -184,6 +184,32 @@ Auto-calibración al arrancar:
 -DPSOC_AUTO_CAL_DELAY_MS=500
 -DPSOC_AUTO_CAL_RETRY_MS=3000
 ```
+
+### Autotest de placa (`slaveTest`)
+
+El autotest no inicia una corrida solo al arrancar. Esto evita tocar la cadena
+analógica por accidente durante una sesión exclusivamente digital.
+
+```powershell
+Set-Location 'C:\Github\Tesis\src\firmware\esp32\Nodo comunicación\slave'
+pio run -e slaveTest -t upload
+pio device monitor --port COM8 --baud 115200
+```
+
+Comandos de uso diario:
+
+| Comando | Prueba |
+|---|---|
+| `b` | Enlaces digitales I2C, UART y SYNC. |
+| `c` | Identidad, captura digital, DFB, SD y reposo del botón PSoC. |
+| `botones` | Los cuatro botones del ESP32, con indicación uno por uno. |
+| `boton` | El botón del PSoC. |
+| `diag on` / `diag off` | Muestra u oculta la telemetría detallada del PSoC. |
+| `run` | Corrida completa, incluida la parte analógica; no usar en una sesión digital. |
+
+Después de subir el ESP32 hay que resetear el PSoC con
+`src/firmware/psoc/reset_psoc.ps1`. El registro de la puesta en marcha del
+2026-09-01 está en `artifacts/registro_pruebas_digitales_2026-09-01.md`.
 
 ## Validacion 2026-07-02
 

@@ -1,0 +1,297 @@
+{
+  "schema_version": 1,
+  "test": "AUTOTEST_PLACA_NODO_ESCLAVO",
+  "status": "failed",
+  "error": null,
+  "started_at_utc": "2026-09-02T01:03:36+00:00",
+  "port": "COM8",
+  "baud": 115200,
+  "dtr": false,
+  "rts": false,
+  "required_always": [
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "B1",
+    "B4"
+  ],
+  "required_with_psoc": [
+    "B2",
+    "B3",
+    "C1",
+    "C4",
+    "C6",
+    "D1",
+    "D2",
+    "D8"
+  ],
+  "finished_at_utc": "2026-09-02T01:04:54+00:00",
+  "raw_lines": 201,
+  "items": [
+    {
+      "code": "A1",
+      "name": "Arranque ESP32",
+      "verdict": "PASS",
+      "detail": "POWERON, heap 204 KB, flash 4 MB"
+    },
+    {
+      "code": "A2",
+      "name": "OLED SSD1306 por SPI",
+      "verdict": "SKIP",
+      "detail": "declarado ausente (hw oled 0)"
+    },
+    {
+      "code": "A3",
+      "name": "Pull-ups de botones",
+      "verdict": "PASS",
+      "detail": "4/4 en alto estable (no descarta pull-up ausente: ver con tester)"
+    },
+    {
+      "code": "A4",
+      "name": "ESP-NOW (init + peer + TX)",
+      "verdict": "PASS",
+      "detail": "esp_now_send=0, canal 1"
+    },
+    {
+      "code": "A5",
+      "name": "Radio / maestro visible",
+      "verdict": "INFO",
+      "detail": "7 redes, GeoNetwork no visible (no es falla de placa)"
+    },
+    {
+      "code": "A6",
+      "name": "GPIO25 (ex PSOC_UART_RX)",
+      "verdict": "SKIP",
+      "detail": "sin conectar por diseno: el PSoC nuevo no tiene pin Tx"
+    },
+    {
+      "code": "B0",
+      "name": "Lineas del bus I2C en reposo",
+      "verdict": "PASS",
+      "detail": "SDA(21) y SCL(22) en alto: los pull-ups estan"
+    },
+    {
+      "code": "B0c",
+      "name": "Pull-ups externos, medidos",
+      "verdict": "INFO",
+      "detail": "SDA flotante 50/50 pu 30/30 pd 30/30 | SCL flotante 50/50 pu 30/30 pd 30/30"
+    },
+    {
+      "code": "B0d",
+      "name": "Pull-up externo de SCL",
+      "verdict": "PASS",
+      "detail": "SCL aguanta el pull-down interno: el pull-up externo llega al pin"
+    },
+    {
+      "code": "B0b",
+      "name": "Reloj del bus (SCL) al arranque",
+      "verdict": "PASS",
+      "detail": "31 flancos en 3 s: el PSoC ESTA transmitiendo"
+    },
+    {
+      "code": "B1",
+      "name": "Subida I2C PSoC->ESP (0x42)",
+      "verdict": "PASS",
+      "detail": "8 B/1.5s, 2 pings, 0 diag, overruns=0"
+    },
+    {
+      "code": "B2a",
+      "name": "El ESP transmite por la UART",
+      "verdict": "PASS",
+      "detail": "131 flancos en GPIO26 al mandar 5 comandos"
+    },
+    {
+      "code": "B2",
+      "name": "Bajada UART ESP->PSoC + vuelta por I2",
+      "verdict": "PASS",
+      "detail": "STATUS respondido en 54 ms"
+    },
+    {
+      "code": "B3",
+      "name": "Linea SYNC GPIO27 -> P0[4]",
+      "verdict": "FAIL",
+      "detail": "0 flancos en 10 ciclos: se esperaban 20 o 10"
+    },
+    {
+      "code": "C1",
+      "name": "Identidad del PSoC",
+      "verdict": "PASS",
+      "detail": "clase=GEO, Fs=2604 Hz, 4 etapas, 5 canales AMux"
+    },
+    {
+      "code": "C2",
+      "name": "Sin trampas de IRQ / HardFault",
+      "verdict": "PASS",
+      "detail": "IRQ inesperadas=0, hardfaults=0, vistas por el ESP=0"
+    },
+    {
+      "code": "C3",
+      "name": "EEPROM de calibracion (CRC-16)",
+      "verdict": "WARN",
+      "detail": "0/9 slots: placa sin calibrar todavia (esperable)"
+    },
+    {
+      "code": "C4",
+      "name": "Camino digital E2E (rampa cruda)",
+      "verdict": "SKIP",
+      "detail": "sin linea de SYNC (ver B3) no se puede disparar una captura"
+    },
+    {
+      "code": "C5",
+      "name": "Filtro FIR de hardware (DFB)",
+      "verdict": "SKIP",
+      "detail": "sin linea de SYNC (ver B3) no se puede disparar una captura"
+    },
+    {
+      "code": "C6",
+      "name": "SD FatFs (ruteo SPIp nuevo)",
+      "verdict": "FAIL",
+      "detail": "el PSoC no ve tarjeta (estado=0x00): declarado PRESENTE: revisar soldadura"
+    },
+    {
+      "code": "C7",
+      "name": "Pulsador del PSoC en reposo",
+      "verdict": "PASS",
+      "detail": "nivel 1 estable en 5 lecturas"
+    },
+    {
+      "code": "D1",
+      "name": "Reposo de los taps analogicos",
+      "verdict": "PASS",
+      "detail": "ch0=1035mV ch1=1014mV ch2=896mV ch3=1122mV"
+    },
+    {
+      "code": "D1b",
+      "name": "AMuxCapacitor (100 nF a Vss)",
+      "verdict": "INFO",
+      "detail": "1052 mV (cerca de Vss es lo esperado)"
+    },
+    {
+      "code": "D2",
+      "name": "Matriz DC IDAC->etapa",
+      "verdict": "FAIL",
+      "detail": "4/4 barridos, 3 etapa(s) sin respuesta, 2 fuga(s): etapa 0 no mueve su tap (133 uV/cod)"
+    },
+    {
+      "code": "D2.0",
+      "name": "pendientes uV/codigo",
+      "verdict": "INFO",
+      "detail": "133.1 -218.4 31.0 -0.5"
+    },
+    {
+      "code": "D2.1",
+      "name": "pendientes uV/codigo",
+      "verdict": "INFO",
+      "detail": "-30.0 199.3 -1706.6 0.0"
+    },
+    {
+      "code": "D2.2",
+      "name": "pendientes uV/codigo",
+      "verdict": "INFO",
+      "detail": "0.9 -6.7 1906.4 0.5"
+    },
+    {
+      "code": "D2.3",
+      "name": "pendientes uV/codigo",
+      "verdict": "INFO",
+      "detail": "-0.5 0.0 0.0 -0.5"
+    },
+    {
+      "code": "D3",
+      "name": "Asentamiento del ultimo tap",
+      "verdict": "PASS",
+      "detail": "deriva 5ms->500ms = 0 uV"
+    },
+    {
+      "code": "D4",
+      "name": "Ganancia PGAout 1x vs 4x",
+      "verdict": "FAIL",
+      "detail": "cociente 0.00 (nominal 4.00, tol 25%)"
+    },
+    {
+      "code": "D6.0",
+      "name": "Piso de ruido del tap",
+      "verdict": "PASS",
+      "detail": "media 1035289 uV, RMS 19 uV, pp 228 uV, 50Hz 0 uV"
+    },
+    {
+      "code": "D6.1",
+      "name": "Piso de ruido del tap",
+      "verdict": "PASS",
+      "detail": "media 1015110 uV, RMS 76 uV, pp 514 uV, 50Hz 0 uV"
+    },
+    {
+      "code": "D6.2",
+      "name": "Piso de ruido del tap",
+      "verdict": "PASS",
+      "detail": "media 893898 uV, RMS 152 uV, pp 1163 uV, 50Hz 0 uV"
+    },
+    {
+      "code": "D6.3",
+      "name": "Piso de ruido del tap",
+      "verdict": "PASS",
+      "detail": "media 1122283 uV, RMS 19 uV, pp 228 uV, 50Hz 0 uV"
+    },
+    {
+      "code": "D6b",
+      "name": "Carga de la entrada (indicador de ge",
+      "verdict": "INFO",
+      "detail": "ch0: RMS 19 uV, 50 Hz 0 uV. Con geofono baja; con la entrada abierta sube. Comparar las dos corr"
+    },
+    {
+      "code": "D8",
+      "name": "Auto-calibracion",
+      "verdict": "SKIP",
+      "detail": "desactivada: la maquina de calibracion todavia no esta portada de VDAC8 a IDAC8, su veredicto no"
+    },
+    {
+      "code": "D5",
+      "name": "Coherencia de rangos del ADC",
+      "verdict": "SKIP",
+      "detail": "el tap quedo fuera de +-0.45 V: la config 2 recortaria"
+    },
+    {
+      "code": "B4",
+      "name": "Integridad de trama en toda la corrid",
+      "verdict": "PASS",
+      "detail": "bBad=0 badLen=0 (drop=134 informativo)"
+    }
+  ],
+  "firmware_json": {
+    "verdict": "FAIL",
+    "pass": 19,
+    "fail": [
+      "B3",
+      "C6",
+      "D2",
+      "D4"
+    ],
+    "warn": [
+      "C3"
+    ],
+    "skip": 6,
+    "info": 8
+  },
+  "summary_verdict": "NO APTO",
+  "counts": {
+    "PASS": 19,
+    "FAIL": 4,
+    "WARN": 1,
+    "SKIP": 6,
+    "INFO": 8
+  },
+  "fails": [
+    "B3",
+    "C6",
+    "D2",
+    "D4"
+  ],
+  "warns": [
+    "C3"
+  ],
+  "missing_required": [],
+  "problems": [],
+  "board_verdict": "NO APTO",
+  "coverage": "completa"
+}

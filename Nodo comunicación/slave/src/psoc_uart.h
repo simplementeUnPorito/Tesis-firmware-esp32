@@ -118,7 +118,7 @@
 #define ST_ID_IDENTITY  0x01
 #define ST_ID_EEPROM    0x02
 #define ST_ID_SYNC      0x03
-#define ST_ID_SD        0x04
+#define ST_ID_SD        0x04   /* v0=estado; v1=[stage][R1][pads][errores] */
 #define ST_ID_ADCCFG    0x05
 #define ST_ID_STAGES    0x06
 #define ST_ID_IRQTRAP   0x07
@@ -229,6 +229,7 @@
 #define PSOC_EVT_SD_STATUS        0x48  /* bit0 presente, bits1-2 tipo, bit3 test, bit4 FAT, bit5 sesión, bit6 captura */
 #define PSOC_EVT_SD_SESSION       0x49  /* value=1: GEOLAST.BIN COMPLETE/listo; 0: inválido */
 #define PSOC_EVT_SD_ERROR         0x4A  /* value: bit0 write fail, bit1 overrun, bit2 dir/header, bit3 read fail dump */
+#define PSOC_EVT_ARMED_TIMEOUT    0x4B  /* PSoC aborto ARMED porque no llego SYNC */
 
 struct PsocSample {
     int16_t  raw_input;

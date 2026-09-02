@@ -540,6 +540,7 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_CAL_PI_BUCKET32:return "CAL_PI_BUCKET32";
         case PSOC_EVT_CAL_PI_STABLE:  return "CAL_PI_STABLE";
         case PSOC_EVT_CAL_AMUX_CAP:   return "CAL_AMUX_CAP";
+        case PSOC_EVT_ARMED_TIMEOUT:  return "ARMED_TIMEOUT";
         default:                      return "UNKNOWN";
     }
 }

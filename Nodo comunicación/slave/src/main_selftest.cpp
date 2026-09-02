@@ -107,6 +107,15 @@ static const int32_t TH_NOISE_RMS_DEAD_UV = 2;         /* ADC congelado */
 static const int32_t TH_NOISE_RMS_MAX_UV  = 200000;    /* etapa oscilando */
 static const int32_t TH_NOISE_MAINS_WARN_UV = 100000;  /* 100 mV de 50 Hz */
 
+/* D8 (auto-calibracion) DESACTIVADO a pedido de Elias, 2026-09-01.
+ *
+ * La maquina de calibracion viene de cuando las referencias eran VDAC8; con el
+ * cambio a IDAC8 su modelo de planta, sus targets y sus ganancias PI quedaron
+ * sin portar. Correrla hoy no dice nada util sobre la placa: falla siempre, y
+ * ademas se come minutos de cada corrida. Se deja el codigo intacto y se
+ * saltea el test, para poder reactivarlo con una linea cuando este portada. */
+#define ST_D8_HABILITADO 0
+
 /* Flancos que manda el ESP para probar la linea de SYNC. */
 static const int TH_SYNC_EDGES = 20;
 
@@ -236,6 +245,10 @@ static uint8_t g_psocStages = 0;
 static uint8_t g_amuxChannels = 0;
 static uint8_t g_hwClass = 0xFF;
 
+/* Resultado de B3. Si la linea de SYNC no anda, NINGUNA captura puede
+ * arrancar, y peor: dejar al PSoC armado lo vuelve sordo. */
+static bool g_syncOk = false;
+
 static Preferences g_prefs;
 
 static void hwLoad()
@@ -292,10 +305,16 @@ static int  g_busSdaPd = 0, g_busSclPd = 0;  /* con pull-DOWN interno */
  * trama de 4 bytes a la velocidad del bus dura decenas de microsegundos: un
  * muestreo por software no la vería nunca. */
 static volatile uint32_t g_sclEdges = 0;
+static volatile uint32_t g_txEdges  = 0;   /* flancos en la UART hacia el PSoC */
 
 static void IRAM_ATTR onSclEdge()
 {
     g_sclEdges++;
+}
+
+static void IRAM_ATTR onTxEdge()
+{
+    g_txEdges++;
 }
 
 /* ── Callbacks ───────────────────────────────────────────────────────────── */
@@ -304,9 +323,61 @@ static void onSelfTest(const PsocSelfTestResult &r)
     if (g_stRxN < ST_RX_MAX) { g_stRx[g_stRxN++] = r; }
 }
 
+/* Nombre corto de los eventos que importan para el autotest. El resto sale en
+ * hexadecimal: alcanza para seguir la pista. */
+static const char *diagNombre(uint8_t ev)
+{
+    switch (ev) {
+        case 0x01: return "BOOT";
+        case 0x02: return "ANALOG_READY";
+        case 0x10: return "CAL_START";
+        case 0x11: return "CAL_DONE";
+        case 0x12: return "CAL_BUSY";
+        case 0x20: return "WAIT_ESP";
+        case 0x21: return "ESP_SEEN";
+        case 0x30: return "RX_CMD";
+        case 0x31: return "SETN";
+        case 0x32: return "ARMED";
+        case 0x33: return "SYNC_RISE";
+        case 0x34: return "SYNC_FALL";
+        case 0x35: return "SAMPLING_START";
+        case 0x36: return "CAPTURE_DONE";
+        case 0x37: return "DUMP_START";
+        case 0x38: return "DUMP_DONE";
+        case 0x39: return "START_NOW";
+        case 0x3A: return "DEBUG_MODE";
+        case 0x3B: return "STATUS_REQ";
+        case 0x3E: return "CAPTURE_CLAMPED";
+        case 0x45: return "CAPTURE_WATCHDOG";
+        case 0x46: return "TIMER_STORM";
+        case 0x47: return "CHAIN_NEXT";
+        case 0x48: return "SD_STATUS";
+        case 0x49: return "SD_SESSION";
+        case 0x4A: return "SD_ERROR";
+        case 0x7E: return "IRQ_INESPERADA";
+        case 0x7F: return "HARDFAULT";
+        default:   return nullptr;
+    }
+}
+
+/* La consola normal es para el operador. Los eventos internos ensuciaban las
+ * instrucciones interactivas; siguen contandose y pueden verse con `diag on`. */
+static bool g_diagEcho = false;   /* comando USB: 'diag on|off' */
+
 static void onDiag(const PsocDiagEvent &e)
 {
     g_diagCount++;
+    if (g_diagEcho) {
+        const char *n = diagNombre(e.event);
+        if (n != nullptr) {
+            Serial.printf("    <psoc %s val=%u estado=%u>\n", n,
+                          (unsigned)e.value, (unsigned)e.psoc_state);
+        } else {
+            Serial.printf("    <psoc 0x%02X val=%u estado=%u>\n",
+                          (unsigned)e.event, (unsigned)e.value,
+                          (unsigned)e.psoc_state);
+        }
+    }
     switch (e.event) {
         case 0x32: g_evArmed = true; break;                 /* PSOC_EVT_ARMED */
         case 0x11: g_evCalDone = true; g_evCalOk = e.value; break;  /* CAL_DONE */
@@ -439,6 +510,46 @@ static bool stSetIdac(uint8_t stage, uint8_t code)
             const PsocSelfTestResult *r = stFind((uint8_t)(ST_ID_IDAC_BASE | stage));
             if (r && r->status == ST_OK) { return true; }
         }
+    }
+    return false;
+}
+
+/* Espera a que el PSoC vuelva a IDLE.
+ *
+ * El PSoC corre auto-calibracion al arrancar y al cambiar de configuracion, y
+ * mientras esta en PSOC_CALIBRATING rechaza las primitivas del autotest. Eso
+ * dura decenas de segundos: si el autotest arranca antes, todo el grupo C y D
+ * falla por un motivo que no tiene nada que ver con la placa. Es la trampa F6
+ * que ya esta documentada en el banco ("tras ToggleReset esperar la auto-cal").
+ *
+ * Se sondea con un reporte inocuo: si vuelve ST_OK, esta en IDLE; si vuelve
+ * ST_REJECTED, v1 trae el estado en el que esta. */
+static bool stEsperarIdle(uint32_t timeoutMs)
+{
+    uint32_t t0 = millis();
+    bool aviso = false;
+    while ((millis() - t0) < timeoutMs) {
+        stRxClear();
+        psoc.stReport(ST_REP_ADCCFG);
+        if (stAwait(1, 1500) >= 1) {
+            const PsocSelfTestResult *r = stFindAny(ST_ID_ADCCFG);
+            if (r != nullptr && r->status == ST_OK) {
+                if (aviso) {
+                    Serial.printf("    PSoC en IDLE despues de %lu s.\n",
+                                  (unsigned long)((millis() - t0) / 1000u));
+                }
+                return true;
+            }
+            const PsocSelfTestResult *rj = stFindAny(ST_ID_IDENTITY);
+            if (!aviso) {
+                aviso = true;
+                Serial.printf("    Esperando a que el PSoC salga de su estado %ld "
+                              "(auto-calibracion al boot), hasta %lu s...\n",
+                              rj ? (long)rj->v1 : -1L,
+                              (unsigned long)(timeoutMs / 1000u));
+            }
+        }
+        stPump(1000);
     }
     return false;
 }
@@ -660,17 +771,6 @@ static bool groupB()
                      "SCL aguanta el pull-down interno: el pull-up externo llega al pin");
     }
 
-    if (g_busSclFlancos > 0u) {
-        stReportItem("B0b", "Reloj del bus (SCL) al arranque", ST_V_PASS,
-                     "%lu flancos en 3 s: el PSoC ESTA transmitiendo",
-                     (unsigned long)g_busSclFlancos);
-    } else {
-        stReportItem("B0b", "Reloj del bus (SCL) al arranque", ST_V_FAIL,
-                     "0 flancos en 3 s: el PSoC NO transmite. No es el cableado "
-                     "(ver B0): mirar si arranco, si tiene el firmware de autotest, "
-                     "y si su I2C esta como maestro");
-    }
-
     /* B1 — subida por I2C. El PSoC es maestro y manda pings solo; si no
      * llega nada, o no hay pull-ups en SDA/SCL, o el PSoC no arranco. */
     /* El PSoC se queda en wait_for_esp() hasta ver un PONG o un STATUS. Si se
@@ -704,7 +804,22 @@ static bool groupB()
                      verdictSinRespuesta(g_hw.psoc),
                      "silencio total en 1.5 s. Revisar, en orden: PSoC programado y "
                      "alimentado / pull-ups de SDA(21) y SCL(22) a 3V3 / GND comun / "
-                     "SDA-SCL cruzados. %s", sufijoSinRespuesta(g_hw.psoc));
+                      "SDA-SCL cruzados. %s", sufijoSinRespuesta(g_hw.psoc));
+    }
+
+    /* La ventana de B0b ocurre una sola vez, antes de iniciar Wire. Si el PSoC
+     * fue programado o reseteado despues del ESP, cero flancos en esa ventana
+     * es historico y B1 es la medicion actual que manda. */
+    if (g_busSclFlancos > 0u) {
+        stReportItem("B0b", "Reloj del bus (SCL)", ST_V_PASS,
+                     "%lu flancos observados al arranque",
+                     (unsigned long)g_busSclFlancos);
+    } else if (up) {
+        stReportItem("B0b", "Reloj del bus (SCL)", ST_V_PASS,
+                     "sin flancos en la ventana de boot, pero B1 confirma trafico I2C actual");
+    } else {
+        stReportItem("B0b", "Reloj del bus (SCL)", ST_V_FAIL,
+                     "sin flancos al arranque ni trafico actual: el PSoC no transmite");
     }
 
     if (!up) {
@@ -717,6 +832,33 @@ static bool groupB()
         stReportItem("B3", "Linea SYNC GPIO27 -> P0[4]", ST_V_SKIP,
                      "sin enlace de subida: el PSoC no puede reportar los flancos");
         return false;
+    }
+
+    /* B2a — el ESP, esta transmitiendo?
+     *
+     * Antes de acusar al cable hay que descartar el propio lado. Se cuentan
+     * flancos en el pin de TX mientras se mandan comandos: si no hay flancos,
+     * el problema es la UART del ESP y no la placa. Si hay flancos pero el PSoC
+     * no reacciona (B2), entonces si esta entre el pin del ESP y el del PSoC.
+     *
+     * La interrupcion se puede enganchar a un pin que maneja un periferico: la
+     * matriz de GPIO del ESP32 deja leerlo igual mientras la UART lo maneja. */
+    {
+        g_txEdges = 0;
+        attachInterrupt(digitalPinToInterrupt(PSOC_UART_TX), onTxEdge, CHANGE);
+        for (int k = 0; k < 5; k++) { psoc.requestStatus(); delay(40); }
+        delay(50);
+        detachInterrupt(digitalPinToInterrupt(PSOC_UART_TX));
+        if (g_txEdges > 0u) {
+            stReportItem("B2a", "El ESP transmite por la UART", ST_V_PASS,
+                         "%lu flancos en GPIO%u al mandar 5 comandos",
+                         (unsigned long)g_txEdges, (unsigned)PSOC_UART_TX);
+        } else {
+            stReportItem("B2a", "El ESP transmite por la UART", ST_V_FAIL,
+                         "0 flancos en GPIO%u: la UART del ESP no esta saliendo. "
+                         "El problema es del lado del ESP, no del cable",
+                         (unsigned)PSOC_UART_TX);
+        }
     }
 
     /* B2 — bajada por UART. Se manda STATUS y tienen que volver eventos.
@@ -734,51 +876,55 @@ static bool groupB()
                       : "sin respuesta en 800 ms: revisar GPIO26 -> Rx P15[0]",
                  (unsigned long)rtt);
 
-    /* B3 — linea de SYNC. Es el unico cable que no se puede probar de otra
-     * forma: el PSoC cuenta flancos y el ESP compara con los que genero. */
+    /* B3 — linea de SYNC.
+     *
+     * El camino de captura actual sincroniza SYNC_IN en hardware y lo entrega
+     * a superMaquina; ya no existe el viejo isr_SyncIn que incrementaba el
+     * contador de psoc_selftest.h. Por eso una cuenta de cero NO demuestra una
+     * falla del cable. La prueba robusta es electrica y directa: pedirle al
+     * PSoC que lea P0[4] una vez con GPIO27 bajo y otra mientras sigue alto.
+     * La cuenta se conserva solo como dato diagnostico para variantes viejas. */
+    pinMode(SYNC_TO_PSOC_PIN, OUTPUT);
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    delay(20);
     stRxClear();
     psoc.stSync(1);
     bool armed = (stAwait(1, 1200) >= 1);
+    const PsocSelfTestResult *armResult = armed ? stFind(ST_ID_SYNC) : nullptr;
+    bool sawLow = armResult && armResult->status == ST_OK && armResult->v1 == 0;
     if (!armed) {
         stReportItem("B3", "Linea SYNC GPIO27 -> P0[4]", ST_V_FAIL,
-                     "el PSoC no acepto armar el contador");
+                     "el PSoC no contesto la lectura con GPIO27 en LOW");
     } else {
-        pinMode(SYNC_TO_PSOC_PIN, OUTPUT);
-        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
-        delay(5);
         for (int i = 0; i < TH_SYNC_EDGES / 2; i++) {
             digitalWrite(SYNC_TO_PSOC_PIN, HIGH); delay(6);
             digitalWrite(SYNC_TO_PSOC_PIN, LOW);  delay(6);
         }
-        delay(30);
+        /* Dejar la linea alta durante la consulta: st_handle_sync(0) devuelve
+         * en v1 el nivel fisico leido por SYNC_IN_Read(). */
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+        delay(20);
         stRxClear();
         psoc.stSync(0);
         if (stAwait(1, 1200) >= 1) {
             const PsocSelfTestResult *r = stFind(ST_ID_SYNC);
             int got = r ? (int)r->v0 : -1;
-            /* Se generaron TH_SYNC_EDGES/2 ciclos completos. Segun como este
-             * configurada la interrupcion del pin, la ISR puede disparar en
-             * los dos flancos o en uno solo: las dos cuentas prueban el cable
-             * igual de bien. Exigir una sola convertiria una configuracion
-             * legitima en un FAIL. */
-            bool both = (got == TH_SYNC_EDGES);
-            bool one  = (got == TH_SYNC_EDGES / 2);
-            /* Dos llamadas separadas y no un formato condicional: los dos
-             * formatos toman argumentos distintos y mezclarlos corre los
-             * varargs. */
-            if (both || one) {
+            bool sawHigh = r && r->status == ST_OK && r->v1 != 0;
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+            g_syncOk = sawLow && sawHigh;
+            if (g_syncOk) {
                 stReportItem("B3", "Linea SYNC GPIO27 -> P0[4]", ST_V_PASS,
-                             "%d flancos en %d ciclos (%s)",
-                             got, TH_SYNC_EDGES / 2,
-                             both ? "ambos flancos" : "un flanco");
+                             "P0[4] leyo LOW y HIGH correctamente (contador legacy=%d)",
+                             got);
             } else {
                 stReportItem("B3", "Linea SYNC GPIO27 -> P0[4]", ST_V_FAIL,
-                             "%d flancos en %d ciclos: se esperaban %d o %d",
-                             got, TH_SYNC_EDGES / 2, TH_SYNC_EDGES, TH_SYNC_EDGES / 2);
+                             "P0[4] no sigue a GPIO27: LOW=%d HIGH=%d (contador legacy=%d)",
+                             sawLow ? 1 : 0, sawHigh ? 1 : 0, got);
             }
         } else {
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);
             stReportItem("B3", "Linea SYNC GPIO27 -> P0[4]", ST_V_FAIL,
-                         "el PSoC no contesto la lectura del contador");
+                         "el PSoC no contesto la lectura con GPIO27 en HIGH");
         }
     }
     return true;
@@ -790,6 +936,13 @@ static bool groupB()
  * La usan C4 (rampa cruda), C5 (rampa por el FIR) y D7 (golpe al geofono). */
 static bool stCapture(uint16_t n, int32_t trigger)
 {
+    /* Sin linea de SYNC no se puede arrancar una captura, y ADEMAS armar el
+     * PSoC lo deja MUDO: en PSOC_ARMED su service_runtime() corta UART, I2C y
+     * pings a proposito (ventana critica), y solo sale con un flanco de bajada
+     * de SYNC o un reset. Un solo cable roto encadenaba doce FAIL que no tenian
+     * nada que ver entre si. */
+    if (!g_syncOk) { return false; }
+
     /* Drenar lo que quedo de la captura anterior ANTES de poner el analizador
      * a cero: C4 y C5 corren pegadas y D7 hace dos capturas seguidas, asi que
      * un volcado que todavia esta llegando meteria sus muestras en el
@@ -827,6 +980,65 @@ static bool stCapture(uint16_t n, int32_t trigger)
      * hecho de armarse, asi que una captura que no entrego un solo lote se
      * analizaba igual: C5 la convertia en SKIP y D7 media un fondo inexistente. */
     return (g_batchCount > 0u);
+}
+
+/* La orden DEBUG del firmware PSoC arranca la rampa inmediatamente; no debe
+ * combinarse con stCapture(), que arma otra captura por PRESTART+SYNC. Hacerlo
+ * generaba primero un volcado de 128 lotes, contaminaba C4 y dejaba al PSoC
+ * ocupado para C5/C6/C7. Esta variante fija N antes de habilitar DEBUG y espera
+ * exclusivamente esa captura inmediata. */
+static bool stCaptureDebug(uint16_t n, int32_t trigger)
+{
+    stPump(300);
+    g_batchCount = 0;
+    g_firstBatchSeen = false;
+    anReset(trigger);
+
+    psoc.selectStream(0);
+    stPump(150);
+    psoc.setN(n);
+    stPump(150);
+    psoc.debugRamp(true);
+
+    uint32_t nominal = ((uint32_t)n * 30UL * 1000UL) / 2604UL;
+    uint32_t plazo = nominal + 2000UL + (uint32_t)n * 4UL;
+    uint32_t t0 = millis();
+    while ((g_batchCount < n) && ((millis() - t0) < plazo)) {
+        psoc.poll();
+        delay(1);
+    }
+
+    psoc.debugRamp(false);
+    stPump(500);
+    return (g_batchCount > 0u);
+}
+
+/* Diagnostico compacto que devuelve el driver SD del PSoC. Cada flag indica
+ * que el nivel fisico fue observado al menos una vez mientras el SPI estaba
+ * transfiriendo; ver ambos niveles confirma conmutacion en el propio pad. */
+static const char *sdNiveles(uint8_t flags, uint8_t lowMask, uint8_t highMask)
+{
+    uint8_t seen = flags & (uint8_t)(lowMask | highMask);
+    if (seen == (uint8_t)(lowMask | highMask)) { return "0/1"; }
+    if (seen == lowMask)  { return "solo0"; }
+    if (seen == highMask) { return "solo1"; }
+    return "ninguno";
+}
+
+static const char *sdEtapaInit(uint8_t stage)
+{
+    switch (stage & 0x7Fu) {
+        case 1: return "relojes iniciales";
+        case 2: return "CMD0";
+        case 3: return "CMD8";
+        case 4: return "ACMD41/CMD1";
+        case 5: return "CMD58";
+        case 6: return "CMD16";
+        case 7: return "lectura CSD";
+        case 8: return "capacidad CSD";
+        case 9: return "lista";
+        default: return "sin ejecutar";
+    }
 }
 
 /* ==========================================================================
@@ -910,13 +1122,24 @@ static bool groupC()
      * No pasa por el analogico: si esto anda y lo analogico no, el problema
      * esta acotado al front end. Si esto NO anda, no tiene sentido creerle a
      * ninguna medicion posterior. */
-    psoc.debugRamp(true);
-    stPump(150);
-    psoc.selectStream(0);          /* camino crudo */
-    stPump(150);
-    if (!stCapture(8, 0)) {
+    /* El PSoC re-habilita la captura a SD por su cuenta al arrancar si detecta
+     * la tarjeta montada (default field-safe, hallazgo OK-4 del banco). En ese
+     * modo una captura no manda lotes durante el muestreo y el volcado hay que
+     * pedirlo lote por lote con 0xBF: el autotest esperaria de gusto. Se fuerza
+     * modo RAM antes de cualquier captura. */
+    if (!g_syncOk) {
+        stReportItem("C4", "Camino digital E2E (rampa cruda)", ST_V_SKIP,
+                     "sin linea de SYNC (ver B3) no se puede disparar una captura");
+        stReportItem("C5", "Filtro FIR de hardware (DFB)", ST_V_SKIP,
+                     "sin linea de SYNC (ver B3) no se puede disparar una captura");
+    } else {
+
+    psoc.sdCapture(0);
+    stPump(600);
+
+    if (!stCaptureDebug(8, 0)) {
         stReportItem("C4", "Camino digital E2E (rampa cruda)", ST_V_FAIL,
-                     "el PSoC no llego a ARMED");
+                     "la captura inmediata de rampa no entrego lotes");
     } else {
         /* La rampa es monotona creciente salvo en el wrap, que ocurre una vez
          * por vuelta del contador. Se tolera un 5 % de no-crecientes. */
@@ -929,9 +1152,6 @@ static bool groupC()
                      n > 1 ? (unsigned long)(g_anMono * 100UL / (n - 1)) : 0UL,
                      (unsigned long)psoc.batchesBad());
     }
-
-    psoc.debugRamp(false);
-    stPump(150);
 
     /* C5 — filtro FIR de hardware (DFB).
      *
@@ -998,6 +1218,7 @@ static bool groupC()
                          ratio, rmsFir, rmsRaw);
         }
     }
+    }   /* fin del bloque que necesita la linea de SYNC */
 
     /* C6 — SD. Es el item que quedo explicitamente sin validar en la placa
      * nueva: los cuatro pines de SPIp quedaron repartidos en cuatro puertos
@@ -1016,25 +1237,41 @@ static bool groupC()
                      "el PSoC no contesto el reporte de SD");
     } else {
         uint8_t s = (uint8_t)sd->v0;
+        uint32_t diag = (uint32_t)sd->v1;
+        uint8_t err   = (uint8_t)(diag & 0xFFu);
+        uint8_t pads  = (uint8_t)((diag >> 8) & 0xFFu);
+        uint8_t r1    = (uint8_t)((diag >> 16) & 0xFFu);
+        uint8_t stage = (uint8_t)((diag >> 24) & 0xFFu);
         bool present  = (s & 0x01) != 0;
         bool selftest = (s & 0x08) != 0;
         bool fat      = (s & 0x10) != 0;
+
+        stReportItem("C6.1", "Diagnostico de pads SPI SD", ST_V_INFO,
+                     "init=%s%s R1=0x%02X; CS=%s SCK=%s MOSI=%s MISO=%s err=0x%02X",
+                     sdEtapaInit(stage), (stage & 0x80u) ? "+RX_TIMEOUT" : "",
+                     (unsigned)r1,
+                     sdNiveles(pads, 0x40u, 0x80u),
+                     sdNiveles(pads, 0x04u, 0x08u),
+                     sdNiveles(pads, 0x10u, 0x20u),
+                     sdNiveles(pads, 0x01u, 0x02u),
+                     (unsigned)err);
 
         if (!present) {
             /* Sin tarjeta no se puede saber si el ruteo de SPIp esta bien.
              * Con la SD declarada presente eso si es una falla. */
             stReportItem("C6", "SD FatFs (ruteo SPIp nuevo)",
                          verdictSinRespuesta(g_hw.sd),
-                         "el PSoC no ve tarjeta (estado=0x%02X): %s",
-                         (unsigned)s, sufijoSinRespuesta(g_hw.sd));
+                         "init detenido en %s, R1=0x%02X (estado=0x%02X): %s",
+                         sdEtapaInit(stage), (unsigned)r1, (unsigned)s,
+                         sufijoSinRespuesta(g_hw.sd));
         } else if (!fat) {
             stReportItem("C6", "SD FatFs (ruteo SPIp nuevo)", ST_V_FAIL,
                          "tarjeta detectada pero FAT sin montar (0x%02X): "
                          "formatear en FAT32, o MISO/MOSI cruzados", (unsigned)s);
         } else if (!selftest) {
             stReportItem("C6", "SD FatFs (ruteo SPIp nuevo)", ST_V_FAIL,
-                         "FAT montado pero el self-test de escritura fallo (0x%02X, err=0x%02lX): "
-                         "sospechar CS (P1[6]) o SCK (P15[5])", (unsigned)s, (long)sd->v1);
+                         "FAT montado pero escritura/lectura fallo (0x%02X, err=0x%02X): "
+                         "ver diagnostico C6.1", (unsigned)s, (unsigned)err);
         } else {
             stReportItem("C6", "SD FatFs (ruteo SPIp nuevo)", ST_V_PASS,
                          "0x%02X tipo=%u FAT montado, escritura y lectura OK",
@@ -1389,12 +1626,21 @@ static void groupD()
     /* D8 — auto-calibracion. Corre ACA, despues de D1..D6 (que necesitan la
      * placa sin calibrar) y antes de D5 (que la necesita calibrada). */
     g_evCalDone = false; g_evCalOk = 0;
+    uint32_t calMs = 0;
+#if ST_D8_HABILITADO
     Serial.println(F("    D8: calibrando (puede tardar ~20 s, tope 180 s)..."));
     uint32_t tcal = millis();
     psoc.calibrate();
     while (!g_evCalDone && (millis() - tcal) < 180000UL) { psoc.poll(); delay(2); }
-    uint32_t calMs = millis() - tcal;
+    calMs = millis() - tcal;
+#endif
     bool calOk = false;
+#if !ST_D8_HABILITADO
+    (void)calMs;
+    stReportItem("D8", "Auto-calibracion", ST_V_SKIP,
+                 "desactivada: la maquina de calibracion todavia no esta portada "
+                 "de VDAC8 a IDAC8, su veredicto no seria valido");
+#else
     if (!g_evCalDone) {
         stReportItem("D8", "Auto-calibracion", ST_V_FAIL,
                      "no termino en 180 s");
@@ -1424,9 +1670,11 @@ static void groupD()
                      det, railed, failed, (unsigned)g_evCalOk,
                      (unsigned long)(calMs / 1000));
     }
+#endif
 
     /* D5 necesita partir de un punto calibrado. Si D8 no cerro bien, ese punto
      * no existe y cualquier veredicto de D5 seria sobre datos de otra cosa. */
+#if ST_D8_HABILITADO
     if (!calOk) {
         stReportItem("D5", "Coherencia de rangos del ADC", ST_V_SKIP,
                      "la calibracion (D8) no cerro bien: falta el punto de partida");
@@ -1435,6 +1683,9 @@ static void groupD()
         stAwait(1, 2000);
         return;
     }
+#else
+    (void)calOk;   /* sin D8, D5 corre igual y se autolimita si el tap no entra */
+#endif
 
     /* D5 — coherencia entre las 4 configs del ADC. Va DESPUES de D8 porque
      * necesita partir de un punto conocido y acotado: con la placa sin
@@ -1583,18 +1834,53 @@ static void testButtonsEsp()
                      "declarados ausentes (hw btn 0)");
         return;
     }
+    const bool diagPrev = g_diagEcho;
+    g_diagEcho = false;
     const uint8_t pins[4] = { LOCAL_BTN_UP_PIN, LOCAL_BTN_DOWN_PIN,
                               LOCAL_BTN_OK_PIN, LOCAL_BTN_BACK_PIN };
     const char *names[4] = { "UP", "DOWN", "OK", "BACK" };
+
+    Serial.println();
+    Serial.println(F("=================================================="));
+    Serial.println(F("        PRUEBA DE LOS 4 BOTONES DEL ESP32"));
+    Serial.println(F("=================================================="));
+    Serial.println(F("Pulsa y suelta SOLO el boton que se indique."));
+    Serial.println(F("Hay 10 segundos para cada boton."));
+
     for (int i = 0; i < 4; i++) {
-        Serial.printf("[ST] Pulsa el boton %s (10 s)...\n", names[i]);
+        Serial.println();
+        Serial.printf("[%d/4] BOTON %s  (GPIO%u)\n", i + 1, names[i],
+                      (unsigned)pins[i]);
+
+        /* No confundir un boton que ya estaba apretado con una pulsacion nueva. */
+        if (digitalRead(pins[i]) == LOW) {
+            Serial.println(F("  Sueltalo primero..."));
+            uint32_t ts = millis();
+            while (digitalRead(pins[i]) == LOW && (millis() - ts) < 3000u) {
+                delay(5);
+            }
+        }
+
+        Serial.println(F("  >>> PULSALO AHORA <<<"));
         uint32_t t0 = millis();
         bool seen = false;
+        int lastSecond = -1;
         while ((millis() - t0) < 10000) {
             if (digitalRead(pins[i]) == LOW) { seen = true; break; }
+            int second = 10 - (int)((millis() - t0) / 1000u);
+            if (second != lastSecond) {
+                Serial.printf("  Esperando %s... %d s\n", names[i], second);
+                lastSecond = second;
+            }
             psoc.poll();   /* no dejar de drenar el ring durante 10 s */
             delay(5);
         }
+        if (seen) {
+            Serial.printf("  [OK] %s DETECTADO. Ahora soltalo.\n", names[i]);
+        } else {
+            Serial.printf("  [ERROR] %s NO fue detectado.\n", names[i]);
+        }
+
         char code[8]; snprintf(code, sizeof(code), "E1.%d", i);
         char name[32]; snprintf(name, sizeof(name), "Boton %s del ESP", names[i]);
         stReportItem(code, name, seen ? ST_V_PASS : ST_V_FAIL,
@@ -1607,13 +1893,19 @@ static void testButtonsEsp()
         uint32_t tr = millis();
         while (digitalRead(pins[i]) == LOW && (millis() - tr) < 3000) { delay(5); }
         if (digitalRead(pins[i]) == LOW) {
+            Serial.printf("  [ERROR] %s sigue apretado/LOW despues de 3 s.\n", names[i]);
             char c2[8]; snprintf(c2, sizeof(c2), "E1.%db", i);
             stReportItem(c2, "  ^ el pin quedo pegado en bajo", ST_V_FAIL,
                          "GPIO%u sigue en LOW 3 s despues: corto a masa o falta el pull-up",
                          (unsigned)pins[i]);
+        } else if (seen) {
+            Serial.printf("  [OK] %s SOLTADO.\n", names[i]);
         }
         delay(200);
     }
+    Serial.println();
+    Serial.println(F("========== FIN PRUEBA BOTONES ESP32 =========="));
+    g_diagEcho = diagPrev;
 }
 
 /* Pulsacion del boton del PSoC (P2[2], el onboard del CY8CKIT-059). */
@@ -1625,24 +1917,67 @@ static void testButtonPsoc()
         return;
     }
 
-    Serial.println(F("[ST] Pulsa el boton del PSoC (10 s)..."));
-    int idle = -1; bool changed = false;
+    const bool diagPrev = g_diagEcho;
+    g_diagEcho = false;
+
+    Serial.println();
+    Serial.println(F("=================================================="));
+    Serial.println(F("            PRUEBA DEL BOTON DEL PSoC"));
+    Serial.println(F("=================================================="));
+    Serial.println(F("Boton conectado a P2[2]. No lo pulses todavia."));
+
+    int idle = -1;
+    stRxClear();
+    psoc.stReport(ST_REP_BUTTON);
+    if (stAwait(1, 1200) >= 1) {
+        const PsocSelfTestResult *r = stFind(ST_ID_BUTTON);
+        if (r != nullptr && (r->v0 == 0 || r->v0 == 1)) {
+            idle = (int)r->v0;
+        }
+    }
+    if (idle < 0) {
+        Serial.println(F("[ERROR] El PSoC no respondio la lectura inicial."));
+        stReportItem("E2", "Boton del PSoC (P2[2])", ST_V_FAIL,
+                     "sin respuesta del PSoC");
+        g_diagEcho = diagPrev;
+        return;
+    }
+
+    Serial.printf("Nivel en reposo: %d\n", idle);
+    Serial.println(F(">>> PULSA Y SUELTA AHORA EL BOTON DEL PSoC <<<"));
+
+    bool changed = false;
     uint32_t t0 = millis();
+    int lastSecond = -1;
     while ((millis() - t0) < 10000) {
+        int second = 10 - (int)((millis() - t0) / 1000u);
+        if (second != lastSecond) {
+            Serial.printf("Esperando boton PSoC... %d s\n", second);
+            lastSecond = second;
+        }
         stRxClear();
         psoc.stReport(ST_REP_BUTTON);
         if (stAwait(1, 800) >= 1) {
             const PsocSelfTestResult *r = stFind(ST_ID_BUTTON);
             if (r) {
-                if (idle < 0) { idle = (int)r->v0; }
-                else if ((int)r->v0 != idle) { changed = true; break; }
+                if ((int)r->v0 != idle) { changed = true; break; }
             }
         }
         delay(30);
     }
+
+    if (changed) {
+        Serial.println(F("[OK] BOTON DEL PSoC DETECTADO."));
+        Serial.println(F("Resultado: PASS"));
+    } else {
+        Serial.println(F("[ERROR] No se detecto ninguna pulsacion en 10 s."));
+        Serial.println(F("Resultado: FAIL"));
+    }
     stReportItem("E2", "Boton del PSoC (P2[2])",
                  changed ? ST_V_PASS : ST_V_FAIL,
                  changed ? "cambio de nivel detectado" : "sin cambio en 10 s");
+    Serial.println(F("========== FIN PRUEBA BOTON PSoC ============="));
+    g_diagEcho = diagPrev;
 }
 
 /* ==========================================================================
@@ -1798,6 +2133,10 @@ static void handleCmd(const char *cmd)
         stReportReset(); (void)groupC(); stReportSummary();
     } else if (!strcmp(cmd, "d")) {
         stReportReset(); groupD(); stReportSummary();
+    } else if (!strcmp(cmd, "botones") || !strcmp(cmd, "btn")) {
+        stReportReset(); testButtonsEsp(); stReportSummary();
+    } else if (!strcmp(cmd, "boton") || !strcmp(cmd, "botonpsoc")) {
+        stReportReset(); testButtonPsoc(); stReportSummary();
     } else if (!strcmp(cmd, "tap") || !strcmp(cmd, "golpe")) {
         stReportReset(); testTap(); stReportSummary();
     } else if (!strcmp(cmd, "e") || !strcmp(cmd, "inter")) {
@@ -1831,6 +2170,37 @@ static void handleCmd(const char *cmd)
     } else if (!strcmp(cmd, "oled no")) {
         g_hw.oled = HW_AUSENTE; hwSave();
         Serial.println(F("[ST] OLED marcado AUSENTE: A2 va a dar SKIP de ahora en mas."));
+    } else if (!strcmp(cmd, "diag on")) {
+        g_diagEcho = true;  Serial.println(F("[ST] eco de DIAG encendido"));
+    } else if (!strcmp(cmd, "diag off")) {
+        g_diagEcho = false; Serial.println(F("[ST] eco de DIAG apagado"));
+    } else if (!strncmp(cmd, "pin ", 4)) {
+        /* Cuadrada lenta en un pin cualquiera, para ubicarlo con el tester y
+         * medir continuidad hasta el otro extremo. Los tres cables del enlace
+         * son GPIO26 (UART hacia el PSoC), GPIO27 (SYNC) y GPIO22 (SCL). */
+        int p = atoi(cmd + 4);
+        if (p < 0 || p > 39) {
+            Serial.println(F("[ST] numero de pin invalido"));
+        } else {
+            Serial.printf("[ST] GPIO%d en cuadrada de 1 Hz por 20 s.\n", p);
+            Serial.println(F("[ST] OJO: mientras dura, ese pin no cumple su funcion normal."));
+            pinMode(p, OUTPUT);
+            for (int i = 0; i < 20; i++) {
+                digitalWrite(p, HIGH); Serial.println(F("[ST]  ALTO")); delay(500);
+                digitalWrite(p, LOW);  Serial.println(F("[ST]  bajo")); delay(500);
+            }
+            Serial.println(F("[ST] listo. Reinicia el ESP para devolverle su funcion al pin."));
+        }
+    } else if (!strcmp(cmd, "sync")) {
+        /* Para ubicar el pin con el tester: 20 s de cuadrada a 1 Hz. */
+        Serial.printf("[ST] GPIO%u en cuadrada de 1 Hz por 20 s. Medi continuidad "
+                      "contra P0[4] del PSoC.\n", (unsigned)SYNC_TO_PSOC_PIN);
+        pinMode(SYNC_TO_PSOC_PIN, OUTPUT);
+        for (int i = 0; i < 20; i++) {
+            digitalWrite(SYNC_TO_PSOC_PIN, HIGH); Serial.println(F("[ST]  ALTO")); delay(500);
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);  Serial.println(F("[ST]  bajo")); delay(500);
+        }
+        Serial.println(F("[ST] listo"));
     } else if (!strcmp(cmd, "probe")) {
         bool ok = psoc.probe(400);
         Serial.printf("[ST] probe=%d bOK=%lu bBad=%lu ping=%lu diag=%lu ovr=%lu\n",
@@ -1841,6 +2211,10 @@ static void handleCmd(const char *cmd)
     } else if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
         Serial.println(F("[ST] run|test  corrida completa"));
         Serial.println(F("[ST] a b c d   corre solo ese grupo"));
+        Serial.println(F("[ST] pin N     cuadrada de 1 Hz en GPIO N, para el tester"));
+        Serial.println(F("[ST]            26=UART al PSoC  27=SYNC  22=SCL  21=SDA"));
+        Serial.println(F("[ST] botones   pulsar los 4 botones del ESP, de a uno"));
+        Serial.println(F("[ST] boton     pulsar el boton del PSoC"));
         Serial.println(F("[ST] tap       golpe al geofono: pico + POLARIDAD"));
         Serial.println(F("[ST] e|inter   fase interactiva (botones + golpe)"));
         Serial.println(F("[ST] probe     estado del enlace con el PSoC"));
@@ -1988,13 +2362,12 @@ void setup()
     stPump(2000);
     (void)psoc.probe(600);
 
-    runAutotest();
-
-    Serial.println(F("[ST] Fase automatica terminada."));
-    Serial.println(F("[ST] Falta la fase INTERACTIVA, que ningun test automatico"));
-    Serial.println(F("[ST] puede cubrir: escribi 'e' para botones + golpe al"));
-    Serial.println(F("[ST] geofono (da la POLARIDAD), o 'tap' para solo el golpe."));
-    Serial.println(F("[ST] 'run' repite lo automatico, 'help' lista todo."));
+    /* No disparar la corrida completa al boot: al programar o abrir el puerto
+     * se puede resetear el ESP y eso ejecutaba tambien el grupo analogico sin
+     * que el operador lo pidiera. `run` conserva la corrida completa; para el
+     * banco digital se usan `b` y `c` de forma explicita. */
+    Serial.println(F("[ST] Autotest listo. 'b' y 'c' corren solo digital;"));
+    Serial.println(F("[ST] 'run' ejecuta la corrida completa, incluido analogico."));
 }
 
 void loop()

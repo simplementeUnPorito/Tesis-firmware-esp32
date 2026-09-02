@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "test": "PUESTA_EN_MARCHA_DIGITAL_NODO_ESCLAVO",
+  "local_date": "2026-09-01",
+  "scope": "digital_only",
+  "board_verdict": "APTO",
+  "hardware": {
+    "esp32_port": "COM8",
+    "psoc_device": "CY8C5888LTI-LP097",
+    "psoc_project": "AcondicionamientoAnalogicoTest/AcondicionamientoAnalogico.cydsn/AcondicionamientoAnalogico.cywrk",
+    "psoc_programmed_successfully_at": "2026-09-01T22:44:33-03:00"
+  },
+  "groups": {
+    "B": { "pass": 8, "fail": 0, "verdict": "APTO" },
+    "C": { "pass": 5, "fail": 0, "warn": 1, "skip": 1, "verdict": "APTO" },
+    "ESP_BUTTONS": { "pass": 4, "fail": 0, "verdict": "APTO" },
+    "PSOC_BUTTON": { "pass": 1, "fail": 0, "verdict": "APTO" }
+  },
+  "checks": [
+    { "code": "B0", "verdict": "PASS", "detail": "SDA/SCL altos y pull-ups externos presentes" },
+    { "code": "B1", "verdict": "PASS", "detail": "PSoC a ESP por I2C, sin overruns" },
+    { "code": "B2a", "verdict": "PASS", "detail": "131 y 129 flancos observados en GPIO26" },
+    { "code": "B2", "verdict": "PASS", "detail": "STATUS por GPIO26 a P15[0], respuesta en 54 ms" },
+    { "code": "B3", "verdict": "PASS", "detail": "GPIO27 a P0[4] leyo LOW y HIGH" },
+    { "code": "B4", "verdict": "PASS", "detail": "bBad=0, badLen=0" },
+    { "code": "C1", "verdict": "PASS", "detail": "GEO, 2604 Hz, 4 etapas, 5 canales AMux" },
+    { "code": "C2", "verdict": "PASS", "detail": "0 IRQ inesperadas, 0 HardFaults" },
+    { "code": "C4", "verdict": "PASS", "detail": "8/8 lotes, 240 muestras, 100% crecientes" },
+    { "code": "C6", "verdict": "PASS", "detail": "FAT montado; escritura/lectura; R1=0x00; pads 0/1; errores=0" },
+    { "code": "C7", "verdict": "PASS", "detail": "P2[2] estable en reposo" },
+    { "code": "E1.0", "verdict": "PASS", "detail": "UP GPIO34 pulsado y soltado" },
+    { "code": "E1.1", "verdict": "PASS", "detail": "DOWN GPIO35 pulsado y soltado" },
+    { "code": "E1.2", "verdict": "PASS", "detail": "OK GPIO36 pulsado y soltado" },
+    { "code": "E1.3", "verdict": "PASS", "detail": "BACK GPIO39 pulsado y soltado" },
+    { "code": "E2", "verdict": "PASS", "detail": "Boton PSoC P2[2], cambio de nivel detectado" }
+  ],
+  "non_failures": [
+    { "code": "C3", "verdict": "WARN", "detail": "0/9 slots EEPROM: calibracion analogica pendiente" },
+    { "code": "C5", "verdict": "SKIP", "detail": "RMS insuficiente para evaluar DFB; no es un defecto soldado" }
+  ],
+  "excluded": [
+    "cadena analogica",
+    "autocalibracion",
+    "ganancias",
+    "ruido analogico"
+  ],
+  "notes": "Resultado consolidado de corridas manuales b, c, botones y boton. Los JSON anteriores con status=failed son evidencia intermedia previa a las correcciones."
+}
