@@ -68,6 +68,22 @@
 #define PSOC_I2C_RX_RING 4096
 #endif
 
+/* Velocidad del bus. TIENE que coincidir con la del maestro, que es el PSoC:
+ * I2C_DATA_RATE = 1000 kbps en el I2C.h de su TopDesign. El esclavo del ESP32
+ * ajusta su filtro de glitch y sus umbrales de FIFO con este valor; si queda
+ * configurado mas lento que el maestro, descarta los flancos y no dispara
+ * onReceive nunca, con el bus electricamente perfecto. */
+#ifndef PSOC_I2C_FREQ_HZ
+#define PSOC_I2C_FREQ_HZ 1000000UL
+#endif
+
+/* Buffer del esclavo. Un frame de datos son 95 bytes; el default de 32 los
+ * partiria en varias llamadas a onReceive (no es fatal, el ring reensambla,
+ * pero se pierden bytes en rafaga). Se aplica ANTES de Wire.begin(). */
+#ifndef PSOC_I2C_RX_BUF
+#define PSOC_I2C_RX_BUF 256
+#endif
+
 #define PSOC_FRAME_MARKER 0xAB
 #define SPI_BATCH_SAMPLES 30                              /* muestras por lote */
 #define PSOC_FRAME_BYTES  (4 + SPI_BATCH_SAMPLES * 3 + 1) /* 95 */
@@ -91,6 +107,7 @@
 #define ST_REP_IRQ      4
 #define ST_REP_BUTTON   6
 #define ST_REP_SD       5
+#define ST_REP_RESTORE  7
 
 /* status dentro de la trama 0xC5 */
 #define ST_OK       0

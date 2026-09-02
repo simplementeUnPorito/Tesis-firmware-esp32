@@ -94,11 +94,27 @@ void PsocUART::begin(BatchCallback cb, HardwareSerial *serial)
     _i2cHead = 0;
     _i2cTail = 0;
     Wire.onReceive(&PsocUART::_onI2cReceive);
-    Wire.begin((uint8_t)PSOC_I2C_ADDR, (int)PSOC_I2C_SDA, (int)PSOC_I2C_SCL, 0);
+    /* El buffer se fija ANTES de begin(): el esclavo reserva sus colas dentro de
+     * begin() con el tamano vigente, asi que pedirlo despues no las agranda. */
+    Wire.setBufferSize(PSOC_I2C_RX_BUF);
+    /* La frecuencia NO puede ir en 0.
+     *
+     * Con 0, el core la reemplaza por 100 kHz (esp32-hal-i2c-slave.c: "if
+     * (!frequency) frequency = 100000") y configura el filtro de glitch y los
+     * umbrales de FIFO del esclavo para esa velocidad. Pero el maestro es el
+     * PSoC y corre a 1 MHz (I2C_DATA_RATE = 1000 kbps en I2C.h del TopDesign):
+     * un esclavo filtrado para 100 kHz descarta esos flancos y NUNCA dispara
+     * onReceive, aunque el bus este perfecto. Medido en la placa: 862 flancos
+     * en SCL en 3 s y 0 bytes recibidos.
+     *
+     * Tiene que coincidir con el maestro. */
+    Wire.begin((uint8_t)PSOC_I2C_ADDR, (int)PSOC_I2C_SDA, (int)PSOC_I2C_SCL,
+               (uint32_t)PSOC_I2C_FREQ_HZ);
     /* Un frame de datos son 95 bytes: el buffer por defecto (32) los partiría
      * en varias llamadas a onReceive. No es fatal (el ring reensambla), pero
      * agrandarlo evita perder bytes en ráfaga. */
-    Wire.setBufferSize(256);
+    /* setBufferSize ya se llamo antes de begin(); repetirlo aca no tendria
+     * efecto sobre las colas del esclavo. */
 #endif
 
     _idx = 0;

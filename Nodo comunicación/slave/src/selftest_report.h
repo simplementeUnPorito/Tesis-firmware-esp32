@@ -15,6 +15,10 @@ uint16_t stReportCount(StVerdict v);
 bool     stReportAnyFail();
 const char *stReportFirstFail();
 
+/* Devuelve true si algun item FAIL o WARN tiene un codigo que empieza con
+ * `prefix`. Lo usa el bloque de diagnostico para agrupar D6.0..D6.3 bajo D6. */
+bool stReportHasIssueWithPrefix(const char *prefix);
+
 #else
 
 enum StVerdict : uint8_t { ST_V_PASS = 0, ST_V_FAIL, ST_V_WARN, ST_V_SKIP, ST_V_INFO };
@@ -28,5 +32,6 @@ inline void stReportReset() {}
 inline uint16_t stReportCount(StVerdict) { return 0; }
 inline bool stReportAnyFail() { return false; }
 inline const char *stReportFirstFail() { return nullptr; }
+inline bool stReportHasIssueWithPrefix(const char *) { return false; }
 
 #endif
