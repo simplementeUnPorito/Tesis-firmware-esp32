@@ -501,7 +501,9 @@ static bool stMeasDc(uint8_t ch, uint8_t settleSel, int32_t &meanUv, int32_t &pp
     return false;
 }
 
-static bool stSetIdac(uint8_t stage, uint8_t code)
+/* Codigo CON SIGNO, -255..+255, donde 0 es Vref exacto. La codificacion del
+ * signo en la trama la hace psoc.stSetIdac(). */
+static bool stSetIdac(uint8_t stage, int16_t code)
 {
     for (int attempt = 0; attempt < 2; attempt++) {
         if (attempt > 0) { stPump(300); }
@@ -1356,32 +1358,37 @@ static bool  g_slopeSat[4][4];
 /* Barre una etapa y mide todos los taps. Devuelve false si no se pudo. */
 static bool d2SweepStage(uint8_t stage, uint8_t nTaps, int stepCodes)
 {
-    uint8_t base;
+    int16_t base;
     /* Punto de partida: el codigo que tiene puesto ahora. Se centra el
-     * escalon alrededor de el para no alejarse del punto de trabajo. */
+     * escalon alrededor de el para no alejarse del punto de trabajo. El codigo
+     * tiene signo, asi que el default sin dato del PSoC es 0, que es Vref, y no
+     * el 128 de la epoca del VDAC sin signo. */
     stRxClear();
     psoc.stReport(ST_REP_CAL);
     stAwait(nTaps, 2500);
     const PsocSelfTestResult *cur = stFind((uint8_t)(ST_ID_CAL_BASE | stage));
-    base = cur ? (uint8_t)cur->v0 : 128;
+    base = cur ? (int16_t)cur->v0 : 0;
 
+    /* Los rieles son -255 y +255, no 0 y 255: con polarity_reg el rango util es
+     * el doble y el escalon de D2 puede correrse hacia cualquiera de los dos
+     * lados sin quedarse contra un tope que ya no existe. */
     int lo = (int)base - stepCodes;
     int hi = (int)base + stepCodes;
-    if (lo < 0)   { hi -= lo; lo = 0; }
-    if (hi > 255) { lo -= (hi - 255); hi = 255; }
-    if (lo < 0) { lo = 0; }
+    if (lo < -255) { hi -= (lo + 255); lo = -255; }
+    if (hi > 255)  { lo -= (hi - 255); hi = 255; }
+    if (lo < -255) { lo = -255; }
     int span = hi - lo;
     if (span < TH_D2_MIN_STEP) { return false; }
 
     int32_t vlo[4], vhi[4], pp;
     bool okLo[4], okHi[4];
 
-    if (!stSetIdac(stage, (uint8_t)lo)) { (void)stSetIdac(stage, base); return false; }
+    if (!stSetIdac(stage, (int16_t)lo)) { (void)stSetIdac(stage, base); return false; }
     for (uint8_t ch = 0; ch < nTaps; ch++) {
         okLo[ch] = stMeasDc(ch, SEL_SETTLE_DC, vlo[ch], pp);
         if (!okLo[ch]) { vlo[ch] = 0; }
     }
-    if (!stSetIdac(stage, (uint8_t)hi)) { (void)stSetIdac(stage, base); return false; }
+    if (!stSetIdac(stage, (int16_t)hi)) { (void)stSetIdac(stage, base); return false; }
     for (uint8_t ch = 0; ch < nTaps; ch++) {
         okHi[ch] = stMeasDc(ch, SEL_SETTLE_DC, vhi[ch], pp);
         if (!okHi[ch]) { vhi[ch] = 0; }
@@ -1679,9 +1686,15 @@ static void groupD()
             const PsocSelfTestResult *r = stFind((uint8_t)(ST_ID_CAL_BASE | k));
             if (!r) { failed++; continue; }
             if (r->status != ST_OK) { failed++; }
-            /* Un codigo pegado a 0 o a 255 significa que el offset de esa
-             * etapa no se pudo anular: hay algo mal en esa etapa. */
-            if (r->v0 <= 0 || r->v0 >= 255) { railed++; }
+            /* Un codigo pegado a un riel significa que el offset de esa etapa
+             * no se pudo anular: hay algo mal en esa etapa.
+             *
+             * OJO con el signo: los rieles ahora son -255 y +255. El 0 dejo de
+             * ser un riel y paso a ser Vref exacto, o sea el MEJOR resultado
+             * posible; con la condicion vieja (v0 <= 0) una etapa perfectamente
+             * calibrada se reportaba como pegada al riel y D8 daba FAIL en una
+             * placa sana. */
+            if (r->v0 <= -255 || r->v0 >= 255) { railed++; }
             char one[20];
             snprintf(one, sizeof(one), "%s%ld", k ? "/" : "", (long)r->v0);
             strncat(det, one, sizeof(det) - strlen(det) - 1);
@@ -1731,11 +1744,11 @@ static void groupD()
         psoc.stReport(ST_REP_CAL);
         stAwait(nTaps, 2500);
         const PsocSelfTestResult *cal = stFind((uint8_t)(ST_ID_CAL_BASE | stage));
-        uint8_t baseCode = cal ? (uint8_t)cal->v0 : 128;
+        int16_t baseCode = cal ? (int16_t)cal->v0 : 0;
         int offCode = (int)baseCode + 40;
-        if (offCode > 255) { offCode = (int)baseCode - 40; }
-        if (offCode < 0)   { offCode = 0; }
-        bool offsetOk = stSetIdac(stage, (uint8_t)offCode);
+        if (offCode > 255)  { offCode = (int)baseCode - 40; }
+        if (offCode < -255) { offCode = -255; }
+        bool offsetOk = stSetIdac(stage, (int16_t)offCode);
 
         uint8_t cfgAplicadas = 0;
         for (uint8_t cfg = 1; cfg <= 4; cfg++) {
@@ -2248,11 +2261,11 @@ static void handleCmd(const char *cmd)
     } else if (!strncmp(cmd, "idac ", 5)) {
         int etapa = -1, code = -1;
         if (sscanf(cmd + 5, "%d %d", &etapa, &code) == 2 &&
-            etapa >= 0 && etapa <= 3 && code >= 0 && code <= 255) {
-            bool ok = stSetIdac((uint8_t)etapa, (uint8_t)code);
+            etapa >= 0 && etapa <= 3 && code >= -255 && code <= 255) {
+            bool ok = stSetIdac((uint8_t)etapa, (int16_t)code);
             Serial.printf("#IDAC %d %d %d\n", etapa, code, (int)ok);
         } else {
-            Serial.println(F("[ST] uso: idac <etapa 0-3> <codigo 0-255>"));
+            Serial.println(F("[ST] uso: idac <etapa 0-3> <codigo -255..255, 0=Vref>"));
         }
     } else if (!strncmp(cmd, "dc ", 3)) {
         int ch = -1, sel = (int)SEL_SETTLE_DC;
@@ -2308,7 +2321,7 @@ static void handleCmd(const char *cmd)
         int etapa = -1, lo = 0, hi = 255, paso = 16, ch = -1;
         int got = sscanf(cmd + 6, "%d %d %d %d %d", &etapa, &lo, &hi, &paso, &ch);
         if (got >= 4 && etapa >= 0 && etapa <= 3 && paso > 0 &&
-            lo >= 0 && hi <= 255 && lo <= hi && ch >= -1 && ch <= 4) {
+            lo >= -255 && hi <= 255 && lo <= hi && ch >= -1 && ch <= 4) {
             uint8_t chLo = (ch < 0) ? 0u : (uint8_t)ch;
             uint8_t chHi = (ch < 0) ? 3u : (uint8_t)ch;
             Serial.printf("#SWEEPSTART %d %d %d %d %d\n", etapa, lo, hi, paso, ch);
@@ -2316,7 +2329,7 @@ static void handleCmd(const char *cmd)
             bool corto = false;
             for (; code <= hi && !corto; code += paso) {
                 if (Serial.available() > 0) { corto = true; break; }
-                if (!stSetIdac((uint8_t)etapa, (uint8_t)code)) {
+                if (!stSetIdac((uint8_t)etapa, (int16_t)code)) {
                     Serial.printf("#SWEEPERR %d\n", code);
                     continue;
                 }

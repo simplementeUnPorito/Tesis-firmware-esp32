@@ -277,7 +277,24 @@ public:
     /* Comandos del autotest (ver psoc_selftest.h del proyecto PSoC de test). */
     void stReport(uint8_t what)              { _sendCmd1(PSOC_CMD_ST_REPORT, what); }
     void stSync(uint8_t arm)                 { _sendCmd1(PSOC_CMD_ST_SYNC, arm); }
-    void stSetIdac(uint8_t stage, uint8_t c) { _sendCmd2(PSOC_CMD_ST_SET_IDAC, stage, c); }
+    /* El codigo del IDAC tiene SIGNO: 0 es Vref y el signo va a polarity_reg.
+     * La trama 0xA2 sigue siendo de dos bytes; el signo viaja en el BIT 7 DEL
+     * BYTE DE ETAPA, que estaba libre porque la etapa entra en dos bits. Esta
+     * es la contraparte de ST_IDAC_SIGN_BIT en psoc_selftest.h, y hay que
+     * moverlas juntas. Una trama vieja, con el bit 7 en cero, sigue
+     * significando exactamente lo mismo que antes. */
+    void stSetIdac(uint8_t stage, int16_t code)
+    {
+        uint8_t stageByte = (uint8_t)(stage & 0x0Fu);
+        int16_t magnitude = code;
+
+        if (magnitude < 0) {
+            stageByte |= 0x80u;   /* ST_IDAC_SIGN_BIT */
+            magnitude = (int16_t)(-magnitude);
+        }
+        if (magnitude > 255) { magnitude = 255; }
+        _sendCmd2(PSOC_CMD_ST_SET_IDAC, stageByte, (uint8_t)magnitude);
+    }
     void stMeasDc(uint8_t settleSel, uint8_t ch)
         { _sendCmd1(PSOC_CMD_ST_MEAS_DC, (uint8_t)(((settleSel & 0x07u) << 4) | (ch & 0x0Fu))); }
     void stMeasAc(uint8_t nSel, uint8_t ch)
