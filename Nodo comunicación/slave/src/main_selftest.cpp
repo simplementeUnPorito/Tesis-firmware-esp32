@@ -2267,6 +2267,35 @@ static void handleCmd(const char *cmd)
         } else {
             Serial.println(F("[ST] uso: idac <etapa 0-3> <codigo -255..255, 0=Vref>"));
         }
+    } else if (!strncmp(cmd, "adc ", 4)) {
+        /* Cambia el rango del ADC y mide, opcionalmente, un tap.
+         *
+         * Existe para una pregunta concreta: si lo que el autotest informa en
+         * µV es de verdad esa tensión. Las cuatro configuraciones tienen
+         * rangos distintos (±2,5 / ±0,512 / ±1,024 / ±0,625 V) y el mismo nodo
+         * medido en todas tiene que dar el MISMO valor. Si en vez de eso el
+         * valor escala con el rango, la conversión de cuentas a µV está mal y
+         * todas las tensiones que venimos leyendo tienen un factor de más.
+         *
+         * Sin esto la comparación sólo existía adentro de D5 y no se podía
+         * pedir suelta. */
+        int cfg = -1, ch = -1;
+        int got = sscanf(cmd + 4, "%d %d", &cfg, &ch);
+        if (got >= 1 && cfg >= 1 && cfg <= 4) {
+            bool ok = stSetAdcConfig((uint8_t)cfg);
+            stPump(300);
+            if (ok && got >= 2 && ch >= 0 && ch <= 4) {
+                int32_t media = 0, pp = 0;
+                bool okm = stMeasDc((uint8_t)ch, SEL_SETTLE_DC, media, pp);
+                Serial.printf("#ADC %d %d %ld %ld %d\n", cfg, ch,
+                              (long)media, (long)pp, (int)okm);
+            } else {
+                Serial.printf("#ADC %d -1 0 0 %d\n", cfg, (int)ok);
+            }
+        } else {
+            Serial.println(F("[ST] uso: adc <cfg 1-4> [canal 0-4]  "
+                             "(1=+-2,5V 2=+-0,512V 3=+-1,024V 4=+-0,625V)"));
+        }
     } else if (!strncmp(cmd, "dc ", 3)) {
         int ch = -1, sel = (int)SEL_SETTLE_DC;
         int got = sscanf(cmd + 3, "%d %d", &ch, &sel);
@@ -2383,6 +2412,7 @@ static void handleCmd(const char *cmd)
         Serial.println(F("[ST] dc N [S]  una medida DC del canal N del AMux"));
         Serial.println(F("[ST] ac N [S]  media, RMS, pp y 50 Hz del canal N"));
         Serial.println(F("[ST] mon N [ms] [n]  osciloscopio lento; corta con una tecla"));
+        Serial.println(F("[ST] adc C [N]  cambia el rango del ADC (1-4) y mide el canal N"));
         Serial.println(F("[ST] sweep E lo hi paso [N]  barre un IDAC y mide"));
         Serial.println(F("[ST] pga C / pgaout C   ganancias (codigo 0-8)"));
     } else if (cmd[0] != '\0') {
