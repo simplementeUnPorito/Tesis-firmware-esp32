@@ -280,6 +280,63 @@ cosas concretas del firmware, no por la placa: la máquina de calibración sigue
 siendo la de los VDAC8 y no está portada a IDAC8, y `polarity_reg` no se escribe
 nunca, así que las referencias no pueden cruzar `Vref`.
 
+## Port de la autocalibración a IDAC con signo (2026-09-03, de madrugada)
+
+Hecho, compilado y sin probar en la placa: el KitProg se desconectó al cerrarse
+la notebook y no volvió, así que el PSoC no se pudo grabar. El firmware compila
+limpio, sin warnings, 67488 B de flash y 17400 B de SRAM.
+
+**`polarity_reg` se escribe.** Era el bloqueo de fondo: el componente existía,
+sus cuatro bits van a las entradas `ipolarity` de los IDAC, y ningún archivo del
+firmware lo tocaba. Ahora el código de calibración es **con signo, −255..+255**,
+el 0 es exactamente `Vref` —el único punto desde el que se puede corregir para
+los dos lados— y la autoridad queda en ±478 mV. En EEPROM la magnitud sigue en
+el byte que ya existía y los cuatro signos entran en un byte que estaba libre en
+la misma fila: no cambia ni el tamaño de la fila ni el CRC.
+
+**El limitador de un código por muestra era un bug y se fue.** Con él, el PI
+nunca aplicaba su propia ley de control: la dominaba el limitador, y una etapa
+que necesitaba moverse 84 códigos tardaba 84 muestras como piso mientras la
+integral seguía cargando. La simulación lo cuantificó: ante un salto legítimo de
+60 códigos, sin limitador la etapa 3 entra en banda a las 135 muestras; con el
+limitador no entra ni en 30000.
+
+**El PGA ya se puede calibrar.** La etapa 0 es la única sin ganancia fija —su
+tap es la salida del PGA de entrada— y ahora su ganancia de lazo sigue a la
+ganancia del PGA en vez de usar siempre la de 1×.
+
+**Legacy borrado**: el servo lento y la búsqueda binaria. Queda el PI solo.
+
+### Hasta dónde llega la corrección, y por qué importa
+
+Con la escala real de esta placa, esto es lo que cada referencia puede mover en
+su propio tap usando todo el rango de ±255 códigos:
+
+| tap | µV por código (medido en D2) | alcance con todo el rango |
+|---|---:|---:|
+| ch0 `PGAgain` | 57,7 (PGA en 1×) | ±14,7 mV |
+| ch1 `BPo` | 190,2 | ±48,5 mV |
+| ch2 `SUMo` | 770,1 | ±196,4 mV |
+| ch3 `LPo` | 1221,2 | ±311,4 mV |
+
+Y D1 mide los taps en 1010, 1015, 1030 y 907 mV. **Si esas lecturas son
+desviación respecto de `Vref`, la calibración no llega**: le falta entre un
+factor 3 y un factor 60 según la etapa, y el PI va a terminar con el código
+contra el riel. Eso explicaría por qué la calibración nunca cerró.
+
+Ese "si" no está confirmado y es exactamente lo que hay que medir primero,
+porque cambia el diagnóstico entero. El experimento ahora es de dos comandos,
+gracias a que el código con signo hace que el 0 sea `Vref`:
+
+```text
+idac 0 0      # referencia de la etapa 0 exactamente en Vref
+dc 0          # ¿cuánto lee su propio tap?
+```
+
+Si `ch0` da cerca de 0, las lecturas son relativas a `Vref`, los offsets son
+reales y la red de referencias es insuficiente tal como está. Si da ~1 V, la
+interpretación de la escala del ADC está mal y hay que rehacer la cuenta.
+
 ## Qué queda abierto
 
 1. **Portar la calibración a IDAC8 y escribir `polarity_reg`.** Es el
