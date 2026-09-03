@@ -515,6 +515,30 @@ static bool stSetIdac(uint8_t stage, uint8_t code)
     return false;
 }
 
+/* Una medicion AC de un tap: media, RMS, pico a pico y componente de 50 Hz.
+ *
+ * El autotest la usaba solo adentro de D6. Los comandos de laboratorio la
+ * necesitan suelta, asi que se factoriza aca en vez de duplicar el emparejado
+ * de las dos tramas (0x6x y 0x7x) que el PSoC manda por cada medicion. */
+static bool stMeasAcOnce(uint8_t ch, uint8_t nSel, int32_t &mediaUv,
+                         int32_t &rmsUv, int32_t &ppUv, int32_t &hz50Uv)
+{
+    stRxClear();
+    psoc.stMeasAc(nSel, ch);
+    /* 0xA7 promedia hasta 8192 muestras a 2604 Hz: puede tardar varios
+     * segundos. El plazo es generoso a proposito. */
+    if (stAwait(2, 20000u) >= 2) {
+        const PsocSelfTestResult *a = stFind((uint8_t)(ST_ID_ACA_BASE | ch));
+        const PsocSelfTestResult *b = stFind((uint8_t)(ST_ID_ACB_BASE | ch));
+        if (a != nullptr && b != nullptr) {
+            mediaUv = a->v0; rmsUv  = a->v1;
+            ppUv    = b->v0; hz50Uv = b->v1;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Espera a que el PSoC vuelva a IDLE.
  *
  * El PSoC corre auto-calibracion al arrancar y al cambiar de configuracion, y
@@ -2209,6 +2233,125 @@ static void handleCmd(const char *cmd)
                       (unsigned long)psoc.batchesBad(), (unsigned long)psoc.pingsRx(),
                       (unsigned long)psoc.diagEventsRx(),
                       (unsigned long)psoc.i2cOverruns());
+    /* -- Comandos de laboratorio ------------------------------------------
+     * El autotest ya usaba las primitivas 0xA2/0xA4/0xA7 del PSoC adentro de
+     * sus grupos, pero no las publicaba. Sin ellas, desde la PC no se podia
+     * mover un IDAC ni mirar un tap: cualquier experimento obligaba a agregar
+     * codigo y regrabar. Estos comandos las exponen crudas.
+     *
+     * Ninguno necesita el SYNC armado: 0xA4 y 0xA7 MIDEN, no capturan, asi que
+     * andan apenas hay enlace con el PSoC.
+     *
+     * La salida va prefijada con '#' y en campos separados por espacios para
+     * que la PC la parsee sin adivinar. El texto para humanos sigue con [ST].
+     */
+    } else if (!strncmp(cmd, "idac ", 5)) {
+        int etapa = -1, code = -1;
+        if (sscanf(cmd + 5, "%d %d", &etapa, &code) == 2 &&
+            etapa >= 0 && etapa <= 3 && code >= 0 && code <= 255) {
+            bool ok = stSetIdac((uint8_t)etapa, (uint8_t)code);
+            Serial.printf("#IDAC %d %d %d\n", etapa, code, (int)ok);
+        } else {
+            Serial.println(F("[ST] uso: idac <etapa 0-3> <codigo 0-255>"));
+        }
+    } else if (!strncmp(cmd, "dc ", 3)) {
+        int ch = -1, sel = (int)SEL_SETTLE_DC;
+        int got = sscanf(cmd + 3, "%d %d", &ch, &sel);
+        if (got >= 1 && ch >= 0 && ch <= 4 && sel >= 0 && sel <= 7) {
+            int32_t media = 0, pp = 0;
+            bool ok = stMeasDc((uint8_t)ch, (uint8_t)sel, media, pp);
+            Serial.printf("#DC %d %d %ld %ld %d\n", ch, sel,
+                          (long)media, (long)pp, (int)ok);
+        } else {
+            Serial.println(F("[ST] uso: dc <canal 0-4> [asentamiento 0-7]"));
+        }
+    } else if (!strncmp(cmd, "ac ", 3)) {
+        int ch = -1, sel = (int)SEL_N_NOISE;
+        int got = sscanf(cmd + 3, "%d %d", &ch, &sel);
+        if (got >= 1 && ch >= 0 && ch <= 4 && sel >= 0 && sel <= 7) {
+            int32_t media = 0, rms = 0, pp = 0, hz50 = 0;
+            bool ok = stMeasAcOnce((uint8_t)ch, (uint8_t)sel, media, rms, pp, hz50);
+            Serial.printf("#AC %d %d %ld %ld %ld %ld %d\n", ch, sel,
+                          (long)media, (long)rms, (long)pp, (long)hz50, (int)ok);
+        } else {
+            Serial.println(F("[ST] uso: ac <canal 0-4> [n 0-7]"));
+        }
+    } else if (!strncmp(cmd, "mon ", 4)) {
+        /* Osciloscopio lento: una medida DC por vuelta. No es una captura a
+         * 2604 Hz, es para ver el punto de trabajo moverse mientras se toca un
+         * IDAC o una ganancia. Corta con cualquier tecla. */
+        int ch = -1, periodo = 200, n = 200;
+        int got = sscanf(cmd + 4, "%d %d %d", &ch, &periodo, &n);
+        if (got >= 1 && ch >= 0 && ch <= 4) {
+            if (periodo < 0)          { periodo = 0; }
+            if (n <= 0 || n > 100000) { n = 200; }
+            Serial.printf("#MONSTART %d %d %d\n", ch, periodo, n);
+            uint32_t t0 = millis();
+            int i = 0;
+            for (; i < n; i++) {
+                if (Serial.available() > 0) { break; }
+                int32_t media = 0, pp = 0;
+                bool ok = stMeasDc((uint8_t)ch, SEL_SETTLE_FAST, media, pp);
+                Serial.printf("#MON %d %lu %d %ld %ld %d\n", i,
+                              (unsigned long)(millis() - t0), ch,
+                              (long)media, (long)pp, (int)ok);
+                if (periodo > 0) { delay((uint32_t)periodo); }
+            }
+            Serial.printf("#MONEND %d\n", i);
+        } else {
+            Serial.println(F("[ST] uso: mon <canal 0-4> [ms] [n]  (corta con una tecla)"));
+        }
+    } else if (!strncmp(cmd, "sweep ", 6)) {
+        /* Barrido de un IDAC midiendo uno o todos los taps: es la matriz D2
+         * pero manual, para ver la curva entera en vez de dos puntos. Con
+         * asentamiento de 500 ms cada punto tarda eso por canal. */
+        int etapa = -1, lo = 0, hi = 255, paso = 16, ch = -1;
+        int got = sscanf(cmd + 6, "%d %d %d %d %d", &etapa, &lo, &hi, &paso, &ch);
+        if (got >= 4 && etapa >= 0 && etapa <= 3 && paso > 0 &&
+            lo >= 0 && hi <= 255 && lo <= hi && ch >= -1 && ch <= 4) {
+            uint8_t chLo = (ch < 0) ? 0u : (uint8_t)ch;
+            uint8_t chHi = (ch < 0) ? 3u : (uint8_t)ch;
+            Serial.printf("#SWEEPSTART %d %d %d %d %d\n", etapa, lo, hi, paso, ch);
+            int code = lo;
+            bool corto = false;
+            for (; code <= hi && !corto; code += paso) {
+                if (Serial.available() > 0) { corto = true; break; }
+                if (!stSetIdac((uint8_t)etapa, (uint8_t)code)) {
+                    Serial.printf("#SWEEPERR %d\n", code);
+                    continue;
+                }
+                for (uint8_t c = chLo; c <= chHi; c++) {
+                    int32_t media = 0, pp = 0;
+                    bool ok = stMeasDc(c, SEL_SETTLE_DC, media, pp);
+                    Serial.printf("#SWEEP %d %d %u %ld %ld %d\n", etapa, code,
+                                  (unsigned)c, (long)media, (long)pp, (int)ok);
+                }
+            }
+            /* No se restaura el codigo: en un experimento manual uno quiere que
+             * quede donde lo dejo. Se informa cual quedo puesto. */
+            Serial.printf("#SWEEPEND %d %d\n", etapa,
+                          (code > hi) ? (code - paso) : code);
+        } else {
+            Serial.println(F("[ST] uso: sweep <etapa> <lo> <hi> <paso> [canal|-1=todos]"));
+        }
+    } else if (!strncmp(cmd, "pgaout ", 7)) {
+        int code = -1;
+        if (sscanf(cmd + 7, "%d", &code) == 1 && code >= 0 && code <= 8) {
+            psoc.setPgaout((uint8_t)code);
+            stPump(400);
+            Serial.printf("#GAIN pgaout %d\n", code);
+        } else {
+            Serial.println(F("[ST] uso: pgaout <codigo 0-8>"));
+        }
+    } else if (!strncmp(cmd, "pga ", 4)) {
+        int code = -1;
+        if (sscanf(cmd + 4, "%d", &code) == 1 && code >= 0 && code <= 8) {
+            psoc.setPga((uint8_t)code);
+            stPump(400);
+            Serial.printf("#GAIN pga %d\n", code);
+        } else {
+            Serial.println(F("[ST] uso: pga <codigo 0-8>"));
+        }
     } else if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
         Serial.println(F("[ST] run|test  corrida completa"));
         Serial.println(F("[ST] a b c d   corre solo ese grupo"));
@@ -2222,6 +2365,13 @@ static void handleCmd(const char *cmd)
         Serial.println(F("[ST] hw        ver el perfil de hardware presente"));
         Serial.println(F("[ST] hw X N    X=oled|btn|geo|sd|psoc  N=0 ausente 1 presente 2 auto"));
         Serial.println(F("[ST] oled si|no  confirmar a ojo si el OLED anda"));
+        Serial.println(F("[ST] -- laboratorio (no necesitan el SYNC armado) --"));
+        Serial.println(F("[ST] idac E C  fija el IDAC de la etapa E (0-3) en el codigo C"));
+        Serial.println(F("[ST] dc N [S]  una medida DC del canal N del AMux"));
+        Serial.println(F("[ST] ac N [S]  media, RMS, pp y 50 Hz del canal N"));
+        Serial.println(F("[ST] mon N [ms] [n]  osciloscopio lento; corta con una tecla"));
+        Serial.println(F("[ST] sweep E lo hi paso [N]  barre un IDAC y mide"));
+        Serial.println(F("[ST] pga C / pgaout C   ganancias (codigo 0-8)"));
     } else if (cmd[0] != '\0') {
         Serial.printf("[ST] comando desconocido '%s' (help)\n", cmd);
     }
@@ -2229,7 +2379,9 @@ static void handleCmd(const char *cmd)
 
 static void serviceUsb()
 {
-    static char line[32];
+    /* 48 y no 32: `sweep 0 0 255 16 -1` ya rozaba el limite anterior, y un
+     * comando truncado se interpreta como otro comando. */
+    static char line[48];
     static uint8_t pos = 0;
     while (Serial.available() > 0) {
         char ch = (char)Serial.read();
