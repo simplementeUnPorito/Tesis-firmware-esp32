@@ -122,8 +122,9 @@ struct MsgStatus {
 struct MsgSetConfig {
     uint8_t cmd;
     uint8_t node_id;
-    uint8_t sub_cmd;  /* 0xA6=PGA, 0xA8=PGAout (GEO), 0xB5=calibrar PSoC; 0xA9/0xAA legacy */
-    uint8_t param;
+    uint8_t sub_cmd;  /* 0xA6=PGA, 0xA8=PGAout, 0xAA=IDAC manual, 0xB5=calibrar */
+    uint8_t param;    /* normal; para 0xAA: bit7=signo, bits0..3=etapa */
+    uint8_t param2;   /* 0 normal; para 0xAA: magnitud 0..255 */
 };
 
 struct MsgCfgAck {

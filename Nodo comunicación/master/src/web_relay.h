@@ -11,7 +11,9 @@
  * Comandos (navegador -> maestro): mensajes de texto JSON planos
  *   {"cmd":"A1","param":1}                      comando estándar   (4 bytes)
  *   {"cmd":"A3","value":100}                    set-N de 16 bits   (5 bytes)
- *   {"cmd":"BD","node":1,"sub":"A6","param":3}  dirigido a esclavo (6 bytes)
+ *   {"cmd":"BD","node":1,"sub":"A6","param":3}  dirigido a esclavo
+ *   {"cmd":"BD","node":1,"sub":"AA","param":130,"param2":200}
+ *                                                   IDAC etapa 2, -200
  * ("cmd"/"sub" llevan el byte en hex, p.ej. "A3"/"BD"/"A6" — igual que en
  * config.py). Se decodifican a MatlabTransport::RxCmd y se encolan para que
  * loop() los drene exactamente como matlab.hasCmd()/handleMatlabCmd(): un solo
@@ -173,11 +175,11 @@ static void webRelayDecodeCmd(const String &json)
     if (!webRelayJsonStr(json, "cmd", cmdStr)) return;
     uint8_t cmd = webRelayHexByte(cmdStr);
 
-    MatlabTransport::RxCmd r = {0, 0, 0, 0, 0, true};
+    MatlabTransport::RxCmd r = {0, 0, 0, 0, 0, true, 0, false};
     r.cmd = cmd;
 
     if (cmd == MATLAB_CMD_DIRECTED) {            /* 0xBD — dirigido a esclavo */
-        long node = 0, param = 0;
+        long node = 0, param = 0, param2 = 0;
         String subStr;
         webRelayJsonInt(json, "node", node);
         webRelayJsonStr(json, "sub", subStr);
@@ -185,6 +187,8 @@ static void webRelayDecodeCmd(const String &json)
         r.node_id = (uint8_t)node;
         r.sub_cmd = webRelayHexByte(subStr);
         r.param   = (uint8_t)param;
+        r.has_param2 = webRelayJsonInt(json, "param2", param2);
+        r.param2 = (uint8_t)param2;
     } else if (cmd == 0xA3 || cmd == 0xAD || cmd == 0xAE) { /* set-N de 16 bits */
         long value = 0;
         webRelayJsonInt(json, "value", value);
@@ -197,8 +201,9 @@ static void webRelayDecodeCmd(const String &json)
     }
 
     webRelayPushCmd(r);
-    LOGM("WEBCMD", "cmd=0x%02X,param=%u,value=%u,node=%u,sub=0x%02X",
-         r.cmd, r.param, r.value, r.node_id, r.sub_cmd);
+    LOGM("WEBCMD", "cmd=0x%02X,param=%u,param2=%u,has2=%u,value=%u,node=%u,sub=0x%02X",
+         r.cmd, r.param, r.param2, (unsigned)r.has_param2,
+         r.value, r.node_id, r.sub_cmd);
 }
 
 /* ── Telemetría: espejar paquetes de 6 bytes hacia los clientes WS ─────────

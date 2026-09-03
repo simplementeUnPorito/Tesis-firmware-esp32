@@ -881,8 +881,8 @@ function sendStd16(cmd, value = 0) {
   ws.send(encodeStd16(cmd, value));
 }
 
-function sendDirected(chIndex, subCmd, param = 0) {
-  ws.send(encodeDirected(chIndex, subCmd, param));
+function sendDirected(chIndex, subCmd, param = 0, param2 = null) {
+  ws.send(encodeDirected(chIndex, subCmd, param, param2));
 }
 
 function setConnIndicator(isConnected) {
@@ -1784,6 +1784,29 @@ function onCalibrateRequested(chIndex) {
   appendLog(`S${chIndex} calibracion solicitada`);
 }
 
+function onManualIdacRequested(chIndex, stage, requestedCode) {
+  const nd = data.nodes[chIndex];
+  const panel = panelFor(chIndex);
+  const s = clamp(Number.parseInt(stage, 10) || 0, 0, 3);
+  const code = clamp(Number.parseInt(requestedCode, 10) || 0, -255, 255);
+  const p1 = s | (code < 0 ? 0x80 : 0);
+  const p2 = Math.abs(code);
+  nd.pending.set(cfg.SUBCMD_VDAC, {
+    param: p1, param2: p2, stage: s, code,
+    sendTime: performance.now(), retries: 0,
+  });
+  if (panel) panel.setManualIdacLock(2);
+  sendDirected(chIndex, cfg.SUBCMD_VDAC, p1, p2);
+  appendLog(`S${chIndex} IDAC manual etapa ${s} -> ${code}`);
+  setTimeout(() => {
+    const pending = nd.pending.get(cfg.SUBCMD_VDAC);
+    if (!pending || pending.stage !== s || pending.code !== code) return;
+    nd.pending.delete(cfg.SUBCMD_VDAC);
+    if (panel) panel.setManualIdacLock(2);
+    appendLog(`S${chIndex} IDAC manual sin confirmacion: etapa ${s}, ${code}`);
+  }, Math.round(cfg.RETRY_SEC * 1000));
+}
+
 function onBlinkLedRequested(chIndex) {
   sendDirected(chIndex, cfg.SUBCMD_BLINK_LED, 0);
   appendLog(`S${chIndex} titilar LED`);
@@ -1976,6 +1999,9 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('ver-requested', () => onVerRequested(chIndex));
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
   panel.addEventListener('calibrate-requested', () => onCalibrateRequested(chIndex));
+  panel.addEventListener('idac-manual-requested', (ev) => {
+    onManualIdacRequested(chIndex, ev.detail.stage, ev.detail.code);
+  });
   panel.addEventListener('latency-requested', () => onLatencyRequested(chIndex));
   panel.addEventListener('blink-led-requested', () => onBlinkLedRequested(chIndex));
   panel.addEventListener('save-eeprom-requested', () => onSaveEepromRequested(chIndex));
@@ -2268,7 +2294,13 @@ function handleAck(pkt, idx) {
   }
 
   if (ackCmd === cfg.SUBCMD_VDAC && idx >= 1 && idx < cfg.MAX_NODES) {
-    appendLog(`ACK legacy VDAC S${idx}: ${ackVal}`);
+    const panel = panelFor(idx);
+    if (panel) panel.setManualIdacLock(ackVal ? 1 : 2);
+    if (pending) {
+      appendLog(`S${idx} IDAC manual ${ackVal ? 'confirmado' : 'rechazado'}: etapa ${pending.stage}, ${pending.code}`);
+    } else {
+      appendLog(`S${idx} IDAC manual ACK ${ackVal}`);
+    }
     return;
   }
 

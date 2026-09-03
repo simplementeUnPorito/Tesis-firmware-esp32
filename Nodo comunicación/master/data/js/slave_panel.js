@@ -56,6 +56,7 @@ function fmtSignedPct(value) {
  * Controls for one slave node (channels 1-3, displayed as Esclavo 1-3).
  *
  * Events: 'pga-changed' {code}, 'pgaout-changed' {code}, 'adc-config-changed' {code},
+ *         'idac-manual-requested' {stage, code},
  *         'fir-apply' {cmd}, 'fir-remove',
  *         'line-notch-changed' {enabled, nHarm},
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
@@ -169,6 +170,35 @@ export class SlavePanel extends EventTarget {
     this._btnCalibrate.title = 'Calibrar PSoC';
     this._btnCalibrate.addEventListener('click', () => this._dispatch('calibrate-requested'));
     root.appendChild(row(el('span', null, 'Calibracion'), this._dotCal, this._btnCalibrate));
+
+    this._ddManualIdacStage = el('select');
+    for (const [stage, name] of cfg.CAL_VDAC_LABELS_GEO.entries()) {
+      this._ddManualIdacStage.appendChild(new Option(`${stage}: ${name}`, String(stage)));
+    }
+    this._inpManualIdac = el('input');
+    this._inpManualIdac.type = 'number';
+    this._inpManualIdac.min = '-255';
+    this._inpManualIdac.max = '255';
+    this._inpManualIdac.step = '1';
+    this._inpManualIdac.value = '0';
+    this._inpManualIdac.title = 'Código IDAC firmado; 0=Vref, rango -255..255';
+    this._btnManualIdac = el('button', null, 'Aplicar IDAC');
+    this._btnManualIdac.addEventListener('click', () => {
+      const stage = Number.parseInt(this._ddManualIdacStage.value, 10);
+      const code = Math.max(-255, Math.min(255,
+        Number.parseInt(this._inpManualIdac.value, 10) || 0));
+      this._inpManualIdac.value = String(code);
+      this._dispatch('idac-manual-requested', { stage, code });
+    });
+    this._dotManualIdac = dot('IDAC manual sin confirmar');
+    this._rowManualIdac = row(
+      labeled('Etapa', this._ddManualIdacStage),
+      labeled('Código', this._inpManualIdac),
+      this._btnManualIdac,
+      this._dotManualIdac,
+    );
+    this._rowManualIdac.style.display = 'none';
+    root.appendChild(this._rowManualIdac);
 
     const firBox = el('div', 'filter-box');
     firBox.appendChild(el('div', 'subhead', 'FIR Filter'));
@@ -429,6 +459,7 @@ export class SlavePanel extends EventTarget {
   /** La fila PGAout solo tiene sentido en nodos GEO con la placa nueva. */
   setPgaoutVisible(visible) {
     this._rowPgaout.style.display = visible ? '' : 'none';
+    this._rowManualIdac.style.display = visible ? '' : 'none';
   }
 
   setPgaout(code) {
@@ -506,6 +537,12 @@ export class SlavePanel extends EventTarget {
     const busyTip = detail ? `Calibrando... ${detail}` : 'Calibrando... (puede tardar hasta ~4 min)';
     setDot(this._dotCal, state, 'Calibracion confirmada por PSoC', 'Calibracion pendiente o fallida',
            'Calibracion sin ejecutar', busyTip);
+  }
+
+  /** state: 0=unknown, 1=confirmed, 2=pending/fail. */
+  setManualIdacLock(state) {
+    setDot(this._dotManualIdac, state, 'IDAC manual confirmado por PSoC',
+           'IDAC manual pendiente o rechazado', 'IDAC manual sin confirmar');
   }
 
   setVdac(vdacByte) {

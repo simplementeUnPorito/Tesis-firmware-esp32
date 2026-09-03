@@ -78,12 +78,14 @@ export function encodeStd16(cmd, value16) {
   return JSON.stringify({ cmd: hex2(cmd & 0xFF), value: value16 & 0xFFFF });
 }
 
-/** Directed slave command: {cmd:"BD", node, sub, param}. Mirrors protocol.encode_directed. */
-export function encodeDirected(nodeId, subCmd, param) {
-  return JSON.stringify({
+/** Directed command. param2 is required only by signed manual IDAC (0xAA). */
+export function encodeDirected(nodeId, subCmd, param, param2 = null) {
+  const out = {
     cmd: hex2(cfg.CMD_DIRECTED),
     node: nodeId & 0xFF,
     sub: hex2(subCmd & 0xFF),
     param: param & 0xFF,
-  });
+  };
+  if (param2 !== null && param2 !== undefined) out.param2 = param2 & 0xFF;
+  return JSON.stringify(out);
 }

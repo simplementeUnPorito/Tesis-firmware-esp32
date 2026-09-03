@@ -851,7 +851,8 @@ static void sendStartProbe(uint8_t nodeId)
 
 /* ── Comando dirigido a un esclavo específico ────────────────────────────── */
 
-static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param, bool fromWeb)
+static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
+                              uint8_t param2, bool hasParam2, bool fromWeb)
 {
     if (node_id == 0 || node_id > NUM_SLAVES) {
         matlab.sendAck(node_id, sub_cmd, 0);
@@ -879,6 +880,17 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param, b
         MASTER_LOG_PRINTF("[MASTER] START_PROBE direct node=%d state=%d\n",
                           node_id, (int)g_state);
         return;
+    }
+
+    if (sub_cmd == 0xAAu) {
+        const uint8_t stage = (uint8_t)(param & 0x0Fu);
+        const bool reservedBitsClear = (param & 0x70u) == 0u;
+        if (!hasParam2 || stage >= 4u || !reservedBitsClear) {
+            matlab.sendAck(node_id, sub_cmd, 0);
+            LOGM("DIRECTED_BAD_IDAC", "node=%u,p1=%u,p2=%u,has2=%u",
+                 node_id, param, param2, (unsigned)hasParam2);
+            return;
+        }
     }
 
     const uint8_t *dst = espnowDstForSlave(node_id);
@@ -918,14 +930,14 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param, b
         LOGM("BLINK_LED", "node=%d", node_id);
     } else {
         /* SaveEEPROM (0xB6) y SelectStream (0xB7) van por MsgSetConfig igual que calibrate */
-        MsgSetConfig msg = { CMD_SET_CONFIG, node_id, sub_cmd, param };
+        MsgSetConfig msg = { CMD_SET_CONFIG, node_id, sub_cmd, param, param2 };
         err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
     }
     if (err != ESP_OK) {
         matlab.sendAck(node_id, sub_cmd, 0);
     }
-    MASTER_LOG_PRINTF("[MASTER] directed node=%d sub=0x%02X param=%d err=%d\n",
-                      node_id, sub_cmd, param, (int)err);
+    MASTER_LOG_PRINTF("[MASTER] directed node=%d sub=0x%02X p1=%d p2=%d err=%d\n",
+                      node_id, sub_cmd, param, param2, (int)err);
 }
 
 /* ── Broadcast ESP-NOW a todos los esclavos ──────────────────────────────── */
@@ -1373,7 +1385,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
             break;
 
         case 0xBD:   /* comando dirigido a esclavo específico */
-            handleDirectedCmd(rxCmd.node_id, rxCmd.sub_cmd, rxCmd.param, fromWeb);
+            handleDirectedCmd(rxCmd.node_id, rxCmd.sub_cmd, rxCmd.param,
+                              rxCmd.param2, rxCmd.has_param2, fromWeb);
             break;
 
         case 0xA7: {  /* debug mode on/off — maestro y esclavos */

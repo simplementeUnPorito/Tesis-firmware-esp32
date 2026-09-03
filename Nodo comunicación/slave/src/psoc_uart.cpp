@@ -257,8 +257,6 @@ void PsocUART::_parseConfigAck()
         _confirmedPgaout = val;
     } else if (cmd == PSOC_CMD_PGAVDAC) {
         _confirmedPgavdac = val;
-    } else if (cmd == PSOC_CMD_VDAC) {
-        _confirmedVdac = val;
     }
 }
 
@@ -288,7 +286,10 @@ void PsocUART::_sendCmd2(uint8_t cmd, uint8_t p1, uint8_t p2)
 void PsocUART::setN(uint16_t n)        { _sendCmd2(PSOC_CMD_SETN, (uint8_t)(n & 0xFF), (uint8_t)(n >> 8)); }
 void PsocUART::preStart()              { _sendCmd1(PSOC_CMD_PRESTART, 0); }
 void PsocUART::startNow()              { _sendCmd1(PSOC_CMD_START_NOW, 0); }
-void PsocUART::setVdac(uint8_t v)      { _sendCmd1(PSOC_CMD_VDAC, v); }
+void PsocUART::setStageDac(uint8_t stageWithSign, uint8_t magnitude)
+{
+    _sendCmd2(PSOC_CMD_VDAC, stageWithSign, magnitude);
+}
 void PsocUART::setPga(uint8_t code)    { _sendCmd1(PSOC_CMD_PGA, code); }
 void PsocUART::setPgaout(uint8_t code) { _sendCmd1(PSOC_CMD_PGAOUT, code); }
 void PsocUART::setPgavdac(uint8_t code){ _sendCmd1(PSOC_CMD_PGAVDAC, code); }

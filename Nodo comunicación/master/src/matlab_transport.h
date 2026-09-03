@@ -21,12 +21,13 @@
  *     cmd 0xA3: start sampling  N = n_lo|n_hi<<8 (lotes, 0=usar actual)
  *     cmd 0xAE: set record len  N = n_lo|n_hi<<8
  *
- *   Comando dirigido a esclavo (6 bytes):
+ *   Comando dirigido a esclavo (6 bytes; 7 para IDAC manual 0xAA):
  *     [0xAB][0xBD][node_id][sub_cmd][param][node_id^sub_cmd^param]
+ *     [0xAB][0xBD][node_id][0xAA][signo|etapa][magnitud][xor de payload]
  *     sub_cmd 0xA6: set PGA gain    param: código 0-8
  *     sub_cmd 0xA8: PGAout (GEO)  param: código 0-8
  *     sub_cmd 0xA9: legacy PGAvdac  param: código 0-8
- *     sub_cmd 0xAA: legacy VDAC     param: 0-255
+ *     sub_cmd 0xAA: IDAC manual     p1: bit7 signo + etapa 0-3; p2: magnitud
  *     sub_cmd 0xA7: debug node ESP  param: 0/1
  *     sub_cmd 0xB2: ver (captura única) param: ignorado
  *     sub_cmd 0xB3: debug PSoC rampa param: 0/1
@@ -82,10 +83,12 @@ public:
         uint8_t  sub_cmd;  /* válido solo cuando cmd == 0xBD */
         uint16_t value;    /* valor 16 bits para 0xA3/0xAD/0xAE (set N) */
         bool     valid;
+        uint8_t  param2;       /* segundo parametro, solo 0xAA dirigido */
+        bool     has_param2;
     };
     /* Drain one command from the queue (returns {valid=false} when empty) */
     RxCmd lastCmd() {
-        if (_cmdHead == _cmdTail) return {0,0,0,0,0,false};
+        if (_cmdHead == _cmdTail) return {0,0,0,0,0,false,0,false};
         RxCmd r = _cmdQueue[_cmdTail];
         _cmdTail = (uint8_t)((_cmdTail + 1) % CMD_Q_SIZE);
         return r;
@@ -97,7 +100,7 @@ private:
     RxCmd   _cmdQueue[CMD_Q_SIZE];
     uint8_t _cmdHead    = 0;
     uint8_t _cmdTail    = 0;
-    uint8_t _rxBuf[6];
+    uint8_t _rxBuf[7];
     uint8_t _rxIdx      = 0;
     uint8_t _rxExpected = 4;
     MatlabPacketRelay _relay = nullptr;
@@ -138,6 +141,10 @@ inline void MatlabTransport::loop()
             if (c == MATLAB_CMD_DIRECTED)            _rxExpected = 6;
             else if (c == 0xA3 || c == 0xAD || c == 0xAE) _rxExpected = 5; /* set N 16 bits */
             else                                     _rxExpected = 4;
+        }
+        if (_rxIdx == 4 && _rxBuf[1] == MATLAB_CMD_DIRECTED &&
+            _rxBuf[3] == 0xAAu) {
+            _rxExpected = 7;
         }
         if (_rxIdx >= _rxExpected) {
             _parseRx();
@@ -244,14 +251,27 @@ inline void MatlabTransport::_parseRx()
 {
     if (_rxBuf[0] != 0xAB) return;
 
-    if (_rxExpected == 6) {
+    if (_rxExpected == 7) {
+        /* IDAC manual: [AB][BD][node][AA][signo|etapa][magnitud][cs]. */
+        uint8_t node_id = _rxBuf[2];
+        uint8_t sub_cmd = _rxBuf[3];
+        uint8_t param   = _rxBuf[4];
+        uint8_t param2  = _rxBuf[5];
+        uint8_t cs      = _rxBuf[6];
+        if (cs != (uint8_t)(node_id ^ sub_cmd ^ param ^ param2)) return;
+        RxCmd r = { MATLAB_CMD_DIRECTED, param, node_id, sub_cmd,
+                    (uint16_t)((uint16_t)param | ((uint16_t)param2 << 8)),
+                    true, param2, true };
+        _pushCmd(r);
+    } else if (_rxExpected == 6) {
         /* Comando dirigido: [0xAB][0xBD][node_id][sub_cmd][param][cs] */
         uint8_t node_id = _rxBuf[2];
         uint8_t sub_cmd = _rxBuf[3];
         uint8_t param   = _rxBuf[4];
         uint8_t cs      = _rxBuf[5];
         if (cs != (uint8_t)(node_id ^ sub_cmd ^ param)) return;
-        _pushCmd({ MATLAB_CMD_DIRECTED, param, node_id, sub_cmd, param, true });
+        _pushCmd({ MATLAB_CMD_DIRECTED, param, node_id, sub_cmd,
+                   param, true, 0, false });
     } else if (_rxExpected == 5) {
         /* set N (16 bits): [0xAB][cmd][n_lo][n_hi][cmd^n_lo^n_hi] */
         uint8_t cmd  = _rxBuf[1];
@@ -260,13 +280,13 @@ inline void MatlabTransport::_parseRx()
         uint8_t cs   = _rxBuf[4];
         if (cs != (uint8_t)(cmd ^ nlo ^ nhi)) return;
         uint16_t val = (uint16_t)nlo | ((uint16_t)nhi << 8);
-        _pushCmd({ cmd, nlo, 0, 0, val, true });
+        _pushCmd({ cmd, nlo, 0, 0, val, true, 0, false });
     } else {
         /* Comando estándar: [0xAB][cmd][param][cs] */
         uint8_t cmd   = _rxBuf[1];
         uint8_t param = _rxBuf[2];
         uint8_t cs    = _rxBuf[3];
         if (cs != (uint8_t)(cmd ^ param)) return;
-        _pushCmd({ cmd, param, 0, 0, param, true });
+        _pushCmd({ cmd, param, 0, 0, param, true, 0, false });
     }
 }

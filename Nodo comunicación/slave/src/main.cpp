@@ -1313,9 +1313,8 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
         case 0xA9:
             g_pgavdac = value;
             break;
-        case 0xAA:
-            g_vdac_byte = value;
-            break;
+        /* 0xAA ya no es un VDAC global de un byte. Su ACK devuelve p1
+         * (signo|etapa), no una magnitud que tenga sentido en heartbeat. */
         case PSOC_CMD_SD_CAPTURE:
             g_psoc_sd_capture_enabled = (value != 0u);
             break;
@@ -2256,6 +2255,35 @@ static bool requestDecimationFromUsb(uint8_t factor)
     return sent;
 }
 
+/* Banco/campo: mover una referencia firmada sin usar el protocolo de autotest
+ * 0xA2. El ACK esperado es p1 (signo|etapa), exactamente como lo define el
+ * firmware PSoC de campo para 0xAA. */
+static bool requestManualIdacFromUsb(uint8_t stage, int16_t code)
+{
+    if (stage >= 4u || code < -255 || code > 255) {
+        return false;
+    }
+    servicePsocConfigAck();
+    if (g_cfg_waiting || !ensurePsocReadyForConfig()) {
+        return false;
+    }
+
+    uint8_t p1 = stage;
+    int16_t magnitude = code;
+    if (magnitude < 0) {
+        p1 |= 0x80u;
+        magnitude = (int16_t)-magnitude;
+    }
+    psoc.setStageDac(p1, (uint8_t)magnitude);
+    waitForPsocConfigAck(PSOC_CMD_VDAC, p1);
+    SLAVE_LOG_PRINTF("[USB] idac stage=%u code=%d -> PSoC 0xAA p1=%u p2=%u\n",
+                     (unsigned)stage, (int)code, (unsigned)p1,
+                     (unsigned)magnitude);
+    LOGM("USB_CMD", "cmd=idac,stage=%u,code=%d,p1=%u,p2=%u",
+         (unsigned)stage, (int)code, (unsigned)p1, (unsigned)magnitude);
+    return true;
+}
+
 static void handleUsbCommand(const char *cmd)
 {
     uint8_t value = 0u;
@@ -2307,6 +2335,17 @@ static void handleUsbCommand(const char *cmd)
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAOUT, value, "pgaout");
     } else if (usbParseGainParam(cmd, "pgavdac", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
+    } else if (!strncmp(cmd, "idac ", 5)) {
+        int stage = -1;
+        int code = 0;
+        if (sscanf(cmd + 5, "%d %d", &stage, &code) == 2 &&
+            stage >= 0 && stage < 4 && code >= -255 && code <= 255) {
+            if (!requestManualIdacFromUsb((uint8_t)stage, (int16_t)code)) {
+                SLAVE_LOG_PRINTF("[USB] idac rechazado: PSoC/config ocupado\n");
+            }
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: idac <etapa 0-3> <codigo -255..255>\n");
+        }
     } else if (usbParseGainParam(cmd, "range", value)) {
         (void)requestAdcConfigFromUsb(value);
     } else if (usbParseGainParam(cmd, "decim", value)) {
@@ -2344,9 +2383,9 @@ static void handleUsbCommand(const char *cmd)
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
 #else
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, range N, decim N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N\n");
 #endif
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
@@ -2595,6 +2634,7 @@ static void handleSetConfig(const MsgSetConfig *cfg)
 
     const uint8_t subCmd = cfg->sub_cmd;
     const uint8_t param = cfg->param;
+    const uint8_t param2 = cfg->param2;
     uint8_t ok = 1;
     bool waitAck = false;
     switch (cfg->sub_cmd) {
@@ -2619,9 +2659,15 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                 waitAck = true;
             }
             break;
-        case 0xAA:                       /* VDAC (calibración) */
-            waitAck = true;
+        case 0xAA: {                     /* IDAC manual firmado de campo */
+            const uint8_t stage = (uint8_t)(param & 0x0Fu);
+            if (stage >= 4u || (param & 0x70u) != 0u) {
+                ok = 0;
+            } else {
+                waitAck = true;
+            }
             break;
+        }
         case PSOC_CMD_CALIBRATE:
             waitAck = true;
             break;
@@ -2676,7 +2722,7 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                     psoc.setPgavdac(param);
                     break;
                 case 0xAA:
-                    psoc.setVdac(param);
+                    psoc.setStageDac(param, param2);
                     break;
                 case PSOC_CMD_CALIBRATE:
                     psoc.calibrate();
@@ -2709,10 +2755,10 @@ static void handleSetConfig(const MsgSetConfig *cfg)
     } else {
         sendCfgAck(subCmd, ok);
     }
-    SLAVE_LOG_PRINTF("[SLAVE] cfg sub=0x%02X p=%u ok=%u\n",
-                     subCmd, param, ok);
-    LOGM("CFG", "sub=0x%02X,p=%u,ok=%u,wait=%u",
-         subCmd, param, ok, (unsigned)waitAck);
+    SLAVE_LOG_PRINTF("[SLAVE] cfg sub=0x%02X p1=%u p2=%u ok=%u\n",
+                     subCmd, param, param2, ok);
+    LOGM("CFG", "sub=0x%02X,p1=%u,p2=%u,ok=%u,wait=%u",
+         subCmd, param, param2, ok, (unsigned)waitAck);
 }
 
 static void handleDebugNode(const MsgDebugNode *dbg)

@@ -305,7 +305,9 @@ public:
     void setN(uint16_t n);
     void preStart();
     void startNow();
-    void setVdac(uint8_t v);
+    /* 0xAA de campo: p1=signo|etapa, p2=magnitud. El setVdac() viejo enviaba
+     * una trama de un byte que el PSoC actual ya no acepta. */
+    void setStageDac(uint8_t stageWithSign, uint8_t magnitude);
     void setPga(uint8_t code);
     void setPgaout(uint8_t code);
     void setPgavdac(uint8_t code);
@@ -369,7 +371,6 @@ private:
     uint8_t         _confirmedPga = 0;
     uint8_t         _confirmedPgaout = 0;
     uint8_t         _confirmedPgavdac = 0;
-    uint8_t         _confirmedVdac = 128;
     uint8_t         _lastByte  = 0;
     uint32_t        _lastByteMs= 0;
     bool            _lastByteSeen = false;
