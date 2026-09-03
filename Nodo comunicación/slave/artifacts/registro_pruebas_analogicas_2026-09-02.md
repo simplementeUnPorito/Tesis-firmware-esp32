@@ -324,6 +324,24 @@ desviación respecto de `Vref`, la calibración no llega**: le falta entre un
 factor 3 y un factor 60 según la etapa, y el PI va a terminar con el código
 contra el riel. Eso explicaría por qué la calibración nunca cerró.
 
+### La curva en S probablemente no es del IDAC
+
+El barrido de `Vref_LP` mostró zona plana entre los códigos 0 y 40 y compresión
+arriba de 200, y quedó modelado como no linealidad del IDAC. Revisándolo, es más
+probable que sea **la salida de la etapa contra un límite**, no el DAC:
+745,98 mV es el valor **más bajo de todo el barrido**, así que los primeros
+cuarenta códigos dando todos lo mismo se explica mejor por recorte de la salida
+que por un DAC muerto. La compresión de arriba sería el otro extremo. El tramo
+útil sería entonces ~746 a ~982 mV, unos 236 mV de excursión total, que es poco.
+
+Distinguirlo es otro experimento corto: barrer `Vref_LP` midiendo un tap **aguas
+arriba** en vez de `ch3`. Si el tap de arriba se mueve lineal mientras `ch3` se
+aplana, el DAC está bien y lo que recorta es la etapa.
+
+```text
+sweep 3 0 240 40 2     # barre Vref_LP pero mide ch2 (SUMo), aguas arriba
+```
+
 Ese "si" no está confirmado y es exactamente lo que hay que medir primero,
 porque cambia el diagnóstico entero. El experimento ahora es de dos comandos,
 gracias a que el código con signo hace que el 0 sea `Vref`:
