@@ -1456,22 +1456,52 @@ static void servicePsocConfigAck()
     }
 }
 
+/* Manda SETN al PSoC y espera su ACK, CON UN REINTENTO.
+ *
+ * El reintento no es precaucion teorica: se cazo el fallo con las dos puntas
+ * abiertas a la vez. Cada tanto una captura vuelve vacia, y la unica diferencia
+ * entre la vuelta que anda y la que no es esta:
+ *
+ *   anda:  [PSoC] SETN ack val=5 pstate=0/IDLE  -> ARMED -> CAPTURE_DONE
+ *   falla: [SLAVE] PSoC SETN ack timeout ...    -> HOT_WAIT aborted
+ *                                               -> START ignored state=0
+ *
+ * O sea que el ACK del PSoC a este comando no llega dentro del plazo, el
+ * esclavo aborta el armado -bien: mejor eso que capturar basura- y el START
+ * siguiente se ignora. Medido, pasa en el orden del 4 % de las capturas, y el
+ * resto del camino no falla: 0 de 60 fallos en 0xAA, SET_RECLEN y ARM.
+ *
+ * Mandarlo una sola vez era la excepcion en este firmware: todos los demas
+ * caminos de comando al PSoC ya usan el mismo reintento acotado de dos
+ * intentos, justamente porque hay una clase de transitorio que se traga el
+ * primer comando en silencio. */
 static bool sendAndConfirmPsocSetN(uint16_t n_batches)
 {
     const uint8_t expected = (n_batches > 255u) ? 255u : (uint8_t)n_batches;
-    const uint32_t startMs = millis();
-    const uint32_t startSeq = g_psoc_setn_seq;
 
-    psoc.setN(n_batches);
-    while ((uint32_t)(millis() - startMs) < PSOC_SETN_ACK_TIMEOUT_MS) {
-        psoc.poll();
-        servicePsocConfigAck();
-        if (g_psoc_setn_seq != startSeq &&
-            g_psoc_last_setn_value == expected &&
-            (int32_t)(g_psoc_last_setn_ms - startMs) >= 0) {
-            return true;
+    for (int intento = 0; intento < 2; intento++) {
+        const uint32_t startMs = millis();
+        const uint32_t startSeq = g_psoc_setn_seq;
+
+        psoc.setN(n_batches);
+        while ((uint32_t)(millis() - startMs) < PSOC_SETN_ACK_TIMEOUT_MS) {
+            psoc.poll();
+            servicePsocConfigAck();
+            if (g_psoc_setn_seq != startSeq &&
+                g_psoc_last_setn_value == expected &&
+                (int32_t)(g_psoc_last_setn_ms - startMs) >= 0) {
+                if (intento > 0) {
+                    SLAVE_LOG_PRINTF("[SLAVE] SETN ack en el reintento n=%u\n",
+                                     (unsigned)n_batches);
+                }
+                return true;
+            }
+            delay(1);
         }
-        delay(1);
+        if (intento == 0) {
+            SLAVE_LOG_PRINTF("[SLAVE] SETN sin ack n=%u; reintento\n",
+                             (unsigned)n_batches);
+        }
     }
 
     SLAVE_LOG_PRINTF("[SLAVE] PSoC SETN ack timeout n=%u expected=%u last=%u age=%lu\n",
