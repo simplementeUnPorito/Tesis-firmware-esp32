@@ -600,9 +600,28 @@ static uint32_t absCounts32(int32_t value)
     return (value < 0) ? (uint32_t)(-value) : (uint32_t)value;
 }
 
+/* Cuentas del ADC centradas, o sea la DESVIACION que el lazo controla.
+ *
+ * Tiene que dar lo mismo que cal_pi_compare_counts() del PSoC
+ * (calibration.c), porque las dos son la misma funcion escrita dos veces. No
+ * daba: la del PSoC resta CAL_TARGET_1V_COUNTS para GEO y esta devolvia el
+ * valor crudo. Consecuencia: una calibracion convergida a menos de 0,5 mV se
+ * informaba como un error de -1000 mV, porque el log restaba el objetivo (0)
+ * al nivel ABSOLUTO del tap en vez de a su desviacion.
+ *
+ * No es cosmetico: estos son los unicos numeros por los que se puede ver que
+ * hizo la calibracion, y decian exactamente lo contrario de lo que paso.
+ *
+ * Los taps GEO descansan fisicamente sobre Vref ~= 1 V y el ADC entrega el
+ * nivel absoluto; el cero que se calibra es la componente diferencial
+ * alrededor de ese modo comun. En HAMMER no se centra, se toma el modulo,
+ * igual que en el PSoC. */
+#define PSOC_CAL_TARGET_1V_COUNTS 52429L   /* = CAL_TARGET_1V_COUNTS del PSoC */
+
 static int32_t psocCalCompareCounts(int32_t raw)
 {
-    return (g_psoc_hw_class == 1u) ? (int32_t)absCounts32(raw) : raw;
+    return (g_psoc_hw_class == 1u) ? (int32_t)absCounts32(raw)
+                                   : (raw - PSOC_CAL_TARGET_1V_COUNTS);
 }
 
 static int32_t adcCountsToMv(int32_t counts)
