@@ -2432,6 +2432,48 @@ static void handleCmd(const char *cmd)
             psoc.stMeasDc(3u, ch);
             stPump(700);
         }
+    } else if (!strncmp(cmd, "calparam ", 9)) {
+        /* Ajusta un parametro de calibracion del PSoC SIN REGRABARLO.
+         *
+         *   calparam tau <segundos>    tau de la planta
+         *   calparam mult <decimas>    espera, en decimas de tau. 20 = 2 tau
+         *
+         * tau viaja en unidades de 250 ms porque el frame lleva solo dos bytes
+         * y tiene que entrar en uno. La respuesta trae el valor QUE QUEDO, no
+         * el pedido: si el PSoC lo rechazo por fuera de rango, se ve.
+         */
+        char que[8] = {0};
+        float val = -1.0f;
+        if (sscanf(cmd + 9, "%7s %f", que, &val) == 2 && val >= 0.0f) {
+            uint8_t id = 0xFFu, byte = 0u;
+            if (!strcmp(que, "tau")) {
+                id = 0u;
+                long u = lroundf(val * 1000.0f / 250.0f);   /* segundos -> x250 ms */
+                if (u < 1 || u > 255) {
+                    Serial.println(F("[ST] tau fuera de 0,25 .. 63,75 s"));
+                    id = 0xFEu;
+                } else {
+                    byte = (uint8_t)u;
+                }
+            } else if (!strcmp(que, "mult")) {
+                id = 1u;
+                if (val > 100.0f) {
+                    Serial.println(F("[ST] el multiplicador no puede pasar de 100 (10 tau)"));
+                    id = 0xFEu;
+                } else {
+                    byte = (uint8_t)lroundf(val);
+                }
+            }
+            if (id <= 1u) {
+                psoc.calParam(id, byte);
+                stPump(600);
+                Serial.printf("#CALPARAM %s %u\n", que, (unsigned)byte);
+            } else if (id == 0xFFu) {
+                Serial.println(F("[ST] uso: calparam tau <segundos> | calparam mult <decimas>"));
+            }
+        } else {
+            Serial.println(F("[ST] uso: calparam tau <segundos> | calparam mult <decimas>"));
+        }
     } else if (!strcmp(cmd, "quien") || !strcmp(cmd, "id")) {
         /* IDENTIDAD DE LA PLACA. Lo pidio Elias el 2026-09-05 y tiene una razon
          * concreta y cara: el 2026-09-04 se perdio una tarde entera midiendo el
@@ -2482,6 +2524,7 @@ static void handleCmd(const char *cmd)
         Serial.println(F("[ST] snapshot  reporte del PSoC por etapa (asi se mira GEO_LP)"));
         Serial.println(F("[ST] taps      los cuatro taps de una"));
         Serial.println(F("[ST] quien|id  quien es esta placa: firmware, MAC y si hay PSoC"));
+        Serial.println(F("[ST] calparam tau <s> | calparam mult <decimas>  ajusta sin regrabar"));
     } else if (cmd[0] != '\0') {
         Serial.printf("[ST] comando desconocido '%s' (help)\n", cmd);
     }

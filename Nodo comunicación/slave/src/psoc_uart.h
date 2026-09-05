@@ -140,6 +140,7 @@
 #define PSOC_CMD_DEBUG     0xB3
 #define PSOC_CMD_START_NOW 0xB4
 #define PSOC_CMD_CALIBRATE    0xB5
+#define PSOC_CMD_CAL_PARAM      0xB2u   /* parametros de calibracion en caliente */
 #define PSOC_CMD_SAVE_EEPROM  0xB6
 #define PSOC_CMD_SELECT_STREAM 0xB7
 #define PSOC_CMD_ADC_SNAPSHOT 0xB8
@@ -311,6 +312,11 @@ public:
     void setPga(uint8_t code);
     void setPgaout(uint8_t code);
     void setPgavdac(uint8_t code);
+    /* Parametro de calibracion en caliente (0xB2). id 0 = tau en unidades de
+     * 250 ms, id 1 = multiplicador de la espera en decimas de tau. El PSoC
+     * contesta un cfg_ack con el valor QUE QUEDO, que puede no ser el pedido si
+     * estaba fuera de rango. */
+    void calParam(uint8_t id, uint8_t valor) { _sendCmd2(PSOC_CMD_CAL_PARAM, id, valor); }
     void calibrate();
     void saveEeprom();
     void selectStream(uint8_t mode);
