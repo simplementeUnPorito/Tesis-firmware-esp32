@@ -2394,6 +2394,68 @@ static void handleCmd(const char *cmd)
         } else {
             Serial.println(F("[ST] uso: pga <codigo 0-8>"));
         }
+    /* -- Comandos que faltaban para poder VALIDAR la calibracion -----------
+     *
+     * Hasta el 2026-09-05 la consola de laboratorio podia mover IDACs y mirar
+     * taps, pero NO podia disparar una calibracion ni leer su veredicto. O sea
+     * que la pregunta que origino todo el trabajo -"subir la espera hace que la
+     * calibracion se sostenga?"- no se podia contestar desde el banco. Estos
+     * comandos cierran ese hueco.
+     */
+    } else if (!strcmp(cmd, "cal")) {
+        /* OJO CON EL PLAZO. Con la espera de planta en 2 tau la calibracion
+         * tarda 4 etapas x 2 x 29,5 s = 236 s solo de espera, mas el lazo. El
+         * plazo de 180 s que usa D8 quedo CORTO al pasar de 1 a 2 tau y habria
+         * dado un falso "no termino". 420 s deja margen incluso si tau sube a
+         * 40 s por temperatura. */
+        g_evCalDone = false; g_evCalOk = 0;
+        uint32_t t0 = millis();
+        psoc.calibrate();
+        while (!g_evCalDone && (millis() - t0) < 420000UL) { psoc.poll(); delay(2); }
+        uint32_t ms = millis() - t0;
+        Serial.printf("#CAL %d %lu\n", (int)(g_evCalDone ? g_evCalOk : 0),
+                      (unsigned long)ms);
+        if (!g_evCalDone) {
+            Serial.println(F("[ST] la calibracion no aviso CAL_DONE en 420 s"));
+        }
+    } else if (!strcmp(cmd, "snapshot") || !strcmp(cmd, "snap")) {
+        /* Reporte por etapa del PSoC (0xB8). Es como se mira GEO_LP despues de
+         * calibrar y de esperar, que es el criterio de aceptacion de Elias. */
+        psoc.adcSnapshot();
+        stPump(1500);
+    } else if (!strcmp(cmd, "taps")) {
+        /* Los cuatro taps de una. Existe porque medirlos con cuatro `dc`
+         * separados desde la PC paga cuatro viajes de ida y vuelta, y sobre
+         * todo porque entre uno y otro la planta sigue moviendose: para
+         * comparar taps entre si conviene que esten lo mas juntos posible. */
+        for (uint8_t ch = 0; ch < 4; ch++) {
+            psoc.stMeasDc(3u, ch);
+            stPump(700);
+        }
+    } else if (!strcmp(cmd, "quien") || !strcmp(cmd, "id")) {
+        /* IDENTIDAD DE LA PLACA. Lo pidio Elias el 2026-09-05 y tiene una razon
+         * concreta y cara: el 2026-09-04 se perdio una tarde entera midiendo el
+         * ESP MAESTRO creyendo que era el esclavo. El maestro contestaba consola
+         * y perfil perfectamente, porque era un ESP sano; lo unico que lo
+         * delataba era que del otro lado no habia ningun PSoC.
+         *
+         * Por eso la respuesta incluye las tres cosas que distinguen una placa:
+         * que firmware corre, su MAC -que es unica y no se reasigna como los
+         * COM- y si tiene un PSoC contestando. Con varios nodos conectados a la
+         * vez, esto es lo que permite saber cual es cual sin adivinar. */
+        /* WiFi.macAddress() en vez de esp_read_mac(): la primera esta
+         * garantizada por WiFi.h, que ya se incluye, y la segunda vive en
+         * esp_mac.h segun la version de IDF. No vale la pena arriesgar el build
+         * por una MAC. */
+        uint8_t mac[6] = {0};
+        WiFi.macAddress(mac);
+        bool hayPsoc = psoc.probe(600);
+        Serial.printf("#QUIEN slaveTest %02X:%02X:%02X:%02X:%02X:%02X psoc=%d clase=%u etapas=%u\n",
+                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                      (int)hayPsoc, (unsigned)g_hwClass, (unsigned)g_psocStages);
+        Serial.printf("[ST] %s\n", hayPsoc
+                      ? "hay un PSoC contestando: esta placa es un NODO ESCLAVO"
+                      : "NO hay PSoC del otro lado: esto NO es un esclavo armado");
     } else if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
         Serial.println(F("[ST] run|test  corrida completa"));
         Serial.println(F("[ST] a b c d   corre solo ese grupo"));
@@ -2415,6 +2477,11 @@ static void handleCmd(const char *cmd)
         Serial.println(F("[ST] adc C [N]  cambia el rango del ADC (1-4) y mide el canal N"));
         Serial.println(F("[ST] sweep E lo hi paso [N]  barre un IDAC y mide"));
         Serial.println(F("[ST] pga C / pgaout C   ganancias (codigo 0-8)"));
+        Serial.println(F("[ST] -- calibracion y validacion --"));
+        Serial.println(F("[ST] cal       corre la autocalibracion y espera el veredicto"));
+        Serial.println(F("[ST] snapshot  reporte del PSoC por etapa (asi se mira GEO_LP)"));
+        Serial.println(F("[ST] taps      los cuatro taps de una"));
+        Serial.println(F("[ST] quien|id  quien es esta placa: firmware, MAC y si hay PSoC"));
     } else if (cmd[0] != '\0') {
         Serial.printf("[ST] comando desconocido '%s' (help)\n", cmd);
     }
