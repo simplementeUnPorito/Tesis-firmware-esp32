@@ -71,9 +71,29 @@
  * se informa como valor medido con ventana WARN.
  * ------------------------------------------------------------------------- */
 
-/* Riel del ADC. El criterio de saturacion del banco es |V| >= 2,3 V como
- * margen frente a los rieles de +-2,5 V (ver AnalisisCircuito/README.md). */
-static const int32_t TH_RAIL_UV = 2300000;
+/* LA VENTANA DONDE LA LECTURA ES UNA MEDIDA DEL TAP, en uV del banco.
+ *
+ * Esto era `|V| >= 2,3 V`, pensado como margen frente a los rieles de +-2,5 V
+ * del ADC. El razonamiento tenia sentido para la ENTRADA del ADC, pero no para
+ * lo que el autotest mide: los taps de esta cadena se sientan entre 0,96 y
+ * 1,12 V del banco, y sus rieles reales estan en 0,748 y 1,1227 V. Un umbral en
+ * 2,3 V nunca se alcanza.
+ *
+ * O sea que D1 -"algun tap esta contra un riel"- NO PODIA FALLAR NUNCA. Daba
+ * PASS con la cadena entera saturada, que es exactamente el estado que tiene que
+ * detectar. Encontrado el 2026-09-06 auditando la coherencia de la
+ * documentacion contra lo medido.
+ *
+ * Los limites salen de la recta banco->real verificada con tester en sus dos
+ * anclas, 0 V contra masa y Vdda (ver escala_banco.py y MEDICIONES §13):
+ *
+ *     0 V   -> 880,4 mV de banco
+ *     Vdda  -> 1122,7 mV de banco
+ *
+ * El margen de 25 mV deja afuera los bordes, donde la etapa ya no transmite
+ * aunque la lectura todavia signifique algo. */
+static const int32_t TH_VENTANA_MIN_UV = 880400 + 25000;
+static const int32_t TH_VENTANA_MAX_UV = 1122700 - 25000;
 
 /* Escalon del barrido de IDAC para la matriz D2, en codigos. 20 LSB a
  * 3,75 mV/LSB son 75 mV en la referencia. Chico a proposito: el sumador
@@ -581,7 +601,13 @@ static bool stEsperarIdle(uint32_t timeoutMs)
     return false;
 }
 
-static bool isSaturated(int32_t uv) { return (uv >= TH_RAIL_UV) || (uv <= -TH_RAIL_UV); }
+/* Saturado = fuera de la ventana observable. Ojo con el nombre: por debajo de
+ * la ventana el ADC no esta saturado -30 % de su rango- pero la lectura no mide
+ * el tap igual, asi que a los efectos del autotest es lo mismo: no se puede
+ * confiar en ese numero. */
+static bool isSaturated(int32_t uv) {
+    return (uv <= TH_VENTANA_MIN_UV) || (uv >= TH_VENTANA_MAX_UV);
+}
 
 /* Cambia el rango del ADC y CONFIRMA con el ACK del PSoC.
  *
