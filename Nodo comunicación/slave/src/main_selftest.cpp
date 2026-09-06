@@ -2407,18 +2407,20 @@ static void handleCmd(const char *cmd)
          * etapas por (2 tau de entrada + hasta 5 pasos de 1 tau) = 412 s
          * nominales, y mas si tau sube por temperatura. Los 420 s de antes
          * quedaron cortos apenas el lazo empezo a esperar de verdad entre pasos
-         * -sin esa espera medía el pasado y se iba al riel, 2026-09-05-. Con
-         * tau = 30 s no hay forma de calibrar esto en menos de varios minutos:
-         * es lo que pide la fisica, no una ineficiencia. 900 s deja margen. */
+         * -sin esa espera medía el pasado y se iba al riel, 2026-09-05-. Y la
+         * secuencia que hace falta es LP-ADDER-LP, o sea dos pasadas, porque el
+         * ADDER no puede rescatar a un LP saturado: son ~950 s nominales. Con
+         * tau = 30 s no hay forma de calibrar esto en minutos: es lo que pide la
+         * fisica, no una ineficiencia. 1500 s deja margen. */
         g_evCalDone = false; g_evCalOk = 0;
         uint32_t t0 = millis();
         psoc.calibrate();
-        while (!g_evCalDone && (millis() - t0) < 900000UL) { psoc.poll(); delay(2); }
+        while (!g_evCalDone && (millis() - t0) < 1500000UL) { psoc.poll(); delay(2); }
         uint32_t ms = millis() - t0;
         Serial.printf("#CAL %d %lu\n", (int)(g_evCalDone ? g_evCalOk : 0),
                       (unsigned long)ms);
         if (!g_evCalDone) {
-            Serial.println(F("[ST] la calibracion no aviso CAL_DONE en 900 s"));
+            Serial.println(F("[ST] la calibracion no aviso CAL_DONE en 1500 s"));
         }
     } else if (!strcmp(cmd, "snapshot") || !strcmp(cmd, "snap")) {
         /* Reporte por etapa del PSoC (0xB8). Es como se mira GEO_LP despues de
