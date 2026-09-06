@@ -2403,20 +2403,22 @@ static void handleCmd(const char *cmd)
      * comandos cierran ese hueco.
      */
     } else if (!strcmp(cmd, "cal")) {
-        /* OJO CON EL PLAZO. Con la espera de planta en 2 tau la calibracion
-         * tarda 4 etapas x 2 x 29,5 s = 236 s solo de espera, mas el lazo. El
-         * plazo de 180 s que usa D8 quedo CORTO al pasar de 1 a 2 tau y habria
-         * dado un falso "no termino". 420 s deja margen incluso si tau sube a
-         * 40 s por temperatura. */
+        /* OJO CON EL PLAZO. Una calibracion honesta de esta cadena son dos
+         * etapas por (2 tau de entrada + hasta 5 pasos de 1 tau) = 412 s
+         * nominales, y mas si tau sube por temperatura. Los 420 s de antes
+         * quedaron cortos apenas el lazo empezo a esperar de verdad entre pasos
+         * -sin esa espera medía el pasado y se iba al riel, 2026-09-05-. Con
+         * tau = 30 s no hay forma de calibrar esto en menos de varios minutos:
+         * es lo que pide la fisica, no una ineficiencia. 900 s deja margen. */
         g_evCalDone = false; g_evCalOk = 0;
         uint32_t t0 = millis();
         psoc.calibrate();
-        while (!g_evCalDone && (millis() - t0) < 420000UL) { psoc.poll(); delay(2); }
+        while (!g_evCalDone && (millis() - t0) < 900000UL) { psoc.poll(); delay(2); }
         uint32_t ms = millis() - t0;
         Serial.printf("#CAL %d %lu\n", (int)(g_evCalDone ? g_evCalOk : 0),
                       (unsigned long)ms);
         if (!g_evCalDone) {
-            Serial.println(F("[ST] la calibracion no aviso CAL_DONE en 420 s"));
+            Serial.println(F("[ST] la calibracion no aviso CAL_DONE en 900 s"));
         }
     } else if (!strcmp(cmd, "snapshot") || !strcmp(cmd, "snap")) {
         /* Reporte por etapa del PSoC (0xB8). Es como se mira GEO_LP despues de
@@ -2436,7 +2438,11 @@ static void handleCmd(const char *cmd)
         /* Ajusta un parametro de calibracion del PSoC SIN REGRABARLO.
          *
          *   calparam tau <segundos>    tau de la planta
-         *   calparam mult <decimas>    espera, en decimas de tau. 20 = 2 tau
+         *   calparam mult <decimas>    espera AL ENTRAR a la etapa, en decimas
+         *                              de tau. 20 = 2 tau
+         *   calparam paso <decimas>    espera DESPUES DE CADA PASO del lazo.
+         *                              10 = 1 tau. Es la que faltaba y sin ella
+         *                              el lazo se va al riel.
          *
          * tau viaja en unidades de 250 ms porque el frame lleva solo dos bytes
          * y tiene que entrar en uno. La respuesta trae el valor QUE QUEDO, no
@@ -2463,8 +2469,16 @@ static void handleCmd(const char *cmd)
                 } else {
                     byte = (uint8_t)lroundf(val);
                 }
+            } else if (!strcmp(que, "paso")) {
+                id = 3u;
+                if (val > 100.0f) {
+                    Serial.println(F("[ST] la espera por paso no puede pasar de 100 (10 tau)"));
+                    id = 0xFEu;
+                } else {
+                    byte = (uint8_t)lroundf(val);
+                }
             }
-            if (id <= 1u) {
+            if (id <= 3u && id != 2u) {
                 psoc.calParam(id, byte);
                 stPump(600);
                 Serial.printf("#CALPARAM %s %u\n", que, (unsigned)byte);
