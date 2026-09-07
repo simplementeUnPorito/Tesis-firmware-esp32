@@ -1373,13 +1373,24 @@ static bool groupC()
  * ========================================================================== */
 
 /* Pendientes medidas en D2, en uV por codigo de IDAC. Filas = etapa que se
- * mueve, columnas = tap donde se mide. */
-static float g_slope[4][4];
-static bool  g_slopeOk[4][4];
+ * mueve, columnas = tap de señal donde se mide. GEO tiene cuatro actuadores y
+ * cinco taps desde que se agregó OPA_SUMo antes de PGAout. */
+static const uint8_t ST_MAX_STAGES = 4u;
+static const uint8_t ST_MAX_SIGNAL_TAPS = 5u;
+static const uint8_t ST_MAX_AMUX_CHANNELS = 6u;
+static float g_slope[ST_MAX_STAGES][ST_MAX_SIGNAL_TAPS];
+static bool  g_slopeOk[ST_MAX_STAGES][ST_MAX_SIGNAL_TAPS];
 /* Un extremo del barrido contra el riel comprime la pendiente. Se marca aparte
  * porque D4 (cociente de ganancia) tiene que negarse a dar un veredicto en vez
  * de informar un cociente que en realidad es basura. */
-static bool  g_slopeSat[4][4];
+static bool  g_slopeSat[ST_MAX_STAGES][ST_MAX_SIGNAL_TAPS];
+
+/* Canal propio de cada actuador. En informes viejos de cuatro taps LP era
+ * ch3; en el mapa nuevo ch3 es SUMo y LPo pasó a ch4. */
+static uint8_t d2OwnTap(uint8_t stage, uint8_t nTaps)
+{
+    return (nTaps >= 5u && stage == 3u) ? 4u : stage;
+}
 
 /* Barre una etapa y mide todos los taps. Devuelve false si no se pudo. */
 static bool d2SweepStage(uint8_t stage, uint8_t nTaps, int stepCodes)
@@ -1391,7 +1402,8 @@ static bool d2SweepStage(uint8_t stage, uint8_t nTaps, int stepCodes)
      * el 128 de la epoca del VDAC sin signo. */
     stRxClear();
     psoc.stReport(ST_REP_CAL);
-    stAwait(nTaps, 2500);
+    stAwait((g_psocStages > 0u && g_psocStages <= ST_MAX_STAGES)
+            ? g_psocStages : ST_MAX_STAGES, 2500);
     const PsocSelfTestResult *cur = stFind((uint8_t)(ST_ID_CAL_BASE | stage));
     base = cur ? (int16_t)cur->v0 : 0;
 
@@ -1406,8 +1418,8 @@ static bool d2SweepStage(uint8_t stage, uint8_t nTaps, int stepCodes)
     int span = hi - lo;
     if (span < TH_D2_MIN_STEP) { return false; }
 
-    int32_t vlo[4], vhi[4], pp;
-    bool okLo[4], okHi[4];
+    int32_t vlo[ST_MAX_SIGNAL_TAPS], vhi[ST_MAX_SIGNAL_TAPS], pp;
+    bool okLo[ST_MAX_SIGNAL_TAPS], okHi[ST_MAX_SIGNAL_TAPS];
 
     if (!stSetIdac(stage, (int16_t)lo)) { (void)stSetIdac(stage, base); return false; }
     for (uint8_t ch = 0; ch < nTaps; ch++) {
@@ -1451,7 +1463,14 @@ static bool d2SweepStage(uint8_t stage, uint8_t nTaps, int stepCodes)
 
 static void groupD()
 {
-    uint8_t nTaps = (g_psocStages > 0 && g_psocStages <= 4) ? g_psocStages : 4;
+    uint8_t nStages = (g_psocStages > 0 && g_psocStages <= ST_MAX_STAGES)
+                    ? g_psocStages : ST_MAX_STAGES;
+    /* El último canal es AMuxCapacitor. Esto conserva compatibilidad con el
+     * firmware viejo (5 canales -> 4 señales) y habilita el nuevo
+     * (6 canales -> 5 señales). */
+    uint8_t nTaps = (g_amuxChannels > nStages &&
+                     g_amuxChannels <= ST_MAX_AMUX_CHANNELS)
+                  ? (uint8_t)(g_amuxChannels - 1u) : nStages;
 
     /* D1 — reposo de las referencias. */
     {
@@ -1500,26 +1519,27 @@ static void groupD()
      * tolerancias: una etapa mueve los taps de aguas abajo y no los de aguas
      * arriba. Eso localiza la falla en una etapa concreta sin pedirle
      * precision a nada. */
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
+    for (uint8_t i = 0u; i < ST_MAX_STAGES; i++) {
+        for (uint8_t j = 0u; j < ST_MAX_SIGNAL_TAPS; j++) {
             g_slope[i][j] = 0.0f; g_slopeOk[i][j] = false; g_slopeSat[i][j] = false;
         }
     }
     int sweeps = 0;
-    for (uint8_t k = 0; k < nTaps; k++) {
+    for (uint8_t k = 0; k < nStages; k++) {
         Serial.printf("    D2: barriendo etapa %u de %u...\n",
-                      (unsigned)(k + 1u), (unsigned)nTaps);
+                      (unsigned)(k + 1u), (unsigned)nStages);
         if (d2SweepStage(k, nTaps, TH_D2_STEP_CODES)) { sweeps++; }
     }
 
     {
         int badFwd = 0, badIso = 0;
         char worst[64]; worst[0] = '\0';
-        for (uint8_t k = 0; k < nTaps; k++) {
-            float diag = fabsf(g_slope[k][k]);
+        for (uint8_t k = 0; k < nStages; k++) {
+            uint8_t own = d2OwnTap(k, nTaps);
+            float diag = fabsf(g_slope[k][own]);
             /* Propagacion hacia adelante: la etapa tiene que mover su propio
              * tap. Si no lo mueve, esa etapa esta muerta. */
-            if (!g_slopeOk[k][k] || diag < (float)TH_D2_MIN_SLOPE_UV_PER_CODE) {
+            if (!g_slopeOk[k][own] || diag < (float)TH_D2_MIN_SLOPE_UV_PER_CODE) {
                 badFwd++;
                 if (worst[0] == '\0') {
                     snprintf(worst, sizeof(worst), "etapa %u no mueve su tap (%.0f uV/cod)",
@@ -1527,7 +1547,7 @@ static void groupD()
                 }
             }
             /* Aislamiento hacia atras. */
-            for (uint8_t m = 0; m < k; m++) {
+            for (uint8_t m = 0; m < own; m++) {
                 if (g_slopeOk[k][m] && diag > 0.0f &&
                     fabsf(g_slope[k][m]) > TH_D2_ISOLATION_RATIO * diag) {
                     badIso++;
@@ -1545,17 +1565,17 @@ static void groupD()
         if (worst[0] != '\0') {
             stReportItem("D2", "Matriz DC IDAC->etapa", v,
                          "%d/%u barridos, %d etapa(s) sin respuesta, %d fuga(s): %s",
-                         sweeps, (unsigned)nTaps, badFwd, badIso, worst);
+                          sweeps, (unsigned)nStages, badFwd, badIso, worst);
         } else {
             stReportItem("D2", "Matriz DC IDAC->etapa", v,
                          "%d/%u barridos, triangular superior OK, aislamiento < %.0f%%",
-                         sweeps, (unsigned)nTaps,
+                          sweeps, (unsigned)nStages,
                          (double)(TH_D2_ISOLATION_RATIO * 100.0f));
         }
 
         /* Las pendientes crudas se imprimen siempre: son el dato que sirve
          * para diagnosticar, mas alla del veredicto. */
-        for (uint8_t k = 0; k < nTaps; k++) {
+        for (uint8_t k = 0; k < nStages; k++) {
             char row[96]; row[0] = '\0';
             for (uint8_t m = 0; m < nTaps; m++) {
                 char one[24];
@@ -1705,10 +1725,10 @@ static void groupD()
     } else {
         stRxClear();
         psoc.stReport(ST_REP_CAL);
-        stAwait(nTaps, 3000);
+        stAwait(nStages, 3000);
         int railed = 0, failed = 0;
         char det[96]; det[0] = '\0';
-        for (uint8_t k = 0; k < nTaps; k++) {
+        for (uint8_t k = 0; k < nStages; k++) {
             const PsocSelfTestResult *r = stFind((uint8_t)(ST_ID_CAL_BASE | k));
             if (!r) { failed++; continue; }
             if (r->status != ST_OK) { failed++; }
@@ -1759,7 +1779,7 @@ static void groupD()
     {
         int32_t uv[5]; int got = 0; bool clipped = false;
         uint8_t ch = (uint8_t)(nTaps - 1);
-        uint8_t stage = (uint8_t)(nTaps - 1);
+        uint8_t stage = (uint8_t)(nStages - 1);
 
         /* D8 deja el tap EN EL NULO (target = 0 counts). Comparar cuatro
          * medidas de ~0 uV no valida nada: cualquier escalado, correcto o no,
@@ -1768,7 +1788,7 @@ static void groupD()
          * config 2 (+-0,512 V) no recorte. */
         stRxClear();
         psoc.stReport(ST_REP_CAL);
-        stAwait(nTaps, 2500);
+        stAwait(nStages, 2500);
         const PsocSelfTestResult *cal = stFind((uint8_t)(ST_ID_CAL_BASE | stage));
         int16_t baseCode = cal ? (int16_t)cal->v0 : 0;
         int offCode = (int)baseCode + 40;
@@ -2310,7 +2330,7 @@ static void handleCmd(const char *cmd)
         if (got >= 1 && cfg >= 1 && cfg <= 4) {
             bool ok = stSetAdcConfig((uint8_t)cfg);
             stPump(300);
-            if (ok && got >= 2 && ch >= 0 && ch <= 4) {
+            if (ok && got >= 2 && ch >= 0 && ch < (int)ST_MAX_AMUX_CHANNELS) {
                 int32_t media = 0, pp = 0;
                 bool okm = stMeasDc((uint8_t)ch, SEL_SETTLE_DC, media, pp);
                 Serial.printf("#ADC %d %d %ld %ld %d\n", cfg, ch,
@@ -2319,30 +2339,30 @@ static void handleCmd(const char *cmd)
                 Serial.printf("#ADC %d -1 0 0 %d\n", cfg, (int)ok);
             }
         } else {
-            Serial.println(F("[ST] uso: adc <cfg 1-4> [canal 0-4]  "
+            Serial.println(F("[ST] uso: adc <cfg 1-4> [canal 0-5]  "
                              "(1=+-2,5V 2=+-0,512V 3=+-1,024V 4=+-0,625V)"));
         }
     } else if (!strncmp(cmd, "dc ", 3)) {
         int ch = -1, sel = (int)SEL_SETTLE_DC;
         int got = sscanf(cmd + 3, "%d %d", &ch, &sel);
-        if (got >= 1 && ch >= 0 && ch <= 4 && sel >= 0 && sel <= 7) {
+        if (got >= 1 && ch >= 0 && ch < (int)ST_MAX_AMUX_CHANNELS && sel >= 0 && sel <= 7) {
             int32_t media = 0, pp = 0;
             bool ok = stMeasDc((uint8_t)ch, (uint8_t)sel, media, pp);
             Serial.printf("#DC %d %d %ld %ld %d\n", ch, sel,
                           (long)media, (long)pp, (int)ok);
         } else {
-            Serial.println(F("[ST] uso: dc <canal 0-4> [asentamiento 0-7]"));
+            Serial.println(F("[ST] uso: dc <canal 0-5> [asentamiento 0-7]"));
         }
     } else if (!strncmp(cmd, "ac ", 3)) {
         int ch = -1, sel = (int)SEL_N_NOISE;
         int got = sscanf(cmd + 3, "%d %d", &ch, &sel);
-        if (got >= 1 && ch >= 0 && ch <= 4 && sel >= 0 && sel <= 7) {
+        if (got >= 1 && ch >= 0 && ch < (int)ST_MAX_AMUX_CHANNELS && sel >= 0 && sel <= 7) {
             int32_t media = 0, rms = 0, pp = 0, hz50 = 0;
             bool ok = stMeasAcOnce((uint8_t)ch, (uint8_t)sel, media, rms, pp, hz50);
             Serial.printf("#AC %d %d %ld %ld %ld %ld %d\n", ch, sel,
                           (long)media, (long)rms, (long)pp, (long)hz50, (int)ok);
         } else {
-            Serial.println(F("[ST] uso: ac <canal 0-4> [n 0-7]"));
+            Serial.println(F("[ST] uso: ac <canal 0-5> [n 0-7]"));
         }
     } else if (!strncmp(cmd, "mon ", 4)) {
         /* Osciloscopio lento: una medida DC por vuelta. No es una captura a
@@ -2350,7 +2370,7 @@ static void handleCmd(const char *cmd)
          * IDAC o una ganancia. Corta con cualquier tecla. */
         int ch = -1, periodo = 200, n = 200;
         int got = sscanf(cmd + 4, "%d %d %d", &ch, &periodo, &n);
-        if (got >= 1 && ch >= 0 && ch <= 4) {
+        if (got >= 1 && ch >= 0 && ch < (int)ST_MAX_AMUX_CHANNELS) {
             if (periodo < 0)          { periodo = 0; }
             if (n <= 0 || n > 100000) { n = 200; }
             Serial.printf("#MONSTART %d %d %d\n", ch, periodo, n);
@@ -2367,7 +2387,7 @@ static void handleCmd(const char *cmd)
             }
             Serial.printf("#MONEND %d\n", i);
         } else {
-            Serial.println(F("[ST] uso: mon <canal 0-4> [ms] [n]  (corta con una tecla)"));
+            Serial.println(F("[ST] uso: mon <canal 0-5> [ms] [n]  (corta con una tecla)"));
         }
     } else if (!strncmp(cmd, "sweep ", 6)) {
         /* Barrido de un IDAC midiendo uno o todos los taps: es la matriz D2
@@ -2376,9 +2396,15 @@ static void handleCmd(const char *cmd)
         int etapa = -1, lo = 0, hi = 255, paso = 16, ch = -1;
         int got = sscanf(cmd + 6, "%d %d %d %d %d", &etapa, &lo, &hi, &paso, &ch);
         if (got >= 4 && etapa >= 0 && etapa <= 3 && paso > 0 &&
-            lo >= -255 && hi <= 255 && lo <= hi && ch >= -1 && ch <= 4) {
+            lo >= -255 && hi <= 255 && lo <= hi && ch >= -1 &&
+            ch < (int)ST_MAX_AMUX_CHANNELS) {
             uint8_t chLo = (ch < 0) ? 0u : (uint8_t)ch;
-            uint8_t chHi = (ch < 0) ? 3u : (uint8_t)ch;
+            uint8_t chHi = (ch < 0)
+                         ? ((g_amuxChannels >= 2u &&
+                             g_amuxChannels <= ST_MAX_AMUX_CHANNELS)
+                            ? (uint8_t)(g_amuxChannels - 2u)
+                            : (uint8_t)(ST_MAX_SIGNAL_TAPS - 1u))
+                         : (uint8_t)ch;
             Serial.printf("#SWEEPSTART %d %d %d %d %d\n", etapa, lo, hi, paso, ch);
             int code = lo;
             bool corto = false;
@@ -2454,11 +2480,14 @@ static void handleCmd(const char *cmd)
         psoc.adcSnapshot();
         stPump(1500);
     } else if (!strcmp(cmd, "taps")) {
-        /* Los cuatro taps de una. Existe porque medirlos con cuatro `dc`
+        /* Todos los taps de señal. Existe porque medirlos con varios `dc`
          * separados desde la PC paga cuatro viajes de ida y vuelta, y sobre
          * todo porque entre uno y otro la planta sigue moviendose: para
          * comparar taps entre si conviene que esten lo mas juntos posible. */
-        for (uint8_t ch = 0; ch < 4; ch++) {
+        uint8_t n = (g_amuxChannels >= 2u &&
+                     g_amuxChannels <= ST_MAX_AMUX_CHANNELS)
+                  ? (uint8_t)(g_amuxChannels - 1u) : ST_MAX_SIGNAL_TAPS;
+        for (uint8_t ch = 0; ch < n; ch++) {
             psoc.stMeasDc(3u, ch);
             stPump(700);
         }
@@ -2564,7 +2593,7 @@ static void handleCmd(const char *cmd)
         Serial.println(F("[ST] -- calibracion y validacion --"));
         Serial.println(F("[ST] cal       corre la autocalibracion y espera el veredicto"));
         Serial.println(F("[ST] snapshot  reporte del PSoC por etapa (asi se mira GEO_LP)"));
-        Serial.println(F("[ST] taps      los cuatro taps de una"));
+        Serial.println(F("[ST] taps      todos los taps de señal de una"));
         Serial.println(F("[ST] quien|id  quien es esta placa: firmware, MAC y si hay PSoC"));
         Serial.println(F("[ST] calparam tau <s> | calparam mult <decimas>  ajusta sin regrabar"));
     } else if (cmd[0] != '\0') {
