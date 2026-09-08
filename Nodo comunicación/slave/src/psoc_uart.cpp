@@ -294,6 +294,8 @@ void PsocUART::setPga(uint8_t code)    { _sendCmd1(PSOC_CMD_PGA, code); }
 void PsocUART::setPgaout(uint8_t code) { _sendCmd1(PSOC_CMD_PGAOUT, code); }
 void PsocUART::setPgavdac(uint8_t code){ _sendCmd1(PSOC_CMD_PGAVDAC, code); }
 void PsocUART::calibrate()             { _sendCmd1(PSOC_CMD_CALIBRATE, 1); }
+void PsocUART::acceptExternalCalibration()
+    { _sendCmd1(PSOC_CMD_ACCEPT_EXTERNAL_CAL, PSOC_ACCEPT_EXTERNAL_CAL_MAGIC); }
 void PsocUART::saveEeprom()            { _sendCmd1(PSOC_CMD_SAVE_EEPROM, 0); }
 void PsocUART::selectStream(uint8_t m) { _sendCmd1(PSOC_CMD_SELECT_STREAM, m); }
 void PsocUART::setAdcConfig(uint8_t c) { _sendCmd1(PSOC_CMD_ADC_CONFIG, c); }

@@ -537,6 +537,42 @@ static bool stSetIdac(uint8_t stage, int16_t code)
     return false;
 }
 
+/* Habilita y ejecuta el guardado de un resultado verificado por el controlador
+ * externo. Son dos ACK independientes: si falta cualquiera, EEPROM no se
+ * informa como guardada. El comando de aceptación lleva una clave para que un
+ * byte suelto no convierta ajustes manuales en calibración válida. */
+static bool stCommitExternalCalibration(bool &accepted, bool &saved)
+{
+    uint8_t cmd, value;
+    accepted = false;
+    saved = false;
+    while (psoc.takeConfigAck(cmd, value)) { }
+    psoc.acceptExternalCalibration();
+    uint32_t t0 = millis();
+    while ((millis() - t0) < 2000u) {
+        psoc.poll();
+        if (psoc.takeConfigAck(cmd, value) &&
+            cmd == PSOC_CMD_ACCEPT_EXTERNAL_CAL) {
+            accepted = (value == 1u);
+            break;
+        }
+        delay(1);
+    }
+    if (!accepted) { return false; }
+
+    psoc.saveEeprom();
+    t0 = millis();
+    while ((millis() - t0) < 4000u) {
+        psoc.poll();
+        if (psoc.takeConfigAck(cmd, value) && cmd == PSOC_CMD_SAVE_EEPROM) {
+            saved = (value == 1u);
+            break;
+        }
+        delay(1);
+    }
+    return accepted && saved;
+}
+
 /* Una medicion AC de un tap: media, RMS, pico a pico y componente de 50 Hz.
  *
  * El autotest la usaba solo adentro de D6. Los comandos de laboratorio la
@@ -2454,6 +2490,10 @@ static void handleCmd(const char *cmd)
      * calibracion se sostenga?"- no se podia contestar desde el banco. Estos
      * comandos cierran ese hueco.
      */
+    } else if (!strcmp(cmd, "savecal")) {
+        bool accepted = false, saved = false;
+        (void)stCommitExternalCalibration(accepted, saved);
+        Serial.printf("#SAVECAL %d %d\n", (int)accepted, (int)saved);
     } else if (!strcmp(cmd, "cal")) {
         /* OJO CON EL PLAZO. Una calibracion honesta de esta cadena son dos
          * etapas por (2 tau de entrada + hasta 5 pasos de 1 tau) = 412 s
@@ -2592,6 +2632,7 @@ static void handleCmd(const char *cmd)
         Serial.println(F("[ST] pga C / pgaout C   ganancias (codigo 0-8)"));
         Serial.println(F("[ST] -- calibracion y validacion --"));
         Serial.println(F("[ST] cal       corre la autocalibracion y espera el veredicto"));
+        Serial.println(F("[ST] savecal   acepta resultado externo verificado y guarda EEPROM"));
         Serial.println(F("[ST] snapshot  reporte del PSoC por etapa (asi se mira GEO_LP)"));
         Serial.println(F("[ST] taps      todos los taps de señal de una"));
         Serial.println(F("[ST] quien|id  quien es esta placa: firmware, MAC y si hay PSoC"));

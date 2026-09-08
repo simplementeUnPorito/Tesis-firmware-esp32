@@ -137,6 +137,8 @@
 #define PSOC_CMD_STATUS    0xA5
 #define PSOC_CMD_SETN      0xA3
 #define PSOC_CMD_PRESTART  0xB1
+#define PSOC_CMD_ACCEPT_EXTERNAL_CAL 0xB0
+#define PSOC_ACCEPT_EXTERNAL_CAL_MAGIC 0xC7
 #define PSOC_CMD_DEBUG     0xB3
 #define PSOC_CMD_START_NOW 0xB4
 #define PSOC_CMD_CALIBRATE    0xB5
@@ -318,6 +320,7 @@ public:
      * estaba fuera de rango. */
     void calParam(uint8_t id, uint8_t valor) { _sendCmd2(PSOC_CMD_CAL_PARAM, id, valor); }
     void calibrate();
+    void acceptExternalCalibration();
     void saveEeprom();
     void selectStream(uint8_t mode);
     void setAdcConfig(uint8_t cfg);
