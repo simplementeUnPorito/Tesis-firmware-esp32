@@ -248,7 +248,7 @@ static volatile bool     g_psoc_arm_ready = false;
 /* Watchdog de HOT_WAIT: si el PSoC no confirma ARMED se reintenta preStart y,
  * si sigue mudo, se aborta con NACK en vez de quedar colgado hasta un power
  * cycle (bug de campo 2026-07-11: "START funciona una vez y nunca más"). */
-#define HOTWAIT_READY_TIMEOUT_MS 700u
+#define HOTWAIT_READY_TIMEOUT_MS 2000u
 #define HOTWAIT_REARM_MAX 2u
 #define HOTWAIT_ABORT_MS 5000u
 #define HOTWAIT_ARMED_ABORT_MS 300000u
@@ -1696,11 +1696,13 @@ static void requestCaptureFromUsb(uint16_t n)
      * ACK ARMED, no de pérdida de frames UART. El path real maestro->esclavo no
      * sufre esto porque PRESTART y START llegan separados por radio. */
     if (g_state == HOT_WAIT) {
-        uint32_t deadline = millis() + 800u;   /* margen holgado para el ACK ARMED */
-        while (!storeReadyForHotWait() && (int32_t)(millis() - deadline) < 0) {
+        const uint32_t waitStart = millis();
+        while (g_state == HOT_WAIT && !storeReadyForHotWait() &&
+               (uint32_t)(millis() - waitStart) < HOTWAIT_ABORT_MS) {
             psoc.poll();
             servicePsocConfigAck();
             serviceHotWaitWatchdog();   /* re-arma preStart si ARMED no llega */
+            delay(1);
         }
     }
     requestUsbStartFromHotWait();
