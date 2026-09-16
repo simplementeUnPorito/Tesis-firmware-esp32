@@ -273,6 +273,14 @@ typedef void (*SelfTestCallback)(const PsocSelfTestResult &result);
 
 class PsocUART {
 public:
+    /* Runtime calibration protocol, available in field and test builds.
+     * Metadata keys/units documented in PSoC control_config.h. */
+    bool controlCommand(uint8_t opcode, uint8_t p1=0, uint8_t p2=0);
+    bool controlSet(uint8_t parameter, int32_t value);
+    bool controlUsb(const char *line);
+    int32_t controlMetadata(uint16_t key, bool capture=false) const
+        { return key<512 ? (capture?_controlCapture[key]:_controlLive[key]) : 0; }
+    bool controlCaptureValid() const { return _controlCaptureValid; }
     void begin(BatchCallback cb = nullptr, HardwareSerial *serial = nullptr);
     void onDiag(DiagCallback cb);
     void onSelfTest(SelfTestCallback cb);
@@ -357,6 +365,10 @@ public:
     uint32_t i2cOverruns() const { return _i2cOverruns; }
 
 private:
+    int32_t _controlLive[512] = {};
+    int32_t _controlCapture[512] = {};
+    bool _controlCaptureValid=false;
+    void _parseControlMetadata();
     HardwareSerial *_ser       = nullptr;
     BatchCallback   _cb        = nullptr;
     DiagCallback    _diagCb    = nullptr;

@@ -2243,6 +2243,7 @@ static void runAutotest()
 /* ── Consola USB ─────────────────────────────────────────────────────────── */
 static void handleCmd(const char *cmd)
 {
+    if(psoc.controlUsb(cmd))return;
     if (!strcmp(cmd, "run") || !strcmp(cmd, "test")) {
         runAutotest();
     } else if (!strcmp(cmd, "a")) {

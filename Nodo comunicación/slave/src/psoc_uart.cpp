@@ -169,6 +169,8 @@ void PsocUART::poll()
                 continue;   /* frame corto: [AB][C4][event][val][state][crc] */
             } else if (_buf[1] == PSOC_CTRL_ST_RESULT) {
                 continue;   /* autotest: [AB][C5][id][st][v0 x4][v1 x4][crc] */
+            } else if (_buf[1] == 0xC6) {
+                continue;
             } else {
                 _badLen++;
             }
@@ -195,6 +197,9 @@ void PsocUART::poll()
             _parseSelfTestResult();
             continue;
         }
+        if (_idx >= 11 && _buf[1] == 0xC6) {
+            _idx=0;_parseControlMetadata();continue;
+        }
         if (_idx >= PSOC_FRAME_BYTES) {
             _idx = 0;
             _parseFrame();
@@ -202,6 +207,57 @@ void PsocUART::poll()
     }
 }
 
+void PsocUART::_parseControlMetadata()
+{
+    uint8_t crc=0;
+    for(unsigned i=2;i<10;++i)crc^=_buf[i];
+    if(crc!=_buf[10] || _buf[2]!=1){++_badLen;return;}
+    uint16_t key=(uint16_t)_buf[4]|((uint16_t)_buf[5]<<8);
+    int32_t value=(int32_t)((uint32_t)_buf[6]|((uint32_t)_buf[7]<<8)|((uint32_t)_buf[8]<<16)|((uint32_t)_buf[9]<<24));
+    if(key>=512){++_badLen;return;}
+    bool capture=_buf[3]!=0;
+    if(capture && key==0x100)_controlCaptureValid=false;
+    (capture?_controlCapture:_controlLive)[key]=value;
+    if(capture && key==0x1ff)_controlCaptureValid=true;
+    Serial.printf("#CTL %u %u %ld\n",capture?1:0,(unsigned)key,(long)value);
+    if(key==0x102)Serial.printf("[CAL] %s\n",value?"ESTOY_EN_BANDA":"SALI_DE_BANDA");
+}
+bool PsocUART::controlCommand(uint8_t opcode,uint8_t p1,uint8_t p2)
+{
+    if(opcode<0xD0||opcode>0xD7)return false;
+    uint8_t cmd,val;
+    while(takeConfigAck(cmd,val)){}
+    _sendCmd2(opcode,p1,p2);
+    uint32_t start=millis();
+    while(millis()-start<2000) {
+        poll();
+        if(takeConfigAck(cmd,val)&&cmd==opcode)return val==1;
+        delay(1);
+    }
+    return false;
+}
+bool PsocUART::controlSet(uint8_t parameter,int32_t value)
+{
+    if(!controlCommand(0xD0,parameter))return false;
+    for(unsigned i=0;i<4;++i)
+        if(!controlCommand((uint8_t)(0xD1+i),(uint8_t)((uint32_t)value>>(8*i))))return false;
+    return controlCommand(0xD5);
+}
+bool PsocUART::controlUsb(const char *line)
+{
+    if(strncmp(line,"ctl ",4))return false;
+    unsigned id;long value;bool ok=false;
+    if(sscanf(line+4,"set %u %ld",&id,&value)==2 && id<256)ok=controlSet((uint8_t)id,(int32_t)value);
+    else if(sscanf(line+4,"get %u",&id)==1 && id<256)ok=controlCommand(0xD7,(uint8_t)id);
+    else if(sscanf(line+4,"channel %u",&id)==1 && id<5)
+        ok=controlSet(25,(int32_t)id)&&controlCommand(0xD6,1);
+    else {
+        const char *names[]={"apply","save","defaults","learn","pause","resume","report"};
+        for(unsigned i=0;i<7;++i)if(!strcmp(line+4,names[i]))ok=controlCommand(0xD6,(uint8_t)(i+1));
+    }
+    Serial.printf("#CTL_ACK %u %s\n",ok?1:0,line);
+    return true;
+}
 void PsocUART::_parseFrame()
 {
     uint8_t crc = 0;

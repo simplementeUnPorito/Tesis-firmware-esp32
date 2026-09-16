@@ -2335,6 +2335,7 @@ static bool requestManualIdacFromUsb(uint8_t stage, int16_t code)
 
 static void handleUsbCommand(const char *cmd)
 {
+    if(psoc.controlUsb(cmd))return;
     uint8_t value = 0u;
     uint16_t value16 = 0u;
     uint16_t value16b = 0u;
