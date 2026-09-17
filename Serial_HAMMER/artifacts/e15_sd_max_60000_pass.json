@@ -1,0 +1,402 @@
+{
+  "batches": 60000,
+  "baud": 115200,
+  "capture": {
+    "elapsed_to_complete_s": 695.235,
+    "fill": 60000,
+    "forbidden_events": [],
+    "sd_session": 1,
+    "setn_ack_value": 255,
+    "sync_elapsed_s": 4.911,
+    "target": 60000
+  },
+  "checks": [
+    {
+      "detail": "",
+      "name": "probe psoc=1",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "status parseable",
+      "passed": true
+    },
+    {
+      "detail": "state=0 fill=0/0",
+      "name": "estado inicial limpio",
+      "passed": true
+    },
+    {
+      "detail": "fs=2604",
+      "name": "Fs nativa",
+      "passed": true
+    },
+    {
+      "detail": "bBad=0 drop=15525 badLen=0",
+      "name": "UART inicial sin lotes malos",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 sub=0xBB val=1",
+      "name": "decim=1 confirmado",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 sub=0xB7 val=0",
+      "name": "stream RAW confirmado",
+      "passed": true
+    },
+    {
+      "detail": "status=0x37",
+      "name": "SD presente y FAT montado",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 sub=0xBD val=1",
+      "name": "self-test FatFs confirmado",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 sub=0xBE val=1",
+      "name": "captura SD habilitada",
+      "passed": true
+    },
+    {
+      "detail": "status=0x7F",
+      "name": "status SD listo para 60000",
+      "passed": true
+    },
+    {
+      "detail": "] SETN ack val=255 pstate=0/IDLE [2539412582][S1] [SLAVE] HOT_WAIT n=60000 ready=0 [2539412675][S1] [USB] pre n=60000 state=2 ready=0 [2539587321][S1] [PSoC] ARMED val=255 pstate=1/ARMED fill=0/60000",
+      "name": "store SD sin clamp",
+      "passed": true
+    },
+    {
+      "detail": "val=255",
+      "name": "SETN max aceptado",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "PSoC IDLE al aceptar SETN",
+      "passed": true
+    },
+    {
+      "detail": "elapsed=0.390s",
+      "name": "PSoC ARMED para 60000",
+      "passed": true
+    },
+    {
+      "detail": "[2539799114][S1] [USB] sync start n=60000 sync=0->1 bytes=233093",
+      "name": "SYNC 0->1 para 60000",
+      "passed": true
+    },
+    {
+      "detail": "elapsed=695.235s",
+      "name": "sesion SD 60000 completa",
+      "passed": true
+    },
+    {
+      "detail": "status=0x77",
+      "name": "sesion COMPLETE recuperable",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 timeouts=0",
+      "name": "sdread extremo 0",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 timeouts=0",
+      "name": "sdread extremo 59999",
+      "passed": true
+    },
+    {
+      "detail": "[3236105000][S1] [USB] sdread ignored: seq=60000 fuera de rango (fill=60000)",
+      "name": "sdread 60000 rechazado localmente",
+      "passed": true
+    },
+    {
+      "detail": "attempts=1 sub=0xBE val=0",
+      "name": "cleanup captura SD deshabilitada",
+      "passed": true
+    },
+    {
+      "detail": "status=0x37",
+      "name": "cleanup GEOLAST preservado con SD capture=off",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "status parseable",
+      "passed": true
+    },
+    {
+      "detail": "SD off state=0 fill=0/0 fs=2604",
+      "name": "cleanup final limpio",
+      "passed": true
+    }
+  ],
+  "cleanup": {
+    "attempted": true,
+    "errors": [],
+    "final_diag": {
+      "b_bad": 0,
+      "bad_len": 0,
+      "drops": 15539,
+      "fill": 0,
+      "fs_hz": 2604,
+      "state": 0,
+      "target": 0
+    },
+    "manual_reset_required": false,
+    "probe_ok": true,
+    "sd_status_after_restore": 55,
+    "sdcap_ack": 0,
+    "sdcap_restored": true,
+    "sync_drops_delta": 14
+  },
+  "cleanup_ok": true,
+  "completed_at_utc": "2026-07-12T17:28:50.832019+00:00",
+  "dtr": false,
+  "error": null,
+  "last_phase": "clean",
+  "persistence": {
+    "canonical_data_bytes": 5400000,
+    "canonical_samples": 1800000,
+    "expected_blocks": 12000,
+    "expected_file_bytes": 6144512,
+    "oor_seq": 60000,
+    "reads": [
+      {
+        "attempts": [
+          {
+            "attempt": 1,
+            "timeouts": 0
+          }
+        ],
+        "seq": 0,
+        "summary": {
+          "dig0": 41201,
+          "dig29": 41983,
+          "flags": 0,
+          "raw0": -24335,
+          "raw29": -23553,
+          "seq": 0,
+          "sum": -718053
+        }
+      },
+      {
+        "attempts": [
+          {
+            "attempt": 1,
+            "timeouts": 0
+          }
+        ],
+        "seq": 59999,
+        "summary": {
+          "dig0": 40325,
+          "dig29": 40403,
+          "flags": 0,
+          "raw0": -25211,
+          "raw29": -25133,
+          "seq": 59999,
+          "sum": -746423
+        }
+      }
+    ],
+    "sd_status_recovered": 119
+  },
+  "port": "COM12",
+  "preflight": {
+    "baseline_diag": {
+      "b_bad": 0,
+      "bad_len": 0,
+      "drops": 15525,
+      "fill": 0,
+      "fs_hz": 2604,
+      "state": 0,
+      "target": 0
+    },
+    "sd_status_before": 55,
+    "sd_status_capture": 127
+  },
+  "rts": false,
+  "schema_version": 1,
+  "serial_log": [
+    {
+      "elapsed_s": 2.236,
+      "line": "[2536896399][S1] [PSoC] boot hw=0/GEO pstate=0/IDLE"
+    },
+    {
+      "elapsed_s": 2.236,
+      "line": "[2536896979][S1] [USB] probe psoc=1"
+    },
+    {
+      "elapsed_s": 2.236,
+      "line": "[2536897075][S1] [SLAVE 1] USB_PROBE bOK=2001 bBad=0 uartBytes=232956 mark=11771 drop=15523 badLen=0 ping=7758 diag=1762 rx=1 edge=951804/1 last=0xE5 age=0 txOK=1302 txFail=0 state=0 fill=0/0 fs=2604"
+    },
+    {
+      "elapsed_s": 2.457,
+      "line": "[2537124814][S1] [USB] stop"
+    },
+    {
+      "elapsed_s": 2.457,
+      "line": "[2537124954][S1] [SLAVE 1] volviendo a WAIT_ARM"
+    },
+    {
+      "elapsed_s": 2.678,
+      "line": "[2537345713][S1] [USB] clear"
+    },
+    {
+      "elapsed_s": 2.678,
+      "line": "[2537345841][S1] [SLAVE 1] volviendo a WAIT_ARM"
+    },
+    {
+      "elapsed_s": 3.204,
+      "line": "[2537858406][S1] [PSoC] boot hw=0/GEO pstate=0/IDLE"
+    },
+    {
+      "elapsed_s": 3.204,
+      "line": "[2537858963][S1] [SLAVE 1] USB_STATUS bOK=2001 bBad=0 uartBytes=232995 mark=11778 drop=15525 badLen=0 ping=7759 diag=1767 rx=1 edge=951984/1 last=0xE5 age=0 txOK=1302 txFail=0 state=0 fill=0/0 fs=2604"
+    },
+    {
+      "elapsed_s": 3.427,
+      "line": "[2538093485][S1] [USB] decim 1 -> PSoC CMD 0xBB"
+    },
+    {
+      "elapsed_s": 3.427,
+      "line": "[2538096061][S1] [SLAVE] PSoC cfg ack sub=0xBB val=1 expected=1 ok=1"
+    },
+    {
+      "elapsed_s": 3.65,
+      "line": "[2538315520][S1] [USB] stream 0 -> PSoC CMD 0xB7"
+    },
+    {
+      "elapsed_s": 3.65,
+      "line": "[2538317426][S1] [SLAVE] PSoC cfg ack unsolicited sub=0xB7 val=0"
+    },
+    {
+      "elapsed_s": 3.926,
+      "line": "[2538591350][S1] [PSoC] SD status=0x37 present=1 type=3 selftest=0"
+    },
+    {
+      "elapsed_s": 3.926,
+      "line": "[2538591652][S1] [SLAVE] PSoC cfg ack unsolicited sub=0xBC val=55"
+    },
+    {
+      "elapsed_s": 4.297,
+      "line": "[2538968314][S1] [SLAVE] PSoC cfg ack unsolicited sub=0xBD val=1"
+    },
+    {
+      "elapsed_s": 4.519,
+      "line": "[2539188200][S1] [PSoC] SD status=0x7F present=1 type=3 selftest=1"
+    },
+    {
+      "elapsed_s": 4.519,
+      "line": "[2539188353][S1] [SLAVE] PSoC cfg ack unsolicited sub=0xBE val=1"
+    },
+    {
+      "elapsed_s": 4.911,
+      "line": "[2539409314][S1] [SLAVE] store PSoC-SD n=60000"
+    },
+    {
+      "elapsed_s": 4.911,
+      "line": "[2539412426][S1] [PSoC] SETN ack val=255 pstate=0/IDLE"
+    },
+    {
+      "elapsed_s": 4.911,
+      "line": "[2539412582][S1] [SLAVE] HOT_WAIT n=60000 ready=0"
+    },
+    {
+      "elapsed_s": 4.911,
+      "line": "[2539412675][S1] [USB] pre n=60000 state=2 ready=0"
+    },
+    {
+      "elapsed_s": 4.911,
+      "line": "[2539587321][S1] [PSoC] ARMED val=255 pstate=1/ARMED fill=0/60000"
+    },
+    {
+      "elapsed_s": 5.124,
+      "line": "[2539799114][S1] [USB] sync start n=60000 sync=0->1 bytes=233093"
+    },
+    {
+      "elapsed_s": 700.145,
+      "line": "[3234941663][S1] [PSoC] SD_SESSION val=0x01"
+    },
+    {
+      "elapsed_s": 700.145,
+      "line": "[3234941971][S1] [PSoC] CAPTURE_DONE val=255 pstate=2/SAMPLING fill=0/60000"
+    },
+    {
+      "elapsed_s": 700.145,
+      "line": "[3234942428][S1] [SLAVE] START SD complete=1 err=0 fill=60000/60000"
+    },
+    {
+      "elapsed_s": 700.731,
+      "line": "[3235384430][S1] [PSoC] SD status=0x77 present=1 type=3 selftest=0"
+    },
+    {
+      "elapsed_s": 700.731,
+      "line": "[3235384767][S1] [SLAVE] PSoC cfg ack unsolicited sub=0xBC val=119"
+    },
+    {
+      "elapsed_s": 700.973,
+      "line": "[3235626959][S1] [USB] SDREAD seq=0 raw[0]=-24335 raw[29]=-23553 sumRaw=-718053 dig[0]=41201 dig[29]=41983 flags[0]=0x00"
+    },
+    {
+      "elapsed_s": 701.228,
+      "line": "[3235883002][S1] [USB] SDREAD seq=59999 raw[0]=-25211 raw[29]=-25133 sumRaw=-746423 dig[0]=40325 dig[29]=40403 flags[0]=0x00"
+    },
+    {
+      "elapsed_s": 701.44,
+      "line": "[3236105000][S1] [USB] sdread ignored: seq=60000 fuera de rango (fill=60000)"
+    },
+    {
+      "elapsed_s": 701.663,
+      "line": "[3236319101][S1] [PSoC] SD status=0x37 present=1 type=3 selftest=0"
+    },
+    {
+      "elapsed_s": 701.663,
+      "line": "[3236319282][S1] [SLAVE] PSoC cfg ack unsolicited sub=0xBE val=0"
+    },
+    {
+      "elapsed_s": 701.874,
+      "line": "[3236539270][S1] [USB] clear"
+    },
+    {
+      "elapsed_s": 701.874,
+      "line": "[3236539443][S1] [SLAVE 1] volviendo a WAIT_ARM"
+    },
+    {
+      "elapsed_s": 702.366,
+      "line": "[3237005416][S1] [PSoC] boot hw=0/GEO pstate=0/IDLE"
+    },
+    {
+      "elapsed_s": 702.366,
+      "line": "[3237006012][S1] [USB] probe psoc=1"
+    },
+    {
+      "elapsed_s": 702.366,
+      "line": "[3237006108][S1] [SLAVE 1] USB_PROBE bOK=2003 bBad=0 uartBytes=234084 mark=11933 drop=15535 badLen=0 ping=7764 diag=1906 rx=1 edge=957005/1 last=0xE5 age=0 txOK=1302 txFail=0 state=0 fill=0/0 fs=2604"
+    },
+    {
+      "elapsed_s": 702.643,
+      "line": "[3237283403][S1] [PSoC] boot hw=0/GEO pstate=0/IDLE"
+    },
+    {
+      "elapsed_s": 702.643,
+      "line": "[3237283971][S1] [SLAVE 1] USB_STATUS bOK=2003 bBad=0 uartBytes=234115 mark=11939 drop=15539 badLen=0 ping=7766 diag=1909 rx=1 edge=957145/1 last=0xE5 age=0 txOK=1302 txFail=0 state=0 fill=0/0 fs=2604"
+    }
+  ],
+  "started_at_utc": "2026-07-12T17:17:08.052249+00:00",
+  "status": "ok",
+  "test": "E15_SD_MAX_60000",
+  "timing": {
+    "capwait_timeout_ms": 695745,
+    "expected_capture_ms": 693745,
+    "external_deadline_s": 760.0,
+    "nominal_sampling_s": 691.2442396313364,
+    "sd_stall_fallback_ms": 738745
+  }
+}

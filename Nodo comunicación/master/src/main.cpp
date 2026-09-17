@@ -248,6 +248,7 @@ struct CachedHello {
     uint16_t sample_rate = 0;
     uint8_t hw_class = SLAVE_HW_UNKNOWN;
     uint8_t sd_present = 0;
+    uint8_t link_model = SLAVE_LINK_UNKNOWN;
     uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
 };
 static CachedHello g_cachedHello[NUM_SLAVES + 1];
@@ -403,7 +404,8 @@ static void sendCachedStateToWeb()
     for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
         const CachedHello &h = g_cachedHello[node];
         if (h.valid) {
-            matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate, h.hw_class, h.sd_present);
+            matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate,
+                                  h.hw_class, h.sd_present, h.link_model);
         }
     }
     MASTER_LOG_PRINTLN("[WEB] cached READY/HELLO replay sent");
@@ -604,11 +606,21 @@ static const char *slaveHwName(uint8_t hwClass)
     }
 }
 
+static const char *slaveLinkName(uint8_t linkModel)
+{
+    switch (linkModel) {
+        case SLAVE_LINK_SERIAL: return "SERIAL";
+        case SLAVE_LINK_I2C:    return "I2C";
+        default:                return "UNKNOWN";
+    }
+}
+
 static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
 {
-    MASTER_LOG_PRINTF("[MASTER] HELLO node=%d psoc=%d fs=%u hw=%u/%s\n",
+    MASTER_LOG_PRINTF("[MASTER] HELLO node=%d psoc=%d fs=%u hw=%u/%s link=%u/%s\n",
                       msg.node_id, msg.psoc_ok, msg.sample_rate,
-                      msg.hw_class, slaveHwName(msg.hw_class));
+                      msg.hw_class, slaveHwName(msg.hw_class),
+                      msg.link_model, slaveLinkName(msg.link_model));
     if (msg.node_id > 0 && msg.node_id <= NUM_SLAVES) {
         CachedHello &h = g_cachedHello[msg.node_id];
         h.valid = true;
@@ -616,10 +628,12 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
         h.sample_rate = msg.sample_rate;
         h.hw_class = msg.hw_class;
         h.sd_present = msg.sd_present;
+        h.link_model = msg.link_model;
         memcpy(h.mac, senderMac, 6);
         if (isUsableUnicastMac(h.mac)) addPeerIfNeeded(h.mac);
     }
-    matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate, msg.hw_class, msg.sd_present);
+    matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate,
+                          msg.hw_class, msg.sd_present, msg.link_model);
 }
 
 static void onStartAck(const MsgStartAck &msg)
@@ -882,13 +896,34 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
         return;
     }
 
+    const CachedHello &hello = g_cachedHello[node_id];
+    const bool serialAnalogModel = hello.valid &&
+        (hello.link_model == SLAVE_LINK_SERIAL ||
+         (hello.link_model == SLAVE_LINK_UNKNOWN && hello.hw_class == SLAVE_HW_HAMMER));
+
+    /* Middleware de capacidades:
+     * - 0xA8 (PGAout) solo existe en la electrónica I2C nueva.
+     * - 0xAA con dos parámetros es IDAC firmado/por etapa (I2C).
+     * - 0xAA con un parámetro conserva el VDAC global de los nodos SERIAL.
+     * Nunca reenviar un IDAC moderno al PSoC serial: interpretaría p1 como
+     * código VDAC y movería una referencia equivocada. */
+    if (serialAnalogModel && sub_cmd == 0xA8u) {
+        matlab.sendAck(node_id, sub_cmd, 0);
+        LOGM("DIRECTED_UNSUPPORTED", "node=%u,link=serial,sub=0x%02X", node_id, sub_cmd);
+        return;
+    }
+
     if (sub_cmd == 0xAAu) {
         const uint8_t stage = (uint8_t)(param & 0x0Fu);
         const bool reservedBitsClear = (param & 0x70u) == 0u;
-        if (!hasParam2 || stage >= 4u || !reservedBitsClear) {
+        const bool validSerialVdac = serialAnalogModel && !hasParam2;
+        const bool validI2cIdac = !serialAnalogModel && hasParam2 &&
+                                  stage < 4u && reservedBitsClear;
+        if (!validSerialVdac && !validI2cIdac) {
             matlab.sendAck(node_id, sub_cmd, 0);
-            LOGM("DIRECTED_BAD_IDAC", "node=%u,p1=%u,p2=%u,has2=%u",
-                 node_id, param, param2, (unsigned)hasParam2);
+            LOGM("DIRECTED_BAD_ANALOG_REF", "node=%u,serial=%u,p1=%u,p2=%u,has2=%u",
+                 node_id, (unsigned)serialAnalogModel, param, param2,
+                 (unsigned)hasParam2);
             return;
         }
     }

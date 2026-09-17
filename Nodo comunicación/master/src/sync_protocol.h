@@ -40,6 +40,14 @@
 #define SLAVE_HW_HAMMER  1u
 #define SLAVE_HW_UNKNOWN 0xFFu
 
+/* Generación del enlace interno PSoC <-> ESP. Es independiente de hw_class:
+ * puede haber GEO o HAMMER tanto SERIAL como I2C. En la placa I2C actual los
+ * comandos bajan por UART y las respuestas/muestras suben por I2C; el nombre
+ * identifica esa generación de placa, no obliga a que ambos sentidos sean I2C. */
+#define SLAVE_LINK_SERIAL  0u
+#define SLAVE_LINK_I2C     1u
+#define SLAVE_LINK_UNKNOWN 0xFFu
+
 /* sub_cmd bajo CMD_SET_CONFIG que NO se reenvía al PSoC — vive 100% en el
  * ESP32 del esclavo (handleSetConfig() lo resuelve local, nunca llega a
  * psoc_uart). 0=deshabilitar SD, 1=habilitar (solo si sd_present=1, ver
@@ -50,6 +58,8 @@
 #define SLAVE_CMD_SET_SD_ENABLE 0xC0u
 
 #define MSG_HELLO_LEGACY_BYTES 5u
+#define MSG_HELLO_HW_BYTES     6u
+#define MSG_HELLO_SD_BYTES     7u
 
 #pragma pack(push, 1)
 
@@ -143,6 +153,8 @@ struct MsgHello {
                             * agregado al final: HELLO viejos (sin este byte) llegan
                             * con menos bytes y espnow_rx.h ya tolera eso (memcpy
                             * parcial sobre un struct zero-init → sd_present=0). */
+    uint8_t  link_model;  /* SLAVE_LINK_*; agregado al final para que maestros y
+                            * esclavos anteriores sigan aceptando el prefijo. */
 };
 
 struct MsgSetRecLen {

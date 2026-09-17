@@ -766,6 +766,11 @@ static void groupA()
     MsgHello hello;
     hello.cmd = CMD_HELLO; hello.node_id = NODE_ID; hello.psoc_ok = 0;
     hello.sample_rate = 0; hello.hw_class = SLAVE_HW_UNKNOWN; hello.sd_present = 0;
+#if PSOC_I2C_ENABLE
+    hello.link_model = SLAVE_LINK_I2C;
+#else
+    hello.link_model = SLAVE_LINK_SERIAL;
+#endif
     esp_err_t e = espnowSend(bc, (const uint8_t *)&hello, sizeof(hello));
     stReportItem("A4", "ESP-NOW (init + peer + TX)",
                  (e == ESP_OK) ? ST_V_PASS : ST_V_FAIL,

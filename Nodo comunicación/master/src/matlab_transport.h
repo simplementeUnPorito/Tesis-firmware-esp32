@@ -71,7 +71,8 @@ public:
     void sendStatus(uint8_t espnow_ok, uint8_t ap_ch);
     /* Diagnóstico: maestro recibió HELLO de un esclavo (incluye estado PSoC + MAC + FS) */
     void sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok = 0, const uint8_t mac[6] = nullptr,
-                        uint16_t fs = 0, uint8_t hw_class = 0xFF, uint8_t sd_present = 0xFF);
+                        uint16_t fs = 0, uint8_t hw_class = 0xFF,
+                        uint8_t sd_present = 0xFF, uint8_t link_model = 0xFF);
 
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
@@ -207,7 +208,8 @@ inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)
 }
 
 inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6],
-                                            uint16_t fs, uint8_t hw_class, uint8_t sd_present)
+                                            uint16_t fs, uint8_t hw_class, uint8_t sd_present,
+                                            uint8_t link_model)
 {
     /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
     uint8_t fs_code = (fs >= 100u) ? (uint8_t)((fs + 50u) / 100u) : 0u;
@@ -235,6 +237,11 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
          * GEO compilados con pines SD), 0=sin SD/sin detectar. */
         uint8_t sdPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x07, sd_present, 0x00 };
         _emit(sdPkt);
+    }
+    if (link_model != 0xFFu) {
+        /* b2=0x08: 0=SERIAL, 1=I2C. Es independiente de GEO/HAMMER. */
+        uint8_t linkPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x08, link_model, 0x00 };
+        _emit(linkPkt);
     }
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */

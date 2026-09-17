@@ -308,8 +308,10 @@ export class SlavePanel extends EventTarget {
     this._lblLastVal = el('div', 'stat-line', 'Last: --');
     this._lblLatency = el('div', 'stat-line', 'Latency: --');
     this._lblPsoc = el('div', 'stat-line', 'PSoC: ?');
+    this._lblModel = el('div', 'stat-line', 'Modelo: ?');
     this._lblVdac = el('div', 'stat-line', 'VDACs: --');
-    for (const l of [this._lblStats, this._lblLastVal, this._lblLatency, this._lblPsoc, this._lblVdac]) {
+    for (const l of [this._lblStats, this._lblLastVal, this._lblLatency,
+                     this._lblPsoc, this._lblModel, this._lblVdac]) {
       stats.appendChild(l);
     }
     root.appendChild(stats);
@@ -390,6 +392,10 @@ export class SlavePanel extends EventTarget {
 
   setMac(mac) {
     this._lblMac.textContent = `MAC: ${mac.toUpperCase()}`;
+  }
+
+  setHardwareModel(hwName, linkName) {
+    this._lblModel.textContent = `Modelo: ${hwName || '?'} · ${linkName || '?'}`;
   }
 
   setConnected(connected) {

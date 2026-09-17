@@ -49,6 +49,8 @@ export class Packet {
   get helloHwClass() { return this.b1; }
   /** sub 0x07: 1=FAT/SD detectada por el PSoC del esclavo GEO, 0=sin SD. */
   get helloSdPresent() { return this.b1; }
+  /** sub 0x08: modelo del enlace interno PSoC<->ESP (0=SERIAL, 1=I2C). */
+  get helloLinkModel() { return this.b1; }
   get helloMacSub() { return this.b2; }
   get helloMacHi() { return this.b1; }
   get helloMacLo() { return this.b0; }

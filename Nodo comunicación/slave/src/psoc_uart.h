@@ -90,6 +90,7 @@
 #define PSOC_CTRL_ACK_BYTES 5
 #define PSOC_CTRL_DIAG_BYTES 6
 #define PSOC_CTRL_ST_RESULT  0xC5
+#define PSOC_CONTROL_METADATA_VERSION 3u
 #define PSOC_ST_RESULT_BYTES 13
 
 /* Comandos del autotest (ESP -> PSoC). Codigos libres en la tabla del PSoC. */

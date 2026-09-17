@@ -2,16 +2,16 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-19';
-import { WsClient } from './ws_client.js?v=field-study-19';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-19';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-19';
-import { PlotArea } from './plot.js?v=field-study-19';
-import { SpectrumArea } from './spectrum.js?v=field-study-19';
-import { SlavePanel } from './slave_panel.js?v=field-study-19';
-import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-19';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-19';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-19';
+import * as cfg from './config.js?v=field-study-20';
+import { WsClient } from './ws_client.js?v=field-study-20';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-20';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-20';
+import { PlotArea } from './plot.js?v=field-study-20';
+import { SpectrumArea } from './spectrum.js?v=field-study-20';
+import { SlavePanel } from './slave_panel.js?v=field-study-20';
+import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-20';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-20';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-20';
 
 const $ = (id) => document.getElementById(id);
 
@@ -440,6 +440,8 @@ function nodeSnapshot(nd, index, options = {}) {
     psoc_ok: nd.psocOk,
     hw_class: nd.hwClass,
     hw_type: slaveHwClassName(nd.hwClass),
+    link_model: nd.linkModel,
+    link_type: slaveLinkModelName(nd.linkModel),
     hammer_offset_m: offsetM,
     offset_m_from_hammer: offsetM,
     position_m: offsetM,
@@ -976,6 +978,27 @@ function slaveHwClassName(hwClass) {
   return 'UNKNOWN';
 }
 
+function slaveLinkModelName(linkModel) {
+  if (linkModel === 0) return 'SERIAL';
+  if (linkModel === 1) return 'I2C';
+  return 'LEGACY/UNKNOWN';
+}
+
+/* Un HELLO anterior a link_model conserva el comportamiento histórico. Al
+ * declarar SERIAL se ocultan IDAC firmado y PGAout, que son de la placa I2C. */
+function nodeHasModernAnalogControls(nd) {
+  return nd.hwClass === 0 && nd.linkModel !== 0;
+}
+
+function applyReportedNodeCapabilities(chIndex) {
+  if (chIndex <= 0 || chIndex >= cfg.MAX_NODES) return;
+  const nd = data.nodes[chIndex];
+  const panel = panelFor(chIndex);
+  if (!panel) return;
+  panel.setPgaoutVisible(nodeHasModernAnalogControls(nd));
+  panel.setHardwareModel(slaveHwClassName(nd.hwClass), slaveLinkModelName(nd.linkModel));
+}
+
 function applyReportedSlaveType(chIndex, hwClass) {
   if (chIndex <= 0 || chIndex >= cfg.MAX_NODES) return;
   if (hwClass !== 0 && hwClass !== 1) return;
@@ -984,8 +1007,7 @@ function applyReportedSlaveType(chIndex, hwClass) {
   const panel = panelFor(chIndex);
   nd.hwClass = hwClass;
 
-  /* PGAout solo existe en el pipeline GEO de la placa nueva. */
-  if (panel) panel.setPgaoutVisible(hwClass === 0);
+  applyReportedNodeCapabilities(chIndex);
 
   if (hwClass === 1) {
     nd.alias = 'Hammer';
@@ -1012,6 +1034,7 @@ function nodeHasPresence(i) {
   return !!nd.mac
     || nd.psocOk !== null
     || nd.hwClass !== 0xFF
+    || nd.linkModel !== 0xFF
     || nd.fsExactKnown
     || nd.rawBuf.length > 0
     || nd.filtBuf.length > 0;
@@ -1949,7 +1972,7 @@ function loadSlavePanelState(chIndex, panel) {
 
   panel.setPga(nd.pgaCode);
   panel.setPgaout(nd.pgaoutCode);
-  panel.setPgaoutVisible(nd.hwClass === 0);
+  applyReportedNodeCapabilities(chIndex);
   panel.setAdcConfig(nd.adcConfigCode);
   panel.setDecimation(nd.decimationFactor);
   nd.hammerOffset = loadSlaveFloat(chIndex, 'hammer_offset_m', 0);
@@ -2390,6 +2413,16 @@ function handleStatus(pkt, idx) {
       if (panel) panel.setSdPresent(present, nd.sdEnabled);
       appendLog(`HELLO slave=${idx} sd_present=${present ? 1 : 0}`);
     }
+    return;
+  }
+
+  if (pkt.helloMacSub === 0x08) {
+    const nd = data.nodes[idx];
+    nd.linkModel = pkt.helloLinkModel;
+    applyReportedNodeCapabilities(idx);
+    updateSlavePanelStats(idx);
+    renderNodeRow(idx);
+    appendLog(`HELLO slave=${idx} enlace=${slaveLinkModelName(nd.linkModel)}`);
     return;
   }
 

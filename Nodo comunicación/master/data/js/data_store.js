@@ -118,6 +118,7 @@ export class NodeData {
     this.psocOk = null;   // null until first HELLO
     this.mac = '';
     this.hwClass = 0xFF;  // 0=GEO, 1=HAMMER, 0xFF=unknown (reported by PSoC)
+    this.linkModel = 0xFF; // 0=SERIAL, 1=I2C, 0xFF=legacy/unknown (reported by ESP)
     this.sdPresent = false; // FAT/SD detectada por el PSoC (solo esclavos GEO, ver plan_2929_decimation_sd.md)
     this.sdEnabled = false; // estado del toggle SD confirmado por ACK (0xC0)
 

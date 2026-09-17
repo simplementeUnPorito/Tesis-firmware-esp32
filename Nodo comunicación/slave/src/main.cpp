@@ -95,7 +95,10 @@
   #define SLAVE_LAB_TOOLS_ENABLE 0
 #endif
 #ifndef PSOC_AUTO_CAL_ON_READY
-  #define PSOC_AUTO_CAL_ON_READY 1
+  /* Learning must only start after the operator confirms that the sensor is
+   * still.  A newly detected PSoC therefore reports NEEDS_LEARNING but never
+   * authorizes calibration on its own. */
+  #define PSOC_AUTO_CAL_ON_READY 0
 #endif
 #ifndef PSOC_AUTO_CAL_DELAY_MS
   #define PSOC_AUTO_CAL_DELAY_MS 500u
@@ -3600,7 +3603,12 @@ void loop()
         MsgHello h = {
             CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected,
             effectivePsocSampleRateHz(), g_psoc_hw_class,
-            psocSdPresent()   /* SD del PSoC, no del ESP32 (sd_storage obsoleto) */
+            psocSdPresent(),  /* SD del PSoC, no del ESP32 (sd_storage obsoleto) */
+#if PSOC_I2C_ENABLE
+            SLAVE_LINK_I2C
+#else
+            SLAVE_LINK_SERIAL
+#endif
         };
         esp_err_t err = sendToMaster((const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX

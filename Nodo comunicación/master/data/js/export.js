@@ -241,6 +241,7 @@ function orderedSlaveIndices(dataStore, limit = cfg.MAX_NODES - 1) {
 function nodeMetadata(nd, index, paths, connected) {
   const type = nd.alias || cfg.NODE_NAMES[index] || `Node ${index}`;
   const hwType = nd.hwClass === 0 ? 'GEO' : (nd.hwClass === 1 ? 'HAMMER' : 'UNKNOWN');
+  const linkType = nd.linkModel === 0 ? 'SERIAL' : (nd.linkModel === 1 ? 'I2C' : 'LEGACY/UNKNOWN');
   const role = roleFromFields(type, hwType, nd.hwClass);
   const pcbId = pcbIdForNode(index, nd.slaveId);
   const offsetM = offsetFromHammer(nd.hammerOffset, role);
@@ -286,6 +287,8 @@ function nodeMetadata(nd, index, paths, connected) {
     psoc_ok: nd.psocOk,
     hw_class: nd.hwClass,
     hw_type: hwType,
+    link_model: nd.linkModel,
+    link_type: linkType,
     hammer_offset_m: offsetM,
     offset_m_from_hammer: offsetM,
     position_m: offsetM,
@@ -798,7 +801,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-19',
+    web_app_version: 'field-study-20',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,

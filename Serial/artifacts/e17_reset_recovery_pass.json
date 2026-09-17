@@ -1,0 +1,180 @@
+{
+  "autocal": {
+    "boot_log_tail": " stage=1/GEO_BP bucket=-2\n[3494236810][S1] [CAL] pi stage=1/GEO_BP stable=13\n[3494334615][S1] [CAL] pi stage=1/GEO_BP error_dac=-5\n[3494335451][S1] [CAL] pi stage=1/GEO_BP bucket=-2\n[3494335698][S1] [CAL] pi stage=1/GEO_BP stable=255\n[3494433451][S1] [CAL] pi stage=1/GEO_BP error_dac=-3\n[3494434281][S1] [CAL] pi stage=1/GEO_BP bucket=-1\n[3494434533][S1] [CAL] pi stage=1/GEO_BP stable=131\n[3494532282][S1] [CAL] pi stage=1/GEO_BP error_dac=-3\n[3494533112][S1] [CAL] pi stage=1/GEO_BP bucket=-1\n[3494533359][S1] [CAL] pi stage=1/GEO_BP stable=255\n[3494631104][S1] [CAL] pi stage=1/GEO_BP error_dac=0\n[3494631951][S1] [CAL] pi stage=1/GEO_BP bucket=0\n[3494632206][S1] [CAL] pi stage=1/GEO_BP stable=107\n[3494729918][S1] [CAL] pi stage=1/GEO_BP error_dac=-1\n[3494730747][S1] [CAL] pi stage=1/GEO_BP bucket=0\n[3494730994][S1] [CAL] pi stage=1/GEO_BP stable=255\n[3494828757][S1] [CAL] pi stage=1/GEO_BP error_dac=-1\n[3494829585][S1] [CAL] pi stage=1/GEO_BP bucket=0\n[3494829832][S1] [CAL] pi stage=1/GEO_BP stable=255\n[3494927585][S1] [CAL] pi stage=1/GEO_BP error_dac=-1\n[3494928410][S1] [CAL] pi stage=1/GEO_BP bucket=0\n[3494928657][S1] [CAL] pi stage=1/GEO_BP stable=255\n[3495051686][S1] [USB] probe psoc=1\n[3495051814][S1] [SLAVE 1] USB_PROBE bOK=2003 bBad=0 uartBytes=269421 mark=17928 drop=16135 badLen=0 ping=8064 diag=7568 rx=1 edge=1135990/1 last=0xE5 age=1 txOK=1302 txFail=0 state=0 fill=0/0 fs=2604\n[3496430708][S1] [CAL] result stage=2/GEO_ADDER ok=1 dac=148 raw=-830 raw_mV=-16 abs=830 cmp=-830 cmp_mV=-16 target=0 target_mV=0 err=830 err_mV=16 meas16=-830\n[3496441599][S1] [CAL] begin stage=3/GEO_LP\n[3496442458][S1] [CAL] target stage=3/GEO_LP counts=0 mV=0\n[3496443310][S1] [CAL] pi stage=3/GEO_LP gain_x1000=6000\n[3496453803][S1] [CAL] pi stage=3/GEO_LP deadband_dac=8\n[3496454043][S1] [CAL] AMux signal channel=3\n[3496464504][S1] [CAL] AMux cap channel=4\n[3496583682][S1] [USB] probe psoc=1\n[3496583790][S1] [SLAVE 1] USB_PROBE bOK=2003 bBad=0 uartBytes=270123 mark=18046 drop=16139 badLen=0 ping=8066 diag=7682 rx=1 edge=1139569/1 last=0xE5 age=1 txOK=1302 txFail=0 state=0 fill=0/0 fs=2604\n[3496626458][S1] [CAL] pi stage=3/GEO_LP error_dac=-20\n[3496627314][S1] [CAL] pi stage=3/GEO_LP bucket=-2\n[3496627566][S1] [CAL] pi stage=3/GEO_LP stable=1\n[3496724890][S1] [CAL] pi stage=3/GEO_LP error_dac=-20\n[3496725720][S1] [CAL] pi stage=3/GEO_LP bucket=-2\n[3496725968][S1] [CAL] pi stage=3/GEO_LP stable=255\n[3496823713][S1] [CAL] pi stage=3/GEO_LP error_dac=-14\n[3496824543][S1] [CAL] pi stage=3/GEO_LP bucket=-1\n[3496824791][S1] [CAL] pi stage=3/GEO_LP stable=153\n[3496922552][S1] [CAL] pi stage=3/GEO_LP error_dac=-14\n[3496923379][S1] [CAL] pi stage=3/GEO_LP bucket=-1\n[3496923627][S1] [CAL] pi stage=3/GEO_LP stable=255\n[3497021384][S1] [CAL] pi stage=3/GEO_LP error_dac=-14\n[3497022209][S1] [CAL] pi stage=3/GEO_LP bucket=-1\n[3497022461][S1] [CAL] pi stage=3/GEO_LP stable=255\n[3497120210][S1] [CAL] pi stage=3/GEO_LP error_dac=-8\n[3497121027][S1] [CAL] pi stage=3/GEO_LP bucket=0\n[3497121283][S1] [CAL] pi stage=3/GEO_LP stable=24\n[3497219019][S1] [CAL] pi stage=3/GEO_LP error_dac=-8\n[3497219848][S1] [CAL] pi stage=3/GEO_LP bucket=0\n[3497220103][S1] [CAL] pi stage=3/GEO_LP stable=255\n[3497317848][S1] [CAL] pi stage=3/GEO_LP error_dac=-8\n[3497318677][S1] [CAL] pi stage=3/GEO_LP bucket=0\n[3497318924][S1] [CAL] pi stage=3/GEO_LP stable=255\n[3497416747][S1] [CAL] pi stage=3/GEO_LP error_dac=-8\n[3497417573][S1] [CAL] pi stage=3/GEO_LP bucket=0\n[3497417820][S1] [CAL] pi stage=3/GEO_LP stable=255\n[3498294510][S1] [CAL] result stage=3/GEO_LP ok=1 dac=146 raw=1228 raw_mV=23 abs=1228 cmp=1228 cmp_mV=23 target=0 target_mV=0 err=-1228 err_mV=-23 meas16=1228\n[3498305408][S1] [CAL] done ok=0\n[3498428399][S1] [PSoC] boot hw=0/GEO pstate=0/IDLE\n[3498428963][S1] [USB] probe psoc=1\n[3498429057][S1] [SLAVE 1] USB_PROBE bOK=2003 bBad=0 uartBytes=270981 mark=18190 drop=16143 badLen=0 ping=8068 diag=7822 rx=1 edge=1143935/1 last=0xE5 age=0 txOK=1302 txFail=0 state=0 fill=0/0 fs=2604\n",
+    "healthy_after_s": 18.2
+  },
+  "autocal_deadline_s": 150.0,
+  "baud": 115200,
+  "checks": [
+    {
+      "detail": "0 bytes",
+      "name": "drain inicial acotado",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "preflight probe psoc=1",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "preflight PSoC IDLE",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "preflight status USB parseable",
+      "passed": true
+    },
+    {
+      "detail": "fs=2604",
+      "name": "preflight Fs nativa",
+      "passed": true
+    },
+    {
+      "detail": "bBad=0",
+      "name": "preflight UART sin lotes malos",
+      "passed": true
+    },
+    {
+      "detail": "state=0",
+      "name": "preflight ESP fuera de captura",
+      "passed": true
+    },
+    {
+      "detail": "status=0x37",
+      "name": "preflight SD presente y FAT montado",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "pre-reset: sdinfo responde",
+      "passed": true
+    },
+    {
+      "detail": "status=0x37",
+      "name": "pre-reset sesion COMPLETE montada y capture off",
+      "passed": true
+    },
+    {
+      "detail": "KitProg (CMSIS-DAP/236111)",
+      "name": "KitProg detectado",
+      "passed": true
+    },
+    {
+      "detail": "OpenPort \"KitProg (CMSIS-DAP/236111)\" \"C:\\Program Files (x86)\\Cypress\\Programmer\\\" < 0 OK SetProtocol 8 < 0 OK SetProtocolClock 152 < 0 OK SetProtocolConnector 1 < 0 OK ToggleReset 0 100 < 0 OK ClosePort < 0 OK quit <OK <OK",
+      "name": "ToggleReset ejecutado",
+      "passed": true
+    },
+    {
+      "detail": "elapsed=18.2s",
+      "name": "PSoC sano tras reset (psoc=1, IDLE, fs=2604)",
+      "passed": true
+    },
+    {
+      "detail": "",
+      "name": "post-reset: sdinfo responde",
+      "passed": true
+    },
+    {
+      "detail": "status=0x77",
+      "name": "post-reset GEOLAST COMPLETE recuperado y capture re-armado (boot default)",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=1 attempts=1 retry_used=no",
+      "name": "ACK 0xBB post-reset",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xB7 val=0 attempts=1 retry_used=no",
+      "name": "ACK 0xB7 post-reset",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBE val=0 attempts=1 retry_used=no",
+      "name": "ACK 0xBE SD=off post-reset",
+      "passed": true
+    },
+    {
+      "detail": "requested=4 expected=4 fill=4/4 fs=2604 bBad=0 delta_bOK=4",
+      "name": "RAM 4 lotes post-reset",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBE val=1 attempts=1 retry_used=no",
+      "name": "ACK 0xBE SD=on post-reset",
+      "passed": true
+    },
+    {
+      "detail": "requested=5 expected=5 fill=5/5 fs=2604 bBad=0 delta_bOK=0",
+      "name": "SD 5 lotes post-reset",
+      "passed": true
+    },
+    {
+      "detail": "resumen de 30 muestras esperado",
+      "name": "sdread seq=0 post-reset",
+      "passed": true
+    },
+    {
+      "detail": "resumen de 30 muestras esperado",
+      "name": "sdread seq=4 post-reset",
+      "passed": true
+    },
+    {
+      "detail": "seq=5 fill esperado=5",
+      "name": "sdread seq=5 rechazado OOR post-reset",
+      "passed": true
+    },
+    {
+      "detail": "[USB] stop",
+      "name": "cleanup stop",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBE val=0 attempts=1 retry_used=no",
+      "name": "cleanup ACK sdcap 0",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xB7 val=0 attempts=1 retry_used=no",
+      "name": "cleanup ACK stream 0",
+      "passed": true
+    },
+    {
+      "detail": "sub=0xBB val=1 attempts=1 retry_used=no",
+      "name": "cleanup ACK decim 1",
+      "passed": true
+    },
+    {
+      "detail": "[USB] clear",
+      "name": "cleanup clear",
+      "passed": true
+    },
+    {
+      "detail": "psoc=1 pstate=IDLE fs=2604 fill=0/0 bBad=0",
+      "name": "estado final limpio",
+      "passed": true
+    }
+  ],
+  "completed_at_utc": "2026-07-12T17:33:18.118763+00:00",
+  "dtr": false,
+  "error": null,
+  "port": "COM12",
+  "post_reset": {
+    "sd_status": 119
+  },
+  "pre_reset": {
+    "sd_status": 55
+  },
+  "reset": {
+    "kitprog": "KitProg (CMSIS-DAP/236111)",
+    "ppcli_output": "OpenPort \"KitProg (CMSIS-DAP/236111)\" \"C:\\Program Files (x86)\\Cypress\\Programmer\\\"\n<\n0 OK\nSetProtocol 8\n<\n0 OK\nSetProtocolClock 152\n<\n0 OK\nSetProtocolConnector 1\n<\n0 OK\nToggleReset 0 100\n<\n0 OK\nClosePort\n<\n0 OK\nquit\n<OK\n<OK\n",
+    "skipped": false
+  },
+  "rts": false,
+  "schema_version": 1,
+  "started_at_utc": "2026-07-12T17:32:51.421624+00:00",
+  "status": "ok",
+  "test": "E17_PSOC_RESET_RECOVERY"
+}

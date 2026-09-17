@@ -121,9 +121,10 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         instance->_handleCfgAck((const MsgCfgAck *)data);
     } else if (first == CMD_HELLO && (size_t)len >= MSG_HELLO_LEGACY_BYTES) {
         MsgHello hello = {};
+        hello.hw_class = SLAVE_HW_UNKNOWN;
+        hello.link_model = SLAVE_LINK_UNKNOWN;
         const size_t copyLen = ((size_t)len < sizeof(MsgHello)) ? (size_t)len : sizeof(MsgHello);
         memcpy(&hello, data, copyLen);
-        if ((size_t)len < sizeof(MsgHello)) hello.hw_class = SLAVE_HW_UNKNOWN;
         instance->_handleHello(&hello, mac);
     } else if (first == CMD_START_ACK && (size_t)len >= sizeof(MsgStartAck)) {
         instance->_handleStartAck((const MsgStartAck *)data);

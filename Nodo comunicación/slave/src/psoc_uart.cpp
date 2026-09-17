@@ -211,7 +211,11 @@ void PsocUART::_parseControlMetadata()
 {
     uint8_t crc=0;
     for(unsigned i=2;i<10;++i)crc^=_buf[i];
-    if(crc!=_buf[10] || _buf[2]!=1){++_badLen;return;}
+    /* Version 2 narrows the PSoC ADC-validity window and invalidates the old
+     * persisted profile, but keeps this 11-byte wire frame unchanged.  Accept
+     * both deployed schemas during the transition and reject future layouts
+     * explicitly instead of silently losing all controller telemetry. */
+    if(crc!=_buf[10] || _buf[2]<1 || _buf[2]>PSOC_CONTROL_METADATA_VERSION){++_badLen;return;}
     uint16_t key=(uint16_t)_buf[4]|((uint16_t)_buf[5]<<8);
     int32_t value=(int32_t)((uint32_t)_buf[6]|((uint32_t)_buf[7]<<8)|((uint32_t)_buf[8]<<16)|((uint32_t)_buf[9]<<24));
     if(key>=512){++_badLen;return;}

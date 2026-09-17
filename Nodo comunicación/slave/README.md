@@ -36,7 +36,42 @@ esta completo envia `CMD_VIEW ok=2`; el maestro recupera los lotes con
   `SYNC_IN` P0[4]. GPIO32 queda como sincronismo externo opcional.
   El PSoC nunca arranca por comando UART.
 
+> **Actualización 2026-09-16 (placa nueva).** La subida PSoC → ESP ya no es
+> UART sino **I2C con el ESP como esclavo** (`PSOC_I2C_ADDR=0x42`, SDA=21,
+> SCL=22, `Wire.onReceive` + ring de 4 KiB); `Serial2` queda solo para bajar
+> comandos al PSoC. El nombre `psoc_uart.*` es histórico. Cada ráfaga I2C
+> larga perturba la cadena analógica ~0,5 s: el firmware del PSoC ya espacia
+> los reportes y el control ignora las lecturas afectadas.
+
+## Control y calibración del PSoC (`ctl`)
+
+Desde el firmware unificado del 2026-09-16 la calibración vive en el PSoC
+(ver `src/firmware/psoc/AcondicionamientoAnalogico.cydsn/CONTROL_UNIFICADO.md`).
+El esclavo solo transporta. Por el USB del ESP (115200), en `slave2`:
+
+```
+ctl report               estado, perfil, IDAC, DC de los 5 taps (+ config)
+ctl get N | ctl set N V  leer / preparar el parámetro N (tabla en control_config.h)
+ctl apply | save | defaults
+ctl learn                autoriza el aprendizaje lento IDAC0/IDAC1 (sensor quieto)
+ctl pause | resume
+ctl channel N            canal de captura: 0 SEo, 1 BPo, 2 OPA_SUMo, 3 SUMo, 4 LPo
+ctl get 255              traza cruda de las últimas 127 lecturas de LPo
+```
+
+Respuesta: `#CTL_ACK 0|1 <comando>` y líneas `#CTL <captura> <clave> <valor>`
+(clave `0x100` estado, `0x102` banda, `0x110..0x113` IDAC, `0x120+4i` DC del
+canal i, `0x1ff` fin de snapshot). El esclavo imprime `[CAL] ESTOY_EN_BANDA` /
+`[CAL] SALI_DE_BANDA` al cambiar la banda y guarda el snapshot de captura para
+los metadatos. Herramientas de PC: `lab/ctl_log.py`, `lab/ctl_trace.py`,
+`lab/monitor_control.ps1`.
+
 ## Auto-calibración
+
+> **Pendiente de commit (2026-09-16):** `PSOC_AUTO_CAL_ON_READY` pasa a `0`. El
+> aprendizaje solo arranca con autorización explícita (`ctl learn`), para no
+> aprender con el sensor en movimiento. El texto de abajo describe el
+> comportamiento anterior.
 
 Al detectar el PSoC al arrancar, el esclavo programa una auto-calibración
 500 ms después (`PSOC_AUTO_CAL_ON_READY=1`, `PSOC_AUTO_CAL_DELAY_MS=500`).

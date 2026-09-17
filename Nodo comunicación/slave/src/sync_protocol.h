@@ -43,6 +43,10 @@
 #define SLAVE_HW_HAMMER  1u
 #define SLAVE_HW_UNKNOWN 0xFFu
 
+#define SLAVE_LINK_SERIAL  0u
+#define SLAVE_LINK_I2C     1u
+#define SLAVE_LINK_UNKNOWN 0xFFu
+
 /* sub_cmd bajo CMD_SET_CONFIG que NO se reenvía al PSoC — vive 100% en el
  * ESP32 del esclavo (handleSetConfig() lo resuelve local, nunca llega a
  * psoc_uart). 0=deshabilitar SD, 1=habilitar (solo si sd_present=1, ver
@@ -163,6 +167,8 @@ struct MsgHello {
                             * agregado al final del struct: aditivo, no rompe firmwares
                             * viejos que no lo leen (quedaría en 0 si un binario viejo
                             * arma el HELLO sin inicializarlo). */
+    uint8_t  link_model;  /* Generación del enlace PSoC<->ESP, independiente de
+                            * GEO/HAMMER. Campo aditivo al final del HELLO. */
 };
 
 struct MsgSetRecLen {
