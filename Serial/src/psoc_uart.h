@@ -132,6 +132,7 @@
 #define PSOC_EVT_SD_STATUS        0x48  /* bit0 presente, bits1-2 tipo, bit3 test, bit4 FAT, bit5 sesión, bit6 captura */
 #define PSOC_EVT_SD_SESSION       0x49  /* value=1: GEOLAST.BIN COMPLETE/listo; 0: inválido */
 #define PSOC_EVT_SD_ERROR         0x4A  /* value: bit0 write fail, bit1 overrun, bit2 dir/header, bit3 read fail dump */
+#define PSOC_EVT_ARMED_TIMEOUT    0x4B  /* PSoC abortó ARMED porque no llegó SYNC */
 
 struct PsocSample {
     int16_t  raw_input;

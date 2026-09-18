@@ -102,6 +102,32 @@
 #ifndef PSOC_AUTO_CAL_RETRY_MS
   #define PSOC_AUTO_CAL_RETRY_MS 3000u
 #endif
+/* Ganancia con la que tiene que ARRANCAR el nodo. Placas SERIAL: PGA x50; no tienen PGAout.
+ * El PSoC arranca con el default del TopDesign (x1) y, en la placa I2C, recién
+ * después de hablar con el ESP su lazo de control pasa el hardware a x4/x24
+ * sin avisarlo. El ESP fija estos códigos tras cada arranque del PSoC (o del
+ * propio ESP) y los confirma por el camino normal de config, así el maestro y
+ * la web ven la ganancia real. Códigos: 0=x1 1=x2 2=x4 3=x8 4=x16 5=x24 6=x32
+ * 7=x48 8=x50. 0xFF = no tocar. */
+#ifndef SLAVE_BOOT_PGA_CODE
+  #define SLAVE_BOOT_PGA_CODE 8u
+#endif
+#ifndef SLAVE_BOOT_PGAOUT_CODE
+  #define SLAVE_BOOT_PGAOUT_CODE 255u   /* solo si el PSoC reporta GEO */
+#endif
+#ifndef SLAVE_BOOT_GAIN_DELAY_MS
+  #define SLAVE_BOOT_GAIN_DELAY_MS 4000u   /* el PSoC termina su init (control_init) */
+#endif
+static uint8_t  g_boot_gain_step = 0u;      /* 0 nada, 1 PGA, 2 PGAout */
+static uint8_t  g_boot_gain_tries = 0u;
+static uint32_t g_boot_gain_due_ms = 0u;
+
+static void scheduleBootGains()
+{
+    g_boot_gain_step = 1u;
+    g_boot_gain_tries = 0u;
+    g_boot_gain_due_ms = millis() + SLAVE_BOOT_GAIN_DELAY_MS;
+}
 #ifndef WIFI_TX_POWER_QDBM
   #define WIFI_TX_POWER_QDBM 78
 #endif
@@ -152,6 +178,25 @@ static uint8_t g_masterTxMac[6] = {
 #endif
 
 /* ── Estado ──────────────────────────────────────────────────────────────── */
+/* Seguimiento del canal del maestro, portado de bb6b753 (esclavo I2C,
+ * 2026-07-24). El maestro también se asocia a la red del cliente y su AP es
+ * arrastrado al canal de esa red; con el canal 1 fijo este esclavo quedaba
+ * sordo. Se busca el AP por SSID y se adopta su canal. No toca el protocolo
+ * con el PSoC ni el ESP-NOW. */
+#ifndef MASTER_AP_SSID
+#define MASTER_AP_SSID  "GeoNetwork"
+#endif
+#ifndef MASTER_CH_FALLBACK
+#define MASTER_CH_FALLBACK  1
+#endif
+/* Silencio tolerado antes de rescanear: mayor que la captura más larga. */
+#ifndef MASTER_SILENCE_MS
+#define MASTER_SILENCE_MS  (45u * 1000u)
+#endif
+
+static volatile uint32_t g_lastMasterRxMs = 0;
+static uint8_t  g_masterChannel = MASTER_CH_FALLBACK;
+
 enum SlaveState { WAIT_ARM, ARMED, HOT_WAIT, SAMPLING, STOPPED };
 static volatile SlaveState g_state       = WAIT_ARM;
 static bool                g_psocConnected = false;  /* resultado de probe() en setup */
@@ -180,7 +225,14 @@ static          uint32_t   g_auto_cal_due_ms = 0;
 /* ── Store-and-forward ───────────────────────────────────────────────────── */
 static uint16_t    g_rec_n_batches = 0;          /* 0 = modo streaming clásico */
 static uint16_t    g_store_fill    = 0;
-static bool         g_psoc_sd_capture_enabled = false; /* ACK confirmado de 0xBE */
+static bool         g_psoc_sd_capture_enabled = false; /* estado REAL del PSoC (ack 0xBE / SD_STATUS) */
+/* Preferencia del usuario (web o USB). Decide si una captura larga va a SD.
+ * Se separa del estado real porque syncPsocSdForCapture() apaga la SD del
+ * PSoC en las capturas que entran en RAM: su drenaje mete una espiga cada
+ * 57,6 ms en la señal, y un PSoC sin la regla nueva la usaría igual. */
+static bool         g_sd_user_enabled = false;
+static bool         g_sd_sync_pending = false;   /* ack esperado por la sincronización */
+static bool         g_sd_overridden = false;     /* PSoC distinto de la preferencia a propósito */
 static bool         g_psoc_sd_store_active = false;    /* captura actual vive en GEOLAST.BIN */
 static bool         g_psoc_sd_session_complete = false;
 static bool         g_psoc_sd_capture_error = false;
@@ -616,7 +668,29 @@ static void onPsocDiag(const PsocDiagEvent &event)
         event.event != PSOC_EVT_DUMP_DONE &&
         event.event != PSOC_EVT_CAPTURE_DONE &&
         event.event != PSOC_EVT_SD_SESSION &&
-        event.event != PSOC_EVT_SD_ERROR) {
+        event.event != PSOC_EVT_SD_ERROR &&
+        event.event != PSOC_EVT_ARMED_TIMEOUT) {
+        return;
+    }
+
+    /* Portado de 8a0db0a: el PSoC se desarmó solo porque no llegó el SYNC. */
+    if (event.event == PSOC_EVT_ARMED_TIMEOUT) {
+        const bool hadCapture = g_view_store_active || g_start_store_active;
+        const uint8_t failedSubCmd = g_view_store_active ? CMD_VIEW : CMD_START;
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        g_view_store_active = false;
+        g_start_store_active = false;
+        g_psoc_sd_store_active = false;
+        g_psoc_sd_session_complete = false;
+        g_psoc_sd_capture_error = true;
+        g_store_fill = 0u;
+        g_state = STOPPED;
+        if (hadCapture) {
+            sendCfgAck(failedSubCmd, 0u);
+        }
+        SLAVE_LOG_PRINTLN("[SLAVE] PSoC ARMED timeout -> STOPPED");
+        LOGM("PSOC_ARMED_TIMEOUT", "capture=%u,sub=0x%02X",
+             (unsigned)hadCapture, (unsigned)failedSubCmd);
         return;
     }
 
@@ -674,6 +748,7 @@ static void onPsocDiag(const PsocDiagEvent &event)
 
     if (event.event == PSOC_EVT_BOOT) {
         g_psoc_hw_class = event.value;
+        scheduleBootGains();
         SLAVE_LOG_PRINTF("[PSoC] boot hw=%u/%s pstate=%u/%s\n",
                          event.value, psocHwName(event.value),
                          event.psoc_state, psocStateName(event.psoc_state));
@@ -686,6 +761,9 @@ static void onPsocDiag(const PsocDiagEvent &event)
         g_psoc_sd_status = event.value;
         g_psoc_sd_known = true;
         g_psoc_sd_capture_enabled = (event.value & 0x40u) != 0u;
+        if (!g_sd_overridden && !g_sd_sync_pending) {
+            g_sd_user_enabled = g_psoc_sd_capture_enabled;
+        }
         SLAVE_LOG_PRINTF("[PSoC] SD status=0x%02X present=%u type=%u selftest=%u\n",
                          event.value, (unsigned)(event.value & 1u),
                          (unsigned)((event.value >> 1) & 3u),
@@ -1266,7 +1344,15 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
             g_vdac_byte = value;
             break;
         case PSOC_CMD_SD_CAPTURE:
+            if (value > 1u) break;            /* 0xEE = rechazo, no cambió nada */
             g_psoc_sd_capture_enabled = (value != 0u);
+            if (g_sd_sync_pending) {
+                g_sd_sync_pending = false;
+                g_sd_overridden = (g_psoc_sd_capture_enabled != g_sd_user_enabled);
+            } else {
+                g_sd_user_enabled = g_psoc_sd_capture_enabled;
+                g_sd_overridden = false;
+            }
             break;
         default:
             break;
@@ -1387,22 +1473,36 @@ static void servicePsocConfigAck()
     }
 }
 
+/* Portado de 83613f0 (esclavo I2C, 2026-09-04): un solo SETN sin ACK dejaba
+ * ~4 % de capturas vacías; todos los demás comandos al PSoC ya reintentan una
+ * vez por el mismo transitorio que se traga el primer comando. */
 static bool sendAndConfirmPsocSetN(uint16_t n_batches)
 {
     const uint8_t expected = (n_batches > 255u) ? 255u : (uint8_t)n_batches;
-    const uint32_t startMs = millis();
-    const uint32_t startSeq = g_psoc_setn_seq;
 
-    psoc.setN(n_batches);
-    while ((uint32_t)(millis() - startMs) < PSOC_SETN_ACK_TIMEOUT_MS) {
-        psoc.poll();
-        servicePsocConfigAck();
-        if (g_psoc_setn_seq != startSeq &&
-            g_psoc_last_setn_value == expected &&
-            (int32_t)(g_psoc_last_setn_ms - startMs) >= 0) {
-            return true;
+    for (int intento = 0; intento < 2; intento++) {
+        const uint32_t startMs = millis();
+        const uint32_t startSeq = g_psoc_setn_seq;
+
+        psoc.setN(n_batches);
+        while ((uint32_t)(millis() - startMs) < PSOC_SETN_ACK_TIMEOUT_MS) {
+            psoc.poll();
+            servicePsocConfigAck();
+            if (g_psoc_setn_seq != startSeq &&
+                g_psoc_last_setn_value == expected &&
+                (int32_t)(g_psoc_last_setn_ms - startMs) >= 0) {
+                if (intento > 0) {
+                    SLAVE_LOG_PRINTF("[SLAVE] SETN ack en el reintento n=%u\n",
+                                     (unsigned)n_batches);
+                }
+                return true;
+            }
+            delay(1);
         }
-        delay(1);
+        if (intento == 0) {
+            SLAVE_LOG_PRINTF("[SLAVE] SETN sin ack n=%u; reintento\n",
+                             (unsigned)n_batches);
+        }
     }
 
     SLAVE_LOG_PRINTF("[SLAVE] PSoC SETN ack timeout n=%u expected=%u last=%u age=%lu\n",
@@ -1413,6 +1513,38 @@ static bool sendAndConfirmPsocSetN(uint16_t n_batches)
          (unsigned)n_batches, (unsigned)expected,
          (unsigned)g_psoc_last_setn_value,
          (unsigned long)(millis() - g_psoc_last_setn_ms));
+    return false;
+}
+
+/* Deja la SD del PSoC como la necesita ESTA captura: prendida solo si no
+ * entra en RAM. Funciona con cualquier firmware de PSoC (con o sin la regla
+ * de psoc_arm), porque el PSoC usa la SD siempre que tenga el flag. */
+static bool syncPsocSdForCapture(bool want)
+{
+    if (!want && g_psoc_sd_known && !psocSdPresent()) return true;
+    if (g_psoc_sd_known && g_psoc_sd_capture_enabled == want && !g_sd_sync_pending) return true;
+
+    for (int intento = 0; intento < 2; intento++) {
+        const uint32_t startMs = millis();
+        g_sd_sync_pending = true;
+        psoc.sdCapture(want ? 1u : 0u);
+        while ((uint32_t)(millis() - startMs) < PSOC_SETN_ACK_TIMEOUT_MS) {
+            psoc.poll();
+            servicePsocConfigAck();
+            if (!g_sd_sync_pending) {
+                if (g_psoc_sd_capture_enabled == want) {
+                    g_psoc_sd_known = true;
+                    return true;
+                }
+                break;
+            }
+            delay(1);
+        }
+    }
+    g_sd_sync_pending = false;
+    SLAVE_LOG_PRINTF("[SLAVE] PSoC SD %s sin confirmar\n", want ? "ON" : "OFF");
+    LOGM("SD_SYNC_FAIL", "want=%u,actual=%u",
+         (unsigned)want, (unsigned)g_psoc_sd_capture_enabled);
     return false;
 }
 
@@ -1883,6 +2015,41 @@ static void requestDebugPsocFromUsb(uint16_t enable)
     LOGM("USB_CMD", "cmd=debugpsoc,en=%u", (unsigned)(enable != 0u));
 }
 
+static void serviceBootGains()
+{
+    if (g_boot_gain_step == 0u || (int32_t)(millis() - g_boot_gain_due_ms) < 0) {
+        return;
+    }
+    if (!g_psocConnected || captureOrDumpBusy() || g_cfg_waiting) {
+        g_boot_gain_due_ms = millis() + 500u;
+        return;
+    }
+    if (++g_boot_gain_tries > 6u) {
+        SLAVE_LOG_PRINTF("[BOOT_GAIN] abandonado en paso %u\n", (unsigned)g_boot_gain_step);
+        LOGM("BOOT_GAIN", "ev=giveup,step=%u", (unsigned)g_boot_gain_step);
+        g_boot_gain_step = 0u;
+        return;
+    }
+    g_boot_gain_due_ms = millis() + 1000u;
+    if (g_boot_gain_step == 1u) {
+        /* g_pga_code es lo que el PSoC confirmó por ack: si ya coincide, listo. */
+        if (SLAVE_BOOT_PGA_CODE > 8u || g_pga_code == SLAVE_BOOT_PGA_CODE) {
+            g_boot_gain_step = 2u;
+            g_boot_gain_tries = 0u;
+            g_boot_gain_due_ms = millis();
+            return;
+        }
+        if (!ensurePsocReadyForConfig()) return;
+        psoc.setPga(SLAVE_BOOT_PGA_CODE);
+        waitForPsocConfigAck(0xA6u, SLAVE_BOOT_PGA_CODE);
+        SLAVE_LOG_PRINTF("[BOOT_GAIN] PGA -> codigo %u\n", (unsigned)SLAVE_BOOT_PGA_CODE);
+        LOGM("BOOT_GAIN", "ev=pga,code=%u", (unsigned)SLAVE_BOOT_PGA_CODE);
+        return;
+    }
+
+    g_boot_gain_step = 0u;
+}
+
 static void requestPrestartFromUsb(uint16_t n)
 {
     if (captureOrDumpBusy()) {
@@ -2277,7 +2444,7 @@ static uint16_t clampPsocCaptureBatches(uint16_t n)
         n = PSOC_SD_CAPTURE_MAX_BATCHES;
     }
     if (n > PSOC_CAPTURE_MAX_BATCHES) {
-        if (g_psoc_sd_capture_enabled && psocSdPresent()) {
+        if (g_sd_user_enabled && psocSdPresent()) {
             return n;
         }
         return (uint16_t)PSOC_CAPTURE_MAX_BATCHES;
@@ -2310,7 +2477,8 @@ static void enterHotWait(uint16_t n_batches)
     g_start_fallback_sent = false;
     g_psoc_arm_ready = false;
     /* Armar el PSoC por UART: set N y pre-start (queda esperando flanco SYNC). */
-    psocReady = sendAndConfirmPsocSetN(n_batches);
+    psocReady = syncPsocSdForCapture(g_psoc_sd_store_active) &&
+                sendAndConfirmPsocSetN(n_batches);
     if (!psocReady) {
         allocStore(0);
         g_state = STOPPED;
@@ -2556,6 +2724,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
     if (len < 1) return;
     learnMasterMac(mac);
+    g_lastMasterRxMs = millis();   /* para el seguimiento de canal */
     uint8_t cmd = data[0];
     if (g_state == SAMPLING && cmd != CMD_STOP && cmd != CMD_ARM) {
         /* En debug/test, VER puede interrumpir para evitar race condition */
@@ -2798,8 +2967,11 @@ static void allocStore(uint16_t n_batches)
     freeStoreRam();
     g_store_fill   = 0;
     g_rec_n_batches= n_batches;
+    /* Misma regla que psoc_arm(): la SD solo si la captura no entra en la RAM
+     * del PSoC; su drenaje mete una espiga cada 57,6 ms en la señal. */
     g_psoc_sd_store_active =
-        (n_batches > 0u && g_psoc_sd_capture_enabled && psocSdPresent());
+        (n_batches > (uint16_t)PSOC_CAPTURE_MAX_BATCHES &&
+         g_sd_user_enabled && psocSdPresent());
     g_psoc_sd_session_complete = false;
     g_psoc_sd_capture_error = false;
     g_psoc_sd_read_pending = false;
@@ -2902,6 +3074,21 @@ static void servicePsocSdReadTimeout()
 
 /* ── Callback PSoC — batch recibido ─────────────────────────────────────── */
 
+/* Lotes leídos de la SD del PSoC: las marcas de escritura vienen en los bits
+ * 21-22 del int24 (XOR contra el signo). Se restaura el valor y la marca pasa
+ * al byte flags. Solo se aplica a lotes de SD: la rampa debug usa los 24 bits. */
+static void decodeSdMarks(SampleBytes *s)
+{
+    for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+        const uint8_t rep = (s[i].digi2 & 0x80u) ? 0x03u : 0x00u;
+        const uint8_t mark = (uint8_t)(((s[i].digi2 >> 5) & 0x03u) ^ rep);
+        if (mark != 0u) {
+            s[i].digi2 ^= (uint8_t)(mark << 5);
+            s[i].flags |= mark;
+        }
+    }
+}
+
 static void psocBatchToStored(const PsocBatch &batch, SampleBytes *dst)
 {
     for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
@@ -2934,6 +3121,7 @@ static void onBatch(const PsocBatch &batch)
         uint32_t fs = effectivePsocSampleRateHz();
         if (fs == 0u) fs = PSOC_NATIVE_SAMPLE_RATE_HZ;
         psocBatchToStored(batch, stored);
+        decodeSdMarks(stored);
         g_psoc_sd_read_pending = false;
         if (g_psoc_sd_read_usb) {
             /* Banco (sdread N): volcar resumen por USB en vez de ESP-NOW. */
@@ -3016,6 +3204,55 @@ static void onBatch(const PsocBatch &batch)
     }
 }
 
+/* ── Seguimiento del canal del maestro ───────────────────────────────────── */
+
+#if !defined(ESP8266)
+/* Busca el AP del maestro por SSID y devuelve su canal. Bloquea ~2 s; solo se
+ * llama en boot o cuando el maestro ya no habla, nunca durante una captura. */
+static uint8_t findMasterChannel(uint8_t fallback)
+{
+    int n = WiFi.scanNetworks(false /*async*/, true /*hidden*/);
+    uint8_t ch = 0;
+    int32_t best = -1000;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) != MASTER_AP_SSID) continue;
+        /* Puede haber más de un maestro al alcance: quedarse con el más fuerte. */
+        if (WiFi.RSSI(i) > best) { best = WiFi.RSSI(i); ch = WiFi.channel(i); }
+    }
+    WiFi.scanDelete();
+    if (ch == 0) {
+        SLAVE_LOG_PRINTF("[SLAVE] AP '%s' no encontrado en %d redes; canal %u\n",
+                         MASTER_AP_SSID, n, fallback);
+        return fallback;
+    }
+    SLAVE_LOG_PRINTF("[SLAVE] AP '%s' en canal %u (%d dBm)\n",
+                     MASTER_AP_SSID, ch, (int)best);
+    return ch;
+}
+
+/* Si el maestro deja de hablar puede haberse movido de canal: rescanear.
+ * Durante SAMPLING y HOT_WAIT el silencio es parte del protocolo. */
+static void masterChannelService()
+{
+    if (g_state == SAMPLING || g_state == HOT_WAIT) return;
+    if (g_lastMasterRxMs == 0) return;      /* nunca habló: el boot ya escaneó */
+    if ((millis() - g_lastMasterRxMs) < MASTER_SILENCE_MS) return;
+
+    uint8_t ch = findMasterChannel(g_masterChannel);
+    if (ch != g_masterChannel) {
+        SLAVE_LOG_PRINTF("[SLAVE] maestro cambió de canal %u -> %u\n",
+                         g_masterChannel, ch);
+        g_masterChannel = ch;
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    }
+    /* Reiniciar el reloj aunque no cambie, para no rescanear en bucle. */
+    g_lastMasterRxMs = millis();
+}
+#else
+static uint8_t findMasterChannel(uint8_t fallback) { return fallback; }
+static void masterChannelService() {}
+#endif
+
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
 void setup()
@@ -3056,11 +3293,12 @@ void setup()
     esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
     WiFi.disconnect();
     delay(100);
-    /* Fijar canal 1 explícitamente para coincidir con el AP del maestro.
+    /* Fijar explícitamente el canal del AP del maestro (1 si no se lo encuentra).
      * Sin esto, STA desconectado puede quedar en canal 0 (indefinido) y los
      * paquetes ESP-NOW se pierden porque maestro y esclavo están en canales distintos. */
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    SLAVE_LOG_PRINTF("[SLAVE] MAC: %s  ch=%d\n",
+    g_masterChannel = findMasterChannel(MASTER_CH_FALLBACK);
+    esp_wifi_set_channel(g_masterChannel, WIFI_SECOND_CHAN_NONE);
+    SLAVE_LOG_PRINTF("[SLAVE] MAC: %s  ch=%d (maestro)\n",
                      WiFi.macAddress().c_str(), WiFi.channel());
     SLAVE_LOG_PRINTF("[SLAVE] WiFi ps=off tx=%d qdBm\n", WIFI_TX_POWER_QDBM);
 #endif
@@ -3097,6 +3335,7 @@ void setup()
         SLAVE_LOG_PRINTF("[SLAVE %d] PSoC: DETECTADO\n", NODE_ID);
         LOGM("PSOC", "detected=1");
         scheduleAutoCalibration(PSOC_AUTO_CAL_DELAY_MS);
+        scheduleBootGains();
     } else {
         SLAVE_LOG_PRINTF("[SLAVE %d] PSoC sin respuesta — reintentando en loop\n", NODE_ID);
         LOGM("PSOC", "detected=0,retry=loop");
@@ -3112,6 +3351,7 @@ void loop()
 {
     if (g_state != SAMPLING) {
         debugEspHardwareService();
+        masterChannelService();   /* no corre en SAMPLING/HOT_WAIT */
     }
 
     /* Drenar siempre la UART del PSoC (onBatch ignora si no está SAMPLING). */
@@ -3143,6 +3383,7 @@ void loop()
     servicePsocSdReadTimeout();
     serviceUsbCommands();
     serviceAutoCalibration();
+    serviceBootGains();
     serviceCompletionAckRetry();
     serviceHotWaitWatchdog();
 
@@ -3253,6 +3494,7 @@ void loop()
             SLAVE_LOG_PRINTF("[SLAVE %d] PSoC: DETECTADO\n", NODE_ID);
             LOGM("PSOC", "detected=1");
             scheduleAutoCalibration(PSOC_AUTO_CAL_DELAY_MS);
+            scheduleBootGains();
         }
     }
 
@@ -3282,7 +3524,10 @@ void loop()
             CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected,
             effectivePsocSampleRateHz(), g_psoc_hw_class,
             psocSdPresent(),  /* SD del PSoC, no del ESP32 (sd_storage obsoleto) */
-            SLAVE_LINK_SERIAL
+            SLAVE_LINK_SERIAL,
+            0xFFu,           /* ctl_status: sin lazo de control */
+            g_pga_code,
+            0xFFu            /* sin PGAout */
         };
         esp_err_t err = sendToMaster((const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX

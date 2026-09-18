@@ -2,16 +2,16 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-20';
-import { WsClient } from './ws_client.js?v=field-study-20';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-20';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-20';
-import { PlotArea } from './plot.js?v=field-study-20';
-import { SpectrumArea } from './spectrum.js?v=field-study-20';
-import { SlavePanel } from './slave_panel.js?v=field-study-20';
-import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-20';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-20';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-20';
+import * as cfg from './config.js?v=field-study-23';
+import { WsClient } from './ws_client.js?v=field-study-23';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-23';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-23';
+import { PlotArea } from './plot.js?v=field-study-23';
+import { SpectrumArea } from './spectrum.js?v=field-study-23';
+import { SlavePanel } from './slave_panel.js?v=field-study-23';
+import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-23';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-23';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-23';
 
 const $ = (id) => document.getElementById(id);
 
@@ -442,6 +442,8 @@ function nodeSnapshot(nd, index, options = {}) {
     hw_type: slaveHwClassName(nd.hwClass),
     link_model: nd.linkModel,
     link_type: slaveLinkModelName(nd.linkModel),
+    ctl_status: nd.ctlStatus,
+    sd_marks: nd.sdMarksFor(raw.length),
     hammer_offset_m: offsetM,
     offset_m_from_hammer: offsetM,
     position_m: offsetM,
@@ -990,12 +992,21 @@ function nodeHasModernAnalogControls(nd) {
   return nd.hwClass === 0 && nd.linkModel !== 0;
 }
 
+/* Mismo criterio que handleDirectedCmd() del maestro: SERIAL declarado, o
+ * HAMMER sin link_model (firmware anterior al campo). */
+function nodeIsSerialAnalog(nd) {
+  return nd.linkModel === 0 || (nd.linkModel === 0xFF && nd.hwClass === 1);
+}
+
 function applyReportedNodeCapabilities(chIndex) {
   if (chIndex <= 0 || chIndex >= cfg.MAX_NODES) return;
   const nd = data.nodes[chIndex];
   const panel = panelFor(chIndex);
   if (!panel) return;
   panel.setPgaoutVisible(nodeHasModernAnalogControls(nd));
+  panel.setManualVdacVisible(nodeIsSerialAnalog(nd));
+  panel.setControlMode(nd.linkModel === 1);
+  panel.setControlStatus(nd.ctlStatus);
   panel.setHardwareModel(slaveHwClassName(nd.hwClass), slaveLinkModelName(nd.linkModel));
 }
 
@@ -1295,6 +1306,10 @@ function adcCountsToVolts(counts, nd) {
 
 function handleData(nd, pkt) {
   const rawVal = adcCountsToVolts(pkt.value24, nd);
+  if (nd.pendingMarkFlags) {
+    nd.sdMarks.push([nd.totalSamples, nd.pendingMarkFlags]);
+    nd.pendingMarkFlags = 0;
+  }
 
   if (!nd.gotFirst) {
     nd.gotFirst = true;
@@ -1746,9 +1761,9 @@ function onSendAll(chIndex) {
   if (panel) panel.setPgaLock(2);
   schedulePgaLockTimeout(chIndex, nd.pgaCode);
 
-  /* PGAout viaja junto con el PGA en el "resend" — solo tiene sentido en GEO;
-   * en un HAMMER el esclavo lo rechaza y el dot queda en "sin lock". */
-  if (nd.hwClass === 0) {
+  /* PGAout viaja junto con el PGA en el "resend" — solo existe en GEO I2C;
+   * en HAMMER o SERIAL el maestro lo rechaza y el dot quedaría "sin lock". */
+  if (nodeHasModernAnalogControls(nd)) {
     sendDirected(chIndex, cfg.SUBCMD_PGAOUT, nd.pgaoutCode);
     nd.pending.set(cfg.SUBCMD_PGAOUT, { param: nd.pgaoutCode, sendTime: performance.now(), retries: 0 });
     if (panel) panel.setPgaoutLock(2);
@@ -1807,26 +1822,25 @@ function onCalibrateRequested(chIndex) {
   appendLog(`S${chIndex} calibracion solicitada`);
 }
 
-function onManualIdacRequested(chIndex, stage, requestedCode) {
+/* Placa SERIAL: 0xAA sin param2 = VDAC global. El maestro solo lo reenvía si
+ * el HELLO del nodo declaró SERIAL (o es un HAMMER sin link_model). */
+function onManualVdacRequested(chIndex, requestedCode) {
   const nd = data.nodes[chIndex];
   const panel = panelFor(chIndex);
-  const s = clamp(Number.parseInt(stage, 10) || 0, 0, 3);
-  const code = clamp(Number.parseInt(requestedCode, 10) || 0, -255, 255);
-  const p1 = s | (code < 0 ? 0x80 : 0);
-  const p2 = Math.abs(code);
+  const code = clamp(Number.parseInt(requestedCode, 10) || 0, 0, 255);
   nd.pending.set(cfg.SUBCMD_VDAC, {
-    param: p1, param2: p2, stage: s, code,
+    kind: 'vdac', param: code, code,
     sendTime: performance.now(), retries: 0,
   });
-  if (panel) panel.setManualIdacLock(2);
-  sendDirected(chIndex, cfg.SUBCMD_VDAC, p1, p2);
-  appendLog(`S${chIndex} IDAC manual etapa ${s} -> ${code}`);
+  if (panel) panel.setManualVdacLock(2);
+  sendDirected(chIndex, cfg.SUBCMD_VDAC, code);
+  appendLog(`S${chIndex} VDAC manual -> ${code} (${vdacCodeMv(code)} mV)`);
   setTimeout(() => {
     const pending = nd.pending.get(cfg.SUBCMD_VDAC);
-    if (!pending || pending.stage !== s || pending.code !== code) return;
+    if (!pending || pending.kind !== 'vdac' || pending.code !== code) return;
     nd.pending.delete(cfg.SUBCMD_VDAC);
-    if (panel) panel.setManualIdacLock(2);
-    appendLog(`S${chIndex} IDAC manual sin confirmacion: etapa ${s}, ${code}`);
+    if (panel) panel.setManualVdacLock(2);
+    appendLog(`S${chIndex} VDAC manual sin confirmacion: ${code}`);
   }, Math.round(cfg.RETRY_SEC * 1000));
 }
 
@@ -2022,8 +2036,8 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('ver-requested', () => onVerRequested(chIndex));
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
   panel.addEventListener('calibrate-requested', () => onCalibrateRequested(chIndex));
-  panel.addEventListener('idac-manual-requested', (ev) => {
-    onManualIdacRequested(chIndex, ev.detail.stage, ev.detail.code);
+  panel.addEventListener('vdac-manual-requested', (ev) => {
+    onManualVdacRequested(chIndex, ev.detail.code);
   });
   panel.addEventListener('latency-requested', () => onLatencyRequested(chIndex));
   panel.addEventListener('blink-led-requested', () => onBlinkLedRequested(chIndex));
@@ -2233,7 +2247,10 @@ function handleAck(pkt, idx) {
         panel.setDecimation(nd.decimationFactor);
         panel.setDecimationLock(2);
       }
-      appendLog(`S${idx} decimacion rechazada, se mantiene ${nd.decimationFactor}`);
+      // El motivo casi siempre es el mismo y no se veia: el nodo rechaza TODA
+      // config mientras tiene una captura en curso o sin descargar.
+      appendLog(`S${idx} decimacion rechazada, se mantiene ${nd.decimationFactor}` +
+                ' (el nodo rechaza configuraciones mientras captura o tiene una captura sin descargar)');
     }
     return;
   }
@@ -2318,11 +2335,11 @@ function handleAck(pkt, idx) {
 
   if (ackCmd === cfg.SUBCMD_VDAC && idx >= 1 && idx < cfg.MAX_NODES) {
     const panel = panelFor(idx);
-    if (panel) panel.setManualIdacLock(ackVal ? 1 : 2);
-    if (pending) {
-      appendLog(`S${idx} IDAC manual ${ackVal ? 'confirmado' : 'rechazado'}: etapa ${pending.stage}, ${pending.code}`);
+    if (pending && pending.kind === 'vdac') {
+      if (panel) panel.setManualVdacLock(ackVal ? 1 : 2);
+      appendLog(`S${idx} VDAC manual ${ackVal ? 'confirmado' : 'rechazado'}: ${pending.code}`);
     } else {
-      appendLog(`S${idx} IDAC manual ACK ${ackVal}`);
+      appendLog(`S${idx} 0xAA ACK ${ackVal}`);
     }
     return;
   }
@@ -2412,6 +2429,40 @@ function handleStatus(pkt, idx) {
       const panel = panelFor(idx);
       if (panel) panel.setSdPresent(present, nd.sdEnabled);
       appendLog(`HELLO slave=${idx} sd_present=${present ? 1 : 0}`);
+    }
+    return;
+  }
+
+  if (pkt.helloMacSub === 0x0A || pkt.helloMacSub === 0x0B) {
+    /* Ganancia real del PSoC. Pisa lo guardado en el navegador, salvo que el
+     * usuario tenga un cambio en vuelo para esa etapa. */
+    const nd = data.nodes[idx];
+    const isPga = pkt.helloMacSub === 0x0A;
+    const sub = isPga ? cfg.SUBCMD_PGA : cfg.SUBCMD_PGAOUT;
+    const code = pkt.helloGainCode;
+    if (code >= cfg.GAIN_NAMES.length || nd.pending.has(sub)) return;
+    const panel = panelFor(idx);
+    if (isPga && nd.pgaCode !== code) {
+      nd.pgaCode = code;
+      saveSlaveSetting(idx, 'pga_code', code);
+      if (panel) panel.setPga(code);
+    } else if (!isPga && nd.pgaoutCode !== code) {
+      nd.pgaoutCode = code;
+      saveSlaveSetting(idx, 'pgaout_code', code);
+      if (panel) panel.setPgaout(code);
+    }
+    return;
+  }
+
+  if (pkt.helloMacSub === 0x09) {
+    const nd = data.nodes[idx];
+    const status = pkt.helloCtlStatus;
+    const changed = status !== nd.ctlStatus;
+    nd.ctlStatus = status;
+    const panel = panelFor(idx);
+    if (panel) panel.setControlStatus(status);
+    if (changed && status !== 0xFF) {
+      appendLog(`S${idx} control ${(status & 0x01) ? 'en banda' : 'fuera de banda'} (estado ${(status >> 1) & 0x07})`);
     }
     return;
   }
@@ -2621,6 +2672,8 @@ ws.addEventListener('packet', (ev) => {
 
   if (pkt.isData) {
     handleData(nd, pkt);
+  } else if (pkt.isMark) {
+    nd.pendingMarkFlags |= pkt.markFlags;
   } else if (pkt.isHeartbeat) {
     nd.pgaCode = pkt.hbPga;
     nd.vdacByte = pkt.hbVdac;

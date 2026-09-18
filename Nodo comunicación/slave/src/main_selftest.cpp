@@ -771,6 +771,9 @@ static void groupA()
 #else
     hello.link_model = SLAVE_LINK_SERIAL;
 #endif
+    hello.ctl_status = SLAVE_CTL_UNKNOWN;
+    hello.pga_code = 0xFFu;
+    hello.pgaout_code = 0xFFu;
     esp_err_t e = espnowSend(bc, (const uint8_t *)&hello, sizeof(hello));
     stReportItem("A4", "ESP-NOW (init + peer + TX)",
                  (e == ESP_OK) ? ST_V_PASS : ST_V_FAIL,

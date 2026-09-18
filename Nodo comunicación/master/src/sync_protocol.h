@@ -48,6 +48,12 @@
 #define SLAVE_LINK_I2C     1u
 #define SLAVE_LINK_UNKNOWN 0xFFu
 
+/* Estado del lazo de control del PSoC I2C, último byte del HELLO.
+ * 0xFF = sin control (placas SERIAL o sin telemetría todavía).
+ * bit0 = en banda, bits1..3 = estado (0 falta aprender, 1 aprendiendo,
+ * 2 corriendo, 3 pausado, 4 falló), bit4 = perfil aprendido válido. */
+#define SLAVE_CTL_UNKNOWN      0xFFu
+
 /* sub_cmd bajo CMD_SET_CONFIG que NO se reenvía al PSoC — vive 100% en el
  * ESP32 del esclavo (handleSetConfig() lo resuelve local, nunca llega a
  * psoc_uart). 0=deshabilitar SD, 1=habilitar (solo si sd_present=1, ver
@@ -77,6 +83,10 @@ struct MsgStop   { uint8_t cmd; };
 struct MsgDebug  { uint8_t cmd; uint8_t enable; };
 
 #define DATA_PKT_MARKER  0xBC
+
+/* SampleBytes.flags: marcas de interferencia conocida (ver PSoC sd_mark). */
+#define SAMPLE_FLAG_SD_WRITE 0x01u   /* el PSoC empezó una escritura a SD */
+#define SAMPLE_FLAG_SD_SYNC  0x02u   /* el PSoC hizo f_sync (FAT + directorio) */
 #define SAMPLES_PER_PART 15
 
 struct SampleBytes {
@@ -155,6 +165,9 @@ struct MsgHello {
                             * parcial sobre un struct zero-init → sd_present=0). */
     uint8_t  link_model;  /* SLAVE_LINK_*; agregado al final para que maestros y
                             * esclavos anteriores sigan aceptando el prefijo. */
+    uint8_t  ctl_status;  /* SLAVE_CTL_*; aditivo, solo lo llena la placa I2C. */
+    uint8_t  pga_code;    /* código de PGA confirmado por el PSoC (0xFF = sin dato) */
+    uint8_t  pgaout_code; /* código de PGAout confirmado (0xFF = no existe / sin dato) */
 };
 
 struct MsgSetRecLen {

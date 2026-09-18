@@ -249,6 +249,9 @@ struct CachedHello {
     uint8_t hw_class = SLAVE_HW_UNKNOWN;
     uint8_t sd_present = 0;
     uint8_t link_model = SLAVE_LINK_UNKNOWN;
+    uint8_t ctl_status = SLAVE_CTL_UNKNOWN;
+    uint8_t pga_code = 0xFF;
+    uint8_t pgaout_code = 0xFF;
     uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
 };
 static CachedHello g_cachedHello[NUM_SLAVES + 1];
@@ -405,7 +408,8 @@ static void sendCachedStateToWeb()
         const CachedHello &h = g_cachedHello[node];
         if (h.valid) {
             matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate,
-                                  h.hw_class, h.sd_present, h.link_model);
+                                  h.hw_class, h.sd_present, h.link_model,
+                                  h.ctl_status, h.pga_code, h.pgaout_code);
         }
     }
     MASTER_LOG_PRINTLN("[WEB] cached READY/HELLO replay sent");
@@ -629,11 +633,15 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
         h.hw_class = msg.hw_class;
         h.sd_present = msg.sd_present;
         h.link_model = msg.link_model;
+        h.ctl_status = msg.ctl_status;
+        h.pga_code = msg.pga_code;
+        h.pgaout_code = msg.pgaout_code;
         memcpy(h.mac, senderMac, 6);
         if (isUsableUnicastMac(h.mac)) addPeerIfNeeded(h.mac);
     }
     matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate,
-                          msg.hw_class, msg.sd_present, msg.link_model);
+                          msg.hw_class, msg.sd_present, msg.link_model,
+                          msg.ctl_status, msg.pga_code, msg.pgaout_code);
 }
 
 static void onStartAck(const MsgStartAck &msg)
@@ -896,6 +904,7 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
         return;
     }
 
+    static constexpr uint8_t SERIAL_VDAC_FLAG = 0x40u;
     const CachedHello &hello = g_cachedHello[node_id];
     const bool serialAnalogModel = hello.valid &&
         (hello.link_model == SLAVE_LINK_SERIAL ||
@@ -914,6 +923,14 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
     }
 
     if (sub_cmd == 0xAAu) {
+        /* Por USB 0xAA siempre llega en 7 bytes, así que el VDAC serial se
+         * codifica con p1=0x40 (bit reservado en el IDAC I2C) y p2=código.
+         * La web puede seguir mandándolo sin param2. */
+        if (serialAnalogModel && hasParam2 && param == SERIAL_VDAC_FLAG) {
+            param = param2;
+            param2 = 0;
+            hasParam2 = false;
+        }
         const uint8_t stage = (uint8_t)(param & 0x0Fu);
         const bool reservedBitsClear = (param & 0x70u) == 0u;
         const bool validSerialVdac = serialAnalogModel && !hasParam2;
@@ -1276,6 +1293,10 @@ static void onBatchReady(const ReassembledBatch &batch)
                     | ((int32_t)s.digi1 << 8)
                     | ((int32_t)s.digi2 << 16);
         if (val & 0x800000) val |= (int32_t)0xFF000000;
+        if (s.flags & (SAMPLE_FLAG_SD_WRITE | SAMPLE_FLAG_SD_SYNC)) {
+            matlab.sendSampleMark(batch.node_id,
+                                  s.flags & (SAMPLE_FLAG_SD_WRITE | SAMPLE_FLAG_SD_SYNC));
+        }
         matlab.sendSample(batch.node_id, val);
         samplePulse();
     }

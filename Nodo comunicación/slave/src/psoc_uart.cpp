@@ -222,6 +222,7 @@ void PsocUART::_parseControlMetadata()
     bool capture=_buf[3]!=0;
     if(capture && key==0x100)_controlCaptureValid=false;
     (capture?_controlCapture:_controlLive)[key]=value;
+    if(!capture)_controlLiveSeen=true;
     if(capture && key==0x1ff)_controlCaptureValid=true;
     Serial.printf("#CTL %u %u %ld\n",capture?1:0,(unsigned)key,(long)value);
     if(key==0x102)Serial.printf("[CAL] %s\n",value?"ESTOY_EN_BANDA":"SALI_DE_BANDA");

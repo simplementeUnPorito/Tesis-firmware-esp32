@@ -28,6 +28,7 @@
  *     sub_cmd 0xA8: PGAout (GEO)  param: código 0-8
  *     sub_cmd 0xA9: legacy PGAvdac  param: código 0-8
  *     sub_cmd 0xAA: IDAC manual     p1: bit7 signo + etapa 0-3; p2: magnitud
+ *                   nodo SERIAL:   p1=0x40 (VDAC global); p2: código VDAC
  *     sub_cmd 0xA7: debug node ESP  param: 0/1
  *     sub_cmd 0xB2: ver (captura única) param: ignorado
  *     sub_cmd 0xB3: debug PSoC rampa param: 0/1
@@ -67,12 +68,16 @@ public:
     void sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val);
     void sendReady(uint8_t nNodes);
     void sendStartLatency(uint8_t nodeId, uint32_t tofUs);
+    /* Marca de interferencia conocida sobre la PRÓXIMA muestra de ese nodo. */
+    void sendSampleMark(uint8_t nodeId, uint8_t flags);
     /* Diagnóstico: estado ESP-NOW del maestro al arrancar */
     void sendStatus(uint8_t espnow_ok, uint8_t ap_ch);
     /* Diagnóstico: maestro recibió HELLO de un esclavo (incluye estado PSoC + MAC + FS) */
     void sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok = 0, const uint8_t mac[6] = nullptr,
                         uint16_t fs = 0, uint8_t hw_class = 0xFF,
-                        uint8_t sd_present = 0xFF, uint8_t link_model = 0xFF);
+                        uint8_t sd_present = 0xFF, uint8_t link_model = 0xFF,
+                        uint8_t ctl_status = 0xFF, uint8_t pga_code = 0xFF,
+                        uint8_t pgaout_code = 0xFF);
 
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
@@ -188,6 +193,14 @@ inline void MatlabTransport::sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val)
     _emit(pkt);
 }
 
+inline void MatlabTransport::sendSampleMark(uint8_t nodeId, uint8_t flags)
+{
+    /* type 0xFB: b2=flags (bit0 escritura SD, bit1 f_sync). Va justo antes de
+     * la muestra marcada; los clientes que no lo conocen lo ignoran. */
+    uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFB, flags, 0x00, 0x00 };
+    _emit(pkt);
+}
+
 inline void MatlabTransport::sendReady(uint8_t nNodes)
 {
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, 0xFF, 0xFE, nNodes, 0x00, 0x00 };
@@ -209,7 +222,8 @@ inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)
 
 inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6],
                                             uint16_t fs, uint8_t hw_class, uint8_t sd_present,
-                                            uint8_t link_model)
+                                            uint8_t link_model, uint8_t ctl_status,
+                                            uint8_t pga_code, uint8_t pgaout_code)
 {
     /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
     uint8_t fs_code = (fs >= 100u) ? (uint8_t)((fs + 50u) / 100u) : 0u;
@@ -242,6 +256,20 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
         /* b2=0x08: 0=SERIAL, 1=I2C. Es independiente de GEO/HAMMER. */
         uint8_t linkPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x08, link_model, 0x00 };
         _emit(linkPkt);
+    }
+    if (ctl_status != 0xFFu) {
+        /* b2=0x09: estado del lazo del PSoC I2C (ver SLAVE_CTL_* en sync_protocol.h). */
+        uint8_t ctlPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x09, ctl_status, 0x00 };
+        _emit(ctlPkt);
+    }
+    if (pga_code != 0xFFu) {
+        /* b2=0x0A / 0x0B: ganancias que el PSoC tiene aplicadas de verdad. */
+        uint8_t pgaPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0A, pga_code, 0x00 };
+        _emit(pgaPkt);
+    }
+    if (pgaout_code != 0xFFu) {
+        uint8_t pgaoutPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0B, pgaout_code, 0x00 };
+        _emit(pgaoutPkt);
     }
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */

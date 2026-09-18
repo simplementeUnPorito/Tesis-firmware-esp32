@@ -93,6 +93,10 @@ struct MsgDebug {
 };
 
 #define DATA_PKT_MARKER  0xBC
+
+/* SampleBytes.flags: marcas de interferencia conocida (ver PSoC sd_mark). */
+#define SAMPLE_FLAG_SD_WRITE 0x01u   /* el PSoC empezó una escritura a SD */
+#define SAMPLE_FLAG_SD_SYNC  0x02u   /* el PSoC hizo f_sync (FAT + directorio) */
 #define SAMPLES_PER_PART 15
 
 struct SampleBytes {
@@ -168,6 +172,9 @@ struct MsgHello {
                             * viejos que no lo leen (quedaría en 0 si un binario viejo
                             * arma el HELLO sin inicializarlo). */
     uint8_t  link_model;  /* SLAVE_LINK_SERIAL. Campo aditivo para el maestro nuevo. */
+    uint8_t  ctl_status;  /* 0xFF: la placa serial no tiene lazo de control */
+    uint8_t  pga_code;    /* código de PGA confirmado por el PSoC (0xFF = sin dato) */
+    uint8_t  pgaout_code; /* código de PGAout confirmado (0xFF = no existe / sin dato) */
 };
 
 struct MsgSetRecLen {

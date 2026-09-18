@@ -119,6 +119,9 @@ export class NodeData {
     this.mac = '';
     this.hwClass = 0xFF;  // 0=GEO, 1=HAMMER, 0xFF=unknown (reported by PSoC)
     this.linkModel = 0xFF; // 0=SERIAL, 1=I2C, 0xFF=legacy/unknown (reported by ESP)
+    this.sdMarks = [];         // [indice absoluto de muestra, flags] de escrituras a SD
+    this.pendingMarkFlags = 0; // marca recibida que aplica a la próxima muestra
+    this.ctlStatus = 0xFF; // lazo del PSoC I2C: bit0 en banda, bits1-3 estado, bit4 perfil
     this.sdPresent = false; // FAT/SD detectada por el PSoC (solo esclavos GEO, ver plan_2929_decimation_sd.md)
     this.sdEnabled = false; // estado del toggle SD confirmado por ACK (0xC0)
 
@@ -176,6 +179,14 @@ export class NodeData {
     for (let i = 0; i < raw.length; i++) this.rawSum += raw[i];
   }
 
+  /** Marcas de SD relativas a un arreglo de `length` muestras que termina en la última recibida. */
+  sdMarksFor(length) {
+    const first = this.totalSamples - length;
+    return this.sdMarks
+      .filter(([i]) => i >= first && i < this.totalSamples)
+      .map(([i, f]) => [i - first, f]);
+  }
+
   /** Clear sample buffers and reset filter state. */
   clear() {
     this.rawBuf.clear();
@@ -184,6 +195,8 @@ export class NodeData {
     this.filtZi = null;
     this.batchCount = 0;
     this.totalSamples = 0;
+    this.sdMarks = [];
+    this.pendingMarkFlags = 0;
     this.gotFirst = false;
     this.tFirst = 0;
     this.captureActive = false;

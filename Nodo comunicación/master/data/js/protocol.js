@@ -24,6 +24,8 @@ export class Packet {
   get isAck() { return this.ptype === cfg.PTYPE_ACK; }
   get isReady() { return this.ptype === cfg.PTYPE_READY; }
   get isLatency() { return this.ptype === cfg.PTYPE_LATENCY; }
+  get isMark() { return this.ptype === cfg.PTYPE_MARK; }
+  get markFlags() { return this.b2; }
   get isStatus() { return this.ptype === cfg.PTYPE_STATUS; }
 
   // Heartbeat fields
@@ -51,6 +53,10 @@ export class Packet {
   get helloSdPresent() { return this.b1; }
   /** sub 0x08: modelo del enlace interno PSoC<->ESP (0=SERIAL, 1=I2C). */
   get helloLinkModel() { return this.b1; }
+  /** sub 0x09: estado del lazo del PSoC I2C (bit0 banda, bits1-3 estado, bit4 perfil; 0xFF sin dato). */
+  get helloCtlStatus() { return this.b1; }
+  /** sub 0x0A / 0x0B: código de PGA / PGAout aplicado en el PSoC. */
+  get helloGainCode() { return this.b1; }
   get helloMacSub() { return this.b2; }
   get helloMacHi() { return this.b1; }
   get helloMacLo() { return this.b0; }

@@ -56,7 +56,7 @@ function fmtSignedPct(value) {
  * Controls for one slave node (channels 1-3, displayed as Esclavo 1-3).
  *
  * Events: 'pga-changed' {code}, 'pgaout-changed' {code}, 'adc-config-changed' {code},
- *         'idac-manual-requested' {stage, code},
+ *         'vdac-manual-requested' {code},
  *         'fir-apply' {cmd}, 'fir-remove',
  *         'line-notch-changed' {enabled, nHarm},
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
@@ -169,36 +169,35 @@ export class SlavePanel extends EventTarget {
     this._btnCalibrate = el('button', null, 'Calibrar');
     this._btnCalibrate.title = 'Calibrar PSoC';
     this._btnCalibrate.addEventListener('click', () => this._dispatch('calibrate-requested'));
-    root.appendChild(row(el('span', null, 'Calibracion'), this._dotCal, this._btnCalibrate));
+    this._lblCal = el('span', null, 'Calibracion');
+    root.appendChild(row(this._lblCal, this._dotCal, this._btnCalibrate));
+    /* Placa I2C: la calibración es el lazo permanente del PSoC. No hay botón,
+     * el punto dice si está en banda (verde) o no (rojo). */
+    this._controlMode = false;
 
-    this._ddManualIdacStage = el('select');
-    for (const [stage, name] of cfg.CAL_VDAC_LABELS_GEO.entries()) {
-      this._ddManualIdacStage.appendChild(new Option(`${stage}: ${name}`, String(stage)));
-    }
-    this._inpManualIdac = el('input');
-    this._inpManualIdac.type = 'number';
-    this._inpManualIdac.min = '-255';
-    this._inpManualIdac.max = '255';
-    this._inpManualIdac.step = '1';
-    this._inpManualIdac.value = '0';
-    this._inpManualIdac.title = 'Código IDAC firmado; 0=Vref, rango -255..255';
-    this._btnManualIdac = el('button', null, 'Aplicar IDAC');
-    this._btnManualIdac.addEventListener('click', () => {
-      const stage = Number.parseInt(this._ddManualIdacStage.value, 10);
-      const code = Math.max(-255, Math.min(255,
-        Number.parseInt(this._inpManualIdac.value, 10) || 0));
-      this._inpManualIdac.value = String(code);
-      this._dispatch('idac-manual-requested', { stage, code });
+    /* Placas SERIAL: una sola referencia VDAC global (calibrador de una fase). */
+    this._inpManualVdac = el('input');
+    this._inpManualVdac.type = 'number';
+    this._inpManualVdac.min = '0';
+    this._inpManualVdac.max = '255';
+    this._inpManualVdac.step = '1';
+    this._inpManualVdac.value = '128';
+    this._inpManualVdac.title = 'Código VDAC global de la placa SERIAL, 0..255';
+    this._btnManualVdac = el('button', null, 'Aplicar VDAC');
+    this._btnManualVdac.addEventListener('click', () => {
+      const code = Math.max(0, Math.min(255,
+        Number.parseInt(this._inpManualVdac.value, 10) || 0));
+      this._inpManualVdac.value = String(code);
+      this._dispatch('vdac-manual-requested', { code });
     });
-    this._dotManualIdac = dot('IDAC manual sin confirmar');
-    this._rowManualIdac = row(
-      labeled('Etapa', this._ddManualIdacStage),
-      labeled('Código', this._inpManualIdac),
-      this._btnManualIdac,
-      this._dotManualIdac,
+    this._dotManualVdac = dot('VDAC manual sin confirmar');
+    this._rowManualVdac = row(
+      labeled('VDAC', this._inpManualVdac),
+      this._btnManualVdac,
+      this._dotManualVdac,
     );
-    this._rowManualIdac.style.display = 'none';
-    root.appendChild(this._rowManualIdac);
+    this._rowManualVdac.style.display = 'none';
+    root.appendChild(this._rowManualVdac);
 
     const firBox = el('div', 'filter-box');
     firBox.appendChild(el('div', 'subhead', 'FIR Filter'));
@@ -299,7 +298,8 @@ export class SlavePanel extends EventTarget {
     this._btnBlinkLed.title = 'Hace titilar el LED del ESP esclavo para identificarlo físicamente';
     this._btnBlinkLed.addEventListener('click', () => this._dispatch('blink-led-requested'));
 
-    hwBox.appendChild(row(this._btnSaveEeprom, this._dotEeprom));
+    this._rowEeprom = row(this._btnSaveEeprom, this._dotEeprom);
+    hwBox.appendChild(this._rowEeprom);
     hwBox.appendChild(row(this._btnBlinkLed));
     root.appendChild(hwBox);
 
@@ -417,6 +417,7 @@ export class SlavePanel extends EventTarget {
       this.setAdcConfigLock(0);
       this.setDecimationLock(0);
       this.setCalibrationLock(0);
+      if (this._controlMode) setDot(this._dotCal, 0, '', '', 'Control sin telemetria');
       this.setSdPresent(false, false);
       this.setSdLock(0);
     }
@@ -465,7 +466,17 @@ export class SlavePanel extends EventTarget {
   /** La fila PGAout solo tiene sentido en nodos GEO con la placa nueva. */
   setPgaoutVisible(visible) {
     this._rowPgaout.style.display = visible ? '' : 'none';
-    this._rowManualIdac.style.display = visible ? '' : 'none';
+  }
+
+  /** La fila VDAC global solo existe en placas SERIAL. */
+  setManualVdacVisible(visible) {
+    this._rowManualVdac.style.display = visible ? '' : 'none';
+  }
+
+  /** state: 0=unknown, 1=confirmed, 2=pending/fail. */
+  setManualVdacLock(state) {
+    setDot(this._dotManualVdac, state, 'VDAC manual confirmado por PSoC',
+           'VDAC manual pendiente o rechazado', 'VDAC manual sin confirmar');
   }
 
   setPgaout(code) {
@@ -539,16 +550,41 @@ export class SlavePanel extends EventTarget {
 
   /** state: 0=unknown, 1=ok, 2=pending/fail, 3=calibrando (en curso). */
   setCalibrationLock(state, detail) {
-    if (!this._dotCal) return;
+    if (!this._dotCal || this._controlMode) return;
     const busyTip = detail ? `Calibrando... ${detail}` : 'Calibrando... (puede tardar hasta ~4 min)';
     setDot(this._dotCal, state, 'Calibracion confirmada por PSoC', 'Calibracion pendiente o fallida',
            'Calibracion sin ejecutar', busyTip);
   }
 
-  /** state: 0=unknown, 1=confirmed, 2=pending/fail. */
-  setManualIdacLock(state) {
-    setDot(this._dotManualIdac, state, 'IDAC manual confirmado por PSoC',
-           'IDAC manual pendiente o rechazado', 'IDAC manual sin confirmar');
+
+  /** Placa I2C: sin botón Calibrar ni Guardar EEPROM (el perfil se guarda
+   * solo al aprender); el punto de calibración pasa a ser el estado del lazo. */
+  setControlMode(enabled) {
+    if (this._controlMode === !!enabled) return;   /* llega con cada HELLO */
+    this._controlMode = !!enabled;
+    this._btnCalibrate.style.display = enabled ? 'none' : '';
+    this._rowEeprom.style.display = enabled ? 'none' : '';
+    this._lblCal.textContent = enabled ? 'Control' : 'Calibracion';
+    /* La placa I2C no tiene VDAC global: ese "VDACs: legacy 128" era el valor
+     * por defecto de la web, no un dato de la placa. El estado real de las
+     * referencias lo da el punto del lazo. */
+    this._lblVdac.style.display = enabled ? 'none' : '';
+    if (!enabled) setDot(this._dotCal, 0, '', '', 'Calibracion sin ejecutar');
+  }
+
+  /** status: byte ctl_status del HELLO (0xFF = sin telemetría). */
+  setControlStatus(status) {
+    if (!this._controlMode) return;
+    if (status === 0xFF || status === null || status === undefined) {
+      setDot(this._dotCal, 0, '', '', 'Control sin telemetria');
+      return;
+    }
+    const names = ['falta aprender', 'aprendiendo', 'corriendo', 'pausado', 'falló'];
+    const state = (status >> 1) & 0x07;
+    const inBand = (status & 0x01) !== 0;
+    const profile = (status & 0x10) !== 0;
+    const tip = `Lazo ${names[state] ?? state}, perfil ${profile ? 'aprendido' : 'sin aprender'}`;
+    setDot(this._dotCal, inBand ? 1 : 2, `En banda. ${tip}`, `Fuera de banda. ${tip}`, tip);
   }
 
   setVdac(vdacByte) {

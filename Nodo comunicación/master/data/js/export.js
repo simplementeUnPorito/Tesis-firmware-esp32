@@ -289,6 +289,8 @@ function nodeMetadata(nd, index, paths, connected) {
     hw_type: hwType,
     link_model: nd.linkModel,
     link_type: linkType,
+    ctl_status: nd.ctlStatus,
+    sd_marks: nd.sdMarksFor(nd.rawBuf.length),
     hammer_offset_m: offsetM,
     offset_m_from_hammer: offsetM,
     position_m: offsetM,
@@ -351,6 +353,9 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     decimation_factor: decimationFactorForNode(node),
     sd_present: sdPresentForNode(node),
     sd_enabled: sdEnabledForNode(node),
+    // [indice en raw, flags]: bit0 escritura a SD, bit1 f_sync. La interferencia
+    // empieza en esa muestra; ver quitar_ruido_sd.py.
+    sd_marks: Array.isArray(node?.sd_marks) ? node.sd_marks : [],
     vdac_byte: node?.vdac_byte ?? 128,
     cal_vdacs: calVdacsForNode(node),
     cal_vdac_details: calVdacDetailsForNode(node),
@@ -801,7 +806,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-20',
+    web_app_version: 'field-study-23',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,

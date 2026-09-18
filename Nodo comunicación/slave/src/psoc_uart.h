@@ -282,6 +282,8 @@ public:
     int32_t controlMetadata(uint16_t key, bool capture=false) const
         { return key<512 ? (capture?_controlCapture[key]:_controlLive[key]) : 0; }
     bool controlCaptureValid() const { return _controlCaptureValid; }
+    /* true desde la primera trama de telemetría viva del lazo. */
+    bool controlLiveSeen() const { return _controlLiveSeen; }
     void begin(BatchCallback cb = nullptr, HardwareSerial *serial = nullptr);
     void onDiag(DiagCallback cb);
     void onSelfTest(SelfTestCallback cb);
@@ -369,6 +371,7 @@ private:
     int32_t _controlLive[512] = {};
     int32_t _controlCapture[512] = {};
     bool _controlCaptureValid=false;
+    bool _controlLiveSeen=false;
     void _parseControlMetadata();
     HardwareSerial *_ser       = nullptr;
     BatchCallback   _cb        = nullptr;

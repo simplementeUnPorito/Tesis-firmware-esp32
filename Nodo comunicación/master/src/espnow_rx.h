@@ -123,6 +123,9 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         MsgHello hello = {};
         hello.hw_class = SLAVE_HW_UNKNOWN;
         hello.link_model = SLAVE_LINK_UNKNOWN;
+        hello.ctl_status = SLAVE_CTL_UNKNOWN;
+        hello.pga_code = 0xFFu;
+        hello.pgaout_code = 0xFFu;
         const size_t copyLen = ((size_t)len < sizeof(MsgHello)) ? (size_t)len : sizeof(MsgHello);
         memcpy(&hello, data, copyLen);
         instance->_handleHello(&hello, mac);

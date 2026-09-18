@@ -17,9 +17,13 @@ copia recuperada de Git.
 Los valores originales están en `platformio.ini`: `PSOC_UART_TX=16`,
 `PSOC_UART_RX=17` y `SYNC_TO_PSOC_PIN=23`.
 
-La lógica PSoC serial, VDAC y de calibración se conserva. Sobre esta base solo
-se agregó el metadato aditivo `link_model=SERIAL` al HELLO para que el maestro
-nuevo seleccione la interfaz correcta. La copia histórica exacta, sin esa
+La lógica PSoC serial, VDAC y de calibración se conserva. Sobre esta base se
+agregó el metadato aditivo `link_model=SERIAL` al HELLO para que el maestro
+nuevo seleccione la interfaz correcta. Además se portaron del esclavo I2C el
+seguimiento del canal del maestro, el reintento de SETN y la reacción a
+`PSOC_EVT_ARMED_TIMEOUT` (detalle en `../HANDOFF_COMPATIBILIDAD_SERIAL_I2C.md`).
+Envs: `slave1` para el HAMMER (nodo 1) y `slave3` para la GEO serial (nodo 3),
+porque el nodo 2 es la GEO I2C. La copia histórica exacta, sin esa
 adaptación, queda en `../Serial_HAMMER`.
 
 También se copió `src/scope_measurement.h` desde el mismo commit y se ajustó
