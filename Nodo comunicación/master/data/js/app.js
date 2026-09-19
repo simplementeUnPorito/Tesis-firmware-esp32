@@ -2,16 +2,16 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-23';
-import { WsClient } from './ws_client.js?v=field-study-23';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-23';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-23';
-import { PlotArea } from './plot.js?v=field-study-23';
-import { SpectrumArea } from './spectrum.js?v=field-study-23';
-import { SlavePanel } from './slave_panel.js?v=field-study-23';
-import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-23';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-23';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-23';
+import * as cfg from './config.js?v=field-study-26';
+import { WsClient } from './ws_client.js?v=field-study-26';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-26';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-26';
+import { PlotArea } from './plot.js?v=field-study-26';
+import { SpectrumArea } from './spectrum.js?v=field-study-26';
+import { SlavePanel } from './slave_panel.js?v=field-study-26';
+import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-26';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-26';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-26';
 
 const $ = (id) => document.getElementById(id);
 
@@ -820,7 +820,14 @@ function updateCapturePreview() {
     const hInfo = captureLimitInfo(hSecs);
     hammerTxt = ` · HAMMER ${hInfo.n} lotes / ${hInfo.actualSecs.toFixed(2)} s`;
   }
-  el.textContent = `GEO ${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}${hammerTxt}`;
+  // Tope sin SD: 512 lotes de muestras YA decimadas, asi que crece con N
+  // (decim 2 => el doble de segundos, decim 3 => el triple).
+  const maxRamSecs = (cfg.PSOC_RAM_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fs;
+  const usaSd = info.n > cfg.PSOC_RAM_CAPTURE_MAX_BATCHES;
+  const sdTxt = usaSd
+    ? ` · USA SD (sin SD hasta ${maxRamSecs.toFixed(2)} s)`
+    : ` · sin SD (tope ${maxRamSecs.toFixed(2)} s)`;
+  el.textContent = `GEO ${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}${hammerTxt}${sdTxt}`;
 }
 
 /* W1 (auditoría 2026-07-11): fija Duración GEOs al techo de RAM (512 lotes)
@@ -1473,6 +1480,10 @@ function applyGlobalFs(fsHz, logMessage = '') {
   syncDataBufferForFs();
   applyDisplayWindow();
   updateGlobalFsDisplay();
+  // El preview de captura (lotes, segundos reales y tope sin SD) se calcula con
+  // la Fs efectiva: si no se refresca aca, al cambiar la decimacion sigue
+  // mostrando los lotes de la Fs anterior hasta que el operador toca Duracion.
+  updateCapturePreview();
   for (let i = 1; i < cfg.MAX_NODES; i++) renderNodeRow(i);
   if (logMessage) appendLog(logMessage);
 }
@@ -1807,6 +1818,35 @@ function onSendAll(chIndex) {
   appendLog(`S${chIndex} enviar config: PGA ${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}, ADC ${adcConfigForCode(nd.adcConfigCode).label}, decim ${nd.decimationFactor}`);
 }
 
+/* Mux de etapas: el PSoC digitaliza otra etapa de la cadena por la misma ruta
+ * de captura. Es una VISTA: no toca el lazo ni la calibracion, no se guarda en
+ * EEPROM, y se ve en la proxima captura (con el lazo corriendo, su barrido
+ * vuelve a mover el AMux entre capturas). Vale para I2C y para SERIAL. */
+function onViewChannelRequested(chIndex, channel) {
+  const nd = data.nodes[chIndex];
+  const ch = channel === cfg.VIEW_CHANNEL_NONE
+    ? cfg.VIEW_CHANNEL_NONE
+    : clamp(parseInt(channel, 10) || 0, 0, cfg.VIEW_CHANNELS.length - 1);
+  sendDirected(chIndex, cfg.SUBCMD_VIEW_CHANNEL, ch);
+  nd.pending.set(cfg.SUBCMD_VIEW_CHANNEL, { param: ch, sendTime: performance.now(), retries: 0 });
+  const nombre = ch === cfg.VIEW_CHANNEL_NONE
+    ? 'senal normal'
+    : (cfg.VIEW_CHANNELS.find((c) => c.code === ch)?.label ?? ch);
+  appendLog(`S${chIndex} etapa pedida: ${nombre} (se ve en la proxima captura)`);
+}
+
+/* I2C: el lazo calibra solo y se congela por histeresis cuando esta en banda.
+ * Esto lo obliga a corregir a fondo un rato (sin congelarse) para que rehaga el
+ * punto de trabajo. NO es la calibracion legacy por etapas (0xB5), que barre las
+ * referencias una por una y tarda ~15 s: aca es el mismo lazo, sin freno. */
+function onForceCalRequested(chIndex) {
+  const nd = data.nodes[chIndex];
+  sendDirected(chIndex, cfg.SUBCMD_FORCE_PI, cfg.FORCE_PI_SECONDS);
+  nd.pending.set(cfg.SUBCMD_FORCE_PI,
+                 { param: cfg.FORCE_PI_SECONDS, sendTime: performance.now(), retries: 0 });
+  appendLog(`S${chIndex} lazo forzado ${cfg.FORCE_PI_SECONDS} s: corrige sin congelarse`);
+}
+
 function onCalibrateRequested(chIndex) {
   const nd = data.nodes[chIndex];
   nd.calVdacs = emptyCalVdacs();
@@ -2036,6 +2076,9 @@ function wireSlavePanel(chIndex, panel) {
   panel.addEventListener('ver-requested', () => onVerRequested(chIndex));
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
   panel.addEventListener('calibrate-requested', () => onCalibrateRequested(chIndex));
+  panel.addEventListener('force-cal-requested', () => onForceCalRequested(chIndex));
+  panel.addEventListener('view-channel-requested',
+                         (ev) => onViewChannelRequested(chIndex, ev.detail.channel));
   panel.addEventListener('vdac-manual-requested', (ev) => {
     onManualVdacRequested(chIndex, ev.detail.code);
   });
@@ -2230,7 +2273,14 @@ function handleAck(pkt, idx) {
         panel.setDecimationLock(1);
       }
       renderNodeRow(idx);
-      appendLog(`S${idx} decimacion confirmada: ${f} (${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f)} Hz)`);
+      // La Fs efectiva NO espera al HELLO: mientras el nodo retiene una captura
+      // sin descargar deja de emitir HELLO, y con la Fs nativa vieja el tope sin
+      // SD se calculaba mal (decim 2 + 6 s daba 521 lotes y se iba a la SD
+      // cuando en realidad entran 261). El HELLO exacto lo refina despues.
+      const fsHz = Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f);
+      applyGlobalFs(fsHz);
+      appendLog(`S${idx} decimacion confirmada: ${f} (${fsHz} Hz, sin SD hasta ` +
+                `${((cfg.PSOC_RAM_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fsHz).toFixed(2)} s)`);
     } else if (pending && (pending.retries ?? 0) < 1) {
       // ok=0 tipico: el esclavo estaba ocupado con otro config o el PSoC no
       // estaba IDLE todavia. Un unico reintento diferido suele alcanzar.
@@ -2251,6 +2301,33 @@ function handleAck(pkt, idx) {
       // config mientras tiene una captura en curso o sin descargar.
       appendLog(`S${idx} decimacion rechazada, se mantiene ${nd.decimationFactor}` +
                 ' (el nodo rechaza configuraciones mientras captura o tiene una captura sin descargar)');
+    }
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_FORCE_PI && idx >= 1 && idx < cfg.MAX_NODES) {
+    data.nodes[idx].pending.delete(cfg.SUBCMD_FORCE_PI);
+    appendLog(ackVal
+      ? `S${idx} lazo forzado: corrigiendo ${cfg.FORCE_PI_SECONDS} s sin histeresis`
+      : `S${idx} forzado rechazado: el lazo no esta corriendo (capturando, aprendiendo o sin perfil)`);
+    return;
+  }
+
+  if (ackCmd === cfg.SUBCMD_VIEW_CHANNEL && idx >= 1 && idx < cfg.MAX_NODES) {
+    const nd = data.nodes[idx];
+    const panel = panelFor(idx);
+    /* Lo que llega es el ok=0/1 del esclavo, NO el canal: el esclavo ya
+     * comparo el eco del PSoC contra lo que pidio. El canal es el pendiente. */
+    const pedido = pending ? pending.param : null;
+    nd.pending.delete(cfg.SUBCMD_VIEW_CHANNEL);
+    if (!ackVal) {
+      if (panel) panel.setViewChannel(null);
+      appendLog(`S${idx} etapa rechazada: no existe en esa placa o el nodo no estaba en reposo`);
+    } else {
+      if (panel) panel.setViewChannel(pedido);
+      const item = cfg.VIEW_CHANNELS.find((c) => c.code === pedido);
+      appendLog(`S${idx} etapa confirmada: ${
+        pedido === cfg.VIEW_CHANNEL_NONE ? 'senal normal' : (item ? item.label : pedido)}`);
     }
     return;
   }

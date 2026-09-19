@@ -2640,6 +2640,12 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                 waitAck = true;
             }
             break;
+        case PSOC_CMD_VIEW_CHANNEL:         /* 0xAC: canal del AMux a mirar (vista) */
+            /* 0xFF = volver al canal normal; el resto lo valida el PSoC
+             * contra los canales que existen en SU placa, que no son los
+             * mismos en la I2C y en la SERIAL. */
+            waitAck = true;
+            break;
         case PSOC_CMD_SD_CAPTURE:           /* 0xBE: 0/1 — modo captura a SD del PSoC */
             if (param > 1u) {
                 ok = 0;
@@ -2684,6 +2690,9 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                     break;
                 case PSOC_CMD_SET_DECIMATION:
                     psoc.setDecimation(param);
+                    break;
+                case PSOC_CMD_VIEW_CHANNEL:
+                    psoc.setViewChannel(param);
                     break;
                 case PSOC_CMD_SD_CAPTURE:
                     psoc.sdCapture(param);

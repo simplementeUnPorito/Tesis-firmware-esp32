@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-study-19';
+import * as cfg from './config.js?v=field-study-26';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -170,7 +170,35 @@ export class SlavePanel extends EventTarget {
     this._btnCalibrate.title = 'Calibrar PSoC';
     this._btnCalibrate.addEventListener('click', () => this._dispatch('calibrate-requested'));
     this._lblCal = el('span', null, 'Calibracion');
-    root.appendChild(row(this._lblCal, this._dotCal, this._btnCalibrate));
+    /* Placa I2C: el lazo calibra solo y de forma permanente, pero a veces hace
+     * falta obligarlo a rehacerlo (se cambio una ganancia, se movio el punto de
+     * trabajo). Mismo comando 0xB5 que el boton clasico, con otro nombre para
+     * que quede claro que es una intervencion y no la operacion normal. */
+    this._btnForceCal = el('button', null, 'Forzar calibracion');
+    this._btnForceCal.title = 'Rehace la calibracion del PSoC ahora. Interrumpe la senal ' +
+                              'unos segundos: no usarlo con una captura en curso.';
+    this._btnForceCal.style.display = 'none';
+    this._btnForceCal.addEventListener('click', () => this._dispatch('force-cal-requested'));
+    root.appendChild(row(this._lblCal, this._dotCal, this._btnCalibrate, this._btnForceCal));
+
+    /* Mux de etapas: mirar cualquier punto de la cadena por la misma ruta de
+     * captura. Vale para los dos modelos — el PSoC rechaza el canal que no
+     * existe en SU placa. */
+    this._ddViewChannel = el('select');
+    for (const item of cfg.VIEW_CHANNELS) {
+      this._ddViewChannel.appendChild(new Option(item.label, String(item.code)));
+    }
+    this._ddViewChannel.value = '4';
+    this._ddViewChannel.title = 'Etapa de la cadena que el PSoC digitaliza. Se aplica al ' +
+                                'elegirla, asi Ver y START capturan esa etapa.';
+    /* Sin boton: elegir ES aplicar. El PSoC se queda con la etapa hasta que se
+     * cambie, asi que cualquier captura posterior sale de ahi. */
+    this._ddViewChannel.addEventListener('change', () => {
+      const channel = Number.parseInt(this._ddViewChannel.value, 10);
+      this._dispatch('view-channel-requested', { channel });
+    });
+    this._dotViewChannel = dot('Etapa sin confirmar');
+    root.appendChild(row(labeled('Etapa', this._ddViewChannel), this._dotViewChannel));
     /* Placa I2C: la calibración es el lazo permanente del PSoC. No hay botón,
      * el punto dice si está en banda (verde) o no (rojo). */
     this._controlMode = false;
@@ -513,6 +541,20 @@ export class SlavePanel extends EventTarget {
   }
 
   /** state: 0=unknown, 1=locked, 2=pending/fail. */
+  /** channel: canal confirmado por el PSoC, o null si fue rechazado. */
+  setViewChannel(channel) {
+    if (channel === null || channel === undefined) {
+      setDot(this._dotViewChannel, 2, '', '', 'Etapa rechazada por el PSoC');
+      return;
+    }
+    if (channel !== cfg.VIEW_CHANNEL_NONE) this._ddViewChannel.value = String(channel);
+    const item = cfg.VIEW_CHANNELS.find((c) => c.code === channel);
+    setDot(this._dotViewChannel, 1, '', '',
+           channel === cfg.VIEW_CHANNEL_NONE
+             ? 'Mirando la senal normal'
+             : `Mirando ${item ? item.label : channel}`);
+  }
+
   setDecimationLock(state) {
     setDot(this._dotDecim, state, 'Decimación confirmada por PSoC',
            'Decimación pendiente o sin confirmacion', 'Decimación sin confirmar');
@@ -563,6 +605,7 @@ export class SlavePanel extends EventTarget {
     if (this._controlMode === !!enabled) return;   /* llega con cada HELLO */
     this._controlMode = !!enabled;
     this._btnCalibrate.style.display = enabled ? 'none' : '';
+    this._btnForceCal.style.display = enabled ? '' : 'none';
     this._rowEeprom.style.display = enabled ? 'none' : '';
     this._lblCal.textContent = enabled ? 'Control' : 'Calibracion';
     /* La placa I2C no tiene VDAC global: ese "VDACs: legacy 128" era el valor

@@ -61,6 +61,13 @@
 #define PSOC_CMD_SET_DECIMATION 0xBB /* factor 1..100 (1=sin decimar). Fs efectiva = 2604/factor */
 #define PSOC_CMD_SD_STATUS   0xBC    /* p=0 estado cacheado, p=1 re-init. Ack: byte de estado SD */
 #define PSOC_CMD_SD_TEST     0xBD    /* self-test FatFs GEOTEST.BIN. Ack: 1 OK / 0 fallo */
+/* Canal del AMux que el PSoC digitaliza: VISTA de diagnostico para mirar
+ * otra etapa de la cadena por la misma ruta de captura. No toca el lazo ni
+ * la calibracion y no se guarda en EEPROM. 0xFF = canal normal.
+ * Ack: canal aplicado, o 0xEE si esa placa no tiene ese canal / no esta IDLE. */
+#define PSOC_CMD_VIEW_CHANNEL 0xAC
+#define PSOC_VIEW_CHANNEL_NONE 0xFF
+
 #define PSOC_CMD_SD_CAPTURE  0xBE    /* p=1 captura a SD (permite N>512), p=0 RAM-only. Ack 0/1, 0xEE=rechazo */
 #define PSOC_CMD_SD_READ_BATCH 0xBF  /* uint16 LE; éxito: frame normal seq=índice */
 
@@ -178,6 +185,9 @@ public:
     void selectStream(uint8_t mode);
     void setAdcConfig(uint8_t cfg);
     void setDecimation(uint8_t factor);
+    /* Canal del AMux a digitalizar (vista de diagnostico, 0xFF = el de
+     * siempre). No toca el lazo de control del PSoC. */
+    void setViewChannel(uint8_t channel);
     void sdStatus(uint8_t reinit);   /* consulta/re-init de la SD del PSoC (0xBC) */
     void sdTest();                   /* self-test de bloque en la SD del PSoC (0xBD) */
     void sdCapture(uint8_t enable);  /* modo captura a SD del PSoC (0xBE) */

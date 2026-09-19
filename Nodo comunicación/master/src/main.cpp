@@ -216,8 +216,16 @@ static uint32_t g_captureDumpDueMs = 0;
 static uint32_t g_captureDoneMask = 0;
 static bool     g_dumpRequiresWebClient = false;
 static bool     g_dumpWaitingForWeb = false;
+static uint8_t  g_dumpSkipStreak  = 0;   /* lotes seguidos que el esclavo no entregó */
+static uint32_t g_dumpWsWaitMs    = 0;   /* desde cuándo se espera un cliente web */
 #define DUMP_MAX_RETRIES  30
 #define DUMP_BATCH_TIMEOUT_MS 300
+/* Cortes de cordura del volcado. Sin ellos un esclavo que capturó 0 lotes deja
+ * al maestro moliendo DUMP_MAX_RETRIES x DUMP_BATCH_TIMEOUT_MS por cada lote
+ * pedido: con 261 lotes vacíos son 39 minutos sin atender nada más, que desde
+ * afuera se ve como "el maestro se colgó en DUMPING" (visto 2026-09-18). */
+#define DUMP_MAX_SKIP_STREAK  3
+#define DUMP_WS_WAIT_MAX_MS   30000u
 
 static inline void dumpDeliveryGuardReset()
 {
@@ -255,6 +263,13 @@ struct CachedHello {
     uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
 };
 static CachedHello g_cachedHello[NUM_SLAVES + 1];
+
+/* Sub-comando dirigido 0xBB = factor de decimación (1..100). El PSoC promedia
+ * N muestras y entrega una: Fs efectiva = ADC_SAMPLE_RATE_HZ / N. */
+#define SUBCMD_DECIMATION 0xBBu
+static uint8_t  g_wantDecim = 0;   /* 0 = el maestro todavía no tiene opinión */
+static uint32_t g_authorityNextMs[NUM_SLAVES + 1] = {0};
+static uint8_t  g_authorityTries[NUM_SLAVES + 1]  = {0};
 static volatile bool g_webReplayCachedState = false;
 
 static void beginDump(const char *reason);
@@ -835,6 +850,8 @@ static void beginDump(const char *reason)
             linkQueueBegin(g_rec_n_batches, nodes, nodeCount, expect, g_viewDump);
         }
 
+        g_dumpSkipStreak = 0;
+        g_dumpWsWaitMs = millis();
         requestBatch(g_dumpSlaveIdx, g_dumpBatchSeq);
         g_dumpReqMs = millis();
         MASTER_LOG_PRINTF("[MASTER] DUMPING (%s) slave %d/%d seq 0/%d\n",
@@ -916,7 +933,9 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
      * - 0xAA con un parámetro conserva el VDAC global de los nodos SERIAL.
      * Nunca reenviar un IDAC moderno al PSoC serial: interpretaría p1 como
      * código VDAC y movería una referencia equivocada. */
-    if (serialAnalogModel && sub_cmd == 0xA8u) {
+    /* 0xA8 (PGAout) y 0xAB (forzar el lazo PI) solo existen en la electronica
+     * I2C nueva: la SERIAL no tiene ni esa etapa ni lazo permanente. */
+    if (serialAnalogModel && (sub_cmd == 0xA8u || sub_cmd == 0xABu)) {
         matlab.sendAck(node_id, sub_cmd, 0);
         LOGM("DIRECTED_UNSUPPORTED", "node=%u,link=serial,sub=0x%02X", node_id, sub_cmd);
         return;
@@ -988,8 +1007,63 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
     if (err != ESP_OK) {
         matlab.sendAck(node_id, sub_cmd, 0);
     }
+    /* La N es una propiedad del ARREGLO, no de cada placa: una captura
+     * sincronizada exige que todos compartan Fs. El maestro se queda con la
+     * última que se ordenó y desde ahí desempata (ver serviceSlaveAuthority). */
+    if (sub_cmd == SUBCMD_DECIMATION && err == ESP_OK && param >= 1 && param <= 100) {
+        if (g_wantDecim != param) {
+            g_wantDecim = param;
+            for (uint8_t i = 0; i <= NUM_SLAVES; i++) g_authorityTries[i] = 0;
+        }
+        g_authorityTries[node_id] = 0;
+    }
     MASTER_LOG_PRINTF("[MASTER] directed node=%d sub=0x%02X p1=%d p2=%d err=%d\n",
                       node_id, sub_cmd, param, param2, (int)err);
+}
+
+/* ── Autoridad del maestro sobre la configuración de los esclavos ──────────
+ * Un esclavo puede terminar con otra N que la ordenada: se reinició, entró a
+ * la red después del último "Aplicar", o rechazó el config por estar ocupado.
+ * El HELLO trae su Fs efectiva, así que acá se compara contra la N vigente y,
+ * si difiere, el maestro se la vuelve a imponer. Se reintenta acotado: si tras
+ * AUTHORITY_MAX_TRIES el nodo sigue en otra Fs, es que no puede cumplir (otra
+ * frecuencia nativa, por ejemplo) y se deja de insistir hasta que alguien
+ * ordene una N nueva — insistir para siempre sería ruido de radio inútil. */
+#define AUTHORITY_RETRY_MS  5000u
+#define AUTHORITY_MAX_TRIES 5
+
+static uint16_t expectedFsForDecim(uint8_t decim)
+{
+    if (decim < 1) decim = 1;
+    return (uint16_t)(ADC_SAMPLE_RATE_HZ / decim);
+}
+
+static void serviceSlaveAuthority()
+{
+    if (g_wantDecim == 0) return;                  /* nadie ordenó una N todavía */
+    if (g_state != IDLE && g_state != ARMED) return;   /* config solo en reposo */
+
+    const uint32_t now = millis();
+    const uint16_t wantFs = expectedFsForDecim(g_wantDecim);
+    for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
+        CachedHello &h = g_cachedHello[node];
+        if (!h.valid || h.sample_rate == 0) continue;
+        if (h.sample_rate == wantFs) { g_authorityTries[node] = 0; continue; }
+        if (g_authorityTries[node] >= AUTHORITY_MAX_TRIES) continue;
+        if (g_authorityNextMs[node] != 0 &&
+            (int32_t)(now - g_authorityNextMs[node]) < 0) continue;
+
+        g_authorityNextMs[node] = now + AUTHORITY_RETRY_MS;
+        g_authorityTries[node]++;
+        MASTER_LOG_PRINTF("[MASTER] autoridad node=%d: fs=%u != %u, impongo decim=%u (intento %u)\n",
+                          node, h.sample_rate, wantFs, g_wantDecim,
+                          (unsigned)g_authorityTries[node]);
+        LOGM("AUTHORITY_DECIM", "node=%u,fs=%u,want_fs=%u,decim=%u,try=%u",
+             (unsigned)node, (unsigned)h.sample_rate, (unsigned)wantFs,
+             (unsigned)g_wantDecim, (unsigned)g_authorityTries[node]);
+        handleDirectedCmd(node, SUBCMD_DECIMATION, g_wantDecim, 0, false, false);
+        return;   /* uno por vuelta: no amontonar config en el aire */
+    }
 }
 
 /* ── Broadcast ESP-NOW a todos los esclavos ──────────────────────────────── */
@@ -1015,6 +1089,37 @@ static void broadcastRecordLength(uint16_t nBatches)
         esp_now_send(espnowDstForSlave(node), (uint8_t *)&m, sizeof(m));
         MASTER_LOG_PRINTF("[MASTER] SET_RECLEN node=%u n=%u (hammer)\n", node, n);
     }
+}
+
+/* Termina un volcado que no va a completarse nunca y devuelve el maestro a
+ * reposo. Se usa cuando el esclavo no entrega lotes (capturó 0) o cuando no
+ * queda cliente web al que entregárselos: en los dos casos seguir reintentando
+ * solo sirve para que el maestro deje de atender todo lo demás. */
+static void abortDump(const char *reason)
+{
+    MASTER_LOG_PRINTF("[MASTER] DUMP abortado: %s (node=%d seq=%d)\n",
+                      reason, g_dumpSlaveIdx, g_dumpBatchSeq);
+    LOGM("DUMP_ABORT", "node=%u,seq=%u,reason=%s",
+         (unsigned)g_dumpSlaveIdx, (unsigned)g_dumpBatchSeq, reason);
+    broadcastRecordLength(0);
+    g_viewDump = false;
+    g_viewNode = 0;
+    g_state = armedOrIdleState();
+    g_streaming = false;
+    g_rec_n_batches = 0;
+    g_captureDumpDueMs = 0;
+    g_captureDoneMask = 0;
+    g_dumpBatchSeq = 0;
+    g_dumpRetries = 0;
+    g_dumpRetryPaused = false;
+    g_dumpRequiresWebClient = false;
+    g_dumpWaitingForWeb = false;
+    g_dumpSkipStreak = 0;
+    g_dumpWsWaitMs = 0;
+    dumpDeliveryGuardReset();
+    linkQueueEnd(false);   /* sesión incompleta: no queda en la cola */
+    matlab.sendReady(g_armedCount);
+    matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
 }
 
 static void broadcastPrestart(uint16_t nBatches)
@@ -1754,6 +1859,10 @@ void loop()
         handleMatlabCmd(matlab.lastCmd(), false);
     }
 
+    /* El maestro desempata: si algún esclavo quedó con otra N que la vigente,
+     * se la vuelve a imponer (nodo recién llegado, reinicio, config rechazada). */
+    serviceSlaveAuthority();
+
     /* Comandos llegados por la interfaz web (mismo despachador — ver
      * web_relay.h: se decodifican a RxCmd para no duplicar lógica). */
     while (webRelayHasCmd()) {
@@ -1961,9 +2070,16 @@ void loop()
                 MASTER_LOG_PRINTF("[MASTER] DUMP pause: sin WS node=%d seq=%d\n",
                                   g_dumpSlaveIdx, g_dumpBatchSeq);
                 LOGM("DUMP_PAUSE_WS", "node=%u,seq=%u", g_dumpSlaveIdx, g_dumpBatchSeq);
+                g_dumpWsWaitMs = millis();
             }
             g_dumpWaitingForWeb = true;
             g_dumpReqMs = millis();
+            /* La pausa por falta de WS no tiene fin propio: si la pestaña se
+             * cerró o se recargó, el maestro se quedaba acá para siempre. */
+            if (millis() - g_dumpWsWaitMs > DUMP_WS_WAIT_MAX_MS) {
+                abortDump("no quedo cliente web para entregar");
+                return;
+            }
         } else if (g_dumpWaitingForWeb) {
             MASTER_LOG_PRINTF("[MASTER] DUMP resume WS node=%d seq=%d\n",
                               g_dumpSlaveIdx, g_dumpBatchSeq);
@@ -1981,6 +2097,7 @@ void loop()
             g_dumpBatchRx = false;
             g_dumpRetries = 0;
             g_dumpRetryPaused = false;
+            g_dumpSkipStreak = 0;   /* el esclavo sí entrega: sigue vivo */
             advance = true;
         } else if (!waitingForWeb && g_dumpRetryPaused) {
             if ((int32_t)(millis() - g_dumpRetryDueMs) >= 0) {
@@ -1995,6 +2112,12 @@ void loop()
                                   g_dumpSlaveIdx, g_dumpBatchSeq);
                 g_dumpRetries = 0;
                 g_dumpRetryPaused = false;
+                /* Varios lotes seguidos sin respuesta = el esclavo no tiene la
+                 * captura (o se fue). Pedir los 261 igual no la va a traer. */
+                if (++g_dumpSkipStreak >= DUMP_MAX_SKIP_STREAK) {
+                    abortDump("el esclavo no entrega lotes");
+                    return;
+                }
                 advance = true;
             } else {
                 MASTER_LOG_PRINTF("[MASTER] DUMP retry %d node=%d seq=%d\n",

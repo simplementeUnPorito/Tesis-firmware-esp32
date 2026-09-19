@@ -22,7 +22,7 @@
 #include "sync_protocol.h"
 #include "debug_log.h"
 #include "sd_storage.h"
-#include "../../scope_measurement.h"
+#include "scope_measurement.h"  /* copia exacta del mismo commit; proyecto autocontenido */
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
 #ifndef NODE_ID
@@ -2472,6 +2472,9 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                 waitAck = true;
             }
             break;
+        case PSOC_CMD_VIEW_CHANNEL:         /* 0xAC: canal del AMux a mirar (vista) */
+            waitAck = true;
+            break;
         case PSOC_CMD_SD_CAPTURE:           /* 0xBE: 0/1 — modo captura a SD del PSoC */
             if (param > 1u) {
                 ok = 0;
@@ -2516,6 +2519,9 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                     break;
                 case PSOC_CMD_SET_DECIMATION:
                     psoc.setDecimation(param);
+                    break;
+                case PSOC_CMD_VIEW_CHANNEL:
+                    psoc.setViewChannel(param);
                     break;
                 case PSOC_CMD_SD_CAPTURE:
                     psoc.sdCapture(param);

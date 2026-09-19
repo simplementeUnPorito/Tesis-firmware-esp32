@@ -202,6 +202,7 @@ void PsocUART::saveEeprom()            { _sendCmd1(PSOC_CMD_SAVE_EEPROM, 0); }
 void PsocUART::selectStream(uint8_t m) { _sendCmd1(PSOC_CMD_SELECT_STREAM, m); }
 void PsocUART::setAdcConfig(uint8_t c) { _sendCmd1(PSOC_CMD_ADC_CONFIG, c); }
 void PsocUART::setDecimation(uint8_t factor) { _sendCmd1(PSOC_CMD_SET_DECIMATION, factor); }
+void PsocUART::setViewChannel(uint8_t ch) { _sendCmd1(PSOC_CMD_VIEW_CHANNEL, ch); }
 void PsocUART::sdStatus(uint8_t reinit) { _sendCmd1(PSOC_CMD_SD_STATUS, reinit); }
 void PsocUART::sdTest()                { _sendCmd1(PSOC_CMD_SD_TEST, 0); }
 void PsocUART::sdCapture(uint8_t en)   { _sendCmd1(PSOC_CMD_SD_CAPTURE, en ? 1 : 0); }

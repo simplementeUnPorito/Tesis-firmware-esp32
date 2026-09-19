@@ -37,6 +37,30 @@ export const SUBCMD_SAVE_EEPROM   = 0xB6;   /* mismo código que PSOC_CMD_SAVE_E
 export const SUBCMD_SELECT_STREAM = 0xB7;   /* mismo código que PSOC_CMD_SELECT_STREAM */
 export const SUBCMD_ADC_CONFIG    = 0xBA;   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; las 4 a 2604 Hz nativos */
 export const SUBCMD_DECIMATION    = 0xBB;   /* factor 1..100 (1=sin decimar); Fs efectiva = 2604/factor */
+/* 0xAB: obliga al lazo PI del PSoC a corregir sin congelarse por histeresis
+ * durante N segundos (param). NO es la calibracion legacy por etapas (0xB5):
+ * es el mismo lazo permanente, sin freno, para que rehaga el punto de trabajo
+ * despues de cambiar una ganancia o de tocar los IDAC a mano. */
+export const SUBCMD_FORCE_PI      = 0xAB;
+export const FORCE_PI_SECONDS     = 60;
+
+/* 0xAC: canal del AMux que el PSoC digitaliza — VISTA de diagnostico, no
+ * toca el lazo ni la calibracion y no se guarda en EEPROM (arranque en frio
+ * = senal normal). 0xFF vuelve al canal de siempre. */
+export const SUBCMD_VIEW_CHANNEL  = 0xAC;
+export const VIEW_CHANNEL_NONE    = 0xFF;
+/* Etapas de la cadena en el orden del AMux. La placa I2C tiene las cinco;
+ * la SERIAL GEO solo las cuatro primeras y la SERIAL HAMMER dos — el PSoC
+ * rechaza (ack 0xEE) el canal que no existe en SU placa, que es el unico
+ * lugar donde ese dato es confiable. */
+export const VIEW_CHANNELS = [
+  { code: 0, label: '0 - PGA (SEo)' },
+  { code: 1, label: '1 - Pasabanda (BPo)' },
+  { code: 2, label: '2 - OPA sumador (OPA_SUMo)' },
+  { code: 3, label: '3 - Sumador (SUMo)' },
+  { code: 4, label: '4 - Pasabajos (LPo) = senal' },
+];
+
 export const SUBCMD_SD_CAPTURE    = 0xBE;   /* 0/1: captura a SD del PSoC (solo nodos con sd_present=1). Viaja web→maestro→esclavo→PSoC como cualquier sub_cmd */
 export const SUBCMD_SD_ENABLE     = 0xC0;   /* OBSOLETO (era SD-en-ESP32, purgada 2026-07-11): el esclavo lo rechaza siempre; usar SUBCMD_SD_CAPTURE */
 export const SUBCMD_BLINK_LED     = 0x70;

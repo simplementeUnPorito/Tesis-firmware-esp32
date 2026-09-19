@@ -252,3 +252,75 @@ durante el muestreo. Esa es la regla nueva y quedó verificada de punta a punta.
 
 Señal: media 53355 cuentas, sigma 294, pico a pico 2695, con PGA x4 y PGAout
 x24 aplicados al arrancar.
+
+## Decimación y el tope sin SD (2026-09-18)
+
+Síntoma reportado: «con decimación 2 y 6 s termina usando la SD».
+
+Cadena verificada de punta a punta:
+
+- El PSoC decima con **media de bloque**, no descarte: `g_decim_acc += val;
+  val = g_decim_acc / g_capture_decim_factor` (`main.c:1535-1539`). Guarda la
+  muestra ya promediada, así que un lote son 30 muestras *decimadas*.
+- El esclavo decide SD con `n_batches > PSOC_CAPTURE_MAX_BATCHES` (512) en
+  `allocStore()`, y esos lotes son de muestras decimadas ⇒ **el tope en
+  segundos escala solo con N**: 512·30/fs. Con N=1 son 5,90 s; con N=2, 11,80 s;
+  con N=10, 59,07 s. No hubo que cambiar nada del esclavo.
+- El PSoC informa la fs efectiva (`psoc_adc_effective_fs_hz()` = nativa/N) y
+  manda FS_REPORT tras `PSOC_CMD_SET_DECIMATION`; el esclavo la refleja en
+  `psoc.sampleRate()` y la publica en HELLO sub 0x05. Medido en placa:
+  `decim 5 → 520 Hz`, `decim 2 → 1302 Hz`.
+
+**La falla estaba entera en la web** y eran dos cosas:
+
+1. Mientras el nodo retiene una captura sin descargar (`state=4 fill=n/n`) deja
+   de emitir HELLO, así que la fs de la página se queda en la nativa. Con 2604 Hz,
+   6 s ⇒ 521 lotes > 512 ⇒ SD. Con la fs correcta (1302 Hz) son 261 lotes ⇒ RAM.
+   Arreglo: el ACK ok=1 de decimación aplica ya la fs efectiva
+   (`applyGlobalFs(floor(2604/N))`) sin esperar al HELLO, que después la refina.
+2. `applyGlobalFs()` no llamaba a `updateCapturePreview()`, así que al cambiar la
+   fs el renglón de lotes seguía mostrando el cálculo anterior.
+
+Además el preview ahora dice explícitamente `· sin SD (tope X,XX s)` o
+`· USA SD (sin SD hasta X,XX s)`, para que el límite se vea sin tener que
+deducirlo. Versión de caché de la web: `field-study-24`.
+
+**Trampa de laboratorio:** abrir COM6 desde un script (`probar_maestro.py`,
+`fs_tras_decim.py`) resetea el ESP maestro y le arranca la sesión a la página
+abierta — START y los botones dejan de responder hasta recargar con F5. No
+sondear el maestro por USB mientras alguien usa la web.
+
+## Autoridad del maestro sobre la configuración (2026-09-18)
+
+Pedido: «el maestro debe forzar su autoridad en la configuración de cada esclavo
+si difiere; el maestro desempata».
+
+La N es propiedad del ARREGLO, no de cada placa: una captura sincronizada exige
+que todos compartan Fs. El maestro guarda la última N ordenada (`g_wantDecim`,
+se fija cuando reenvía un `SUBCMD_DECIMATION` con `err == ESP_OK`) y en
+`serviceSlaveAuthority()` compara contra la Fs que cada HELLO informa. Si
+difiere, la vuelve a imponer: uno por vuelta de `loop()`, cada 5 s como mucho, y
+**se rinde a los 5 intentos** — si un nodo no puede cumplir (otra frecuencia
+nativa) insistir para siempre sería ruido de radio inútil; queda en el log
+(`AUTHORITY_DECIM`). Solo actúa con el maestro en IDLE o ARMED.
+
+Probado de punta a punta contra el nodo 2: se ordena decim 4 desde el maestro
+(Fs 651), se desincroniza el nodo a mano por su consola USB (`decim 1`, sin pasar
+por el maestro) y el maestro se la vuelve a imponer sola dentro de los 10 s.
+
+## Cortes de cordura del volcado (2026-09-18)
+
+Un esclavo que capturó 0 lotes dejaba al maestro pidiendo cada lote
+`DUMP_MAX_RETRIES` (30) x `DUMP_BATCH_TIMEOUT_MS` (300) = 9 s: con 261 lotes
+vacíos son **39 minutos** sin atender nada más, que desde afuera se ve como
+«el maestro se colgó en DUMPING». Y la pausa por falta de cliente WS no tenía
+final: una pestaña cerrada lo dejaba ahí para siempre.
+
+Ahora `abortDump()` corta por dos lados: tres lotes seguidos sin respuesta
+(`DUMP_MAX_SKIP_STREAK`) o 30 s sin cliente web (`DUMP_WS_WAIT_MAX_MS`).
+
+**Trampa del banco:** el comando dirigido por USB son **6 bytes**
+`[0xAB][0xBD][nodo][sub][param][xor]`; los 7 bytes son solo para el IDAC manual
+(0xAA). `probar_maestro.directed7()` sirve para 0xAA y **no** para el resto: con
+7 bytes el maestro descarta el comando en silencio y parece que el esclavo lo
+ignoró. Me costó un diagnóstico falso.
