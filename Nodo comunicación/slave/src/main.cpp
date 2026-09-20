@@ -2368,8 +2368,18 @@ static bool requestPsocGainFromUsb(uint8_t subCmd, uint8_t param, const char *na
         return false;
     }
     if (ensurePsocReadyForConfig()) {
+        /* Los TRES subcomandos son distintos.  El else tapaba PGAOUT y mandaba
+         * PGAVDAC en su lugar, asi que `pgaout N` por USB no cambiaba nunca la
+         * ganancia de PGAout: cambiaba la referencia del VDAC y despues se
+         * quedaba esperando un ACK de un comando que jamas se habia enviado.
+         * Descubierto el 2026-09-19 barriendo las 81 combinaciones: el
+         * firmware reportaba PGAOUT=0 en todas, con LPo identico a ganancia 1
+         * y a ganancia 1152.  La ruta web/ESP-NOW siempre estuvo bien; el bug
+         * era solo de la consola USB, que es justo la del banco. */
         if (subCmd == PSOC_CMD_PGA) {
             psoc.setPga(param);
+        } else if (subCmd == PSOC_CMD_PGAOUT) {
+            psoc.setPgaout(param);
         } else {
             psoc.setPgavdac(param);
         }
