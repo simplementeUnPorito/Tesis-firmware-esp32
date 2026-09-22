@@ -209,10 +209,19 @@ static uint8_t  g_masterChannel = MASTER_CH_FALLBACK;
 enum SlaveState { WAIT_ARM, ARMED, HOT_WAIT, SAMPLING, STOPPED };
 static volatile SlaveState g_state       = WAIT_ARM;
 static bool                g_psocConnected = false;  /* resultado de probe() en setup */
-/* GPIO19 -> PSoC P1[4] (esp_reset), con pull-up EXTERNO a 3V3.
- * El PSoC filtra la solicitud y su P2[4] open-drain tira de RST/XRES.
- * En reposo el ESP queda en alta impedancia: nunca aplica 3V3/5V al reset. */
-static constexpr gpio_num_t PSOC_RESET_REQUEST_PIN = GPIO_NUM_19;
+/* GPIO configurado en platformio.ini -> PSoC P1[4] (esp_reset).
+ * Sin pull-up externo: el ESP entrega 3V3 en reposo y 0V al pedir reset.
+ * P2[4] del PSoC, open-drain, es quien tira de RST/XRES. */
+#ifndef PSOC_RESET_REQUEST_PIN
+#error "Definir PSOC_RESET_REQUEST_PIN en platformio.ini"
+#endif
+#if PSOC_RESET_REQUEST_PIN == PSOC_UART_RX
+#error "PSOC_RESET_REQUEST_PIN y PSOC_UART_RX no pueden usar el mismo GPIO"
+#endif
+#if defined(LOCAL_UI_ENABLE) && LOCAL_UI_ENABLE && \
+    PSOC_RESET_REQUEST_PIN == LOCAL_OLED_MISO_PIN
+#error "PSOC_RESET_REQUEST_PIN y LOCAL_OLED_MISO_PIN no pueden usar el mismo GPIO"
+#endif
 static constexpr uint32_t PSOC_RESET_PULSE_MS = 500u;
 static constexpr uint32_t PSOC_RESET_STALE_MS = 15000u;
 static constexpr uint32_t PSOC_RESET_RETRY_MS = 2000u;
@@ -225,26 +234,35 @@ static uint32_t g_psocResetStartedMs = 0u;
 static uint32_t g_psocResetLastProbeMs = 0u;
 static uint32_t g_psocResetLastAutoMs = 0u;
 
+static void drivePsocResetRequestPin(bool high)
+{
+    /* OUTPUT en Arduino-ESP32 es push-pull: fuerza tanto 3V3 como GND. */
+    pinMode(PSOC_RESET_REQUEST_PIN, OUTPUT);
+    digitalWrite(PSOC_RESET_REQUEST_PIN, high ? HIGH : LOW);
+}
+
 static void beginPsocResetRequest(const char *reason)
 {
     if (g_psocResetActive) return;
-    /* Precargar bajo ANTES de habilitar la salida open-drain. */
-    gpio_set_level(PSOC_RESET_REQUEST_PIN, 0);
-    gpio_set_direction(PSOC_RESET_REQUEST_PIN, GPIO_MODE_OUTPUT_OD);
+    drivePsocResetRequestPin(false);
     g_psocResetActive = true;
     g_psocResetStartedMs = millis();
     g_psocConnected = false;
-    SLAVE_LOG_PRINTF("[PSoC] reset solicitado (%s), GPIO19=LOW\n", reason);
+    SLAVE_LOG_PRINTF("[PSoC] reset solicitado (%s), GPIO%d nivel=%d esperado=0\n",
+                     reason, PSOC_RESET_REQUEST_PIN,
+                     digitalRead(PSOC_RESET_REQUEST_PIN));
 }
 
 static void servicePsocResetRequest()
 {
     if (g_psocResetActive &&
         (uint32_t)(millis() - g_psocResetStartedMs) >= PSOC_RESET_PULSE_MS) {
-        gpio_set_direction(PSOC_RESET_REQUEST_PIN, GPIO_MODE_INPUT);
+        drivePsocResetRequestPin(true);
         g_psocResetActive = false;
         g_psocResetFailures = 0u;
-        SLAVE_LOG_PRINTF("[PSoC] reset liberado, GPIO19=Hi-Z\n");
+        SLAVE_LOG_PRINTF("[PSoC] reset liberado, GPIO%d nivel=%d esperado=1\n",
+                         PSOC_RESET_REQUEST_PIN,
+                         digitalRead(PSOC_RESET_REQUEST_PIN));
     }
 }
 static volatile uint64_t   g_t_start_us  = 0;
@@ -2520,7 +2538,23 @@ static void handleUsbCommand(const char *cmd)
     if (cmd[0] == '\0') {
         return;
     }
-    if (usbCommandEquals(cmd, "psocreset")) {
+    if (usbCommandEquals(cmd, "resetlow")) {
+        g_psocResetActive = false;
+        drivePsocResetRequestPin(false);
+        SLAVE_LOG_PRINTF("[USB] resetlow GPIO%d nivel=%d esperado=0\n",
+                         PSOC_RESET_REQUEST_PIN,
+                         digitalRead(PSOC_RESET_REQUEST_PIN));
+    } else if (usbCommandEquals(cmd, "resethigh")) {
+        g_psocResetActive = false;
+        drivePsocResetRequestPin(true);
+        SLAVE_LOG_PRINTF("[USB] resethigh GPIO%d nivel=%d esperado=1\n",
+                         PSOC_RESET_REQUEST_PIN,
+                         digitalRead(PSOC_RESET_REQUEST_PIN));
+    } else if (usbCommandEquals(cmd, "resetstate")) {
+        SLAVE_LOG_PRINTF("[USB] resetstate GPIO%d nivel=%d\n",
+                         PSOC_RESET_REQUEST_PIN,
+                         digitalRead(PSOC_RESET_REQUEST_PIN));
+    } else if (usbCommandEquals(cmd, "psocreset")) {
         if (g_state == SAMPLING || g_state == HOT_WAIT || captureOrDumpBusy()) {
             SLAVE_LOG_PRINTF("[USB] psocreset rechazado: captura/transferencia activa\n");
         } else {
@@ -2617,9 +2651,9 @@ static void handleUsbCommand(const char *cmd)
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
 #else
-        SLAVE_LOG_PRINTF("[USB] commands: psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N\n");
 #endif
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
@@ -3581,10 +3615,13 @@ static void masterChannelService() {}
 
 void setup()
 {
-    /* Seguro incluso durante la programación del ESP: entrada = Hi-Z. */
-    gpio_set_direction(PSOC_RESET_REQUEST_PIN, GPIO_MODE_INPUT);
+    /* Arduino: precargar HIGH y habilitar salida; reafirmar tras pinMode. */
+    drivePsocResetRequestPin(true);
     dbgLogBegin(DBG_LOG_BAUD);   /* Serial USB del esclavo = canal de log */
     SLAVE_LOG_PRINTF("[SLAVE %d] boot\n", NODE_ID);
+    SLAVE_LOG_PRINTF("[PSoC] reset pin GPIO%d OUTPUT, nivel=%d esperado=1\n",
+                     PSOC_RESET_REQUEST_PIN,
+                     digitalRead(PSOC_RESET_REQUEST_PIN));
     /* SD-en-ESP32 purgada (2026-07-11): la SD vive en el PSoC. sd_storage.*
      * queda como stub sin inicializar; sd_present sale de PSOC_EVT_SD_STATUS. */
     /* Heap: el store usa paginas de STORE_PAGE_BATCHES lotes, asi el limite
@@ -3596,6 +3633,11 @@ void setup()
     samplePulseBegin();
     debugEspHardwareBegin();
     localUiBegin();
+    /* SPI.begin() configura sus pads; reclamar reset despues de todo el SPI. */
+    drivePsocResetRequestPin(true);
+    SLAVE_LOG_PRINTF("[PSoC] reset pin post-UI GPIO%d nivel=%d esperado=1\n",
+                     PSOC_RESET_REQUEST_PIN,
+                     digitalRead(PSOC_RESET_REQUEST_PIN));
     SLAVE_LOG_PRINTF("[SCOPE] sample pulse pin=%d idle=%d us=%d\n",
                      SAMPLE_PULSE_PIN, SAMPLE_PULSE_IDLE, SAMPLE_PULSE_US);
     SLAVE_LOG_PRINTF("[SCOPE] debugHardware=%d start pin=%d idle=%d us=%d\n",
@@ -3653,22 +3695,14 @@ void setup()
     beginPsocRxScan();
 #endif
 
-    /* Intentar detectar el PSoC una vez. Si no responde, se reintenta cada 2 s
-     * en loop() para no bloquear ESP-NOW ni la generación de batches debug. */
-    SLAVE_LOG_PRINTF("[SLAVE %d] Buscando PSoC...\n", NODE_ID);
-    g_psocConnected = psoc.probe(300);
-    g_psocEverSeen = g_psocConnected;
-    if (g_psocConnected) {
-        SLAVE_LOG_PRINTF("[SLAVE %d] PSoC: DETECTADO\n", NODE_ID);
-        LOGM("PSOC", "detected=1");
-        scheduleAutoCalibration(PSOC_AUTO_CAL_DELAY_MS);
-        scheduleBootGains();
-    } else {
-        SLAVE_LOG_PRINTF("[SLAVE %d] PSoC sin respuesta — reintentando en loop\n", NODE_ID);
-        LOGM("PSOC", "detected=0,retry=loop");
-    }
+    /* Arrancar siempre desde un estado conocido. El pulso se completa de forma
+     * no bloqueante en loop(); el probe periódico corre recién después de que
+     * servicePsocResetRequest() libere la solicitud de reset. Esto evita probar
+     * la UART/I2C mientras el PSoC todavía está retenido en XRES. */
+    beginPsocResetRequest("arranque del esclavo");
+    LOGM("PSOC_RESET", "reason=boot");
 
-    SLAVE_LOG_PRINTF("[SLAVE %d] listo, esperando ARM\n", NODE_ID);
+    SLAVE_LOG_PRINTF("[SLAVE %d] listo, reseteando PSoC antes de esperar ARM\n", NODE_ID);
     LOGM("BOOT", "node=%d,psoc=%d", NODE_ID, (int)g_psocConnected);
 }
 
