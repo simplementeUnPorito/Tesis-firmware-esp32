@@ -17,6 +17,7 @@
 
 #include <Arduino.h>
 #include <esp_wifi.h>
+#include <driver/gpio.h>
 #include "psoc_uart.h"
 #include "espnow_transport.h"
 #include "sync_protocol.h"
@@ -208,6 +209,44 @@ static uint8_t  g_masterChannel = MASTER_CH_FALLBACK;
 enum SlaveState { WAIT_ARM, ARMED, HOT_WAIT, SAMPLING, STOPPED };
 static volatile SlaveState g_state       = WAIT_ARM;
 static bool                g_psocConnected = false;  /* resultado de probe() en setup */
+/* GPIO19 -> PSoC P1[4] (esp_reset), con pull-up EXTERNO a 3V3.
+ * El PSoC filtra la solicitud y su P2[4] open-drain tira de RST/XRES.
+ * En reposo el ESP queda en alta impedancia: nunca aplica 3V3/5V al reset. */
+static constexpr gpio_num_t PSOC_RESET_REQUEST_PIN = GPIO_NUM_19;
+static constexpr uint32_t PSOC_RESET_PULSE_MS = 500u;
+static constexpr uint32_t PSOC_RESET_STALE_MS = 15000u;
+static constexpr uint32_t PSOC_RESET_RETRY_MS = 2000u;
+static constexpr uint32_t PSOC_RESET_COOLDOWN_MS = 60000u;
+static bool g_psocResetActive = false;
+static bool g_psocEverSeen = false;
+static uint8_t g_psocResetFailures = 0u;
+static uint8_t g_psocAutoResetCount = 0u;
+static uint32_t g_psocResetStartedMs = 0u;
+static uint32_t g_psocResetLastProbeMs = 0u;
+static uint32_t g_psocResetLastAutoMs = 0u;
+
+static void beginPsocResetRequest(const char *reason)
+{
+    if (g_psocResetActive) return;
+    /* Precargar bajo ANTES de habilitar la salida open-drain. */
+    gpio_set_level(PSOC_RESET_REQUEST_PIN, 0);
+    gpio_set_direction(PSOC_RESET_REQUEST_PIN, GPIO_MODE_OUTPUT_OD);
+    g_psocResetActive = true;
+    g_psocResetStartedMs = millis();
+    g_psocConnected = false;
+    SLAVE_LOG_PRINTF("[PSoC] reset solicitado (%s), GPIO19=LOW\n", reason);
+}
+
+static void servicePsocResetRequest()
+{
+    if (g_psocResetActive &&
+        (uint32_t)(millis() - g_psocResetStartedMs) >= PSOC_RESET_PULSE_MS) {
+        gpio_set_direction(PSOC_RESET_REQUEST_PIN, GPIO_MODE_INPUT);
+        g_psocResetActive = false;
+        g_psocResetFailures = 0u;
+        SLAVE_LOG_PRINTF("[PSoC] reset liberado, GPIO19=Hi-Z\n");
+    }
+}
 static volatile uint64_t   g_t_start_us  = 0;
 static volatile bool       g_debug_mode  = false;
 static          uint32_t   g_debug_count = 0;
@@ -2481,7 +2520,13 @@ static void handleUsbCommand(const char *cmd)
     if (cmd[0] == '\0') {
         return;
     }
-    if (usbCommandEquals(cmd, "probe")) {
+    if (usbCommandEquals(cmd, "psocreset")) {
+        if (g_state == SAMPLING || g_state == HOT_WAIT || captureOrDumpBusy()) {
+            SLAVE_LOG_PRINTF("[USB] psocreset rechazado: captura/transferencia activa\n");
+        } else {
+            beginPsocResetRequest("USB");
+        }
+    } else if (usbCommandEquals(cmd, "probe")) {
         requestProbeFromUsb();
     } else if (usbCommandEquals(cmd, "status") || usbCommandEquals(cmd, "s")) {
         requestStatusFromUsb();
@@ -2572,9 +2617,9 @@ static void handleUsbCommand(const char *cmd)
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N\n");
 #else
-        SLAVE_LOG_PRINTF("[USB] commands: probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N\n");
 #endif
         LOGM("USB_CMD", "cmd=help,ok=1");
     } else {
@@ -3536,6 +3581,8 @@ static void masterChannelService() {}
 
 void setup()
 {
+    /* Seguro incluso durante la programación del ESP: entrada = Hi-Z. */
+    gpio_set_direction(PSOC_RESET_REQUEST_PIN, GPIO_MODE_INPUT);
     dbgLogBegin(DBG_LOG_BAUD);   /* Serial USB del esclavo = canal de log */
     SLAVE_LOG_PRINTF("[SLAVE %d] boot\n", NODE_ID);
     /* SD-en-ESP32 purgada (2026-07-11): la SD vive en el PSoC. sd_storage.*
@@ -3610,6 +3657,7 @@ void setup()
      * en loop() para no bloquear ESP-NOW ni la generación de batches debug. */
     SLAVE_LOG_PRINTF("[SLAVE %d] Buscando PSoC...\n", NODE_ID);
     g_psocConnected = psoc.probe(300);
+    g_psocEverSeen = g_psocConnected;
     if (g_psocConnected) {
         SLAVE_LOG_PRINTF("[SLAVE %d] PSoC: DETECTADO\n", NODE_ID);
         LOGM("PSOC", "detected=1");
@@ -3628,6 +3676,7 @@ void setup()
 
 void loop()
 {
+    servicePsocResetRequest();
     if (g_state != SAMPLING) {
         debugEspHardwareService();
         /* Reengancharse al canal del maestro si dejo de hablar. No corre durante
@@ -3754,15 +3803,44 @@ void loop()
 
     /* Reintento no-bloqueante de detección del PSoC — cada 2 s, fuera de captura activa */
     static uint32_t lastProbeMs = 0;
-    if (!g_psocConnected && g_state != SAMPLING && g_state != HOT_WAIT &&
+    if (!g_psocConnected && !g_psocResetActive &&
+        g_state != SAMPLING && g_state != HOT_WAIT &&
         g_view_remaining == 0 && (millis() - lastProbeMs) >= 2000) {
         lastProbeMs = millis();
         g_psocConnected = psoc.probe(300);
         if (g_psocConnected) {
+            g_psocEverSeen = true;
+            g_psocResetFailures = 0u;
             SLAVE_LOG_PRINTF("[SLAVE %d] PSoC: DETECTADO\n", NODE_ID);
             LOGM("PSOC", "detected=1");
             scheduleAutoCalibration(PSOC_AUTO_CAL_DELAY_MS);
             scheduleBootGains();
+        }
+    }
+
+    /* Sólo recuperar una conexión que alguna vez funcionó. Dos probes
+     * fallidos, fuera de captura, antes de pulsar reset. Máximo 3 por arranque
+     * y 60 s entre pulsos para no ocultar una falla eléctrica persistente. */
+    if (g_psocConnected) {
+        g_psocEverSeen = true;
+        g_psocResetFailures = 0u;
+    }
+    if (g_psocEverSeen && !g_psocResetActive &&
+        g_state == WAIT_ARM && !captureOrDumpBusy() &&
+        g_view_remaining == 0 && !g_cfg_waiting &&
+        psoc.hasLastByte() && psoc.lastByteAgeMs() >= PSOC_RESET_STALE_MS &&
+        g_psocAutoResetCount < 3u &&
+        (g_psocAutoResetCount == 0u ||
+         (uint32_t)(millis() - g_psocResetLastAutoMs) >= PSOC_RESET_COOLDOWN_MS) &&
+        (uint32_t)(millis() - g_psocResetLastProbeMs) >= PSOC_RESET_RETRY_MS) {
+        g_psocResetLastProbeMs = millis();
+        g_psocConnected = psoc.probe(300);
+        if (g_psocConnected) {
+            g_psocResetFailures = 0u;
+        } else if (++g_psocResetFailures >= 2u) {
+            g_psocResetLastAutoMs = millis();
+            g_psocAutoResetCount++;
+            beginPsocResetRequest("UART sin respuesta");
         }
     }
 
