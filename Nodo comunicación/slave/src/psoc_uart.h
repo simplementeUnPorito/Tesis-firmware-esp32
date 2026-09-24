@@ -282,6 +282,15 @@ typedef void (*BatchCallback)(const PsocBatch &batch);
 typedef void (*DiagCallback)(const PsocDiagEvent &event);
 typedef void (*SelfTestCallback)(const PsocSelfTestResult &result);
 
+/* Tabla de puntos de trabajo del PSoC (control_config.h del PSoC, no tocar
+ * desde aca). Parametros de controlSet() y acciones de controlCommand(0xD6,..). */
+#define CP_PUNTO_POLICY 47
+#define CP_PUNTO_ARG    48
+#define CONTROL_PUNTO_SET   8
+#define CONTROL_PUNTO_DUMP  9
+#define CONTROL_PUNTO_CLEAR 10
+#define CONTROL_PUNTO_POL   11
+
 class PsocUART {
 public:
     /* Runtime calibration protocol, available in field and test builds.

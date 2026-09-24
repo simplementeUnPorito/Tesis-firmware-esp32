@@ -252,10 +252,39 @@ bool PsocUART::controlUsb(const char *line)
 {
     if(strncmp(line,"ctl ",4))return false;
     unsigned id;long value;bool ok=false;
+    unsigned par,pol;int c0,c1,c2,c3;
     if(sscanf(line+4,"set %u %ld",&id,&value)==2 && id<256)ok=controlSet((uint8_t)id,(int32_t)value);
     else if(sscanf(line+4,"get %u",&id)==1 && id<256)ok=controlCommand(0xD7,(uint8_t)id);
     else if(sscanf(line+4,"channel %u",&id)==1 && id<5)
         ok=controlSet(25,(int32_t)id)&&controlCommand(0xD6,1);
+    /* Tabla de puntos de trabajo. Probar los patrones mas especificos ANTES
+     * que "punto <par> <c0> <c1> <c2> <c3>", que si no se comeria "policy"/
+     * "dump"/"clear" como si fueran el primer %u. */
+    else if(sscanf(line+4,"punto policy %u",&pol)==1 && pol<=3)
+        ok=controlCommand(0xD6,CONTROL_PUNTO_POL,(uint8_t)pol);
+    else if(sscanf(line+4,"punto dump %u",&par)==1 && par<=80)
+        ok=controlCommand(0xD6,CONTROL_PUNTO_DUMP,(uint8_t)par);
+    else if(!strcmp(line+4,"punto clear"))
+        ok=controlCommand(0xD6,CONTROL_PUNTO_CLEAR,0xFF);
+    else if(sscanf(line+4,"punto clear %u",&par)==1 && par<=80)
+        ok=controlCommand(0xD6,CONTROL_PUNTO_CLEAR,(uint8_t)par);
+    else if(!strcmp(line+4,"puntos"))
+        ok=controlCommand(0xD6,CONTROL_PUNTO_DUMP,0xFF);
+    else if(sscanf(line+4,"punto %u %d %d %d %d",&par,&c0,&c1,&c2,&c3)==5 && par<=80
+            && c0>=-255&&c0<=255 && c1>=-255&&c1<=255 && c2>=-255&&c2<=255 && c3>=-255&&c3<=255) {
+        /* Palabra de 32 bits stageada en CP_PUNTO_ARG (ver psoc_uart.h):
+         * bits0-6 par, bit7 cual, bits8-17 primer codigo+512,
+         * bits18-27 segundo codigo+512, bit28 commit (solo en la 2da palabra). */
+        uint32_t w1=((uint32_t)par&0x7Fu)
+                   |(((uint32_t)(c0+512)&0x3FFu)<<8)
+                   |(((uint32_t)(c1+512)&0x3FFu)<<18);
+        uint32_t w2=((uint32_t)par&0x7Fu)|0x80u
+                   |(((uint32_t)(c2+512)&0x3FFu)<<8)
+                   |(((uint32_t)(c3+512)&0x3FFu)<<18)
+                   |(1u<<28);
+        ok=controlSet(CP_PUNTO_ARG,(int32_t)w1)&&controlCommand(0xD6,CONTROL_PUNTO_SET)
+           &&controlSet(CP_PUNTO_ARG,(int32_t)w2)&&controlCommand(0xD6,CONTROL_PUNTO_SET);
+    }
     else {
         const char *names[]={"apply","save","defaults","learn","pause","resume","report"};
         for(unsigned i=0;i<7;++i)if(!strcmp(line+4,names[i]))ok=controlCommand(0xD6,(uint8_t)(i+1));
