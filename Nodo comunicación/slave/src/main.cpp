@@ -95,6 +95,13 @@
 #ifndef SLAVE_LAB_TOOLS_ENABLE
   #define SLAVE_LAB_TOOLS_ENABLE 0
 #endif
+/* Lineas de protocolo para un parser de host (dumpusb/rftest/sdstress): sin
+ * el prefijo "[t][S2] " de SLAVE_LOG_PRINTF, igual que LOGM con "#M,...". */
+#if DBG_ENABLE
+  #define SLAVE_LOG_RAW(...) DBG_STREAM.printf(__VA_ARGS__)
+#else
+  #define SLAVE_LOG_RAW(...) do {} while (0)
+#endif
 #ifndef PSOC_AUTO_CAL_ON_READY
   /* Learning must only start after the operator confirms that the sensor is
    * still.  A newly detected PSoC therefore reports NEEDS_LEARNING but never
@@ -309,6 +316,33 @@ static uint32_t     g_psoc_sd_read_started_ms = 0;
 #define PSOC_SD_READ_TIMEOUT_MS 450u  /* H3 auditoría 2026-07-11: ~3.6% de lecturas 0xBF
                                         * superan 250 ms (pico periódico); 450 ms absorbe casi
                                         * todas sin NACK y el maestro re-pide el mismo seq igual */
+
+/* ── rftest (banco): trafico ESP-NOW controlado, EN PARALELO a una captura ──
+ * Sin esto medir el ruido que mete la radio exige esperar a que transmita
+ * por casualidad. Dispara una trama fija cada periodo_ms sin bloquear, para
+ * correr junto con "cap N". Ver USB "rftest" y loop() -> serviceRfTest(). */
+static uint32_t g_rftest_hasta_ms   = 0;   /* millis() de fin; 0 = sin trafico armado */
+static uint32_t g_rftest_periodo_ms = 0;
+static uint8_t  g_rftest_bytes      = 0;
+static uint32_t g_rftest_enviados   = 0;
+static uint32_t g_rftest_fallos     = 0;
+static uint32_t g_rftest_prox_ms    = 0;
+static bool     g_rftest_running    = false; /* para imprimir "#RFTEST fin" una sola vez */
+
+/* ── sdstress (banco): escrituras a la SD del PSoC EN PARALELO a una captura
+ * corta que si entra en RAM. NO toca la regla de g_psoc_sd_store_active: es
+ * un estresor aparte de la SD real de una captura larga. Reusa
+ * PSOC_CMD_SD_TEST (self-test GEOTEST.BIN, el mismo camino que "sdtest")
+ * disparado a un periodo elegido; 58 ms por defecto imita el drenaje real de
+ * una captura a SD (un sector cada 57,6 ms). El ack 0xBD llega por
+ * servicePsocConfigAck() -> applyConfirmedConfig(), que cuenta el fallo solo
+ * mientras g_sdstress_running (asi no se mezcla con un "sdtest" suelto). */
+static uint32_t g_sdstress_hasta_ms   = 0;
+static uint32_t g_sdstress_periodo_ms = 0;
+static uint32_t g_sdstress_escrituras = 0;
+static uint32_t g_sdstress_fallos     = 0;
+static uint32_t g_sdstress_prox_ms    = 0;
+static bool     g_sdstress_running    = false;
 
 #ifndef STORE_PAGE_BATCHES
 #define STORE_PAGE_BATCHES 32u
@@ -526,6 +560,7 @@ static uint32_t expectedCaptureMs(uint16_t n_batches);
 static bool storeReadyForHotWait();
 static void serviceHotWaitWatchdog();
 static void debugEspSetRamp(bool enable);
+static SampleBytes *storeBatchPtr(uint16_t seq);
 
 static void IRAM_ATTR onPsocRxEdge()
 {
@@ -1442,6 +1477,13 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
                 g_sd_overridden = false;
             }
             break;
+        case PSOC_CMD_SD_TEST:
+            /* sdstress (banco): contar el fallo solo mientras el estresor esta
+             * activo, para no mezclarlo con un "sdtest" manual suelto. */
+            if (value == 0u && g_sdstress_running) {
+                g_sdstress_fallos++;
+            }
+            break;
         default:
             break;
     }
@@ -2315,6 +2357,209 @@ static void requestSdReadFromUsb(uint16_t seq)
     psoc.sdReadBatch(seq);
     LOGM("USB_CMD", "cmd=sdread,seq=%u", (unsigned)seq);
 }
+
+static_assert(sizeof(SampleBytes) == 10u,
+              "dumpusb asume 10 bytes por SampleBytes (raw_lo..flags)");
+
+static uint8_t crc8Dump(const uint8_t *data, size_t len)
+{
+    /* CRC-8 simple (poly 0x07, init 0x00): solo para detectar una linea
+     * cortada en el volcado por USB, no es criptografico. */
+    uint8_t crc = 0x00u;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t bit = 0u; bit < 8u; bit++) {
+            crc = (crc & 0x80u) ? (uint8_t)((crc << 1) ^ 0x07u) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/* Banco: volcar por USB los lotes que ya quedaron en RAM, DESPUES de que la
+ * captura termino. Existe porque hoy las muestras solo salen del nodo por
+ * ESP-NOW y leerlas ya prende la radio: eso mide el ruido de la LECTURA, no
+ * el de la captura. La captura tiene que ser limpia; el volcado, que ocurre
+ * despues, puede ser sucio. Formato pensado para un parser de host trivial:
+ * una linea "#DUMP <seq> <600 hex> <crc8 hex>" por lote (ver crc8Dump). */
+static void requestDumpUsbFromUsb(bool hasDesde, uint16_t desde,
+                                   bool hasHasta, uint16_t hasta)
+{
+    if (g_state == SAMPLING) {
+        SLAVE_LOG_PRINTF("[USB] dumpusb rechazado: captura en curso state=%d\n",
+                         (int)g_state);
+        return;
+    }
+    if (g_store_fill == 0u) {
+        SLAVE_LOG_PRINTF("[USB] dumpusb rechazado: sin captura (fill=0)\n");
+        return;
+    }
+
+    uint16_t rangeDesde = hasDesde ? desde : 0u;
+    uint16_t rangeHasta = hasHasta ? hasta : (uint16_t)(g_store_fill - 1u);
+    if (rangeHasta >= g_store_fill) {
+        rangeHasta = (uint16_t)(g_store_fill - 1u);
+    }
+    if (rangeDesde > rangeHasta) {
+        SLAVE_LOG_PRINTF("[USB] dumpusb rango invalido desde=%u hasta=%u fill=%u\n",
+                         (unsigned)rangeDesde, (unsigned)rangeHasta,
+                         (unsigned)g_store_fill);
+        return;
+    }
+
+    uint16_t fs = psoc.sampleRate();
+    if (fs == 0u) { fs = PSOC_NATIVE_SAMPLE_RATE_HZ; }
+
+    SLAVE_LOG_RAW("#DUMP_BEGIN n=%u fs=%u spb=%u bpp=%u pga=%u pgaout=%u\n",
+                  (unsigned)(rangeHasta - rangeDesde + 1u), (unsigned)fs,
+                  (unsigned)SPI_BATCH_SAMPLES, (unsigned)sizeof(SampleBytes),
+                  (unsigned)g_pga_code, (unsigned)g_pgaout);
+
+    static const char hexDigits[] = "0123456789abcdef";
+    const size_t nBytes = (size_t)SPI_BATCH_SAMPLES * sizeof(SampleBytes);
+    char line[32 + SPI_BATCH_SAMPLES * (int)sizeof(SampleBytes) * 2];
+    uint16_t volcados = 0u;
+
+    for (uint16_t seq = rangeDesde; seq <= rangeHasta; seq++) {
+        SampleBytes *batch = storeBatchPtr(seq);
+        if (batch == nullptr) {
+            SLAVE_LOG_RAW("#DUMP_MISS %u\n", (unsigned)seq);
+            yield();
+            continue;
+        }
+        const uint8_t *bytes = (const uint8_t *)batch;
+        const uint8_t crc = crc8Dump(bytes, nBytes);
+
+        int pos = snprintf(line, sizeof(line), "#DUMP %u ", (unsigned)seq);
+        for (size_t i = 0; i < nBytes; i++) {
+            line[pos++] = hexDigits[(bytes[i] >> 4) & 0x0Fu];
+            line[pos++] = hexDigits[bytes[i] & 0x0Fu];
+        }
+        pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " %02x\n", crc);
+        SLAVE_LOG_RAW("%s", line);
+        volcados++;
+        yield();   /* miles de lotes: ceder CPU para no disparar el watchdog */
+    }
+    SLAVE_LOG_RAW("#DUMP_END %u\n", (unsigned)volcados);
+    LOGM("USB_CMD", "cmd=dumpusb,desde=%u,hasta=%u,n=%u",
+         (unsigned)rangeDesde, (unsigned)rangeHasta, (unsigned)volcados);
+}
+
+/* Banco: trafico ESP-NOW controlado y EN PARALELO a una captura, para medir
+ * cuanto ruido agrega transmitir (en vez de esperar a que la radio hable por
+ * casualidad). NO bloquea: arma el estado global y loop() -> serviceRfTest()
+ * dispara una trama por periodo mientras millis() < g_rftest_hasta_ms. La
+ * validacion de rango ya la hizo el parser en handleUsbCommand. */
+static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytesN)
+{
+    if (ms == 0u) {
+        g_rftest_hasta_ms = 0u;
+        g_rftest_running = false;
+        SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
+                      (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+        LOGM("USB_CMD", "cmd=rftest,ok=1,cancel=1");
+        return;
+    }
+    g_rftest_periodo_ms = periodoMs;
+    g_rftest_bytes      = (uint8_t)bytesN;
+    g_rftest_enviados   = 0u;
+    g_rftest_fallos     = 0u;
+    g_rftest_prox_ms    = millis();
+    g_rftest_running    = true;
+    g_rftest_hasta_ms   = millis() + ms;
+    SLAVE_LOG_RAW("#RFTEST inicio ms=%lu periodo=%lu bytes=%lu\n",
+                  (unsigned long)ms, (unsigned long)periodoMs, (unsigned long)bytesN);
+    LOGM("USB_CMD", "cmd=rftest,ok=1,ms=%lu,periodo=%lu,bytes=%lu",
+         (unsigned long)ms, (unsigned long)periodoMs, (unsigned long)bytesN);
+}
+
+/* loop(): una trama fija por periodo, sin bloquear. Payload de patron fijo,
+ * el contenido no importa para medir ruido inducido por la radio. */
+static void serviceRfTest()
+{
+    if (g_rftest_hasta_ms == 0u) return;
+    const uint32_t now = millis();
+    if (now >= g_rftest_hasta_ms) {
+        g_rftest_hasta_ms = 0u;
+        if (g_rftest_running) {
+            g_rftest_running = false;
+            SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
+                          (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+            LOGM("USB_CMD", "cmd=rftest,event=fin,enviados=%lu,fallos=%lu",
+                 (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+        }
+        return;
+    }
+    if (now < g_rftest_prox_ms) return;
+    g_rftest_prox_ms = now + g_rftest_periodo_ms;
+
+    static uint8_t payload[240];
+    static bool payloadReady = false;
+    if (!payloadReady) {
+        for (uint16_t i = 0; i < sizeof(payload); i++) {
+            payload[i] = (uint8_t)(0xA5u ^ (uint8_t)i);   /* patron fijo, reconocible */
+        }
+        payloadReady = true;
+    }
+
+    const esp_err_t err = sendToMaster(payload, g_rftest_bytes);
+    g_rftest_enviados++;
+    if (err != ESP_OK) { g_rftest_fallos++; }
+}
+
+/* Banco: escrituras a la SD del PSoC EN PARALELO a una captura corta que SI
+ * entra en RAM (no cambia la regla de g_psoc_sd_store_active: es un estresor
+ * aparte). Reusa PSOC_CMD_SD_TEST (0xBD, self-test GEOTEST.BIN, el mismo
+ * camino que "sdtest"); _sendCmd1() es un unico write() de 4 bytes por la
+ * UART del PSoC, no bloquea. El ack 0xBD llega por servicePsocConfigAck() ->
+ * applyConfirmedConfig(), que cuenta el fallo (ver case PSOC_CMD_SD_TEST). */
+static void requestSdStressFromUsb(uint32_t ms, uint32_t periodoMs)
+{
+    if (ms == 0u) {
+        g_sdstress_hasta_ms = 0u;
+        g_sdstress_running = false;
+        SLAVE_LOG_RAW("#SDSTRESS fin escrituras=%lu fallos=%lu\n",
+                      (unsigned long)g_sdstress_escrituras, (unsigned long)g_sdstress_fallos);
+        LOGM("USB_CMD", "cmd=sdstress,ok=1,cancel=1");
+        return;
+    }
+    if (!psocSdPresent()) {
+        SLAVE_LOG_RAW("#SDSTRESS sin sd\n");
+        LOGM("USB_CMD", "cmd=sdstress,ok=0,reason=sin_sd");
+        return;
+    }
+    g_sdstress_periodo_ms = periodoMs;
+    g_sdstress_escrituras = 0u;
+    g_sdstress_fallos     = 0u;
+    g_sdstress_prox_ms    = millis();
+    g_sdstress_running    = true;
+    g_sdstress_hasta_ms   = millis() + ms;
+    SLAVE_LOG_RAW("#SDSTRESS inicio ms=%lu periodo=%lu\n",
+                  (unsigned long)ms, (unsigned long)periodoMs);
+    LOGM("USB_CMD", "cmd=sdstress,ok=1,ms=%lu,periodo=%lu",
+         (unsigned long)ms, (unsigned long)periodoMs);
+}
+
+/* loop(): una escritura por periodo, sin bloquear (ver nota de arriba). */
+static void serviceSdStress()
+{
+    if (g_sdstress_hasta_ms == 0u) return;
+    const uint32_t now = millis();
+    if (now >= g_sdstress_hasta_ms) {
+        g_sdstress_hasta_ms = 0u;
+        if (g_sdstress_running) {
+            g_sdstress_running = false;
+            SLAVE_LOG_RAW("#SDSTRESS fin escrituras=%lu fallos=%lu\n",
+                          (unsigned long)g_sdstress_escrituras, (unsigned long)g_sdstress_fallos);
+            LOGM("USB_CMD", "cmd=sdstress,event=fin,escrituras=%lu,fallos=%lu",
+                 (unsigned long)g_sdstress_escrituras, (unsigned long)g_sdstress_fallos);
+        }
+        return;
+    }
+    if (now < g_sdstress_prox_ms) return;
+    g_sdstress_prox_ms = now + g_sdstress_periodo_ms;
+    psoc.sdTest();
+    g_sdstress_escrituras++;
+}
 #endif
 
 static void requestCalibrationFromUsb()
@@ -2648,10 +2893,47 @@ static void handleUsbCommand(const char *cmd)
         requestLabCaptureFromUsb(1u, value16, "LAB_FIRCAP");
     } else if (usbParseU16Param(cmd, "sdread", value16)) {
         requestSdReadFromUsb(value16);
+    } else if (usbCommandEquals(cmd, "dumpusb")) {
+        requestDumpUsbFromUsb(false, 0u, false, 0u);
+    } else if (!strncmp(cmd, "dumpusb ", 8)) {
+        long a = -1, b = -1;
+        const int n = sscanf(cmd + 8, "%ld %ld", &a, &b);
+        if (n == 1 && a >= 0 && a <= 0xFFFF) {
+            requestDumpUsbFromUsb(true, (uint16_t)a, false, 0u);
+        } else if (n == 2 && a >= 0 && a <= 0xFFFF && b >= 0 && b <= 0xFFFF) {
+            requestDumpUsbFromUsb(true, (uint16_t)a, true, (uint16_t)b);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: dumpusb [desde] [hasta]\n");
+        }
+    } else if (!strncmp(cmd, "rftest", 6) &&
+               (cmd[6] == '\0' || cmd[6] == ' ')) {
+        long ms = -1, periodo = -1, bytesN = -1;
+        const int n = sscanf(cmd + 6, "%ld %ld %ld", &ms, &periodo, &bytesN);
+        if (n >= 1 && ms == 0) {
+            requestRfTestFromUsb(0u, 0u, 0u);
+        } else if (n == 3 && ms > 0 && ms <= 600000 &&
+                   periodo >= 1 && periodo <= 10000 &&
+                   bytesN >= 1 && bytesN <= 240) {
+            requestRfTestFromUsb((uint32_t)ms, (uint32_t)periodo, (uint32_t)bytesN);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: rftest <ms 0-600000> <periodo_ms 1-10000> <bytes 1-240>\n");
+        }
+    } else if (!strncmp(cmd, "sdstress", 8) &&
+               (cmd[8] == '\0' || cmd[8] == ' ')) {
+        long ms = -1, periodo = -1;
+        const int n = sscanf(cmd + 8, "%ld %ld", &ms, &periodo);
+        if (n >= 1 && ms == 0) {
+            requestSdStressFromUsb(0u, 0u);
+        } else if (n == 2 && ms > 0 && ms <= 600000 &&
+                   periodo >= 5 && periodo <= 10000) {
+            requestSdStressFromUsb((uint32_t)ms, (uint32_t)periodo);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: sdstress <ms 0-600000> <periodo_ms 5-10000>\n");
+        }
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, dumpusb [desde] [hasta], rftest ms periodo_ms bytes, sdstress ms periodo_ms, ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #else
         SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #endif
@@ -3751,6 +4033,13 @@ void loop()
     serviceCompletionAckRetry();
     serviceLocalUi();
     serviceHotWaitWatchdog();
+#if SLAVE_LAB_TOOLS_ENABLE
+    /* rftest/sdstress (banco): no bloquean y tienen que poder correr EN
+     * PARALELO con una captura (g_state == SAMPLING incluido: este tramo del
+     * loop no se salta en SAMPLING, ver arriba). */
+    serviceRfTest();
+    serviceSdStress();
+#endif
 
     /* (El parpadeo de identificación lo hace ahora el PSoC con su Timer; el ESP
      * solo reenvía CMD_BLINK_LED por UART en onDataRecv.) */
