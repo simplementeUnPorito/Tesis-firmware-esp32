@@ -3777,6 +3777,22 @@ static void onBatch(const PsocBatch &batch)
                              SPI_BATCH_SAMPLES - 1,
                              (long)batch.samples[SPI_BATCH_SAMPLES - 1].post_digital,
                              (unsigned)batch.samples[0].sample_flags);
+            /* El resumen prueba que 0xBF respondio, pero no alcanza para
+             * medir ruido: perderia 28 de las 30 muestras. Despues de que
+             * la captura termino, el banco recibe el mismo SampleBytes (10 B
+             * por muestra) que entrega dumpusb desde RAM. `stored` conserva
+             * las marcas SD ya decodificadas por decodeSdMarks(). */
+            SLAVE_LOG_PRINTF("#SDREAD %u ", (unsigned)seq);
+            for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+                const SampleBytes &s = stored[i];
+                SLAVE_LOG_PRINTF("%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                                 (unsigned)s.raw_lo, (unsigned)s.raw_hi,
+                                 (unsigned)s.alog0, (unsigned)s.alog1,
+                                 (unsigned)s.alog2, (unsigned)s.digi0,
+                                 (unsigned)s.digi1, (unsigned)s.digi2,
+                                 (unsigned)s.gain, (unsigned)s.flags);
+            }
+            SLAVE_LOG_PRINTLN("");
             return;
         }
         const uint64_t ts = g_t_start_us +
