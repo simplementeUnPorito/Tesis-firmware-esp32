@@ -2295,10 +2295,11 @@ static void requestLabPinsFromUsb()
     rxEdges = g_psoc_rx_edges;
     rxEdgeLevel = g_psoc_rx_last_level;
     interrupts();
-    SLAVE_LOG_PRINTF("[LAB] pins syncOut=%d psocRx=%d rxEdges=%lu rxEdgeLevel=%u\n",
+    SLAVE_LOG_PRINTF("[LAB] pins syncOut=%d psocRx=%d rxEdges=%lu rxEdgeLevel=%u i2cSda=%d i2cScl=%d\n",
                      digitalRead(SYNC_TO_PSOC_PIN),
                      digitalRead(PSOC_UART_RX), (unsigned long)rxEdges,
-                     (unsigned)rxEdgeLevel);
+                      (unsigned)rxEdgeLevel,
+                      digitalRead(PSOC_I2C_SDA), digitalRead(PSOC_I2C_SCL));
 }
 
 static void requestQuietWindowFromUsb(uint16_t n, uint16_t ms)
