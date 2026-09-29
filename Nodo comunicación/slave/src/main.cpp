@@ -669,6 +669,9 @@ static const char *psocDiagName(uint8_t event)
         case PSOC_EVT_CAL_PI_STABLE:  return "CAL_PI_STABLE";
         case PSOC_EVT_CAL_AMUX_CAP:   return "CAL_AMUX_CAP";
         case PSOC_EVT_ARMED_TIMEOUT:  return "ARMED_TIMEOUT";
+        case PSOC_EVT_SD_DIAG_STAGE:  return "SD_DIAG_STAGE";
+        case PSOC_EVT_SD_DIAG_R1:     return "SD_DIAG_R1";
+        case PSOC_EVT_SD_DIAG_PINS:   return "SD_DIAG_PINS";
         default:                      return "UNKNOWN";
     }
 }
@@ -891,7 +894,45 @@ static void onPsocDiag(const PsocDiagEvent &event)
              event.psoc_state, psocStateName(event.psoc_state));
     }
 
-    if (event.event == PSOC_EVT_SD_STATUS) {
+    if (event.event == PSOC_EVT_SD_DIAG_STAGE) {
+        const uint8_t stage = event.value & 0x7Fu;
+        const char *stageName = "UNKNOWN";
+        switch (stage) {
+            case 1u: stageName = "CLOCKS"; break;
+            case 2u: stageName = "CMD0"; break;
+            case 3u: stageName = "CMD8"; break;
+            case 4u: stageName = "ACMD41/CMD1"; break;
+            case 5u: stageName = "CMD58"; break;
+            case 6u: stageName = "CMD16"; break;
+            case 7u: stageName = "CSD"; break;
+            case 8u: stageName = "CAPACITY"; break;
+            case 9u: stageName = "READY"; break;
+            default: break;
+        }
+        SLAVE_LOG_PRINTF("[PSoC] SD diag stage=%u/%s spi_timeout=%u\n",
+                         (unsigned)stage, stageName,
+                         (unsigned)((event.value >> 7) & 1u));
+        LOGM("PSOC_SD_DIAG", "stage=%u,stageName=%s,spiTimeout=%u",
+             (unsigned)stage, stageName,
+             (unsigned)((event.value >> 7) & 1u));
+    } else if (event.event == PSOC_EVT_SD_DIAG_R1) {
+        SLAVE_LOG_PRINTF("[PSoC] SD diag last_r1=0x%02X%s\n",
+                         event.value,
+                         (event.value == 0xFFu) ? " (sin respuesta)" : "");
+        LOGM("PSOC_SD_DIAG", "lastR1=0x%02X", event.value);
+    } else if (event.event == PSOC_EVT_SD_DIAG_PINS) {
+        SLAVE_LOG_PRINTF("[PSoC] SD diag pins=0x%02X MISO=%s SCK=%s MOSI=%s CS=%s\n",
+                         event.value,
+                         ((event.value & 0x03u) == 0x03u) ? "toggle" :
+                         ((event.value & 0x02u) ? "high" : "low"),
+                         ((event.value & 0x0Cu) == 0x0Cu) ? "toggle" :
+                         ((event.value & 0x08u) ? "high" : "low"),
+                         ((event.value & 0x30u) == 0x30u) ? "toggle" :
+                         ((event.value & 0x20u) ? "high" : "low"),
+                         ((event.value & 0xC0u) == 0xC0u) ? "toggle" :
+                         ((event.value & 0x80u) ? "high" : "low"));
+        LOGM("PSOC_SD_DIAG", "pins=0x%02X", event.value);
+    } else if (event.event == PSOC_EVT_SD_STATUS) {
         g_psoc_sd_status = event.value;
         g_psoc_sd_known = true;
         g_psoc_sd_capture_enabled = (event.value & 0x40u) != 0u;

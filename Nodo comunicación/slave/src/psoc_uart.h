@@ -244,6 +244,9 @@
 #define PSOC_EVT_SD_SESSION       0x49  /* value=1: GEOLAST.BIN COMPLETE/listo; 0: inválido */
 #define PSOC_EVT_SD_ERROR         0x4A  /* value: bit0 write fail, bit1 overrun, bit2 dir/header, bit3 read fail dump */
 #define PSOC_EVT_ARMED_TIMEOUT    0x4B  /* PSoC aborto ARMED porque no llego SYNC */
+#define PSOC_EVT_SD_DIAG_STAGE    0x4C  /* bits0-6 etapa init; bit7 timeout SPI */
+#define PSOC_EVT_SD_DIAG_R1       0x4D  /* ultima respuesta R1 (0xFF=sin respuesta) */
+#define PSOC_EVT_SD_DIAG_PINS     0x4E  /* low/high vistos en MISO, SCK, MOSI y CS */
 
 struct PsocSample {
     int16_t  raw_input;
