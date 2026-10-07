@@ -84,6 +84,14 @@
           <div class="row">
             <label>Nombre <input id="export-name" type="text" value="muestra"></label>
             <button id="btn-export">Guardar CSV/ZIP</button>
+            <label title="Carpeta de raw/ donde el servidor guarda la captura">Carpeta
+              <select id="upload-campaign">
+                <option value="Canchiga">Canchiga</option>
+                <option value="Canchita">Canchita</option>
+                <option value="Canchita_2">Canchita_2</option>
+                <option value="laboratorio">laboratorio</option>
+              </select>
+            </label>
             <button id="btn-upload-server" title="Manda el mismo ZIP al servidor por la red del cliente">Subir al server</button>
           </div>
           <div id="export-status" class="status-text">--</div>

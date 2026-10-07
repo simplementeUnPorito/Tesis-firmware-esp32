@@ -2920,12 +2920,17 @@ async function onUploadToServer() {
   }
   const { blob, filename, metadata, liveCapture } = built;
   const kb = (blob.size / 1024).toFixed(0);
-  $('export-status').textContent = `Subiendo ${filename} (${kb} kB)…`;
-  appendLog(`Subiendo ${filename} (${kb} kB) a ${url}`);
+  const campaign = $('upload-campaign').value;
+  $('export-status').textContent = `Subiendo ${filename} (${kb} kB) a ${campaign}…`;
+  appendLog(`Subiendo ${filename} (${kb} kB) a ${url} [${campaign}]`);
   try {
     const r = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/zip', 'X-Geo-Filename': filename },
+      headers: {
+        'Content-Type': 'application/zip',
+        'X-Geo-Filename': filename,
+        'X-Geo-Campaign': $('upload-campaign').value,
+      },
       body: blob,
     });
     const txt = (await r.text()).trim();
@@ -2950,6 +2955,17 @@ async function onUploadToServer() {
   }
 }
 
+// La carpeta elegida se recuerda entre sesiones.
+const CAMPAIGN_KEY = `${SETTINGS_PREFIX}upload_campaign`;
+try {
+  const saved = localStorage.getItem(CAMPAIGN_KEY);
+  if (saved && [...$('upload-campaign').options].some((o) => o.value === saved)) {
+    $('upload-campaign').value = saved;
+  }
+} catch (_) { /* localStorage can be disabled on some phone browser/privacy modes. */ }
+$('upload-campaign').addEventListener('change', () => {
+  try { localStorage.setItem(CAMPAIGN_KEY, $('upload-campaign').value); } catch (_) { /* idem */ }
+});
 $('btn-upload-server').addEventListener('click', onUploadToServer);
 $('btn-preserved-all').addEventListener('click', () => setAllPreservedVisible(true));
 $('btn-preserved-none').addEventListener('click', () => setAllPreservedVisible(false));
