@@ -632,6 +632,9 @@ inline String linkStatusText()
 static uint32_t g_linkStaTryMs = 0;
 static bool     g_linkStaWasUp = false;
 static bool     g_linkStaRetryPending = false;
+static bool     g_linkStaBegun = false;
+static bool     g_linkStaForce = false;   /* intento pedido por el usuario */
+static bool     g_linkStaUserTry = false; /* el intento en curso fue pedido por el usuario */
 
 inline uint8_t linkCurrentChannel()
 {
@@ -654,6 +657,7 @@ inline void linkStaService()
      * guardar no devolvia nada y parecia que habia fallado. */
     if (g_linkStaRetryPending) {
         g_linkStaRetryPending = false;
+        g_linkStaForce = true;
         g_linkStaTryMs = 0;
         if (WiFi.status() == WL_CONNECTED) {
             WiFi.disconnect(false, false);
@@ -680,27 +684,46 @@ inline void linkStaService()
                 MASTER_LOG_PRINTF("[ENLACE] mDNS re-anunciado: http://%s.local\n",
                                   LINK_MDNS_NAME);
             }
-            /* Echar a los clientes del AP: el que acaba de cargar la red ya no
-             * tiene nada que hacer ahi, y mientras siga pegado al AP no ve al
-             * maestro en la red nueva. Al quedar sin AP, el telefono vuelve solo
-             * a su red habitual — donde el maestro ya esta y geo.local resuelve.
-             * Se usa deauth y no softAPdisconnect() porque este ultimo bajaria el
-             * AP entero, y el AP tiene que seguir arriba para el proximo. */
-            esp_wifi_deauth_sta(0);   /* 0 = todas las estaciones */
-            MASTER_LOG_PRINTLN("[ENLACE] clientes del AP echados; buscar geo.local en la red nueva");
+            /* NO se echa a los clientes del AP: el deauth cortaba el navegador con
+             * ERR_NETWORK_CHANGED y el telefono quedaba sin red. El AP sigue en
+             * 192.168.4.1 (no depende de mDNS) y geo-obtain.local resuelve en ambas. */
         } else {
             MASTER_LOG_PRINTF("[ENLACE] STA caida; AP sigue en canal %u\n",
                               linkCurrentChannel());
             LOGM("STA_DOWN", "ch=%u", linkCurrentChannel());
         }
     }
-    if (up) return;
+    if (up) { g_linkStaBegun = false; return; }
+
+    /* Un intento que no engancha sigue reescaneando solo (autoreconnect del core)
+     * y con una unica radio el AP pierde beacons (canal saltando 1/14, pings
+     * perdidos). Se corta el intento a los 8 s o apenas hay un cliente en el AP. */
+    if (g_linkStaBegun &&
+        ((millis() - g_linkStaTryMs) > 8000 ||
+         (!g_linkStaUserTry && WiFi.softAPgetStationNum() > 0))) {
+        WiFi.disconnect(false, false);
+        g_linkStaBegun = false;
+        MASTER_LOG_PRINTLN("[ENLACE] intento STA abortado; AP estable");
+    }
+    if (g_linkStaBegun) return;
 
     if (g_linkStaTryMs != 0 && (millis() - g_linkStaTryMs) < LINK_STA_RETRY_MS) return;
+    /* Con un cliente en el AP (la SPA/WebSocket) NO se reintenta la STA: cada
+     * WiFi.begin hace un escaneo multicanal con la unica radio, el AP deja de
+     * emitir beacons y el telefono pierde la sesion — el "desconectado" que
+     * aparecia cada pocos segundos mientras el hotspot configurado no estaba
+     * cerca. Solo un pedido explicito (Guardar/Conectar ahora) lo fuerza. */
+    if (!g_linkStaForce && WiFi.softAPgetStationNum() > 0) {
+        g_linkStaTryMs = millis();
+        return;
+    }
+    g_linkStaForce = false;
     g_linkStaTryMs = millis();
     /* WiFi.begin sobre WIFI_AP_STA no baja el AP: la SPA sigue servida en
      * 192.168.4.1 durante todo el intento. */
+    WiFi.setAutoReconnect(false);
     WiFi.begin(g_linkCfg.ssid, g_linkCfg.pass);
+    g_linkStaBegun = true;
     MASTER_LOG_PRINTF("[ENLACE] STA intentando %s (canal actual %u)\n",
                       g_linkCfg.ssid, linkCurrentChannel());
 }

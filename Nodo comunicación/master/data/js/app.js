@@ -2963,6 +2963,84 @@ try {
     $('upload-campaign').value = saved;
   }
 } catch (_) { /* localStorage can be disabled on some phone browser/privacy modes. */ }
+// ── Carpetas sincronizadas con el servidor ────────────────────────────────
+// Lista local (localStorage) ∪ lista del servidor (GET /api/folders). Crear una
+// carpeta la agrega aqui y la crea en el servidor (POST /api/folders); si el
+// servidor no esta alcanzable queda local y se empuja en la proxima sync.
+const FOLDERS_KEY = `${SETTINGS_PREFIX}upload_folders`;
+const FOLDER_RE = /^[A-Za-z0-9_][A-Za-z0-9_.\- ]{0,63}$/;
+function folderListLoad() {
+  const base = [...$('upload-campaign').options].map((o) => o.value);
+  try {
+    const extra = JSON.parse(localStorage.getItem(FOLDERS_KEY) || '[]');
+    for (const f of extra) if (!base.includes(f)) base.push(f);
+  } catch (_) { /* lista corrupta o localStorage deshabilitado */ }
+  return base;
+}
+function folderListRender(names) {
+  const sel = $('upload-campaign');
+  const cur = sel.value;
+  sel.replaceChildren(...names.map((n) => {
+    const o = document.createElement('option');
+    o.value = o.textContent = n;
+    return o;
+  }));
+  if (names.includes(cur)) sel.value = cur;
+  try { localStorage.setItem(FOLDERS_KEY, JSON.stringify(names)); } catch (_) { /* idem */ }
+}
+function folderApiBase() {
+  const u = getServerUrl();
+  return u ? u.replace(/\/ingest\/?$/, '').replace(/\/+$/, '') : '';
+}
+async function syncFolders() {
+  const base = folderApiBase();
+  if (!base) return false;
+  try {
+    const r = await fetch(`${base}/api/folders`);
+    if (!r.ok) return false;
+    const remote = (await r.json()).folders || [];
+    const local = folderListLoad();
+    for (const f of local) {
+      if (remote.includes(f)) continue;
+      await fetch(`${base}/api/folders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: f }),
+      }).catch(() => {});
+    }
+    folderListRender([...new Set([...local, ...remote])]);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+folderListRender(folderListLoad());
+try {
+  const savedFolder = localStorage.getItem(CAMPAIGN_KEY);
+  if (savedFolder && folderListLoad().includes(savedFolder)) $('upload-campaign').value = savedFolder;
+} catch (_) { /* idem */ }
+$('btn-folder-new').addEventListener('click', async () => {
+  const name = (prompt('Nombre de la carpeta nueva:') || '').trim();
+  if (!name) return;
+  if (!FOLDER_RE.test(name) || /[. ]$/.test(name)) {
+    $('export-status').textContent = 'Nombre inválido (letras, números, _ - . y espacios)';
+    return;
+  }
+  const names = folderListLoad();
+  if (!names.includes(name)) names.push(name);
+  folderListRender(names);
+  $('upload-campaign').value = name;
+  const ok = await syncFolders();
+  $('export-status').textContent = ok
+    ? `Carpeta ${name} creada y sincronizada con el servidor`
+    : `Carpeta ${name} creada solo en el maestro (servidor inalcanzable; se sincroniza luego)`;
+});
+$('btn-folder-sync').addEventListener('click', async () => {
+  const ok = await syncFolders();
+  $('export-status').textContent = ok ? 'Carpetas sincronizadas con el servidor'
+                                      : 'No se pudo alcanzar el servidor para sincronizar';
+});
+setTimeout(syncFolders, 4000);
 $('upload-campaign').addEventListener('change', () => {
   try { localStorage.setItem(CAMPAIGN_KEY, $('upload-campaign').value); } catch (_) { /* idem */ }
 });
