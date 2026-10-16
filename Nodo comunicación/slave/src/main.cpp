@@ -3932,7 +3932,10 @@ static uint8_t findMasterChannel(uint8_t fallback)
 static void masterChannelService()
 {
     if (g_state == SAMPLING || g_state == HOT_WAIT) return;
-    if (g_lastMasterRxMs == 0) return;      /* nunca hablo: el boot ya escaneo */
+    /* Si el maestro nunca hablo desde el boot, el escaneo del boot puede haber
+     * caido en el canal de respaldo (maestro apagado, o todavia en el canal 1
+     * antes de asociarse al hotspot): sin rescanear, el esclavo quedaba sordo
+     * para siempre. Se cuenta el silencio desde el boot. */
     if ((millis() - g_lastMasterRxMs) < MASTER_SILENCE_MS) return;
 
     uint8_t ch = findMasterChannel(g_masterChannel);

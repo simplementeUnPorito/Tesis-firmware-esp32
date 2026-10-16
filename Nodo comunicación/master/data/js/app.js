@@ -15,7 +15,11 @@ import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-26';
 
 const $ = (id) => document.getElementById(id);
 
-const ws = new WsClient(`ws://${location.host}/ws`);
+// ?takeover=1 en la URL de la pagina reemplaza a otra pestana de la MISMA PC
+// que tenga el WebSocket (el maestro acepta un solo dueño y, sin esto, la
+// pestana nueva queda en "ocupado" hasta que la vieja se cierre).
+const wsTakeover = new URLSearchParams(location.search).get('takeover') === '1';
+const ws = new WsClient(`ws://${location.host}/ws${wsTakeover ? '?takeover=1' : ''}`);
 const data = new DataStore();
 const plotArea = new PlotArea($('plots'));
 const spectrumArea = new SpectrumArea($('spectra'));

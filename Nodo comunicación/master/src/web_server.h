@@ -256,6 +256,12 @@ inline bool webServerBegin()
         request->send(ok ? 200 : 404, "text/plain", ok ? "borrado" : "no existe");
     });
 
+    webServer.on("/enlace/clear", HTTP_POST, [](AsyncWebServerRequest *request) {
+        uint16_t n = linkQueueClear();
+        String body = String("borrados=") + n + "\n" + linkStatusText();
+        request->send(200, "text/plain", body);
+    });
+
     /* Disparar ENLACE sin depender de la SPA ni de MATLAB (equivale al cmd
      * 0xC0 param=1). Se rechaza si el estado no lo permite: nunca a mitad de
      * captura. */

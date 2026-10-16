@@ -276,6 +276,25 @@ inline bool linkQueueBegin(uint16_t nBatches,
      * configurado igual se guarda y el server le pide el nombre al usuario. */
 
     uint32_t need = 48u + (uint32_t)nodeCount * 14u + expectedBytes;
+    /* Ningun cliente drena esta cola todavia (la SPA sube su propio ZIP), asi
+     * que funciona como anillo: se descartan las copias mas viejas hasta que
+     * entre la nueva.  Antes se llenaba con vistas previas y dejaba 8 kB. */
+    while (need > linkQueueFreeBytes()) {
+        String oldest;
+        File dir = LittleFS.open(LINK_QUEUE_DIR);
+        if (!dir || !dir.isDirectory()) break;
+        File e = dir.openNextFile();
+        while (e) {
+            String n = e.name();
+            if (!e.isDirectory() && (oldest.length() == 0 || n < oldest)) oldest = n;
+            e = dir.openNextFile();
+        }
+        dir.close();
+        if (oldest.length() == 0) break;
+        String p = String(LINK_QUEUE_DIR) + "/" + oldest;
+        if (!LittleFS.remove(p)) break;
+        MASTER_LOG_PRINTF("[ENLACE] cola llena: descarto %s\n", p.c_str());
+    }
     if (need > linkQueueFreeBytes()) {
         MASTER_LOG_PRINTF("[ENLACE] cola: no entra (%u B need, %u B libres)\n",
                           (unsigned)need, (unsigned)linkQueueFreeBytes());
@@ -462,6 +481,29 @@ inline bool linkQueueAck(const String &name)
     return ok;
 }
 
+/* Vacia la cola entera (boton "Vaciar cola" de la SPA). No toca un archivo que
+ * se este escribiendo en este momento. Devuelve cuantos borro. */
+inline uint16_t linkQueueClear()
+{
+    uint16_t n = 0;
+    String names[64];
+    uint8_t count = 0;
+    File dir = LittleFS.open(LINK_QUEUE_DIR);
+    if (!dir || !dir.isDirectory()) return 0;
+    File e = dir.openNextFile();
+    while (e && count < 64) {
+        if (!e.isDirectory()) names[count++] = String(LINK_QUEUE_DIR) + "/" + e.name();
+        e = dir.openNextFile();
+    }
+    dir.close();
+    for (uint8_t i = 0; i < count; i++) {
+        if (g_linkQueueOpen && names[i] == g_linkQueuePath) continue;
+        if (LittleFS.remove(names[i])) n++;
+    }
+    MASTER_LOG_PRINTF("[ENLACE] cola vaciada (%u archivos)\n", (unsigned)n);
+    return n;
+}
+
 /* Hook para disparar ENLACE desde un endpoint HTTP. La decision de si el estado
  * lo permite (solo IDLE/ARMED) vive en main.cpp, que es quien conoce la maquina
  * de estados del maestro; aca solo se guarda el puntero. */
@@ -635,6 +677,34 @@ static bool     g_linkStaRetryPending = false;
 static bool     g_linkStaBegun = false;
 static bool     g_linkStaForce = false;   /* intento pedido por el usuario */
 static bool     g_linkStaUserTry = false; /* el intento en curso fue pedido por el usuario */
+static volatile bool g_linkStaAborting = false; /* el disconnect lo pidio el propio maestro */
+
+/* Motivo del ultimo rechazo de la STA, para /enlace/status (la SPA lo muestra
+ * como last_error).  Sin esto "sin conectar" no distinguia clave mala de red
+ * fuera de alcance o en 5 GHz. */
+inline void linkStaOnDisconnect(arduino_event_id_t, arduino_event_info_t info)
+{
+    uint8_t r = info.wifi_sta_disconnected.reason;
+    if (g_linkStaAborting) { g_linkStaAborting = false; return; }
+    const char *why;
+    switch (r) {
+        case WIFI_REASON_NO_AP_FOUND:
+            why = "no encuentro la red (nombre exacto? 2.4 GHz?)"; break;
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_MIC_FAILURE:
+            why = "clave rechazada (o WPA3 solo)"; break;
+        case WIFI_REASON_ASSOC_FAIL:
+        case WIFI_REASON_ASSOC_TOOMANY:
+            why = "el hotspot rechazo la asociacion"; break;
+        case WIFI_REASON_BEACON_TIMEOUT:
+            why = "se perdio la senal del hotspot"; break;
+        default:
+            why = "desconectado"; break;
+    }
+    snprintf(g_linkLastError, sizeof(g_linkLastError), "STA: %s [%u]", why, r);
+}
 
 inline uint8_t linkCurrentChannel()
 {
@@ -693,16 +763,23 @@ inline void linkStaService()
             LOGM("STA_DOWN", "ch=%u", linkCurrentChannel());
         }
     }
-    if (up) { g_linkStaBegun = false; return; }
+    if (up) { g_linkStaBegun = false; g_linkLastError[0] = '\0'; return; }
 
     /* Un intento que no engancha sigue reescaneando solo (autoreconnect del core)
      * y con una unica radio el AP pierde beacons (canal saltando 1/14, pings
-     * perdidos). Se corta el intento a los 8 s o apenas hay un cliente en el AP. */
+     * perdidos). Se corta el intento a los 8 s o apenas hay un cliente en el AP.
+     * El que pidio el usuario (Guardar) tiene 20 s: un hotspot de celular puede
+     * tardar mas en el handshake y cortarlo a los 8 s lo hacia fallar siempre. */
+    uint32_t limite = g_linkStaUserTry ? LINK_STA_CONNECT_TIMEOUT_MS : 8000u;
     if (g_linkStaBegun &&
-        ((millis() - g_linkStaTryMs) > 8000 ||
+        ((millis() - g_linkStaTryMs) > limite ||
          (!g_linkStaUserTry && WiFi.softAPgetStationNum() > 0))) {
+        g_linkStaAborting = true;
         WiFi.disconnect(false, false);
         g_linkStaBegun = false;
+        if (g_linkLastError[0] == '\0')
+            snprintf(g_linkLastError, sizeof(g_linkLastError),
+                     "STA sin respuesta en %u s", (unsigned)(limite / 1000u));
         MASTER_LOG_PRINTLN("[ENLACE] intento STA abortado; AP estable");
     }
     if (g_linkStaBegun) return;
@@ -717,7 +794,11 @@ inline void linkStaService()
         g_linkStaTryMs = millis();
         return;
     }
+    /* Sin esto el intento pedido con Guardar se abortaba en la vuelta siguiente
+     * por tener al propio telefono en el AP: nunca podia conectar. */
+    g_linkStaUserTry = g_linkStaForce;
     g_linkStaForce = false;
+    g_linkLastError[0] = '\0';
     g_linkStaTryMs = millis();
     /* WiFi.begin sobre WIFI_AP_STA no baja el AP: la SPA sigue servida en
      * 192.168.4.1 durante todo el intento. */
@@ -766,6 +847,7 @@ inline int linkScanPoll(String &out)
 inline void linkModeBegin()
 {
     linkConfigLoad();
+    WiFi.onEvent(linkStaOnDisconnect, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
     if (!LittleFS.exists(LINK_QUEUE_DIR)) LittleFS.mkdir(LINK_QUEUE_DIR);
     MASTER_LOG_PRINTF("[ENLACE] cfg ssid=%s site=%s auto=%d cola=%u (%u B)\n",
                       g_linkCfg.ssid, g_linkCfg.site,

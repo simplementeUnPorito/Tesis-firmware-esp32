@@ -135,7 +135,11 @@ export function initEnlaceTab(log) {
     if (!ssid) { show('falta el nombre de la red'); return; }
     const body = new URLSearchParams();
     body.append('ssid', ssid);
-    body.append('pass', $('enlace-pass').value);
+    // El campo de clave no se rellena al cargar (el maestro no la devuelve), asi
+    // que vacio significa "no cambiarla". Mandarlo vacio pisaba la clave buena
+    // cada vez que se apretaba Guardar despues de recargar la pagina.
+    const pass = $('enlace-pass').value;
+    if (pass) body.append('pass', pass);
     body.append('server_url', url);
     // site/distance_mm no se mandan: la geometria (offsets martillo-geofono por
     // nodo) la lleva el ZIP que arma la SPA, que es el camino principal hacia el
@@ -154,6 +158,24 @@ export function initEnlaceTab(log) {
   }
 
   $('btn-enlace-save').addEventListener('click', saveConfig);
+
+  // La cola es una copia de respaldo en el maestro; la SPA sube su propio ZIP,
+  // asi que nadie la drena sola. Esto la vacia a mano.
+  const btnClear = $('btn-enlace-clear');
+  if (btnClear) btnClear.addEventListener('click', async () => {
+    if (!confirm('¿Borrar todas las capturas en cola del maestro?')) return;
+    show('vaciando cola…');
+    try {
+      const r = await fetch('/enlace/clear', { method: 'POST' });
+      const txt = await r.text();
+      if (!r.ok) { show(`el maestro respondió HTTP ${r.status} al vaciar`); return; }
+      const st = parseStatus(txt);
+      render(st, txt);
+      log && log(`Enlace: cola vaciada (${st.borrados || 0} archivos)`);
+    } catch (e) {
+      show('no se pudo vaciar: ' + e);
+    }
+  });
 
   // Escaneo: dice si el maestro VE la red, que es lo primero a descartar cuando
   // no se asocia. Si la red no aparece aca, no es la contrasena: el ESP32 es solo
