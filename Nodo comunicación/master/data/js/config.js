@@ -79,7 +79,10 @@ export const CAL_VDAC_STAGE_COUNT = 4;
 export const SAMPLES_PER_BATCH = 30;
 // GEO: archivo FatFs del PSoC. HAMMER/RAM conserva el tope de 512.
 export const PSOC_CAPTURE_MAX_BATCHES = 60000;
-export const PSOC_RAM_CAPTURE_MAX_BATCHES = 512;
+// Lo que entra en la RAM del ESP esclavo con WiFi arriba (paginas de 32 lotes):
+// medido 2026-10-16: segun el heap entran 416 a 448; 416 es el valor seguro. El PSoC aguanta 512, pero el cuello es
+// el ESP; pedir 512 sin SD lo dejaba trabado. Por encima, el esclavo recorta.
+export const PSOC_RAM_CAPTURE_MAX_BATCHES = 416;
 export const MAX_CAPTURE_SECONDS = 3600;
 export const TEST_DEFAULT_SECONDS = 0.2;
 // Placeholder sample counts for buffer/display sizing before any slave's

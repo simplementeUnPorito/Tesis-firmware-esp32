@@ -39,23 +39,7 @@ const PHASE_LABEL = {
   volviendo: 'volviendo a captura…',
 };
 
-// La pagina tiene que vivir en geo-obtain.local, no en una IP. Motivo: el maestro habita
-// dos redes y el cliente se mueve entre ellas; una pagina cargada desde
-// 192.168.4.1 queda con un origen que deja de existir en cuanto el telefono
-// vuelve a su red, y hay que recargar a mano en la IP nueva. geo-obtain.local resuelve
-// las dos (mDNS del lado del cliente, portal cautivo del lado del AP), asi que el
-// origen sobrevive el cambio y el WebSocket se reconecta solo.
-function ensureStableOrigin() {
-  const h = location.hostname;
-  if (!h || h === 'geo-obtain.local' || h === 'geo-obtain') return;
-  // Solo redirigir si estamos en una IP: un nombre cualquiera puede ser un proxy
-  // o un tunel que el usuario puso a proposito.
-  if (!/^\d+\.\d+\.\d+\.\d+$/.test(h)) return;
-  location.replace(`http://geo-obtain.local${location.pathname}${location.search}`);
-}
-
 export function initEnlaceTab(log) {
-  ensureStableOrigin();
   const statusEl = $('enlace-status');
   if (!statusEl) return;   // tab ausente (firmware viejo / index parcial)
 

@@ -5,7 +5,7 @@
 // CustomEvents instead of Qt signals.
 
 import { decodePacket } from './protocol.js';
-import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-26';
+import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-31';
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
@@ -91,6 +91,9 @@ export class WsClient extends EventTarget {
     ws.onopen = () => {
       this._openMs = Date.now();
       this._log('WS: connected');
+      // ?takeover=1 vale para la primera conexion: en las reconexiones
+      // automaticas dos pestanas se robaban el socket una a la otra.
+      this._url = this._url.replace(/[?&]takeover=1$/, '');
       if (this.authToken) {
         ws.send(JSON.stringify({ cmd: 'AUTH', token: this.authToken }));
       }

@@ -3121,6 +3121,16 @@ static void enterHotWait(uint16_t n_batches)
     g_debug_last_us  = (uint32_t)micros();
     g_start_fallback_sent = false;
     g_psoc_arm_ready = false;
+    /* Sin donde guardar NO se arma el PSoC: armado queda sordo por UART hasta
+     * un reset. allocStore puede haber recortado N a la RAM disponible. */
+    if (n_batches > 0 && !g_psoc_sd_store_active && !storeRamReady()) {
+        g_state = STOPPED;
+        sendHotWaitAck();
+        SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT aborted n=%u: sin RAM en el ESP\n",
+                         (unsigned)n_batches);
+        return;
+    }
+    n_batches = g_rec_n_batches;
     /* Armar el PSoC por UART: set N y pre-start (queda esperando flanco SYNC). */
     psocReady = syncPsocSdForCapture(g_psoc_sd_store_active) &&
                 sendAndConfirmPsocSetN(n_batches);
@@ -3677,6 +3687,17 @@ static void allocStore(uint16_t n_batches)
             remaining -= batchesThisPage;
         }
         g_store_capacity_batches = capacity;
+        /* La RAM del ESP alcanza para menos que la del PSoC (medido 2026-10-16:
+         * 448 lotes entran, 480 no, con WiFi arriba). Antes se liberaba todo y
+         * se seguia armando el PSoC sin donde guardar: quedaba ARMED, sordo por
+         * UART, y el esclavo no volvia a capturar sin reset ("Max RAM lo
+         * traba"). Ahora se recorta a lo que entra y el HOTWAIT_ACK le informa
+         * al maestro el N efectivo. */
+        if (capacity > 0 && capacity < n_batches) {
+            SLAVE_LOG_PRINTF("[SLAVE] RAM ESP alcanza para %u de %u lotes: recorto\n",
+                             (unsigned)capacity, (unsigned)n_batches);
+            g_rec_n_batches = capacity;
+        }
     }
     if (!storeRamReady()) {
         freeStoreRam();

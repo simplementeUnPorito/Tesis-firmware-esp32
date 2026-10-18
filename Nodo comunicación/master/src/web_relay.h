@@ -28,6 +28,12 @@ static AsyncWebSocket ws("/ws");
 
 typedef void (*WebRelayClientHook)();
 static WebRelayClientHook g_webRelayClientHook = nullptr;
+/* true mientras hay una captura o un volcado en curso: ahi no se honra un
+ * ?takeover=1. Dos pestanas con takeover se robaban el socket cada 15 s y le
+ * cortaban el volcado a la que estaba recibiendo (2026-10-16). */
+typedef bool (*WebRelayBusyHook)();
+static WebRelayBusyHook g_webRelayBusyHook = nullptr;
+inline void webRelaySetBusyHook(WebRelayBusyHook hook) { g_webRelayBusyHook = hook; }
 
 /* ── Autenticación de aplicación (WS_AUTH_TOKEN) ───────────────────────────
  * Definir en platformio.ini: -DWS_AUTH_TOKEN='"tu_password"'
@@ -83,6 +89,16 @@ inline bool webRelayHasActiveClient()
     if (ws.count() == 0 || (WS_AUTH_ENABLED && !g_wsAuthOk)) return false;
     if (g_wsAliveMs == 0) return true;
     return (uint32_t)(millis() - g_wsAliveMs) <= WEB_RELAY_ALIVE_MS;
+}
+
+/* Hay un navegador conectado, conteste o no. Durante un volcado grande el
+ * navegador puede tardar mas que WEB_RELAY_ALIVE_MS en responder (esta
+ * dibujando): eso NO es que se haya ido. Tirar sus paquetes en ese rato dejaba
+ * huecos de segundos en la captura (medido 2026-10-16: 2014 muestras a los
+ * 5,7 s de una captura de 20 s) que la web empalmaba sin aviso. */
+inline bool webRelayHasConnectedClient()
+{
+    return ws.count() > 0 && !(WS_AUTH_ENABLED && !g_wsAuthOk);
 }
 
 inline bool webRelayOwnerRecentlyAlive()
@@ -227,7 +243,7 @@ static void webRelayFlush()
     webRelayTxUnlock();
 
     if (len == 0) return;
-    if (!webRelayHasActiveClient()) {
+    if (!webRelayHasConnectedClient()) {
         webRelayTxLock();
         if (g_webRelayTxLen == 0 && len <= WEB_RELAY_TX_BYTES) {
             memcpy(g_webRelayTxBuf, out, len);
@@ -295,7 +311,11 @@ static void webRelayService()
 inline bool webRelayReadyForDumpRequest(bool requireClient = false)
 {
     webRelayService();
-    if (!webRelayHasActiveClient()) return !requireClient;
+    /* Nadie conectado: seguir solo si el volcado no exige navegador. Alguien
+     * conectado pero callado: pausar el volcado, no seguir pidiendo lotes que
+     * despues no hay a quien entregar. */
+    if (!webRelayHasConnectedClient()) return !requireClient;
+    if (!webRelayHasActiveClient()) return false;
 
     size_t pending = 0;
     webRelayTxLock();
@@ -318,7 +338,7 @@ inline bool webRelayReadyForDumpRequest(bool requireClient = false)
 
 static void webRelayPacket(const uint8_t pkt[6])
 {
-    if (!webRelayHasActiveClient()) {
+    if (!webRelayHasConnectedClient()) {
         webRelayTxLock();
         g_webRelayTxLen = 0;
         g_webRelayTxFirstMs = 0;
@@ -368,6 +388,10 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
             if (request != nullptr && request->hasParam("takeover")) {
                 const AsyncWebParameter *p = request->getParam("takeover");
                 forceSameIpTakeover = (p != nullptr && p->value() == "1");
+                if (forceSameIpTakeover && g_webRelayBusyHook && g_webRelayBusyHook()) {
+                    MASTER_LOG_PRINTLN("[WEB] takeover ignorado: captura/volcado en curso");
+                    forceSameIpTakeover = false;
+                }
             }
             bool rejected = false;
             for (auto &c : server->getClients()) {

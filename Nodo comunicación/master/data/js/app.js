@@ -2,16 +2,16 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-26';
-import { WsClient } from './ws_client.js?v=field-study-26';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-26';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-26';
-import { PlotArea } from './plot.js?v=field-study-26';
-import { SpectrumArea } from './spectrum.js?v=field-study-26';
-import { SlavePanel } from './slave_panel.js?v=field-study-26';
-import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-26';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-26';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-26';
+import * as cfg from './config.js?v=field-study-31';
+import { WsClient } from './ws_client.js?v=field-study-31';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-31';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-31';
+import { PlotArea } from './plot.js?v=field-study-31';
+import { SpectrumArea } from './spectrum.js?v=field-study-31';
+import { SlavePanel } from './slave_panel.js?v=field-study-31';
+import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-31';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-31';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-31';
 
 const $ = (id) => document.getElementById(id);
 
@@ -199,7 +199,20 @@ function hardwareFsHz() {
 // Returns the hardware Fs when available, otherwise the measured default rate.
 // HELLO exact (sub-packet 0x05) replaces this fallback as soon as it arrives.
 function currentFsHz() {
-  return hardwareFsHz() || cfg.DEFAULT_SAMPLE_RATE_HZ;
+  return hardwareFsHz() || fallbackFsHz();
+}
+
+// Sin HELLO todavia (p. ej. el maestro se reinicio y no tiene la Fs en cache)
+// la Fs NO es la nativa: es 2604/N con la N confirmada del nodo. Asumir 2604
+// con N=4 pedia 4x lotes (20 s -> 1736 en vez de 434, o sea SD o recorte) y
+// guardaba la captura con una Fs 4x mayor, comprimiendo su eje de tiempo.
+function fallbackFsHz() {
+  let f = 1;
+  for (let i = 1; i < data.nodes.length; i++) {
+    const nd = data.nodes[i];
+    if (nd && nd.decimationFactor > f) f = nd.decimationFactor;
+  }
+  return Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f);
 }
 
 function displayFsHz() {
@@ -211,7 +224,7 @@ function displayFsHz() {
   for (const capture of preservedCaptures) {
     if (capture.fs > 0) return capture.fs;
   }
-  return cfg.DEFAULT_SAMPLE_RATE_HZ;
+  return fallbackFsHz();
 }
 
 function compactTimestamp(date) {
@@ -1107,8 +1120,12 @@ function warnIfRamClamp(n, chIndex) {
             `${cfg.PSOC_RAM_CAPTURE_MAX_BATCHES} lotes`);
 }
 
+// Lotes pedidos en el ultimo START: para avisar si el volcado llega corto.
+let lastStartBatches = 0;
+
 function runStartCapture(req, source = '') {
   clearPendingStart();
+  lastStartBatches = req.n;
   currentCaptureSignature = '';
   for (let i = 1; i < cfg.MAX_NODES; i++) {
     if (nodeConnectedForCapture(data.nodes[i], i)) warnIfRamClamp(req.n, i);
@@ -1416,7 +1433,96 @@ function finalizeNodeFilter(chIndex, reason = '') {
   return nd.filterReady;
 }
 
+// Copia completa del ultimo volcado guardada por el maestro (cola /q, lotes
+// con numero de secuencia). Los paquetes que llegan por WebSocket NO llevan
+// secuencia: si el relay pierde un tramo, lo que sigue se empalma. Con esto la
+// captura se reconstruye entera desde el maestro. Devuelve los nodos repuestos.
+async function recoverFromMasterQueue(expectedBatches) {
+  const list = await fetch('/enlace/queue', { cache: 'no-store' }).then((r) => r.text());
+  const names = list.trim().split(/\r?\n/).map((l) => l.split(' ')[0]).filter(Boolean).sort();
+  const last = names[names.length - 1];
+  if (!last) return [];
+  const resp = await fetch(`/enlace/file?name=${encodeURIComponent(last)}`, { cache: 'no-store' });
+  if (!resp.ok) return [];
+  const b = new Uint8Array(await resp.arrayBuffer());
+  if (b.length < 48 || b[0] !== 0x47 || b[1] !== 0x45 || b[2] !== 0x4f || b[3] !== 0x51) return [];
+  const nodeCount = b[5];
+  const nb = b[6] | (b[7] << 8);
+  if (nb !== expectedBatches) return [];
+  const off = 48 + 14 * nodeCount;
+  const perNode = new Map();
+  for (let p = off; p + 102 <= b.length; p += 102) {
+    const node = b[p];
+    const seq = b[p + 1] | (b[p + 2] << 8);
+    if (!perNode.has(node)) perNode.set(node, new Map());
+    perNode.get(node).set(seq, p + 12);
+  }
+  const restored = [];
+  for (const [node, seqs] of perNode) {
+    const nd = data.nodes[node];
+    if (!nd || seqs.size !== nb) continue;   // la copia tambien esta incompleta
+    nd.rawBuf.clear();
+    nd.rawSum = 0;
+    for (let q = 0; q < nb; q++) {
+      const at = seqs.get(q);
+      if (at === undefined) break;
+      for (let k = 0; k < cfg.SAMPLES_PER_BATCH; k++) {
+        let x = b[at + 3 * k] | (b[at + 3 * k + 1] << 8) | (b[at + 3 * k + 2] << 16);
+        if (x & 0x800000) x -= 0x1000000;
+        const v = adcCountsToVolts(x, nd);
+        nd.rawBuf.push(v);
+        nd.rawSum += v;
+      }
+    }
+    nd.totalSamples = nd.rawBuf.length;
+    nd.batchCount = nb;
+    nd.filterDirty = true;
+    nd.filterReady = false;
+    restored.push(node);
+  }
+  return restored;
+}
+
+let finalizeRecovering = false;
+
 function finalizeCompletedRaw(reason = '') {
+  // Los paquetes de muestra no llevan numero de secuencia: si se pierde un
+  // tramo, lo que sigue se empalma y el eje de tiempo se acorta sin aviso.
+  const expected = lastStartBatches * cfg.SAMPLES_PER_BATCH;
+  const short = [];
+  if (lastStartBatches > 0) {
+    for (let i = 1; i < cfg.MAX_NODES; i++) {
+      const got = data.nodes[i].rawBuf.length;
+      if (got > 0 && got < expected) short.push([i, got]);
+    }
+  }
+  if (!short.length || finalizeRecovering) {
+    finalizeCompletedRawNow(reason);
+    return;
+  }
+  for (const [i, got] of short) {
+    appendLog(`AVISO S${i}: por WebSocket llegaron ${got} de ${expected} muestras; ` +
+              'recuperando la copia completa del maestro…');
+  }
+  finalizeRecovering = true;
+  recoverFromMasterQueue(lastStartBatches)
+    .catch(() => [])
+    .then((restored) => {
+      let stillShort = false;
+      for (const [i] of short) {
+        if (restored.includes(i)) {
+          appendLog(`S${i}: captura recuperada completa desde el maestro (${expected} muestras)`);
+        } else {
+          appendLog(`AVISO S${i}: no se pudo recuperar; queda INCOMPLETO y con tramos empalmados`);
+          stillShort = true;
+        }
+      }
+      finalizeRecovering = false;
+      finalizeCompletedRawNow(stillShort ? 'dump INCOMPLETO' : reason);
+    });
+}
+
+function finalizeCompletedRawNow(reason = '') {
   let count = 0;
   for (let i = 1; i < cfg.MAX_NODES; i++) {
     const nd = data.nodes[i];

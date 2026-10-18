@@ -1779,6 +1779,10 @@ void setup()
          * hacia los clientes WS — protocol.js decodifica el mismo framing. */
         matlab.setPacketRelay(webRelayPacket);
         webRelaySetClientHook(requestWebCachedStateReplay);
+        webRelaySetBusyHook([]() {
+            return g_state == PRESTART || g_state == RUNNING ||
+                   g_state == DUMPING || g_state == SCOPE_MULTI;
+        });
         /* Modo ENLACE: config persistida + cola en el mismo LittleFS que la
          * SPA, por eso va después de webServerBegin() (que hace el mount). */
         linkModeBegin();
@@ -2105,7 +2109,11 @@ void loop()
                 requestBatch(g_dumpSlaveIdx, g_dumpBatchSeq);
                 g_dumpReqMs = millis();
             }
-        } else if (!waitingForWeb && millis() - g_dumpReqMs > DUMP_BATCH_TIMEOUT_MS) {
+        } else if (!waitingForWeb && !g_dumpBatchRx &&
+                   millis() - g_dumpReqMs > DUMP_BATCH_TIMEOUT_MS) {
+            /* Solo cuenta como timeout la espera AL ESCLAVO. Con el lote ya
+             * recibido y el navegador sin lugar, reintentar lo volvia a pedir
+             * (duplicado en la web) y al agotar reintentos lo saltaba (hueco). */
             g_dumpRetries++;
             if (g_dumpRetries >= DUMP_MAX_RETRIES) {
                 MASTER_LOG_PRINTF("[MASTER] DUMP skip node=%d seq=%d\n",
