@@ -344,6 +344,18 @@ static uint32_t g_sdstress_fallos     = 0;
 static uint32_t g_sdstress_prox_ms    = 0;
 static bool     g_sdstress_running    = false;
 
+/* ── sdprobe (banco): prueba parametrizada de ruido SD del PSoC, en paralelo
+ * a una captura corta en RAM. El ack 0xAD se cuenta igual que sdstress. */
+static uint32_t g_sdprobe_hasta_ms   = 0;
+static uint32_t g_sdprobe_periodo_ms = 0;
+static uint32_t g_sdprobe_envios     = 0;
+static uint32_t g_sdprobe_fallos     = 0;
+static uint32_t g_sdprobe_prox_ms    = 0;
+static uint8_t  g_sdprobe_modo       = 0;
+static uint8_t  g_sdprobe_div        = 0;
+static uint8_t  g_sdprobe_slew       = 0;
+static bool     g_sdprobe_running    = false;
+
 #ifndef STORE_PAGE_BATCHES
 #define STORE_PAGE_BATCHES 32u
 #endif
@@ -1525,6 +1537,11 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
                 g_sdstress_fallos++;
             }
             break;
+        case PSOC_CMD_SD_PROBE:
+            if (value == 0u && g_sdprobe_running) {
+                g_sdprobe_fallos++;
+            }
+            break;
         default:
             break;
     }
@@ -2602,6 +2619,61 @@ static void serviceSdStress()
     psoc.sdTest();
     g_sdstress_escrituras++;
 }
+
+static void requestSdProbeFromUsb(uint32_t ms, uint32_t periodoMs,
+                                  uint8_t modo, uint8_t div, uint8_t slew)
+{
+    if (ms == 0u) {
+        g_sdprobe_hasta_ms = 0u;
+        g_sdprobe_running = false;
+        SLAVE_LOG_RAW("#SDPROBE fin envios=%lu fallos=%lu\n",
+                      (unsigned long)g_sdprobe_envios, (unsigned long)g_sdprobe_fallos);
+        LOGM("USB_CMD", "cmd=sdprobe,ok=1,cancel=1");
+        return;
+    }
+    if (!psocSdPresent()) {
+        SLAVE_LOG_RAW("#SDPROBE sin sd\n");
+        LOGM("USB_CMD", "cmd=sdprobe,ok=0,reason=sin_sd");
+        return;
+    }
+    g_sdprobe_periodo_ms = periodoMs;
+    g_sdprobe_envios     = 0u;
+    g_sdprobe_fallos     = 0u;
+    g_sdprobe_prox_ms    = millis();
+    g_sdprobe_modo       = modo;
+    g_sdprobe_div        = div;
+    g_sdprobe_slew       = slew;
+    g_sdprobe_running    = true;
+    g_sdprobe_hasta_ms   = millis() + ms;
+    SLAVE_LOG_RAW("#SDPROBE inicio modo=%u periodo=%lu div=%u slew=%u\n",
+                  (unsigned)modo, (unsigned long)periodoMs,
+                  (unsigned)div, (unsigned)slew);
+    LOGM("USB_CMD", "cmd=sdprobe,ok=1,ms=%lu,periodo=%lu,modo=%u,div=%u,slew=%u",
+         (unsigned long)ms, (unsigned long)periodoMs, (unsigned)modo,
+         (unsigned)div, (unsigned)slew);
+}
+
+static void serviceSdProbe()
+{
+    if (g_sdprobe_hasta_ms == 0u) return;
+    const uint32_t now = millis();
+    if (now >= g_sdprobe_hasta_ms) {
+        g_sdprobe_hasta_ms = 0u;
+        if (g_sdprobe_running) {
+            g_sdprobe_running = false;
+            SLAVE_LOG_RAW("#SDPROBE fin envios=%lu fallos=%lu\n",
+                          (unsigned long)g_sdprobe_envios, (unsigned long)g_sdprobe_fallos);
+            LOGM("USB_CMD", "cmd=sdprobe,event=fin,envios=%lu,fallos=%lu",
+                 (unsigned long)g_sdprobe_envios, (unsigned long)g_sdprobe_fallos);
+        }
+        return;
+    }
+    if (now < g_sdprobe_prox_ms) return;
+    g_sdprobe_prox_ms = now + g_sdprobe_periodo_ms;
+
+    psoc.sdProbe(g_sdprobe_modo, g_sdprobe_div, g_sdprobe_slew);
+    g_sdprobe_envios++;
+}
 #endif
 
 static void requestCalibrationFromUsb()
@@ -2890,6 +2962,20 @@ static void handleUsbCommand(const char *cmd)
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAOUT, value, "pgaout");
     } else if (usbParseGainParam(cmd, "pgavdac", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
+    } else if (!strncmp(cmd, "view ", 5)) {
+        /* Banco: tap del AMux que digitaliza la captura (0xAC, solo IDLE).
+         * 0 PGA/SEo, 1 BP, 2 OPA_SUM, 3 SUMo, 4 LPo; 255 vuelve al de fabrica. */
+        int ch = -1;
+        servicePsocConfigAck();
+        if (sscanf(cmd + 5, "%d", &ch) == 1 &&
+            ((ch >= 0 && ch <= 4) || ch == 255) && !g_cfg_waiting &&
+            ensurePsocReadyForConfig()) {
+            psoc.setViewChannel((uint8_t)ch);
+            waitForPsocConfigAck(PSOC_CMD_VIEW_CHANNEL, (uint8_t)ch);
+            SLAVE_LOG_PRINTF("[USB] view %d -> PSoC CMD 0xAC\n", ch);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: view <0-4|255> (PSoC en IDLE, sin config pendiente)\n");
+        }
     } else if (!strncmp(cmd, "idac ", 5)) {
         int stage = -1;
         int code = 0;
@@ -2972,10 +3058,26 @@ static void handleUsbCommand(const char *cmd)
         } else {
             SLAVE_LOG_PRINTF("[USB] uso: sdstress <ms 0-600000> <periodo_ms 5-10000>\n");
         }
+    } else if (!strncmp(cmd, "sdprobe", 7) &&
+               (cmd[7] == '\0' || cmd[7] == ' ')) {
+        long ms = -1, periodo = -1, modo = -1, div = 0, slew = 0;
+        const int n = sscanf(cmd + 7, "%ld %ld %ld %ld %ld",
+                             &ms, &periodo, &modo, &div, &slew);
+        if (n >= 1 && ms == 0) {
+            requestSdProbeFromUsb(0u, 0u, 0u, 0u, 0u);
+        } else if (n >= 3 && ms > 0 && ms <= 600000 &&
+                   periodo >= 5 && periodo <= 10000 &&
+                   modo >= 0 && modo <= 5 && div >= 0 && div <= 255 &&
+                   slew >= 0 && slew <= 2) {
+            requestSdProbeFromUsb((uint32_t)ms, (uint32_t)periodo,
+                                  (uint8_t)modo, (uint8_t)div, (uint8_t)slew);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: sdprobe <ms 0-600000> <periodo_ms 5-10000> <modo 0-5> [div 0-255] [slew 0-2]\n");
+        }
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, dumpusb [desde] [hasta], rftest ms periodo_ms bytes, sdstress ms periodo_ms, ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, dumpusb [desde] [hasta], rftest ms periodo_ms bytes, sdstress ms periodo_ms, sdprobe ms periodo_ms modo [div] [slew], ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #else
         SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #endif
@@ -4116,11 +4218,12 @@ void loop()
     serviceLocalUi();
     serviceHotWaitWatchdog();
 #if SLAVE_LAB_TOOLS_ENABLE
-    /* rftest/sdstress (banco): no bloquean y tienen que poder correr EN
+    /* rftest/sdstress/sdprobe (banco): no bloquean y tienen que poder correr EN
      * PARALELO con una captura (g_state == SAMPLING incluido: este tramo del
      * loop no se salta en SAMPLING, ver arriba). */
     serviceRfTest();
     serviceSdStress();
+    serviceSdProbe();
 #endif
 
     /* (El parpadeo de identificación lo hace ahora el PSoC con su Timer; el ESP

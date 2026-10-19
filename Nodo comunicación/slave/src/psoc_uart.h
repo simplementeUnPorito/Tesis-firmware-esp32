@@ -161,6 +161,7 @@
 
 #define PSOC_CMD_VIEW_CHANNEL 0xAC
 #define PSOC_VIEW_CHANNEL_NONE 0xFF
+#define PSOC_CMD_SD_PROBE 0xAD    /* p1=modo, p2=div, p3=slew; Ack: 1 OK / 0 fallo */
 
 #define PSOC_CMD_SD_CAPTURE  0xBE    /* p=1 captura a SD (permite N>512), p=0 RAM-only. Ack 0/1, 0xEE=rechazo */
 #define PSOC_CMD_SD_READ_BATCH 0xBF  /* uint16 LE; éxito: frame normal seq=índice */
@@ -364,6 +365,15 @@ public:
     void forcePi(uint8_t seconds);
     void sdStatus(uint8_t reinit);   /* consulta/re-init de la SD del PSoC (0xBC) */
     void sdTest();                   /* self-test de bloque en la SD del PSoC (0xBD) */
+    void sdProbe(uint8_t modo, uint8_t div, uint8_t slew)
+    {
+        if (_ser == nullptr) { return; }
+        const uint8_t f[6] = {
+            PSOC_FRAME_MARKER, PSOC_CMD_SD_PROBE, modo, div, slew,
+            (uint8_t)(PSOC_CMD_SD_PROBE ^ modo ^ div ^ slew)
+        };
+        _ser->write(f, sizeof(f));
+    }
     void sdCapture(uint8_t enable);  /* modo captura a SD del PSoC (0xBE) */
     void sdReadBatch(uint16_t index);/* lectura bajo demanda desde GEOLAST.BIN (0xBF) */
     void adcSnapshot();
