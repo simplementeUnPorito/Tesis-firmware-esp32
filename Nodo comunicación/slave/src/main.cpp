@@ -146,7 +146,7 @@ static void scheduleBootGains()
     g_boot_gain_due_ms = millis() + SLAVE_BOOT_GAIN_DELAY_MS;
 }
 #ifndef WIFI_TX_POWER_QDBM
-  #define WIFI_TX_POWER_QDBM 78
+  #define WIFI_TX_POWER_QDBM 84   /* maximo del ESP32: 21 dBm */
 #endif
 
 /* MAC del ESP maestro. El valor real debe venir de platformio.ini. */
@@ -333,6 +333,48 @@ static uint32_t g_rftest_enviados   = 0;
 static uint32_t g_rftest_fallos     = 0;
 static uint32_t g_rftest_prox_ms    = 0;
 static bool     g_rftest_running    = false; /* para imprimir "#RFTEST fin" una sola vez */
+
+/* Instantes (micros) de cada evento de radio durante la captura. El PSoC
+ * avisa por I2C en cada k*150 muestras (sdprobe modo 7, PSOC_EVT_LAB_PING) y
+ * esos avisos, tambien en micros, son el reloj de referencia: el host
+ * interpola cada evento entre dos avisos y obtiene su muestra exacta, sin la
+ * deriva del IMO del PSoC (+-1 %) ni la latencia de la captura a RAM. */
+#define LAB_POS_MAX 192
+struct LabPos {
+    volatile bool     enSampling;
+    volatile uint32_t base;
+    volatile uint16_t n;
+    uint32_t          pos[LAB_POS_MAX];
+};
+static uint32_t          g_ping_t[LAB_POS_MAX];
+static uint8_t           g_ping_v[LAB_POS_MAX];
+static volatile uint16_t g_ping_n = 0u;
+static bool              g_ping_en_sampling = false;
+static volatile bool     g_rftest_disparo = false;   /* rftest periodo 0: transmitir ya */
+static LabPos g_rftest_pos = {};
+static LabPos g_rfrx_pos   = {};
+
+static void labPosReset(LabPos &p) { p.enSampling = false; p.base = 0u; p.n = 0u; }
+
+/* Llamar seguido (loop/serviceLabWaitSlice) para fijar la base de lotes. */
+static void labPosTick(LabPos &p);
+/* Registra un evento ahora; tambien desde el callback de recepcion. */
+static void labPosMark(LabPos &p);
+static void labPosPrint(const char *tag, LabPos &p);
+
+/* rfrx: registra la llegada de las rafagas del maestro (tramas "RFB1"). */
+static uint32_t g_rfrx_hasta_ms  = 0;
+static bool     g_rfrx_running   = false;
+static uint32_t g_rfrx_recibidas = 0;
+
+/* Pulso para disparar el osciloscopio en cada transmision de rftest. */
+#define RF_TRIG_PIN 4
+
+#if defined(ESP8266)
+static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len);
+#else
+static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len);
+#endif
 
 /* ── sdstress (banco): escrituras a la SD del PSoC EN PARALELO a una captura
  * corta que si entra en RAM. NO toca la regla de g_psoc_sd_store_active: es
@@ -813,8 +855,12 @@ static void sendCfgAckS16(uint8_t hiBase, uint8_t loBase, uint8_t stage, int32_t
     sendCfgAck((uint8_t)(loBase + stage), (uint8_t)(raw & 0xFFu));
 }
 
+static void labPingRecord(uint8_t v);
 static void onPsocDiag(const PsocDiagEvent &event)
 {
+#if SLAVE_LAB_TOOLS_ENABLE
+    if (event.event == PSOC_EVT_LAB_PING) { labPingRecord(event.value); return; }
+#endif
     static uint8_t calStage = 0xFF;
     static uint8_t calDac = 0;
     static int16_t calMeas = 0;
@@ -2281,6 +2327,8 @@ static uint32_t usbCaptureTimeoutMs(uint16_t n)
 
 #if SLAVE_LAB_TOOLS_ENABLE
 static void serviceRfTest();
+static void serviceRfRx();
+static void serviceLabPing();
 static void serviceSdStress();
 static void serviceSdProbe();
 static void serviceEspSd();
@@ -2294,7 +2342,9 @@ static void serviceLabWaitSlice()
     /* capwait/startwait bloquean loop(): sin esto los estresores paralelos
      * (rftest/sdstress/sdprobe/espsd) no corrian DURANTE la captura sino antes y
      * despues, y la captura salia limpia. Medido 2026-10-19: 0 marcas. */
+    serviceLabPing();
     serviceRfTest();
+    serviceRfRx();
     serviceSdStress();
     serviceSdProbe();
     serviceEspSd();
@@ -2546,14 +2596,73 @@ static void requestDumpUsbFromUsb(bool hasDesde, uint16_t desde,
  * casualidad). NO bloquea: arma el estado global y loop() -> serviceRfTest()
  * dispara una trama por periodo mientras millis() < g_rftest_hasta_ms. La
  * validacion de rango ya la hizo el parser en handleUsbCommand. */
+static void labPosTick(LabPos &p)
+{
+    if (!p.enSampling && g_state == SAMPLING) {
+        p.base = psoc.batchesOK();
+        p.enSampling = true;
+    }
+}
+
+static void labPosMark(LabPos &p)
+{
+    if (!p.enSampling || g_state != SAMPLING) return;
+    const uint16_t k = p.n;
+    if (k >= LAB_POS_MAX) return;
+    p.pos[k] = micros();
+    p.n = (uint16_t)(k + 1u);
+}
+
+static void labPosPrint(const char *tag, LabPos &p)
+{
+    SLAVE_LOG_RAW("#%s t %u", tag, (unsigned)p.n);
+    for (uint16_t i = 0; i < p.n; i++) SLAVE_LOG_RAW(" %lu", (unsigned long)p.pos[i]);
+    SLAVE_LOG_RAW("\n");
+    SLAVE_LOG_RAW("#PING t %u", (unsigned)g_ping_n);
+    for (uint16_t i = 0; i < g_ping_n; i++) {
+        SLAVE_LOG_RAW(" %u:%lu", (unsigned)g_ping_v[i], (unsigned long)g_ping_t[i]);
+    }
+    SLAVE_LOG_RAW("\n");
+}
+
+/* Reinicia el registro de pings al empezar cada captura. */
+static void serviceLabPing()
+{
+    if (g_state == SAMPLING) {
+        if (!g_ping_en_sampling) { g_ping_n = 0u; g_ping_en_sampling = true; }
+    } else {
+        g_ping_en_sampling = false;
+    }
+}
+
+static void labPingRecord(uint8_t v)
+{
+    const uint32_t t = micros();
+    const uint16_t k = g_ping_n;
+    if (k < LAB_POS_MAX) { g_ping_t[k] = t; g_ping_v[k] = v; g_ping_n = (uint16_t)(k + 1u); }
+    if (g_rftest_running && g_rftest_periodo_ms == 0u) g_rftest_disparo = true;
+}
+
+static void rftestFin(const char *evento)
+{
+    g_rftest_hasta_ms = 0u;
+    if (!g_rftest_running) return;
+    g_rftest_running = false;
+    labPosPrint("RFTEST", g_rftest_pos);
+    SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
+                  (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+    LOGM("USB_CMD", "cmd=rftest,event=%s,enviados=%lu,fallos=%lu", evento,
+         (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+}
+
 static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytesN)
 {
     if (ms == 0u) {
-        g_rftest_hasta_ms = 0u;
-        g_rftest_running = false;
-        SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
-                      (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
-        LOGM("USB_CMD", "cmd=rftest,ok=1,cancel=1");
+        if (!g_rftest_running) {
+            SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
+                          (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+        }
+        rftestFin("cancel");
         return;
     }
     g_rftest_periodo_ms = periodoMs;
@@ -2561,6 +2670,10 @@ static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytes
     g_rftest_enviados   = 0u;
     g_rftest_fallos     = 0u;
     g_rftest_prox_ms    = millis();
+    g_rftest_disparo    = false;
+    labPosReset(g_rftest_pos);
+    pinMode(RF_TRIG_PIN, OUTPUT);
+    digitalWrite(RF_TRIG_PIN, LOW);
     g_rftest_running    = true;
     g_rftest_hasta_ms   = millis() + ms;
     SLAVE_LOG_RAW("#RFTEST inicio ms=%lu periodo=%lu bytes=%lu\n",
@@ -2570,24 +2683,25 @@ static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytes
 }
 
 /* loop(): una trama fija por periodo, sin bloquear. Payload de patron fijo,
- * el contenido no importa para medir ruido inducido por la radio. */
+ * el contenido no importa para medir ruido inducido por la radio. Cada envio
+ * queda registrado (lote de la captura) y levanta RF_TRIG_PIN ~200 us para
+ * disparar el osciloscopio. */
 static void serviceRfTest()
 {
     if (g_rftest_hasta_ms == 0u) return;
+    labPosTick(g_rftest_pos);
     const uint32_t now = millis();
     if (now >= g_rftest_hasta_ms) {
-        g_rftest_hasta_ms = 0u;
-        if (g_rftest_running) {
-            g_rftest_running = false;
-            SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
-                          (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
-            LOGM("USB_CMD", "cmd=rftest,event=fin,enviados=%lu,fallos=%lu",
-                 (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
-        }
+        rftestFin("fin");
         return;
     }
-    if (now < g_rftest_prox_ms) return;
-    g_rftest_prox_ms = now + g_rftest_periodo_ms;
+    if (g_rftest_periodo_ms == 0u) {
+        if (!g_rftest_disparo) return;
+        g_rftest_disparo = false;
+    } else {
+        if (now < g_rftest_prox_ms) return;
+        g_rftest_prox_ms = now + g_rftest_periodo_ms;
+    }
 
     static uint8_t payload[240];
     static bool payloadReady = false;
@@ -2598,9 +2712,91 @@ static void serviceRfTest()
         payloadReady = true;
     }
 
+    labPosMark(g_rftest_pos);
+    digitalWrite(RF_TRIG_PIN, HIGH);
     const esp_err_t err = sendToMaster(payload, g_rftest_bytes);
+    delayMicroseconds(200);
+    digitalWrite(RF_TRIG_PIN, LOW);
     g_rftest_enviados++;
     if (err != ESP_OK) { g_rftest_fallos++; }
+}
+
+/* rfrx: mientras esta armado, cada trama "RFB1" del maestro (rafaga 0xC1)
+ * queda registrada por onDataRecv; al terminar se informa #RFRX pos. */
+static void rfrxFin()
+{
+    g_rfrx_hasta_ms = 0u;
+    if (!g_rfrx_running) return;
+    g_rfrx_running = false;
+    labPosPrint("RFRX", g_rfrx_pos);
+    SLAVE_LOG_RAW("#RFRX fin recibidas=%lu\n", (unsigned long)g_rfrx_recibidas);
+}
+
+static void requestRfRxFromUsb(uint32_t ms)
+{
+    if (ms == 0u) {
+        if (!g_rfrx_running) SLAVE_LOG_RAW("#RFRX fin recibidas=%lu\n", (unsigned long)g_rfrx_recibidas);
+        rfrxFin();
+        return;
+    }
+    labPosReset(g_rfrx_pos);
+    g_rfrx_recibidas = 0u;
+    g_rfrx_running = true;
+    g_rfrx_hasta_ms = millis() + ms;
+    SLAVE_LOG_RAW("#RFRX inicio ms=%lu\n", (unsigned long)ms);
+}
+
+static void serviceRfRx()
+{
+    if (g_rfrx_hasta_ms == 0u) return;
+    labPosTick(g_rfrx_pos);
+    if (millis() >= g_rfrx_hasta_ms) rfrxFin();
+}
+
+/* Llamado al principio de onDataRecv: true si era una trama de rafaga. */
+static bool rfrxOnFrame(const uint8_t *data, int len)
+{
+    if (len < 4 || data[0] != 'R' || data[1] != 'F' || data[2] != 'B' || data[3] != '1') return false;
+    if (g_rfrx_running) {
+        g_rfrx_recibidas++;
+        labPosMark(g_rfrx_pos);
+    }
+    return true;
+}
+
+/* txpower: potencia maxima de transmision en dBm (2..21). */
+static void requestTxPowerFromUsb(long dbm)
+{
+    if (dbm < 2 || dbm > 21) {
+        SLAVE_LOG_PRINTF("[USB] uso: txpower <dBm 2-21>\n");
+        return;
+    }
+    const esp_err_t err = esp_wifi_set_max_tx_power((int8_t)(dbm * 4));
+    int8_t real = 0;
+    esp_wifi_get_max_tx_power(&real);
+    SLAVE_LOG_RAW("#TXPOWER pedido=%ld dBm real=%d qdBm err=%d\n", dbm, (int)real, (int)err);
+}
+
+/* radio off|on: apaga y vuelve a prender WiFi + ESP-NOW sin reiniciar el ESP
+ * (reiniciarlo resetea el PSoC y obliga al lazo a volver a aprender). */
+static bool g_radio_on = true;
+static void requestRadioFromUsb(bool on)
+{
+    if (!on && g_radio_on) {
+        esp_now_deinit();
+        esp_wifi_stop();
+        g_radio_on = false;
+    } else if (on && !g_radio_on) {
+        esp_wifi_start();
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+        esp_wifi_set_channel(g_masterChannel, WIFI_SECOND_CHAN_NONE);
+        const bool ok = transport.begin(g_masterTxMac);
+        esp_now_register_recv_cb(onDataRecv);
+        g_radio_on = true;
+        if (!ok) SLAVE_LOG_RAW("#RADIO on: ESP-NOW FAIL\n");
+    }
+    SLAVE_LOG_RAW("#RADIO %s\n", g_radio_on ? "on" : "off");
 }
 
 /* Banco: escrituras a la SD del PSoC EN PARALELO a una captura corta que SI
@@ -2673,7 +2869,7 @@ static void requestSdProbeFromUsb(uint32_t ms, uint32_t periodoMs,
         return;
     }
     /* Los modos 0-3 no tocan la tarjeta (solo CS/bus): corren aun sin SD. */
-    if (modo >= 4u && !psocSdPresent()) {
+    if (modo >= 4u && modo <= 5u && !psocSdPresent()) {
         SLAVE_LOG_RAW("#SDPROBE sin sd\n");
         LOGM("USB_CMD", "cmd=sdprobe,ok=0,reason=sin_sd");
         return;
@@ -3696,6 +3892,18 @@ static void handleUsbCommand(const char *cmd)
         } else {
             SLAVE_LOG_PRINTF("[USB] uso: dumpusb [desde] [hasta]\n");
         }
+    } else if (!strncmp(cmd, "rfrx", 4) && (cmd[4] == '\0' || cmd[4] == ' ')) {
+        long ms = -1;
+        if (sscanf(cmd + 4, "%ld", &ms) == 1 && ms >= 0 && ms <= 600000) requestRfRxFromUsb((uint32_t)ms);
+        else SLAVE_LOG_PRINTF("[USB] uso: rfrx <ms 0-600000>\n");
+    } else if (!strncmp(cmd, "txpower", 7) && (cmd[7] == '\0' || cmd[7] == ' ')) {
+        long dbm = -1;
+        sscanf(cmd + 7, "%ld", &dbm);
+        requestTxPowerFromUsb(dbm);
+    } else if (usbCommandEquals(cmd, "radio off")) {
+        requestRadioFromUsb(false);
+    } else if (usbCommandEquals(cmd, "radio on")) {
+        requestRadioFromUsb(true);
     } else if (!strncmp(cmd, "rftest", 6) &&
                (cmd[6] == '\0' || cmd[6] == ' ')) {
         long ms = -1, periodo = -1, bytesN = -1;
@@ -3703,11 +3911,11 @@ static void handleUsbCommand(const char *cmd)
         if (n >= 1 && ms == 0) {
             requestRfTestFromUsb(0u, 0u, 0u);
         } else if (n == 3 && ms > 0 && ms <= 600000 &&
-                   periodo >= 1 && periodo <= 10000 &&
+                   periodo >= 0 && periodo <= 10000 &&
                    bytesN >= 1 && bytesN <= 240) {
             requestRfTestFromUsb((uint32_t)ms, (uint32_t)periodo, (uint32_t)bytesN);
         } else {
-            SLAVE_LOG_PRINTF("[USB] uso: rftest <ms 0-600000> <periodo_ms 1-10000> <bytes 1-240>\n");
+            SLAVE_LOG_PRINTF("[USB] uso: rftest <ms 0-600000> <periodo_ms 0-10000 (0 = en cada ping del PSoC)> <bytes 1-240>\n");
         }
     } else if (!strncmp(cmd, "sdstress", 8) &&
                (cmd[8] == '\0' || cmd[8] == ' ')) {
@@ -3760,7 +3968,7 @@ static void handleUsbCommand(const char *cmd)
             requestSdProbeFromUsb(0u, 0u, 0u, 0u, 0u);
         } else if (n >= 3 && ms > 0 && ms <= 600000 &&
                    periodo >= 5 && periodo <= 10000 &&
-                   modo >= 0 && modo <= 5 && div >= 0 && div <= 255 &&
+                   ((modo >= 0 && modo <= 5) || modo == 7) && div >= 0 && div <= 255 &&
                    slew >= 0 && slew <= 2) {
             requestSdProbeFromUsb((uint32_t)ms, (uint32_t)periodo,
                                   (uint8_t)modo, (uint8_t)div, (uint8_t)slew);
@@ -4205,6 +4413,9 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 #endif
 {
     if (len < 1) return;
+#if SLAVE_LAB_TOOLS_ENABLE
+    if (rfrxOnFrame(data, len)) return;   /* rafaga de banco: no es protocolo */
+#endif
     learnMasterMac(mac);
     g_lastMasterRxMs = millis();   /* para el seguimiento de canal (ver abajo) */
     uint8_t cmd = data[0];
@@ -4914,7 +5125,9 @@ void loop()
     /* rftest/sdstress/sdprobe/espsd (banco): corren EN
      * PARALELO con una captura (g_state == SAMPLING incluido: este tramo del
      * loop no se salta en SAMPLING, ver arriba). */
+    serviceLabPing();
     serviceRfTest();
+    serviceRfRx();
     serviceSdStress();
     serviceSdProbe();
     serviceEspSd();

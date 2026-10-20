@@ -248,6 +248,7 @@
 #define PSOC_EVT_SD_DIAG_STAGE    0x4C  /* bits0-6 etapa init; bit7 timeout SPI */
 #define PSOC_EVT_SD_DIAG_R1       0x4D  /* ultima respuesta R1 (0xFF=sin respuesta) */
 #define PSOC_EVT_SD_DIAG_PINS     0x4E  /* low/high vistos en MISO, SCK, MOSI y CS */
+#define PSOC_EVT_LAB_PING         0x4F  /* sdprobe modo 7: aviso en cada k*150 muestras */
 
 struct PsocSample {
     int16_t  raw_input;

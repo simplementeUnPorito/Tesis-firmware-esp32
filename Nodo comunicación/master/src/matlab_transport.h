@@ -20,6 +20,7 @@
  *     [0xAB][cmd][n_lo][n_hi][cmd^n_lo^n_hi]
  *     cmd 0xA3: start sampling  N = n_lo|n_hi<<8 (lotes, 0=usar actual)
  *     cmd 0xAE: set record len  N = n_lo|n_hi<<8
+ *     cmd 0xC1: rafaga RF de banco, N = duracion en unidades de 10 ms (0 = parar)
  *
  *   Comando dirigido a esclavo (6 bytes; 7 para IDAC manual 0xAA):
  *     [0xAB][0xBD][node_id][sub_cmd][param][node_id^sub_cmd^param]
@@ -87,7 +88,7 @@ public:
         uint8_t  param;    /* parámetro del comando estándar (= value & 0xFF) */
         uint8_t  node_id;  /* válido solo cuando cmd == 0xBD */
         uint8_t  sub_cmd;  /* válido solo cuando cmd == 0xBD */
-        uint16_t value;    /* valor 16 bits para 0xA3/0xAD/0xAE (set N) */
+        uint16_t value;    /* valor 16 bits para 0xA3/0xAD/0xAE/0xC1 (set N) */
         bool     valid;
         uint8_t  param2;       /* segundo parametro, solo 0xAA dirigido */
         bool     has_param2;
@@ -145,7 +146,7 @@ inline void MatlabTransport::loop()
         if (_rxIdx == 2) {
             uint8_t c = _rxBuf[1];
             if (c == MATLAB_CMD_DIRECTED)            _rxExpected = 6;
-            else if (c == 0xA3 || c == 0xAD || c == 0xAE) _rxExpected = 5; /* set N 16 bits */
+            else if (c == 0xA3 || c == 0xAD || c == 0xAE || c == 0xC1) _rxExpected = 5; /* set N 16 bits */
             else                                     _rxExpected = 4;
         }
         if (_rxIdx == 4 && _rxBuf[1] == MATLAB_CMD_DIRECTED &&

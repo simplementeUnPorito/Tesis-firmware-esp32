@@ -127,7 +127,7 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
   #define AP_KEEP_BEACON_DURING_CAPTURE 0
 #endif
 #ifndef WIFI_TX_POWER_QDBM
-  #define WIFI_TX_POWER_QDBM 78
+  #define WIFI_TX_POWER_QDBM 84   /* maximo del ESP32 (el chip la limita a 78) */
 #endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
@@ -184,6 +184,71 @@ static bool              g_hotWaitQueryInFlight = false;
 static bool              g_hotWaitSettling = false;
 static uint32_t          g_hotWaitQueryMs = 0;
 static uint32_t          g_hotWaitSettleDueMs = 0;
+
+/* Rafaga RF de banco (cmd USB 0xC1): trafico ESP-NOW sintetico no bloqueante. */
+static bool              g_rfBurstArmed = false;
+static uint32_t          g_rfBurstStartMs = 0;
+static uint32_t          g_rfBurstDurationMs = 0;
+static uint32_t          g_rfBurstNextTxMs = 0;
+static uint32_t          g_rfBurstCounter = 0;
+static uint32_t          g_rfBurstSent = 0;
+
+static void stopRfBurst()
+{
+    if (!g_rfBurstArmed) return;
+    g_rfBurstArmed = false;
+    MASTER_LOG_PRINTF("[MASTER] RFBURST fin enviadas=%lu\n",
+                      (unsigned long)g_rfBurstSent);
+}
+
+static void armRfBurst(uint16_t duration10Ms)
+{
+    if (duration10Ms == 0) {
+        stopRfBurst();
+        return;
+    }
+
+    uint32_t now = millis();
+    g_rfBurstArmed = true;
+    g_rfBurstStartMs = now;
+    g_rfBurstDurationMs = (uint32_t)duration10Ms * 10u;
+    g_rfBurstNextTxMs = now;
+    g_rfBurstCounter = 0;
+    g_rfBurstSent = 0;
+    MASTER_LOG_PRINTF("[MASTER] RFBURST inicio N=%u duracion_ms=%lu\n",
+                      duration10Ms, (unsigned long)g_rfBurstDurationMs);
+}
+
+static void serviceRfBurst()
+{
+    if (!g_rfBurstArmed) return;
+
+    uint32_t now = millis();
+    if ((uint32_t)(now - g_rfBurstStartMs) >= g_rfBurstDurationMs) {
+        stopRfBurst();
+        return;
+    }
+    if (!g_espnowReady || (int32_t)(now - g_rfBurstNextTxMs) < 0) return;
+
+    uint8_t payload[240];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(0x5A ^ i);
+    }
+    payload[0] = 'R';
+    payload[1] = 'F';
+    payload[2] = 'B';
+    payload[3] = '1';
+    payload[4] = (uint8_t)(g_rfBurstCounter & 0xFFu);
+    payload[5] = (uint8_t)((g_rfBurstCounter >> 8) & 0xFFu);
+    payload[6] = (uint8_t)((g_rfBurstCounter >> 16) & 0xFFu);
+    payload[7] = (uint8_t)((g_rfBurstCounter >> 24) & 0xFFu);
+
+    if (esp_now_send(ESPNOW_BROADCAST, payload, sizeof(payload)) == ESP_OK) {
+        g_rfBurstSent++;
+    }
+    g_rfBurstCounter++;
+    g_rfBurstNextTxMs = now + 58u;
+}
 
 struct StartProbePending {
     bool active;
@@ -1600,6 +1665,11 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
             break;
         }
 
+        case 0xC1:   /* RFBURST: N unidades de 10 ms; 0 = parar */
+            armRfBurst(rxCmd.value);
+            matlab.sendAck(0xFF, 0xC1, (uint8_t)(rxCmd.value & 0xFFu));
+            break;
+
         case 0xC0: {  /* ENLACE: param=1 subir ahora, param=0 auto on/off por value */
             if (param == 0) {
                 /* Configurar el trigger automatico (por captura) sin tocar el
@@ -1829,6 +1899,7 @@ void setup()
 void loop()
 {
     debugEspHardwareService();
+    serviceRfBurst();
 
     /* Fase ENLACE: ESP-NOW esta abajo (no hay esclavos que atender) pero la SPA
      * y los endpoints /enlace/* siguen vivos sobre la red del cliente — es toda
