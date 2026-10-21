@@ -3748,6 +3748,10 @@ static void requestStartNowFromUsb(uint16_t n)
     g_sampling_start_batches_ok = psoc.batchesOK();
     g_state = SAMPLING;
     radioSilencioAlEntrar();
+    /* Camino USB (contexto de loop): apagar ya y, con radiosil on <ms>, dejar
+       que el transitorio del apagado se asiente antes de arrancar el PSoC. */
+    serviceRadioSilencio(true);
+    if (g_radio_silencio && g_radio_silencio_ms > 0u) delay(g_radio_silencio_ms);
     psoc.setN(g_rec_n_batches);
     psoc.startNow();
     SLAVE_LOG_PRINTF("[USB] startnow n=%u bytes=%lu store=%u\n",
