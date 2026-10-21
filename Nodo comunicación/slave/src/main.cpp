@@ -220,6 +220,7 @@ static uint8_t  g_masterChannel = MASTER_CH_FALLBACK;
 
 enum SlaveState { WAIT_ARM, ARMED, HOT_WAIT, SAMPLING, STOPPED };
 static volatile SlaveState g_state       = WAIT_ARM;
+static bool                g_radio_silencio = false;
 static bool                g_psocConnected = false;  /* resultado de probe() en setup */
 /* GPIO configurado en platformio.ini -> PSoC P1[4] (esp_reset).
  * Sin pull-up externo: el ESP entrega 3V3 en reposo y 0V al pedir reset.
@@ -624,8 +625,13 @@ static void learnMasterMac(const uint8_t mac[6])
                      masterMacIsDefaultBroadcast() ? " (auto)" : "");
 }
 
+static void serviceRadioSilencio();
+
 static esp_err_t sendToMaster(const uint8_t *data, size_t len)
 {
+    /* El ACK de fin de captura sale apenas se deja SAMPLING, antes de que el
+       loop vuelva a prender la radio callada por radiosil. */
+    serviceRadioSilencio();
     return espnowSend(g_masterTxMac, data, len);
 }
 
@@ -1521,6 +1527,7 @@ static void onPsocDiag(const PsocDiagEvent &event)
 static void allocStore(uint16_t n_batches);
 static void handleReqBatch(const MsgReqBatch *msg);
 static void sendHotWaitAck();
+static void radioSilencioAlEntrar();
 
 /* ── Callbacks ESP-NOW ───────────────────────────────────────────────────── */
 
@@ -2032,6 +2039,7 @@ static void requestUsbStartFromHotWait()
     g_start_store_active = (g_rec_n_batches > 0 && storeReadyForHotWait());
     g_start_fallback_sent = false;
     g_state = SAMPLING;
+    radioSilencioAlEntrar();
     SLAVE_LOG_PRINTF("[USB] sync start n=%u sync=%d->%d bytes=%lu\n",
                      (unsigned)g_rec_n_batches, syncBefore, syncAfter,
                      (unsigned long)g_sampling_start_psoc_bytes);
@@ -2804,13 +2812,20 @@ static void requestTxPowerFromUsb(long dbm)
 /* radio off|on: apaga y vuelve a prender WiFi + ESP-NOW sin reiniciar el ESP
  * (reiniciarlo resetea el PSoC y obliga al lazo a volver a aprender). */
 static bool g_radio_on = true;
-static void requestRadioFromUsb(bool on)
+static bool g_radio_apagada_por_silencio = false;
+
+static void radioApagar()
 {
-    if (!on && g_radio_on) {
+    if (g_radio_on) {
         esp_now_deinit();
         esp_wifi_stop();
         g_radio_on = false;
-    } else if (on && !g_radio_on) {
+    }
+}
+
+static void radioPrender()
+{
+    if (!g_radio_on) {
         esp_wifi_start();
         esp_wifi_set_ps(WIFI_PS_NONE);
         esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
@@ -2820,7 +2835,42 @@ static void requestRadioFromUsb(bool on)
         g_radio_on = true;
         if (!ok) SLAVE_LOG_RAW("#RADIO on: ESP-NOW FAIL\n");
     }
+}
+
+static void radioSilencioAlEntrar()
+{
+    if (g_radio_silencio && g_radio_on) {
+        radioApagar();
+        g_radio_apagada_por_silencio = true;
+    }
+}
+
+static void serviceRadioSilencio()
+{
+    if (g_radio_silencio && g_radio_apagada_por_silencio &&
+        g_state != SAMPLING && g_state != HOT_WAIT) {
+        radioPrender();
+        g_radio_apagada_por_silencio = false;
+        SLAVE_LOG_RAW("#RADIOSIL vuelve\n");
+    }
+}
+
+static void requestRadioFromUsb(bool on)
+{
+    if (on) radioPrender();
+    else radioApagar();
+    g_radio_apagada_por_silencio = false;
     SLAVE_LOG_RAW("#RADIO %s\n", g_radio_on ? "on" : "off");
+}
+
+static void requestRadioSilencioFromUsb(bool on)
+{
+    g_radio_silencio = on;
+    if (!on && g_radio_apagada_por_silencio) {
+        radioPrender();
+        g_radio_apagada_por_silencio = false;
+    }
+    SLAVE_LOG_RAW("#RADIOSIL %u\n", (unsigned)g_radio_silencio);
 }
 
 /* Banco: escrituras a la SD del PSoC EN PARALELO a una captura corta que SI
@@ -3643,6 +3693,7 @@ static void requestStartNowFromUsb(uint16_t n)
     g_sampling_start_psoc_bytes = psoc.bytesRx();
     g_sampling_start_batches_ok = psoc.batchesOK();
     g_state = SAMPLING;
+    radioSilencioAlEntrar();
     psoc.setN(g_rec_n_batches);
     psoc.startNow();
     SLAVE_LOG_PRINTF("[USB] startnow n=%u bytes=%lu store=%u\n",
@@ -3928,6 +3979,10 @@ static void handleUsbCommand(const char *cmd)
         requestRadioFromUsb(false);
     } else if (usbCommandEquals(cmd, "radio on")) {
         requestRadioFromUsb(true);
+    } else if (usbCommandEquals(cmd, "radiosil off")) {
+        requestRadioSilencioFromUsb(false);
+    } else if (usbCommandEquals(cmd, "radiosil on")) {
+        requestRadioSilencioFromUsb(true);
     } else if (!strncmp(cmd, "rftest", 6) &&
                (cmd[6] == '\0' || cmd[6] == ' ')) {
         long ms = -1, periodo = -1, bytesN = -1;
@@ -4252,6 +4307,7 @@ static void debugEspSetRamp(bool enable)
             /* Modo streaming/test: A7 arranca la rampa inmediatamente. */
             g_t_start_us = (uint64_t)g_debug_last_us;
             g_state = SAMPLING;
+            radioSilencioAlEntrar();
         } else if (g_state == WAIT_ARM || g_state == STOPPED) {
             /* Store-and-forward: A7 solo selecciona debug; START/SYNC arranca. */
             g_state = ARMED;
@@ -4574,6 +4630,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_start_store_active = (g_rec_n_batches > 0 && storeReadyForHotWait() && !g_view_store_active);
         g_start_fallback_sent = false;
         g_state = SAMPLING;
+        radioSilencioAlEntrar();
         SLAVE_LOG_PRINTF("[SLAVE] START_OK target=%u token=%u sync=%d->%d bytes=%lu fill=%u/%u view=%u start=%u\n",
                          (unsigned)targetNode, (unsigned)startToken,
                          syncBefore, syncAfter,
@@ -5109,6 +5166,7 @@ void setup()
 void loop()
 {
     servicePsocResetRequest();
+    serviceRadioSilencio();
     if (g_state != SAMPLING) {
         debugEspHardwareService();
         /* Reengancharse al canal del maestro si dejo de hablar. No corre durante
