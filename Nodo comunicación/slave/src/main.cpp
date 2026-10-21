@@ -25,6 +25,7 @@
   #include <SPI.h>
 #endif
 #include <esp_wifi.h>
+#include <esp_timer.h>
 #include <driver/gpio.h>
 #include "psoc_uart.h"
 #include "espnow_transport.h"
@@ -221,6 +222,8 @@ static uint8_t  g_masterChannel = MASTER_CH_FALLBACK;
 enum SlaveState { WAIT_ARM, ARMED, HOT_WAIT, SAMPLING, STOPPED };
 static volatile SlaveState g_state       = WAIT_ARM;
 static bool                g_radio_silencio = false;
+static volatile bool       g_radio_silencio_pedido = false;
+static uint16_t            g_radio_silencio_ms = 0;
 static bool                g_psocConnected = false;  /* resultado de probe() en setup */
 /* GPIO configurado en platformio.ini -> PSoC P1[4] (esp_reset).
  * Sin pull-up externo: el ESP entrega 3V3 en reposo y 0V al pedir reset.
@@ -625,13 +628,15 @@ static void learnMasterMac(const uint8_t mac[6])
                      masterMacIsDefaultBroadcast() ? " (auto)" : "");
 }
 
-static void serviceRadioSilencio();
+static void serviceRadioSilencio(bool desdeLoop);
+static void iniciarTimerSyncRadioSilencio();
+static void subirSyncConRadioSilencio();
 
 static esp_err_t sendToMaster(const uint8_t *data, size_t len)
 {
     /* El ACK de fin de captura sale apenas se deja SAMPLING, antes de que el
        loop vuelva a prender la radio callada por radiosil. */
-    serviceRadioSilencio();
+    serviceRadioSilencio(false);
     return espnowSend(g_masterTxMac, data, len);
 }
 
@@ -2026,7 +2031,7 @@ static void requestUsbStartFromHotWait()
     }
     uint32_t nowUs = (uint32_t)micros();
     int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
-    digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+    subirSyncConRadioSilencio();
     int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
     g_t_start_us = (uint64_t)nowUs;
     g_store_fill = 0;
@@ -2359,6 +2364,7 @@ static void serviceLabWaitSlice()
     serviceSdProbe();
     serviceEspSd();
 #endif
+    serviceRadioSilencio(true);   /* radiosil: el apagado se difiere al loop */
     delay(1);
 }
 
@@ -2813,6 +2819,46 @@ static void requestTxPowerFromUsb(long dbm)
  * (reiniciarlo resetea el PSoC y obliga al lazo a volver a aprender). */
 static bool g_radio_on = true;
 static bool g_radio_apagada_por_silencio = false;
+static esp_timer_handle_t g_radio_silencio_sync_timer = nullptr;
+
+static void radioSilencioSyncTimerCb(void *)
+{
+    digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+}
+
+static void iniciarTimerSyncRadioSilencio()
+{
+    if (g_radio_silencio_sync_timer != nullptr) return;
+    const esp_timer_create_args_t args = {
+        .callback = &radioSilencioSyncTimerCb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "radiosil_sync",
+        .skip_unhandled_events = false,
+    };
+    if (esp_timer_create(&args, &g_radio_silencio_sync_timer) != ESP_OK) {
+        g_radio_silencio_sync_timer = nullptr;
+        SLAVE_LOG_RAW("#RADIOSIL timer FAIL\n");
+    }
+}
+
+static void subirSyncConRadioSilencio()
+{
+    if (!g_radio_silencio || g_radio_silencio_ms == 0u) {
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+        return;
+    }
+    g_radio_silencio_pedido = true;
+    if (g_radio_silencio_sync_timer == nullptr) {
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+        return;
+    }
+    esp_timer_stop(g_radio_silencio_sync_timer);
+    if (esp_timer_start_once(g_radio_silencio_sync_timer,
+                             (uint64_t)g_radio_silencio_ms * 1000u) != ESP_OK) {
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+    }
+}
 
 static void radioApagar()
 {
@@ -2839,14 +2885,19 @@ static void radioPrender()
 
 static void radioSilencioAlEntrar()
 {
-    if (g_radio_silencio && g_radio_on) {
-        radioApagar();
-        g_radio_apagada_por_silencio = true;
-    }
+    if (g_radio_silencio) g_radio_silencio_pedido = true;
 }
 
-static void serviceRadioSilencio()
+static void serviceRadioSilencio(bool desdeLoop)
 {
+    if (desdeLoop && g_radio_silencio_pedido) {
+        if (g_radio_silencio && g_radio_on &&
+            (g_state == HOT_WAIT || g_state == SAMPLING)) {
+            radioApagar();
+            g_radio_apagada_por_silencio = true;
+        }
+        g_radio_silencio_pedido = false;
+    }
     if (g_radio_silencio && g_radio_apagada_por_silencio &&
         g_state != SAMPLING && g_state != HOT_WAIT) {
         radioPrender();
@@ -2863,14 +2914,17 @@ static void requestRadioFromUsb(bool on)
     SLAVE_LOG_RAW("#RADIO %s\n", g_radio_on ? "on" : "off");
 }
 
-static void requestRadioSilencioFromUsb(bool on)
+static void requestRadioSilencioFromUsb(bool on, uint16_t ms = 0u)
 {
     g_radio_silencio = on;
+    g_radio_silencio_ms = on ? ms : 0u;
+    if (!on) g_radio_silencio_pedido = false;
     if (!on && g_radio_apagada_por_silencio) {
         radioPrender();
         g_radio_apagada_por_silencio = false;
     }
-    SLAVE_LOG_RAW("#RADIOSIL %u\n", (unsigned)g_radio_silencio);
+    SLAVE_LOG_RAW("#RADIOSIL %u %u\n", (unsigned)g_radio_silencio,
+                  (unsigned)g_radio_silencio_ms);
 }
 
 /* Banco: escrituras a la SD del PSoC EN PARALELO a una captura corta que SI
@@ -3981,8 +4035,16 @@ static void handleUsbCommand(const char *cmd)
         requestRadioFromUsb(true);
     } else if (usbCommandEquals(cmd, "radiosil off")) {
         requestRadioSilencioFromUsb(false);
-    } else if (usbCommandEquals(cmd, "radiosil on")) {
-        requestRadioSilencioFromUsb(true);
+    } else if (!strncmp(cmd, "radiosil on", 11) &&
+               (cmd[11] == '\0' || cmd[11] == ' ')) {
+        long ms = 0;
+        char extra = '\0';
+        const int n = sscanf(cmd + 11, "%ld %c", &ms, &extra);
+        if (n <= 1 && ms >= 0 && ms <= 1000) {   /* n = -1: sin numero */
+            requestRadioSilencioFromUsb(true, (uint16_t)ms);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: radiosil on [ms 0-1000]\n");
+        }
     } else if (!strncmp(cmd, "rftest", 6) &&
                (cmd[6] == '\0' || cmd[6] == ' ')) {
         long ms = -1, periodo = -1, bytesN = -1;
@@ -4616,7 +4678,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
             return;
         }
         int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
-        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+        subirSyncConRadioSilencio();
         int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
         /* No START_ACK here: once SYNC rises the PSoC is measuring, so RF stays
            silent until the store is full and CMD_START ok=2 can be sent. */
@@ -5140,6 +5202,7 @@ void setup()
      * arranque llega por ESP-NOW y este flanco lo propaga al PSoC. */
     pinMode(SYNC_TO_PSOC_PIN, OUTPUT);
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    iniciarTimerSyncRadioSilencio();
 
     /* UART → PSoC */
     psoc.begin(onBatch);
@@ -5166,7 +5229,7 @@ void setup()
 void loop()
 {
     servicePsocResetRequest();
-    serviceRadioSilencio();
+    serviceRadioSilencio(true);
     if (g_state != SAMPLING) {
         debugEspHardwareService();
         /* Reengancharse al canal del maestro si dejo de hablar. No corre durante
