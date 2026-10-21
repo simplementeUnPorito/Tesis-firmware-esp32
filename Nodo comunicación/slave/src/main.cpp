@@ -3589,6 +3589,24 @@ static void sdDiagnostico2()
     SLAVE_LOG_RAW("#SDDIAG2 CS lectura bajo=%d alto=%d\n#SDDIAG2 fin\n", csl, csh);
 }
 
+/* Banco: monta la SD del ESP (HSPI) y, si no tiene sistema de archivos, la
+ * formatea en FAT (BORRA la tarjeta). Para tarjetas nuevas o en exFAT, que
+ * SD.begin() no monta y dejan a espsd en "sin_sd". */
+static void requestEspSdFormatFromUsb()
+{
+    cancelEspSd();
+    spiHspi.begin(14, 32, 13, 25);
+    SLAVE_LOG_RAW("#ESPSDFMT inicio (puede tardar minutos)\n");
+    const uint32_t t0 = millis();
+    const bool ok = SD.begin(25, spiHspi, 4000000, "/sd", 5, true);
+    SLAVE_LOG_RAW("#ESPSDFMT ok=%d tipo=%u sectores=%lu MB=%llu ms=%lu\n",
+                  ok ? 1 : 0, (unsigned)SD.cardType(),
+                  (unsigned long)SD.numSectors(),
+                  (unsigned long long)(SD.cardSize() / (1024ull * 1024ull)),
+                  (unsigned long)(millis() - t0));
+    SD.end();
+}
+
 static void requestEspSdFromUsb(uint32_t ms, uint32_t cadaLotes)
 {
     cancelEspSd();
@@ -4096,6 +4114,8 @@ static void handleUsbCommand(const char *cmd)
         sdDiagnostico8();
     } else if (usbCommandEquals(cmd, "sddiag9")) {
         sdDiagnostico9();
+    } else if (usbCommandEquals(cmd, "espsdfmt")) {
+        requestEspSdFormatFromUsb();
     } else if (!strncmp(cmd, "espsd", 5) &&
                (cmd[5] == '\0' || cmd[5] == ' ')) {
         long ms = -1, cadaLotes = -1;
