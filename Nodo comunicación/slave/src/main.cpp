@@ -333,6 +333,8 @@ static uint32_t g_rftest_enviados   = 0;
 static uint32_t g_rftest_fallos     = 0;
 static uint32_t g_rftest_prox_ms    = 0;
 static bool     g_rftest_running    = false; /* para imprimir "#RFTEST fin" una sola vez */
+static bool     g_rftest_broadcast  = false;
+static const uint8_t RFTEST_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 /* Instantes (micros) de cada evento de radio durante la captura. El PSoC
  * avisa por I2C en cada k*150 muestras (sdprobe modo 7, PSOC_EVT_LAB_PING) y
@@ -2655,7 +2657,22 @@ static void rftestFin(const char *evento)
          (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
 }
 
-static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytesN)
+static bool ensureRfTestBroadcastPeer()
+{
+#if defined(ESP8266)
+    return espnowAddPeer(RFTEST_BROADCAST_MAC);
+#else
+    if (esp_now_is_peer_exist(RFTEST_BROADCAST_MAC)) return true;
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, RFTEST_BROADCAST_MAC, sizeof(peer.peer_addr));
+    peer.channel = espnowCurrentChannel();
+    peer.encrypt = false;
+    return esp_now_add_peer(&peer) == ESP_OK;
+#endif
+}
+
+static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytesN,
+                                 bool broadcast)
 {
     if (ms == 0u) {
         if (!g_rftest_running) {
@@ -2665,8 +2682,13 @@ static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytes
         rftestFin("cancel");
         return;
     }
+    if (broadcast && !ensureRfTestBroadcastPeer()) {
+        SLAVE_LOG_PRINTF("[USB] rftest: no se pudo registrar peer broadcast\n");
+        return;
+    }
     g_rftest_periodo_ms = periodoMs;
     g_rftest_bytes      = (uint8_t)bytesN;
+    g_rftest_broadcast  = broadcast;
     g_rftest_enviados   = 0u;
     g_rftest_fallos     = 0u;
     g_rftest_prox_ms    = millis();
@@ -2714,7 +2736,9 @@ static void serviceRfTest()
 
     labPosMark(g_rftest_pos);
     digitalWrite(RF_TRIG_PIN, HIGH);
-    const esp_err_t err = sendToMaster(payload, g_rftest_bytes);
+    const esp_err_t err = g_rftest_broadcast
+        ? espnowSend(RFTEST_BROADCAST_MAC, payload, g_rftest_bytes)
+        : sendToMaster(payload, g_rftest_bytes);
     delayMicroseconds(200);
     digitalWrite(RF_TRIG_PIN, LOW);
     g_rftest_enviados++;
@@ -3907,15 +3931,19 @@ static void handleUsbCommand(const char *cmd)
     } else if (!strncmp(cmd, "rftest", 6) &&
                (cmd[6] == '\0' || cmd[6] == ' ')) {
         long ms = -1, periodo = -1, bytesN = -1;
-        const int n = sscanf(cmd + 6, "%ld %ld %ld", &ms, &periodo, &bytesN);
+        char modo = '\0', extra = '\0';
+        const int n = sscanf(cmd + 6, "%ld %ld %ld %c %c",
+                             &ms, &periodo, &bytesN, &modo, &extra);
         if (n >= 1 && ms == 0) {
-            requestRfTestFromUsb(0u, 0u, 0u);
-        } else if (n == 3 && ms > 0 && ms <= 600000 &&
+            requestRfTestFromUsb(0u, 0u, 0u, false);
+        } else if ((n == 3 || (n == 4 && (modo == 'b' || modo == 'B'))) &&
+                   ms > 0 && ms <= 600000 &&
                    periodo >= 0 && periodo <= 10000 &&
                    bytesN >= 1 && bytesN <= 240) {
-            requestRfTestFromUsb((uint32_t)ms, (uint32_t)periodo, (uint32_t)bytesN);
+            requestRfTestFromUsb((uint32_t)ms, (uint32_t)periodo, (uint32_t)bytesN,
+                                 n == 4);
         } else {
-            SLAVE_LOG_PRINTF("[USB] uso: rftest <ms 0-600000> <periodo_ms 0-10000 (0 = en cada ping del PSoC)> <bytes 1-240>\n");
+            SLAVE_LOG_PRINTF("[USB] uso: rftest <ms 0-600000> <periodo_ms 0-10000 (0 = en cada ping del PSoC)> <bytes 1-240> [b]\n");
         }
     } else if (!strncmp(cmd, "sdstress", 8) &&
                (cmd[8] == '\0' || cmd[8] == ' ')) {
@@ -3978,7 +4006,7 @@ static void handleUsbCommand(const char *cmd)
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, dumpusb [desde] [hasta], rftest ms periodo_ms bytes, sdstress ms periodo_ms, espsd ms cada_lotes, sdprobe ms periodo_ms modo [div] [slew], ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, dumpusb [desde] [hasta], rftest ms periodo_ms bytes [b], sdstress ms periodo_ms, espsd ms cada_lotes, sdprobe ms periodo_ms modo [div] [slew], ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #else
         SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #endif
