@@ -416,10 +416,11 @@ struct GpioScanSlot {
     volatile uint8_t level;
 };
 
+/* S3 N16R8: solo GPIO libres del cableado de PORT_S3.md. Fuera 0/3/45/46
+ * (arranque), 19/20 (USB), 26-37 (flash/PSRAM octal) y 43/44 (consola). */
 static GpioScanSlot g_rx_scan[] = {
-    {4, 0, 0}, {5, 0, 0}, {12, 0, 0}, {13, 0, 0}, {14, 0, 0},
-    {18, 0, 0}, {19, 0, 0}, {21, 0, 0}, {22, 0, 0},
-    {25, 0, 0}, {27, 0, 0}, {32, 0, 0}, {33, 0, 0},
+    {1, 0, 0}, {2, 0, 0}, {4, 0, 0}, {13, 0, 0}, {14, 0, 0},
+    {21, 0, 0}, {42, 0, 0}, {47, 0, 0}, {48, 0, 0},
 };
 
 static void IRAM_ATTR onRxScan0()  { g_rx_scan[0].edges++;  g_rx_scan[0].level  = (uint8_t)digitalRead(g_rx_scan[0].pin); }
@@ -431,20 +432,20 @@ static void IRAM_ATTR onRxScan5()  { g_rx_scan[5].edges++;  g_rx_scan[5].level  
 static void IRAM_ATTR onRxScan6()  { g_rx_scan[6].edges++;  g_rx_scan[6].level  = (uint8_t)digitalRead(g_rx_scan[6].pin); }
 static void IRAM_ATTR onRxScan7()  { g_rx_scan[7].edges++;  g_rx_scan[7].level  = (uint8_t)digitalRead(g_rx_scan[7].pin); }
 static void IRAM_ATTR onRxScan8()  { g_rx_scan[8].edges++;  g_rx_scan[8].level  = (uint8_t)digitalRead(g_rx_scan[8].pin); }
-static void IRAM_ATTR onRxScan9()  { g_rx_scan[9].edges++;  g_rx_scan[9].level  = (uint8_t)digitalRead(g_rx_scan[9].pin); }
-static void IRAM_ATTR onRxScan10() { g_rx_scan[10].edges++; g_rx_scan[10].level = (uint8_t)digitalRead(g_rx_scan[10].pin); }
-static void IRAM_ATTR onRxScan11() { g_rx_scan[11].edges++; g_rx_scan[11].level = (uint8_t)digitalRead(g_rx_scan[11].pin); }
-static void IRAM_ATTR onRxScan12() { g_rx_scan[12].edges++; g_rx_scan[12].level = (uint8_t)digitalRead(g_rx_scan[12].pin); }
 
 static void (* const g_rx_scan_isr[])(void) = {
     onRxScan0, onRxScan1, onRxScan2, onRxScan3, onRxScan4,
-    onRxScan5, onRxScan6, onRxScan7, onRxScan8, onRxScan9,
-    onRxScan10, onRxScan11, onRxScan12,
+    onRxScan5, onRxScan6, onRxScan7, onRxScan8,
 };
+static_assert(sizeof(g_rx_scan_isr) / sizeof(g_rx_scan_isr[0]) ==
+              sizeof(g_rx_scan) / sizeof(g_rx_scan[0]), "un ISR por pin");
 
 static bool rxScanIsReservedPin(uint8_t pin)
 {
-    if (pin == (uint8_t)PSOC_UART_RX ||
+    if (pin == (uint8_t)PSOC_I2C_SDA ||
+        pin == (uint8_t)PSOC_I2C_SCL ||
+        pin == (uint8_t)PSOC_RESET_REQUEST_PIN ||
+        pin == (uint8_t)PSOC_UART_RX ||
         pin == (uint8_t)PSOC_UART_TX ||
         pin == (uint8_t)SYNC_TO_PSOC_PIN ||
         pin == (uint8_t)DEBUG_HW_START_PIN) {
