@@ -1,0 +1,35 @@
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce3808,len:0x41c
+load:0x403c9700,len:0x9a8
+load:0x403cc700,len:0x28ac
+entry 0x403c98b8
+WEBTEST SCAN E2:72:A1:F4:99:90 channel=1 rssi=-11
+WEBTEST AP E2:72:A1:F4:99:90
+WEBTEST PASS /health status=200 bytes=59/59
+WEBTEST PASS / status=200 bytes=10541/10541
+WEBTEST PASS /css/style.css status=200 bytes=11124/11124
+WEBTEST PASS /js/app.js status=200 bytes=122318/122318
+WEBTEST PASS /js/protocol.js status=200 bytes=4116/4116
+WEBTEST PASS /js/ws_client.js status=200 bytes=8173/8173
+WEBTEST PASS /js/data_store.js status=200 bytes=9911/9911
+WEBTEST PASS /js/config.js status=200 bytes=8390/8390
+WEBTEST PASS /js/plot.js status=200 bytes=34574/34574
+WEBTEST PASS /js/enlace.js status=200 bytes=9997/9997
+WEBTEST PASS /js/slave_panel.js status=200 bytes=29357/29357
+WEBTEST PASS /js/spectrum.js status=200 bytes=26208/26208
+WEBTEST PASS /js/export.js status=200 bytes=31705/31705
+WEBTEST PASS /js/signal_proc.js status=200 bytes=15904/15904
+WEBTEST PASS /js/zip_store.js status=200 bytes=3652/3652
+WEBTEST PASS websocket_upgrade
+WEBTEST TRACE A bl=0 avail=0 [89:0 82:6 82:6 82:6 89:0 81:354 82:6 82:6 89:0 82:6 89:0 82:6 89:0 81:354 82:6 89:0 ]
+WEBTEST PASS websocket_command_ack frames=16 pings=6 bin_before=18 bin_after=30 connected=1
+WEBTEST PASS ws_second_client_busy up=1 text=[{"type":"busy","reason":"ws_owner_alive"}
+] close=1 connected=0
+WEBTEST PASS ws_owner_survives_busy connected=1 close=0
+WEBTEST PASS ws_takeover up=1 old_closed=1 new_ack=1 text=[{"type":"link","wifi_rssi":-8,"wifi_clients":1,"slaves":[{"node":1,"rssi":null,"age_ms":null},{"node":2,"rssi":null,"age_ms":null},{"node":3,"rssi":null,"age_ms":null},{"node":4,"rssi":null,"age_ms":null},{"node":5,"rssi":null,"age_ms":null},{"node":6,"rssi":null,"age_ms":null},{"node":7,"rssi":null,"age_ms":null},{"node":8,"rssi":null,"age_ms":null}]}
+]
+WEBTEST RESULT PASS

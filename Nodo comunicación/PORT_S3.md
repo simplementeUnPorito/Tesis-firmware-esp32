@@ -10,12 +10,18 @@ de pruebas siguen en los proyectos originales; no son evidencia del port.
 
 ESP32-S3 N16R8 (16 MiB flash quad, 8 MiB PSRAM octal), Arduino-ESP32 2.0.17
 con PlatformIO `espressif32@6.10.0`. Se fijan versiones de bibliotecas para
-reproducir la compilación: AsyncTCP `v3.5.0` y ESPAsyncWebServer `v3.9.6`
-(versiones fijadas y probadas en este banco; `master` sigue el HEAD de git,
-que al 2026-10-22 ya es posterior, p. ej. ESPAsyncWebServer 3.12.1). No bajarlas a 3.3.2/3.6.0: con
-3.6.0 un encabezado WebSocket partido en varios segmentos TCP hacía
-`LoadProhibited` en `AsyncWebSocketClient::_onData` y reiniciaba el maestro,
-y además los paquetes binarios dejaban de llegar al cliente. La consola usa UART0 a través del CH343, igual
+reproducir la compilación: AsyncTCP `v3.5.0` y ESPAsyncWebServer `v3.12.1`
+(últimos tags al 2026-10-22, probados en este banco; `master` sigue el HEAD
+de git). No bajar ESPAsyncWebServer:
+- 3.6.0: un encabezado WebSocket partido en varios segmentos TCP hacía
+  `LoadProhibited` en `AsyncWebSocketClient::_onData` y reiniciaba el maestro.
+- 3.9.6: no reinicia, pero de forma intermitente la cola de un cliente
+  conectado crecía sin vaciarse (medido q2→q8 en 5 s): llegaban los ping y
+  ningún paquete binario ni ACK. Pasó 2 veces y falló en la mayoría de las
+  corridas del mismo banco, incluso tras reiniciar el maestro; con 3.12.1
+  pasaron las 7 corridas.
+
+La consola usa UART0 a través del CH343, igual
 que las dos placas identificadas. USB CDC nativo está desactivado.
 La partición `default.csv` ocupa los primeros 4 MiB; no usa toda la flash.
 LittleFS conserva offset `0x290000` y tamaño `0x160000` del original.
@@ -113,7 +119,10 @@ placa del esclavo; así no hace falta cambiar la red de la PC. Se asocia a
 `GeoNetwork`, baja los 15 archivos de la SPA comparando contra
 `Content-Length` (incluido `app.js` de 122 KB), abre `/ws` (contesta los
 ping con pong, como un navegador) y envía `{"cmd":"A1","param":0}`. Pasa si
-llega el ACK `56 FF 07 A1 00 00` como trama binaria.
+llega el ACK `56 FF 07 A1 00 00` como trama binaria. Después prueba el lock
+de un cliente desde la misma IP: un segundo `/ws` recibe
+`{"type":"busy","reason":"ws_owner_alive"}` y se cierra, el dueño sigue
+recibiendo ACK, y `/ws?takeover=1` cierra al dueño y pasa a recibir los ACK.
 
 ```powershell
 # Dentro de masterS3 (maestro ya grabado en COM4, con uploadfs):
@@ -121,10 +130,11 @@ pio run -d web_probe -e probe -t upload --upload-port COM8
 # Leer COM8 a 115200 y buscar "WEBTEST RESULT PASS"; después regrabar slaveS3.
 ```
 
-Resultado 2026-10-22: `WEBTEST RESULT PASS` (artifacts/web-probe.txt). Con
-`-DWEBTEST_FRAGMENT_WS=1` el comando sale byte a byte: el maestro cierra esa
-conexión sin reiniciarse (artifacts/web-probe-fragmented.txt). No se probó con
-un navegador real ni con varios clientes simultáneos.
+Resultado 2026-10-22 con 3.12.1: `WEBTEST RESULT PASS` en todos los casos
+(artifacts/web-probe-multiclient.txt). Con `-DWEBTEST_FRAGMENT_WS=1
+-DWEBTEST_ONLY_STEP1` el comando sale byte a byte y el ACK llega igual
+(artifacts/web-probe-fragmented.txt). No se probó con un navegador real ni
+con clientes desde IP distintas (el banco tiene una sola placa libre).
 
 Los fuentes `main_selftest.cpp` y sus herramientas se conservan como referencia,
 pero están excluidos del único entorno slaveS3 de campo. No se anuncia una

@@ -7,7 +7,7 @@ load:0x3fce3808,len:0x41c
 load:0x403c9700,len:0x9a8
 load:0x403cc700,len:0x28ac
 entry 0x403c98b8
-WEBTEST SCAN E2:72:A1:F4:99:90 channel=1 rssi=-9
+WEBTEST SCAN E2:72:A1:F4:99:90 channel=1 rssi=-10
 WEBTEST AP E2:72:A1:F4:99:90
 WEBTEST PASS /health status=200 bytes=59/59
 WEBTEST PASS / status=200 bytes=10541/10541
@@ -25,6 +25,6 @@ WEBTEST PASS /js/export.js status=200 bytes=31705/31705
 WEBTEST PASS /js/signal_proc.js status=200 bytes=15904/15904
 WEBTEST PASS /js/zip_store.js status=200 bytes=3652/3652
 WEBTEST PASS websocket_upgrade
-[ 12146][E][WiFiClient.cpp:429] write(): fail on fd 48, errno: 104, "Connection reset by peer"
-WEBTEST FAIL websocket_command_ack frames=8 pings=4 bin_before=18 bin_after=0 connected=0
-WEBTEST RESULT FAIL
+WEBTEST TRACE A bl=0 avail=0 [89:0 82:6 82:6 82:6 89:0 82:6 82:6 89:0 82:6 81:354 89:0 82:6 89:0 82:6 89:0 ]
+WEBTEST PASS websocket_command_ack frames=15 pings=6 bin_before=18 bin_after=30 connected=1
+WEBTEST RESULT PASS
