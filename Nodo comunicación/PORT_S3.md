@@ -11,7 +11,8 @@ de pruebas siguen en los proyectos originales; no son evidencia del port.
 ESP32-S3 N16R8 (16 MiB flash quad, 8 MiB PSRAM octal), Arduino-ESP32 2.0.17
 con PlatformIO `espressif32@6.10.0`. Se fijan versiones de bibliotecas para
 reproducir la compilación: AsyncTCP `v3.5.0` y ESPAsyncWebServer `v3.9.6`
-(lo que resolvía el HEAD que usa `master`). No bajarlas a 3.3.2/3.6.0: con
+(versiones fijadas y probadas en este banco; `master` sigue el HEAD de git,
+que al 2026-10-22 ya es posterior, p. ej. ESPAsyncWebServer 3.12.1). No bajarlas a 3.3.2/3.6.0: con
 3.6.0 un encabezado WebSocket partido en varios segmentos TCP hacía
 `LoadProhibited` en `AsyncWebSocketClient::_onData` y reiniciaba el maestro,
 y además los paquetes binarios dejaban de llegar al cliente. La consola usa UART0 a través del CH343, igual
