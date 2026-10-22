@@ -1,0 +1,362 @@
+#pragma once
+/*
+ * web_server.h — Servidor HTTP/WS embebido del maestro (interfaz web de campo).
+ *
+ * Sirve la SPA desde LittleFS (partición de datos "spiffs" ya presente en la
+ * tabla de particiones default.csv, ~1.4 MB — ver platformio.ini) y expone un
+ * WebSocket en /ws para telemetría y comandos (ver web_relay.h, que registra
+ * su propio handler sobre este mismo servidor).
+ *
+ * Tras llamar a webServerBegin() en setup(), conectar el espejo de paquetes
+ * con: matlab.setPacketRelay(webRelayPacket);  (no se hace aquí para no
+ * acoplar este header al objeto `matlab`, que es local a main.cpp).
+ */
+
+#include <LittleFS.h>
+#include <ESPAsyncWebServer.h>
+#include "sync_protocol.h"
+#include "master_log.h"
+#include "web_relay.h"
+#include "link_mode.h"   /* endpoints /enlace/* — ver modo ENLACE */
+
+static AsyncWebServer webServer(80);
+
+#ifndef WEB_SIM_ENABLE
+  #define WEB_SIM_ENABLE 1
+#endif
+
+static bool webServerArgLong(AsyncWebServerRequest *request, const char *name, long &out)
+{
+    if (!request->hasParam(name)) return false;
+    out = request->getParam(name)->value().toInt();
+    return true;
+}
+
+static uint8_t webServerSimHwClass(const String &type)
+{
+    if (type == "hammer" || type == "HAMMER" || type == "1") return SLAVE_HW_HAMMER;
+    if (type == "geo" || type == "GEO" || type == "0") return SLAVE_HW_GEO;
+    return SLAVE_HW_UNKNOWN;
+}
+
+static void webServerSendNoContent(AsyncWebServerRequest *r)
+{
+    r->send(204, "text/plain", "");
+}
+
+static void webServerSendAndroidOk(AsyncWebServerRequest *r)
+{
+    r->send(200, "text/plain", "OK");
+}
+
+inline bool webServerBegin()
+{
+    bool fsOk = LittleFS.begin(true);   /* true = formatear si el mount falla */
+    if (!fsOk) {
+        MASTER_LOG_PRINTLN("[WEB] LittleFS mount FAILED");
+    } else {
+        MASTER_LOG_PRINTF("[WEB] LittleFS OK — %u/%u bytes usados\n",
+                          (unsigned)LittleFS.usedBytes(),
+                          (unsigned)LittleFS.totalBytes());
+    }
+
+    DefaultHeaders::Instance().addHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    DefaultHeaders::Instance().addHeader("Pragma", "no-cache");
+    DefaultHeaders::Instance().addHeader("Expires", "0");
+
+    webServer.on("/health", HTTP_GET, [fsOk](AsyncWebServerRequest *request) {
+        String body;
+        body.reserve(160);
+        body += "ok\n";
+        body += "ap_ip=192.168.4.1\n";
+        body += "littlefs=";
+        body += fsOk ? "ok" : "fail";
+        body += "\nused=";
+        body += fsOk ? String((unsigned)LittleFS.usedBytes()) : "0";
+        body += "\ntotal=";
+        body += fsOk ? String((unsigned)LittleFS.totalBytes()) : "0";
+        body += "\n";
+        request->send(200, "text/plain", body);
+    });
+
+    webServer.on("/ws-reset", HTTP_GET, [](AsyncWebServerRequest *request) {
+        webRelayCloseAll();
+        request->send(200, "text/plain", "ok\nws=reset\n");
+    });
+
+#if WEB_SIM_ENABLE
+    webServer.on("/sim/hello", HTTP_GET, [](AsyncWebServerRequest *request) {
+        long nodeArg = 1;
+        long fsArg = 2604;
+        long psocArg = 1;
+        webServerArgLong(request, "node", nodeArg);
+        webServerArgLong(request, "fs", fsArg);
+        webServerArgLong(request, "psoc", psocArg);
+        if (nodeArg < 1) nodeArg = 1;
+        if (nodeArg > 254) nodeArg = 254;
+        if (fsArg < 0) fsArg = 0;
+        if (fsArg > 65535) fsArg = 65535;
+
+        String type = request->hasParam("type") ? request->getParam("type")->value() : "hammer";
+        const uint8_t node = (uint8_t)nodeArg;
+        const uint16_t fs = (uint16_t)fsArg;
+        const uint8_t hwClass = webServerSimHwClass(type);
+        const uint8_t psocOk = psocArg ? 1u : 0u;
+        const uint8_t fsCode = (fs >= 100u) ? (uint8_t)((fs + 50u) / 100u) : 0u;
+
+        uint8_t hello[6] = {
+            MATLAB_PKT_HEADER, node, 0xFD, 0x01, psocOk, fsCode
+        };
+        webRelayPacket(hello);
+
+        if (fs > 0u) {
+            uint8_t fsExact[6] = {
+                MATLAB_PKT_HEADER, node, 0xFD, 0x05,
+                (uint8_t)((fs >> 8) & 0xFFu), (uint8_t)(fs & 0xFFu)
+            };
+            webRelayPacket(fsExact);
+        }
+
+        if (hwClass != SLAVE_HW_UNKNOWN) {
+            uint8_t hwPkt[6] = { MATLAB_PKT_HEADER, node, 0xFD, 0x06, hwClass, 0x00 };
+            webRelayPacket(hwPkt);
+        }
+
+        uint8_t mac[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, node };
+        uint8_t m0[6] = { MATLAB_PKT_HEADER, node, 0xFD, 0x02, mac[0], mac[1] };
+        uint8_t m1[6] = { MATLAB_PKT_HEADER, node, 0xFD, 0x03, mac[2], mac[3] };
+        uint8_t m2[6] = { MATLAB_PKT_HEADER, node, 0xFD, 0x04, mac[4], mac[5] };
+        webRelayPacket(m0);
+        webRelayPacket(m1);
+        webRelayPacket(m2);
+
+        String body;
+        body.reserve(160);
+        body += "ok\nnode="; body += node;
+        body += "\ntype="; body += (hwClass == SLAVE_HW_HAMMER ? "HAMMER" : (hwClass == SLAVE_HW_GEO ? "GEO" : "UNKNOWN"));
+        body += "\nfs="; body += fs;
+        body += "\nmac=DE:AD:BE:EF:00:";
+        if (node < 16) body += "0";
+        body += String(node, HEX);
+        body += "\n";
+        request->send(200, "text/plain", body);
+    });
+#endif
+
+    /* Pagina minima de aprovisionamiento del ENLACE. Va embebida en el firmware
+     * (no en LittleFS) a proposito: es la pantalla que se necesita justamente
+     * cuando algo no esta en su lugar — sin red guardada, o con una red guardada
+     * que no aparece — y tiene que estar disponible aunque no se haya hecho
+     * `pio run -t uploadfs`. Se sirve sobre el AP propio, que es donde cae el
+     * operador cuando el ENLACE no prospera. */
+    /* OJO con el path: en ESPAsyncWebServer un handler registrado en "/x"
+     * tambien matchea "/x/loquesea" (hace url.startsWith(uri + "/")). Cuando
+     * esta pagina estaba en "/enlace" se comia todos los GET de /enlace/status y
+     * /enlace/queue —devolvia el HTML en vez del estado— porque se registra
+     * antes. De ahi el "-setup": un prefijo distinto no puede tapar a los otros.
+     * No renombrar a "/enlace" de nuevo. */
+    webServer.on("/enlace-setup", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/html",
+            "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Enlace - Geophone</title>"
+            "<style>"
+            "body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:20px}"
+            "h1{font-size:1.25rem;margin:0 0 4px}"
+            "p.sub{color:#9aa;margin:0 0 20px;font-size:.9rem}"
+            "label{display:block;margin:14px 0 4px;font-size:.85rem;color:#9cf}"
+            "input{width:100%;box-sizing:border-box;padding:11px;font-size:1rem;"
+            "background:#1b1b1b;color:#eee;border:1px solid #333;border-radius:6px}"
+            "button{width:100%;box-sizing:border-box;margin-top:18px;padding:13px;"
+            "font-size:1rem;border:0;border-radius:6px;background:#2a6;color:#fff}"
+            "button.alt{background:#345;margin-top:10px}"
+            "pre{background:#1b1b1b;padding:12px;border-radius:6px;white-space:pre-wrap;"
+            "font-size:.8rem;color:#9aa;overflow-x:auto}"
+            "</style>"
+            "<h1>Red del enlace</h1>"
+            "<p class='sub'>Red con internet a la que se asocia el maestro para "
+            "que el cliente se lleve las capturas.</p>"
+            "<label for='s'>Nombre de la red</label><input id='s' autocapitalize='off'>"
+            "<label for='p'>Contrase&ntilde;a</label><input id='p' type='password'>"
+            "<button onclick='save()'>Guardar</button>"
+            "<button class='alt' onclick='go()'>Conectar ahora</button>"
+            "<pre id='o'>cargando...</pre>"
+            "<script>"
+            "const O=document.getElementById('o');"
+            "function st(t){O.textContent=t;"
+            "  const m=/^ssid=(.*)$/m.exec(t); if(m&&!document.getElementById('s').value)"
+            "    document.getElementById('s').value=m[1];}"
+            "function load(){fetch('/enlace/status').then(r=>r.text()).then(st)"
+            "  .catch(e=>st('error: '+e));}"
+            "function save(){const b=new URLSearchParams();"
+            "  b.append('ssid',document.getElementById('s').value);"
+            "  b.append('pass',document.getElementById('p').value);"
+            "  fetch('/enlace/config',{method:'POST',body:b}).then(r=>r.text()).then(st)"
+            "  .catch(e=>st('error: '+e));}"
+            "function go(){fetch('/enlace/now',{method:'POST'}).then(r=>r.text()).then(st)"
+            "  .catch(e=>st('error: '+e));}"
+            "load();"
+            "</script>");
+    });
+
+    /* ── Modo ENLACE ──────────────────────────────────────────────────────
+     * La config lleva SSID, password y URL del sink: strings que no entran en
+     * el protocolo de 6 bytes que usan el resto de los comandos, asi que va por
+     * HTTP. El disparo de la subida sí tiene comando (0xC0) para que MATLAB y
+     * la SPA lo puedan mandar por el mismo camino que todo lo demas. */
+    /* Escaneo de redes: evita tener que tipear el SSID. Paso de verdad que se
+     * guardo "S21" en vez de "S21 Ultra de Elias David" y el maestro se quedo sin
+     * asociar sin que nada dijera por que. De paso el escaneo informa el canal de
+     * cada red, que es justo el dato que decide si ESP-NOW puede convivir con la
+     * STA (los esclavos tienen que estar en el canal del hotspot).
+     * Formato: "<canal> <rssi> <ssid>" por linea, mas fuerte primero. */
+    webServer.on("/enlace/scan", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String body;
+        int n = linkScanPoll(body);
+        if (n < 0) {
+            /* 202 = todavia corriendo; el cliente vuelve a preguntar. Nunca
+             * bloquear aca: esta lambda corre en la task de AsyncTCP. */
+            request->send(202, "text/plain", "escaneando\n");
+            return;
+        }
+        request->send(200, "text/plain", body);
+    });
+
+    webServer.on("/enlace/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", linkStatusText());
+    });
+
+    /* Cola: el cliente adquisidor lista, descarga y confirma. Recien con el ACK
+     * el maestro borra — la cola es la copia buena hasta que alguien diga que ya
+     * esta en el server. */
+    webServer.on("/enlace/queue", HTTP_GET, [](AsyncWebServerRequest *request) {
+        linkNoteClientActivity();
+        request->send(200, "text/plain", linkQueueListText());
+    });
+
+    webServer.on("/enlace/file", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasParam("name")) {
+            request->send(400, "text/plain", "falta name");
+            return;
+        }
+        char path[40];
+        if (!linkQueueResolve(request->getParam("name")->value(), path, sizeof(path))) {
+            request->send(404, "text/plain", "no existe");
+            return;
+        }
+        linkNoteClientActivity();
+        request->send(LittleFS, path, "application/octet-stream");
+    });
+
+    webServer.on("/enlace/ack", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!request->hasParam("name", true)) {
+            request->send(400, "text/plain", "falta name");
+            return;
+        }
+        bool ok = linkQueueAck(request->getParam("name", true)->value());
+        request->send(ok ? 200 : 404, "text/plain", ok ? "borrado" : "no existe");
+    });
+
+    webServer.on("/enlace/clear", HTTP_POST, [](AsyncWebServerRequest *request) {
+        uint16_t n = linkQueueClear();
+        String body = String("borrados=") + n + "\n" + linkStatusText();
+        request->send(200, "text/plain", body);
+    });
+
+    /* Disparar ENLACE sin depender de la SPA ni de MATLAB (equivale al cmd
+     * 0xC0 param=1). Se rechaza si el estado no lo permite: nunca a mitad de
+     * captura. */
+    webServer.on("/enlace/now", HTTP_POST, [](AsyncWebServerRequest *request) {
+        const char *why = "";
+        bool ok = linkEnterViaHook(&why);
+        String body = ok ? String("ENLACE pedido\n") : (String("rechazado: ") + why + "\n");
+        body += linkStatusText();
+        request->send(ok ? 200 : 409, "text/plain", body);
+    });
+
+    /* El cliente avisa que termino: volver a canal 1 sin esperar el idle. */
+    webServer.on("/enlace/done", HTTP_POST, [](AsyncWebServerRequest *request) {
+        linkClientDone();
+        request->send(200, "text/plain", linkStatusText());
+    });
+
+    webServer.on("/enlace/config", HTTP_POST, [](AsyncWebServerRequest *request) {
+        LinkConfig cfg = linkConfig();
+        auto grab = [&](const char *name, char *dst, size_t cap) {
+            if (!request->hasParam(name, true)) return;
+            const String &v = request->getParam(name, true)->value();
+            strncpy(dst, v.c_str(), cap - 1);
+            dst[cap - 1] = '\0';
+        };
+        grab("ssid", cfg.ssid, sizeof(cfg.ssid));
+        grab("pass", cfg.pass, sizeof(cfg.pass));
+        grab("site", cfg.site, sizeof(cfg.site));
+        grab("server_url", cfg.server_url, sizeof(cfg.server_url));
+        if (request->hasParam("distance_mm", true)) {
+            cfg.distance_mm = (uint32_t)request->getParam("distance_mm", true)->value().toInt();
+        }
+        if (request->hasParam("auto", true)) {
+            cfg.auto_upload = (request->getParam("auto", true)->value().toInt() != 0);
+        }
+        linkConfigSet(cfg);
+        linkStaRetryNow();   /* Guardar = conectate ahora, sin boton aparte */
+        request->send(200, "text/plain", linkStatusText());
+    });
+
+    webServer.on("/", HTTP_GET, [fsOk](AsyncWebServerRequest *request) {
+        if (fsOk && LittleFS.exists("/index.html")) {
+            request->send(LittleFS, "/index.html", "text/html");
+            return;
+        }
+        request->send(
+            200,
+            "text/html",
+            "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Geophone Scope</title>"
+            "<body style='font-family:sans-serif;background:#111;color:#eee;padding:16px'>"
+            "<h1>Geophone Scope</h1>"
+            "<p>El servidor HTTP del maestro esta funcionando en 192.168.4.1.</p>"
+            "<p>Pero no se encontro <code>/index.html</code> en LittleFS.</p>"
+            "<p>Desde la PC ejecuta:</p>"
+            "<pre>pio run -t uploadfs</pre>"
+            "<p>Luego reinicia el ESP32 y recarga esta pagina.</p>"
+            "<p><a style='color:#9cf' href='/health'>/health</a></p>"
+            "</body>"
+        );
+    });
+
+    if (fsOk) {
+        webServer.serveStatic("/", LittleFS, "/");
+    }
+    webServer.onNotFound([](AsyncWebServerRequest *request) {
+        request->send(404, "text/plain", "Not found. Try /health");
+    });
+
+    /* Respuestas a probes de conectividad — evita que Windows/Android/iOS
+     * marquen la red como "sin internet" e intenten hacer auto-switch. */
+    webServer.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft Connect Test");
+    });
+    webServer.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft NCSI");
+    });
+    webServer.on("/generate_204", HTTP_GET, webServerSendNoContent);
+    webServer.on("/gen_204", HTTP_GET, webServerSendNoContent);
+    webServer.on("/gstatic/generate_204", HTTP_GET, webServerSendNoContent);
+    webServer.on("/connectivity-check/generate_204", HTTP_GET, webServerSendNoContent);
+    webServer.on("/canonical.html", HTTP_GET, webServerSendAndroidOk);
+    webServer.on("/success.txt", HTTP_GET, webServerSendAndroidOk);
+    webServer.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/html",
+            "<!DOCTYPE html><html><head><title>Success</title></head>"
+            "<body>Success</body></html>");
+    });
+    webServer.on("/redirect", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->redirect("/");
+    });
+
+    webRelayBegin(webServer);
+
+    webServer.begin();
+    MASTER_LOG_PRINTLN("[WEB] HTTP server escuchando en :80");
+    return true;
+}
