@@ -3607,6 +3607,42 @@ static void requestEspSdFormatFromUsb()
     SD.end();
 }
 
+/* Banco: escribe /foo.txt en la SD del ESP, lo lee de vuelta y lista la raiz.
+ * Prueba visible de que la tarjeta monta y acepta escrituras con archivo. */
+static void requestEspSdFooFromUsb()
+{
+    cancelEspSd();
+    spiHspi.begin(14, 32, 13, 25);
+    if (!SD.begin(25, spiHspi, 4000000)) {
+        SLAVE_LOG_RAW("#ESPSDFOO sin_sd\n");
+        SD.end();
+        return;
+    }
+    File f = SD.open("/foo.txt", FILE_APPEND);
+    const size_t n = f ? f.printf("foo nodo=%u ms=%lu\n", (unsigned)NODE_ID,
+                                  (unsigned long)millis()) : 0u;
+    if (f) f.close();
+    SLAVE_LOG_RAW("#ESPSDFOO escritos=%u MB=%llu\n", (unsigned)n,
+                  (unsigned long long)(SD.cardSize() / (1024ull * 1024ull)));
+    f = SD.open("/foo.txt", FILE_READ);
+    if (f) {
+        SLAVE_LOG_RAW("#ESPSDFOO contenido (%u B):\n", (unsigned)f.size());
+        while (f.available()) {
+            const String linea = f.readStringUntil('\n');
+            SLAVE_LOG_RAW("#ESPSDFOO | %s\n", linea.c_str());
+        }
+        f.close();
+    }
+    File raiz = SD.open("/");
+    for (File e = raiz.openNextFile(); e; e = raiz.openNextFile()) {
+        SLAVE_LOG_RAW("#ESPSDFOO ls %s %u\n", e.name(), (unsigned)e.size());
+        e.close();
+    }
+    raiz.close();
+    SD.end();
+    SLAVE_LOG_RAW("#ESPSDFOO fin\n");
+}
+
 static void requestEspSdFromUsb(uint32_t ms, uint32_t cadaLotes)
 {
     cancelEspSd();
@@ -4116,6 +4152,8 @@ static void handleUsbCommand(const char *cmd)
         sdDiagnostico9();
     } else if (usbCommandEquals(cmd, "espsdfmt")) {
         requestEspSdFormatFromUsb();
+    } else if (usbCommandEquals(cmd, "espsdfoo")) {
+        requestEspSdFooFromUsb();
     } else if (!strncmp(cmd, "espsd", 5) &&
                (cmd[5] == '\0' || cmd[5] == ' ')) {
         long ms = -1, cadaLotes = -1;
