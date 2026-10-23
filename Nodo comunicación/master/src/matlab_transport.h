@@ -81,7 +81,8 @@ public:
                         uint8_t sd_present = 0xFF, uint8_t link_model = 0xFF,
                         uint8_t ctl_status = 0xFF, uint8_t pga_code = 0xFF,
                         uint8_t pgaout_code = 0xFF, uint32_t ram_batches = 0,
-                        uint32_t sd_batches = 0);
+                        uint32_t sd_batches = 0, uint8_t reset_reason = 0xFF,
+                        uint32_t uptime_s = 0);
 
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
@@ -228,7 +229,8 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
                                             uint16_t fs, uint8_t hw_class, uint8_t sd_present,
                                             uint8_t link_model, uint8_t ctl_status,
                                              uint8_t pga_code, uint8_t pgaout_code,
-                                             uint32_t ram_batches, uint32_t sd_batches)
+                                             uint32_t ram_batches, uint32_t sd_batches,
+                                             uint8_t reset_reason, uint32_t uptime_s)
 {
     /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
     uint8_t fs_code = (fs >= 100u) ? (uint8_t)((fs + 50u) / 100u) : 0u;
@@ -286,6 +288,16 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
                             (uint8_t)((sd16 >> 8) & 0xFFu), (uint8_t)(sd16 & 0xFFu) };
     _emit(ramPkt);
     _emit(sdCapPkt);
+    if (reset_reason != 0xFFu) {
+        /* b2=0x0E: motivo del ultimo reinicio (esp_reset_reason, 9 = caida de
+         * tension); b2=0x0F: segundos encendido, uint16 BE saturado. */
+        const uint16_t up16 = (uptime_s > 0xFFFFu) ? 0xFFFFu : (uint16_t)uptime_s;
+        uint8_t rstPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0E, reset_reason, 0x00 };
+        uint8_t upPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0F,
+                             (uint8_t)((up16 >> 8) & 0xFFu), (uint8_t)(up16 & 0xFFu) };
+        _emit(rstPkt);
+        _emit(upPkt);
+    }
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */
         uint8_t m0[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x02, mac[0], mac[1] };

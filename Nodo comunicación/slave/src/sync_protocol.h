@@ -231,6 +231,9 @@ struct MsgHello {
     uint8_t  pgaout_code; /* código de PGAout confirmado (0xFF = no existe / sin dato) */
     uint32_t ram_batches; /* lotes que entran en RAM (PSoC + ESP) en una captura; aditivo */
     uint32_t sd_batches;  /* lotes que entran en la SD del ESP; 0 = sin SD; aditivo */
+    uint8_t  reset_reason; /* esp_reset_reason() del ultimo arranque (9 = caida de
+                            * tension); aditivo: detecta esclavos que se reinician */
+    uint32_t uptime_s;     /* segundos desde el arranque; aditivo */
 };
 
 struct MsgSetRecLen {

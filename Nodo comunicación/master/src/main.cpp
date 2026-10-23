@@ -339,6 +339,8 @@ struct CachedHello {
     uint8_t pgaout_code = 0xFF;
     uint32_t ram_batches = 0;
     uint32_t sd_batches = 0;
+    uint8_t reset_reason = 0xFFu;
+    uint32_t uptime_s = 0;
     uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
 };
 static CachedHello g_cachedHello[NUM_SLAVES + 1];
@@ -504,7 +506,8 @@ static void sendCachedStateToWeb()
             matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate,
                                   h.hw_class, h.sd_present, h.link_model,
                                    h.ctl_status, h.pga_code, h.pgaout_code,
-                                   h.ram_batches, h.sd_batches);
+                                   h.ram_batches, h.sd_batches,
+                                   h.reset_reason, h.uptime_s);
         }
     }
     MASTER_LOG_PRINTLN("[WEB] cached READY/HELLO replay sent");
@@ -733,13 +736,16 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
         h.pgaout_code = msg.pgaout_code;
         h.ram_batches = msg.ram_batches;
         h.sd_batches = msg.sd_batches;
+        h.reset_reason = msg.reset_reason;
+        h.uptime_s = msg.uptime_s;
         memcpy(h.mac, senderMac, 6);
         if (isUsableUnicastMac(h.mac)) addPeerIfNeeded(h.mac);
     }
     matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate,
                           msg.hw_class, msg.sd_present, msg.link_model,
                           msg.ctl_status, msg.pga_code, msg.pgaout_code,
-                          msg.ram_batches, msg.sd_batches);
+                          msg.ram_batches, msg.sd_batches,
+                          msg.reset_reason, msg.uptime_s);
 }
 
 static void onStartAck(const MsgStartAck &msg)

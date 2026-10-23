@@ -155,6 +155,7 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         hello.ctl_status = SLAVE_CTL_UNKNOWN;
         hello.pga_code = 0xFFu;
         hello.pgaout_code = 0xFFu;
+        hello.reset_reason = 0xFFu;   /* esclavos viejos no lo mandan */
         const size_t copyLen = ((size_t)len < sizeof(MsgHello)) ? (size_t)len : sizeof(MsgHello);
         memcpy(&hello, data, copyLen);
         instance->_handleHello(&hello, mac);

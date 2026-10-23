@@ -2,17 +2,17 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-34';
-import { WsClient } from './ws_client.js?v=field-study-34';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-34';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-34';
-import { PlotArea } from './plot.js?v=field-study-34';
-import { SpectrumArea } from './spectrum.js?v=field-study-34';
-import { SlavePanel } from './slave_panel.js?v=field-study-34';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-34';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-34';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-34';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-34';
+import * as cfg from './config.js?v=field-study-35';
+import { WsClient } from './ws_client.js?v=field-study-35';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-35';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-35';
+import { PlotArea } from './plot.js?v=field-study-35';
+import { SpectrumArea } from './spectrum.js?v=field-study-35';
+import { SlavePanel } from './slave_panel.js?v=field-study-35';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-35';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-35';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-35';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-35';
 
 const $ = (id) => document.getElementById(id);
 
@@ -74,6 +74,8 @@ const CAPTURE_MODE_KEY = `${SETTINGS_PREFIX}capture_mode_v1`;
 const CAPTURE_STORAGE_KEY = `${SETTINGS_PREFIX}capture_storage_v1`;
 const CAPTURE_FAST_KEY = `${SETTINGS_PREFIX}capture_fast_v1`;
 const SIGNATURES_KEY = `${SETTINGS_PREFIX}noise_signatures_v1`;
+// esp_reset_reason(): 9 = caida de tension (lo tipico con bateria floja).
+const RESET_REASON_NAMES = { 1: 'encendido', 3: 'software', 4: 'panico', 5: 'wdt int', 6: 'wdt tarea', 7: 'wdt', 8: 'deep sleep', 9: 'CAIDA DE TENSION', 10: 'sdio' };
 const CAPTURE_MODE_ASYNC = 'async';
 const CAPTURE_MODE_RT_LIMITED = 'realtime-limited';
 const CAPTURE_MODE_RT_UNLIMITED = 'realtime-unlimited';
@@ -1542,7 +1544,9 @@ function renderNodeRow(i) {
   const capacityText = nd.ramBatches === null && nd.sdBatches === null
     ? ''
     : ` RAM ${nd.ramBatches ?? '--'} lotes · ` +
-      (nd.sdBatches === null ? 'SD --' : (nd.sdBatches ? `SD ${nd.sdBatches} lotes` : 'sin SD'));
+      (nd.sdBatches === null ? 'SD --' : (nd.sdBatches ? `SD ${nd.sdBatches} lotes` : 'sin SD')) +
+      (nd.uptimeS != null ? ` · encendido ${nd.uptimeS >= 65535 ? '>18 h' : nd.uptimeS + ' s'}` : '') +
+      (nd.resetReason != null && nd.resetReason !== 0xFF ? ` · reinicio: ${RESET_REASON_NAMES[nd.resetReason] || nd.resetReason}` : '');
   row.querySelector('.cfg').textContent =
     `pga=${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}` +
     ` adc=${adcConfigForCode(nd.adcConfigCode).label}` +
@@ -2926,6 +2930,32 @@ function handleStatus(pkt, idx) {
       if (panel) panel.setSdPresent(present, nd.sdEnabled);
       appendLog(`HELLO slave=${idx} sd_present=${present ? 1 : 0}`);
     }
+    return;
+  }
+
+  if (pkt.helloMacSub === 0x0E) {
+    // Motivo del ultimo reinicio del esclavo (esp_reset_reason).
+    const nd = data.nodes[idx];
+    const reason = pkt.b1 & 0xFF;
+    if (nd.resetReason !== reason) {
+      nd.resetReason = reason;
+      appendLog(`HELLO slave=${idx} reinicio=${RESET_REASON_NAMES[reason] || reason}`);
+      renderNodeRow(idx);
+    }
+    return;
+  }
+
+  if (pkt.helloMacSub === 0x0F) {
+    // Segundos encendido: si baja, el esclavo se reinicio (en campo suele ser
+    // una caida de tension de la bateria durante un pico de radio o SD).
+    const nd = data.nodes[idx];
+    const up = pkt.helloCapacityBatches;
+    if (nd.uptimeS != null && up + 5 < nd.uptimeS) {
+      appendLog(`AVISO S${idx}: el esclavo se reinicio (motivo ` +
+                `${RESET_REASON_NAMES[nd.resetReason] || nd.resetReason}, llevaba ${nd.uptimeS} s)`);
+    }
+    nd.uptimeS = up;
+    renderNodeRow(idx);
     return;
   }
 

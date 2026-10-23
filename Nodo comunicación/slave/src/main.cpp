@@ -5901,7 +5901,9 @@ void loop()
             g_pga_code,
             (g_psoc_hw_class == 0u) ? g_pgaout : (uint8_t)0xFFu,
             live::ramCapacityBatches(),
-            live::sdCapacityBatches()
+            live::sdCapacityBatches(),
+            (uint8_t)esp_reset_reason(),
+            (uint32_t)(millis() / 1000u)
         };
         esp_err_t err = sendToMaster((const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX
