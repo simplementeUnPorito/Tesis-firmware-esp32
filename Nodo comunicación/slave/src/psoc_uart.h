@@ -165,6 +165,12 @@
 
 #define PSOC_CMD_SD_CAPTURE  0xBE    /* p=1 captura a SD (permite N>512), p=0 RAM-only. Ack 0/1, 0xEE=rechazo */
 #define PSOC_CMD_SD_READ_BATCH 0xBF  /* uint16 LE; éxito: frame normal seq=índice */
+/* Captura en vivo (ver psoc_hw.h del PSoC). LIVE_MODE: 0 clasico, 1 vivo,
+ * 2 vivo con rampa de banco. LIVE_ACK: [lote lo][lote hi][flags]. */
+#define PSOC_CMD_LIVE_MODE   0xAE
+#define PSOC_CMD_LIVE_ACK    0xAF
+#define PSOC_LIVE_ACK_REWIND 0x01
+#define PSOC_LIVE_ACK_ONE    0x02
 
 /* Control PSoC -> ESP */
 #define PSOC_CTRL_PING      0xC0
@@ -249,6 +255,10 @@
 #define PSOC_EVT_SD_DIAG_R1       0x4D  /* ultima respuesta R1 (0xFF=sin respuesta) */
 #define PSOC_EVT_SD_DIAG_PINS     0x4E  /* low/high vistos en MISO, SCK, MOSI y CS */
 #define PSOC_EVT_LAB_PING         0x4F  /* sdprobe modo 7: aviso en cada k*150 muestras */
+#define PSOC_EVT_LIVE_DONE        0x50  /* captura en vivo cerrada; value = byte bajo del total */
+#define PSOC_EVT_LIVE_OVERRUN     0x51  /* el anillo del PSoC se lleno: no hubo donde guardar */
+#define PSOC_EVT_LIVE_TOTAL1      0x52  /* bits 8-15 del total, antes de LIVE_DONE */
+#define PSOC_EVT_LIVE_TOTAL2      0x53  /* bits 16-23 del total, antes de LIVE_DONE */
 
 struct PsocSample {
     int16_t  raw_input;
@@ -376,6 +386,17 @@ public:
         _ser->write(f, sizeof(f));
     }
     void sdCapture(uint8_t enable);  /* modo captura a SD del PSoC (0xBE) */
+    void liveMode(uint8_t mode)      { _sendCmd1(PSOC_CMD_LIVE_MODE, mode); }
+    void liveAck(uint16_t batch, uint8_t flags)
+    {
+        if (_ser == nullptr) { return; }
+        const uint8_t lo = (uint8_t)(batch & 0xFFu), hi = (uint8_t)(batch >> 8);
+        const uint8_t f[6] = {
+            PSOC_FRAME_MARKER, PSOC_CMD_LIVE_ACK, lo, hi, flags,
+            (uint8_t)(PSOC_CMD_LIVE_ACK ^ lo ^ hi ^ flags)
+        };
+        _ser->write(f, sizeof(f));
+    }
     void sdReadBatch(uint16_t index);/* lectura bajo demanda desde GEOLAST.BIN (0xBF) */
     void adcSnapshot();
     void blinkLed();             /* pide al PSoC titilar su LED (identificación) */

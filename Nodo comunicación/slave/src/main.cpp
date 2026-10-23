@@ -29,6 +29,7 @@
 #include <driver/gpio.h>
 #include "psoc_uart.h"
 #include "espnow_transport.h"
+#include "live_capture.h"
 #include "sync_protocol.h"
 #include "debug_log.h"
 #include "sd_storage.h"
@@ -441,6 +442,20 @@ static uint32_t    *g_store_ts_us = nullptr;      /* timestamp relativo por batc
 static volatile uint16_t g_view_remaining    = 0; /* legado live deshabilitado */
 static volatile bool     g_view_store_active = false;
 static volatile bool     g_start_store_active = false;
+/* Modo de captura pedido (CAPMODE_*, ver sync_protocol.h). Lo fija el maestro
+ * en PRESTART o el banco con "capmode". El asincronico con RAM del PSoC es el
+ * camino clasico; todo lo demas pasa por live_capture. */
+static uint8_t  g_capmode = 0u;
+static bool     g_capmode_ramp = false;
+static bool     g_live_notified = false;
+static volatile uint8_t  g_psoc_live_ack = 0xFFu;
+static volatile uint32_t g_psoc_live_ack_seq = 0u;
+static int16_t  g_psoc_live_known = -1;
+static bool capmodeIsLive(uint8_t mode)
+{
+    return (mode & CAPMODE_REALTIME) != 0u ||
+           (mode & CAPMODE_STORAGE_MASK) != CAPMODE_STORAGE_PSOC;
+}
 static volatile uint8_t  g_psoc_last_setn_value = 0;
 static volatile uint32_t g_psoc_last_setn_ms = 0;
 static volatile uint32_t g_psoc_setn_seq = 0;
@@ -900,7 +915,27 @@ static void onPsocDiag(const PsocDiagEvent &event)
         event.event != PSOC_EVT_CAPTURE_DONE &&
         event.event != PSOC_EVT_SD_SESSION &&
         event.event != PSOC_EVT_SD_ERROR &&
-        event.event != PSOC_EVT_ARMED_TIMEOUT) {
+        event.event != PSOC_EVT_ARMED_TIMEOUT &&
+        event.event != PSOC_EVT_LIVE_DONE &&
+        event.event != PSOC_EVT_LIVE_OVERRUN &&
+        event.event != PSOC_EVT_LIVE_TOTAL1 &&
+        event.event != PSOC_EVT_LIVE_TOTAL2) {
+        return;
+    }
+
+    if (event.event == PSOC_EVT_LIVE_TOTAL1 || event.event == PSOC_EVT_LIVE_TOTAL2) {
+        live::onPsocTotalByte(event.event == PSOC_EVT_LIVE_TOTAL1 ? 1u : 2u, event.value);
+        return;
+    }
+    if (event.event == PSOC_EVT_LIVE_OVERRUN) {
+        live::onPsocOverrun();
+        SLAVE_LOG_PRINTLN("[LIVE] PSoC: anillo lleno, la captura paro");
+        return;
+    }
+    if (event.event == PSOC_EVT_LIVE_DONE) {
+        live::onPsocDone(event.value);
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        if (g_state == SAMPLING) g_state = STOPPED;
         return;
     }
 
@@ -978,6 +1013,7 @@ static void onPsocDiag(const PsocDiagEvent &event)
 
     if (event.event == PSOC_EVT_BOOT) {
         g_psoc_hw_class = event.value;
+        g_psoc_live_known = -1;
         scheduleBootGains();
         SLAVE_LOG_PRINTF("[PSoC] boot hw=%u/%s pstate=%u/%s\n",
                          event.value, psocHwName(event.value),
@@ -1533,6 +1569,7 @@ static void allocStore(uint16_t n_batches);
 static void handleReqBatch(const MsgReqBatch *msg);
 static void sendHotWaitAck();
 static void radioSilencioAlEntrar();
+static uint16_t effectivePsocSampleRateHz();
 
 /* ── Callbacks ESP-NOW ───────────────────────────────────────────────────── */
 
@@ -1623,6 +1660,10 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
             if (value == 0u && g_sdprobe_running) {
                 g_sdprobe_fallos++;
             }
+            break;
+        case PSOC_CMD_LIVE_MODE:
+            g_psoc_live_ack = value;
+            g_psoc_live_ack_seq++;
             break;
         default:
             break;
@@ -1802,11 +1843,43 @@ static bool sendAndConfirmPsocSetN(uint16_t n_batches)
     return false;
 }
 
+/* Deja el PSoC en el modo de captura de ESTA captura: 0 clasico, 1 en vivo,
+ * 2 en vivo con la rampa de banco. Se cachea y solo viaja si cambia; un boot
+ * del PSoC invalida la cache. */
+static bool syncPsocLiveMode(uint8_t mode)
+{
+    if (g_psoc_live_known == (int16_t)mode) return true;
+    for (int intento = 0; intento < 2; intento++) {
+        const uint32_t startMs = millis();
+        const uint32_t startSeq = g_psoc_live_ack_seq;
+        psoc.liveMode(mode);
+        while ((uint32_t)(millis() - startMs) < PSOC_SETN_ACK_TIMEOUT_MS) {
+            psoc.poll();
+            servicePsocConfigAck();
+            if (g_psoc_live_ack_seq != startSeq) {
+                if (g_psoc_live_ack == mode) {
+                    g_psoc_live_known = (int16_t)mode;
+                    return true;
+                }
+                break;
+            }
+            delay(1);
+        }
+    }
+    g_psoc_live_known = -1;
+    SLAVE_LOG_PRINTF("[SLAVE] PSoC LIVE_MODE %u sin confirmar (ack=%u)\n",
+                     (unsigned)mode, (unsigned)g_psoc_live_ack);
+    return false;
+}
+
 /* Deja la SD del PSoC como la necesita ESTA captura: prendida solo si no
  * entra en RAM. Funciona con cualquier firmware de PSoC (con o sin la regla
  * de psoc_arm), porque el PSoC usa la SD siempre que tenga el flag. */
 static bool syncPsocSdForCapture(bool want)
 {
+    /* El PSoC ya no tiene SD (se saco del TopDesign; la SD es del ESP): 0xBE
+     * contesta 0xEE. Apagada es el unico estado posible. */
+    if (!want) return true;
     if (!want && g_psoc_sd_known && !psocSdPresent()) return true;
     if (g_psoc_sd_known && g_psoc_sd_capture_enabled == want && !g_sd_sync_pending) return true;
 
@@ -2005,6 +2078,35 @@ static void serviceBootGains()
     g_boot_gain_step = 0u;
 }
 
+/* Fin de una captura en vivo: aviso al maestro una sola vez. En asincronico
+ * es el START_DONE de siempre (el maestro descarga); en tiempo real va ademas
+ * el STREAM_END con el total, porque N puede no estar fijado. */
+static void serviceLiveEnd()
+{
+    if (!live::active()) return;
+    if (live::wantsStop() && digitalRead(SYNC_TO_PSOC_PIN) == HIGH) {
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        SLAVE_LOG_PRINTLN("[LIVE] SD llena: corto la captura");
+    }
+    if (g_live_notified || !live::finished()) return;
+    g_live_notified = true;
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    if (g_state == SAMPLING) g_state = STOPPED;
+    const uint32_t total = live::total();
+    g_store_fill = (total > 0xFFFFu) ? 0xFFFFu : (uint16_t)total;
+    if (live::config().realtime) {
+        MsgStreamEnd e = { CMD_STREAM_END, NODE_ID, total, live::endReason() };
+        sendToMaster((const uint8_t *)&e, sizeof(e));
+    }
+    if (g_start_store_active) {
+        g_start_store_active = false;
+        sendCompletionAckWithRetry(CMD_START);
+    }
+    SLAVE_LOG_RAW("#LIVE_END total=%lu reason=%u\n", (unsigned long)total,
+                  (unsigned)live::endReason());
+    live::printStatus();
+}
+
 static void requestPrestartFromUsb(uint16_t n)
 {
     if (captureOrDumpBusy()) {
@@ -2044,6 +2146,7 @@ static void requestUsbStartFromHotWait()
     g_start_store_active = (g_rec_n_batches > 0 && storeReadyForHotWait());
     g_start_fallback_sent = false;
     g_state = SAMPLING;
+    if (live::active()) live::start(g_t_start_us, effectivePsocSampleRateHz());
     radioSilencioAlEntrar();
     SLAVE_LOG_PRINTF("[USB] sync start n=%u sync=%d->%d bytes=%lu\n",
                      (unsigned)g_rec_n_batches, syncBefore, syncAfter,
@@ -2077,6 +2180,7 @@ static void requestCaptureFromUsb(uint16_t n)
 
 static void requestStopFromUsb()
 {
+    if (live::active()) live::requestStop();
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
     g_debug_mode = false;
     debugEspSetRamp(false);
@@ -2366,6 +2470,52 @@ static void serviceLabWaitSlice()
 #endif
     serviceRadioSilencio(true);   /* radiosil: el apagado se difiere al loop */
     delay(1);
+}
+
+/* Banco: captura en vivo completa por USB, con el modo de "capmode". Con
+ * secs > 0 corta con STOP a los secs segundos (para N = 0, sin limite). Espera
+ * el fin (en tiempo real, que el maestro -o el simulado- confirme todo). */
+static void requestLiveCapFromUsb(uint32_t n, uint32_t secs)
+{
+    if (!capmodeIsLive(g_capmode)) {
+        SLAVE_LOG_RAW("#LIVECAP rechazado: capmode es el clasico\n");
+        return;
+    }
+    /* Lo que haria un ARM: soltar la captura anterior, que queda retenida
+     * esperando la descarga. */
+    live::close();
+    requestClearFromUsb();
+    requestCaptureFromUsb((uint16_t)(n > 0xFFFFu ? 0xFFFFu : n));
+    if (!live::active() || g_state != SAMPLING) {
+        SLAVE_LOG_RAW("#LIVECAP no arranco state=%d\n", (int)g_state);
+        live::printStatus();
+        return;
+    }
+    uint32_t fs = effectivePsocSampleRateHz();
+    if (fs == 0u) fs = PSOC_NATIVE_SAMPLE_RATE_HZ;
+    const uint32_t captureMs = (n > 0u)
+        ? (uint32_t)(((uint64_t)n * SPI_BATCH_SAMPLES * 1000u) / fs) : secs * 1000u;
+    const uint32_t limitMs = captureMs + secs * 1000u + 30000u;
+    const uint32_t t0 = millis();
+    uint32_t lastStatMs = t0;
+    bool stopped = false;
+    while ((uint32_t)(millis() - t0) < limitMs && !g_live_notified) {
+        serviceLabWaitSlice();
+        live::service();
+        serviceLiveEnd();
+        if (!stopped && secs > 0u && (uint32_t)(millis() - t0) >= secs * 1000u) {
+            stopped = true;
+            live::requestStop();
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        }
+        if ((uint32_t)(millis() - lastStatMs) >= 2000u) {
+            lastStatMs = millis();
+            live::printStatus();
+        }
+    }
+    SLAVE_LOG_RAW("#LIVECAP fin=%u ms=%lu\n", (unsigned)g_live_notified,
+                  (unsigned long)(millis() - t0));
+    if (!g_live_notified) live::printStatus();
 }
 
 static void waitForLabCaptureDone(const char *tag, uint16_t requestedBatches)
@@ -2844,7 +2994,8 @@ static void iniciarTimerSyncRadioSilencio()
 
 static void subirSyncConRadioSilencio()
 {
-    if (!g_radio_silencio || g_radio_silencio_ms == 0u) {
+    if (!g_radio_silencio || g_radio_silencio_ms == 0u ||
+        (live::active() && live::config().realtime)) {
         digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
         return;
     }
@@ -2885,6 +3036,8 @@ static void radioPrender()
 
 static void radioSilencioAlEntrar()
 {
+    /* En tiempo real la radio tiene que quedar prendida. */
+    if (live::active() && live::config().realtime) return;
     if (g_radio_silencio) g_radio_silencio_pedido = true;
 }
 
@@ -3982,6 +4135,34 @@ static void handleUsbCommand(const char *cmd)
     } else if (usbParseU16Param(cmd, "startnow", value16) ||
                usbParseU16Param(cmd, "now", value16)) {
         requestStartNowFromUsb(value16);
+    } else if (!strncmp(cmd, "capmode", 7) && (cmd[7] == ' ' || cmd[7] == '\0')) {
+        unsigned st = 0, rt = 0, ramp = 0;
+        const int n = sscanf(cmd + 7, "%u %u %u", &st, &rt, &ramp);
+        if (n >= 1 && st <= CAPMODE_STORAGE_SD) {
+            g_capmode = (uint8_t)(st | (rt ? CAPMODE_REALTIME : 0u));
+            g_capmode_ramp = (ramp != 0u);
+        }
+        SLAVE_LOG_RAW("#CAPMODE storage=%u rt=%u ramp=%u\n",
+                      (unsigned)(g_capmode & CAPMODE_STORAGE_MASK),
+                      (unsigned)((g_capmode & CAPMODE_REALTIME) != 0u),
+                      (unsigned)g_capmode_ramp);
+    } else if (!strncmp(cmd, "rtsim", 5) && (cmd[5] == ' ' || cmd[5] == '\0')) {
+        unsigned loss = 0;
+        if (strstr(cmd, "off")) {
+            live::simMaster(false, 0);
+        } else {
+            sscanf(cmd + 5, "%u", &loss);
+            live::simMaster(true, (uint8_t)(loss > 90u ? 90u : loss));
+        }
+        SLAVE_LOG_RAW("#RTSIM on=%u loss=%u\n", (unsigned)live::simEnabled(), loss);
+    } else if (usbCommandEquals(cmd, "livestat")) {
+        live::printStatus();
+    } else if (!strncmp(cmd, "livedump", 8) && (cmd[8] == ' ' || cmd[8] == '\0')) {
+        live::dumpUsb(strstr(cmd, "hex") != nullptr);
+    } else if (!strncmp(cmd, "livecap", 7) && (cmd[7] == ' ' || cmd[7] == '\0')) {
+        unsigned long n = 0, secs = 0;
+        sscanf(cmd + 7, "%lu %lu", &n, &secs);
+        requestLiveCapFromUsb((uint32_t)n, (uint32_t)secs);
     } else if (usbParseU16Param(cmd, "cap", value16) ||
                usbParseU16Param(cmd, "capture", value16) ||
                usbParseU16Param(cmd, "start", value16)) {
@@ -4261,6 +4442,7 @@ static SampleBytes *storeBatchPtr(uint16_t seq)
 
 static bool storeReadyForHotWait()
 {
+    if (live::active()) return g_psoc_arm_ready;
     if (g_rec_n_batches == 0) return true;
     if (!g_psoc_arm_ready) return false;
     if (g_psoc_sd_store_active) return true;
@@ -4269,6 +4451,7 @@ static bool storeReadyForHotWait()
 
 static bool storeAllocated()
 {
+    if (live::active()) return true;
     if (g_rec_n_batches == 0) return true;
     return g_psoc_sd_store_active || storeRamReady();
 }
@@ -4315,10 +4498,67 @@ static uint32_t expectedCaptureMs(uint16_t n_batches)
     return ms + PSOC_START_FALLBACK_EXTRA_MS;
 }
 
+/* Armado de una captura en vivo (todo lo que no es asincronico con la RAM
+ * del PSoC sola). La RAM clasica se libera para que el anillo la use. */
+static void enterHotWaitLive(uint16_t n_batches)
+{
+    allocStore(0);
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    g_t_start_us     = 0;
+    g_store_fill     = 0;
+    g_view_remaining = 0;
+    g_view_store_active = false;
+    g_start_store_active = false;
+    g_debug_count    = 0;
+    g_debug_last_us  = (uint32_t)micros();
+    g_start_fallback_sent = false;
+    g_psoc_arm_ready = false;
+    g_live_notified  = false;
+
+    live::Config c;
+    c.storage  = (uint8_t)(g_capmode & CAPMODE_STORAGE_MASK);
+    c.realtime = (g_capmode & CAPMODE_REALTIME) != 0u;
+    c.nBatches = n_batches;
+    c.ramp     = g_capmode_ramp;
+    const int32_t eff = live::prepare(c);
+    if (eff < 0) {
+        g_rec_n_batches = 0;
+        g_state = STOPPED;
+        sendHotWaitAck();
+        SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live aborted n=%u: sin almacenamiento\n",
+                         (unsigned)n_batches);
+        return;
+    }
+    /* 0xFFFF en el HOTWAIT_ACK = sin limite. */
+    g_rec_n_batches = (eff == 0) ? 0xFFFFu : (uint16_t)eff;
+    const bool psocReady = syncPsocSdForCapture(false) &&
+                           syncPsocLiveMode(g_capmode_ramp ? 2u : 1u) &&
+                           sendAndConfirmPsocSetN((uint16_t)eff);
+    if (!psocReady) {
+        live::close();
+        g_state = STOPPED;
+        sendHotWaitAck();
+        SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live aborted n=%ld: PSoC sin confirmar\n",
+                         (long)eff);
+        return;
+    }
+    psoc.preStart();
+    g_hotwait_enter_ms = millis();
+    g_hotwait_rearm_count = 0;
+    g_state = HOT_WAIT;
+    SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live mode=0x%02X n=%ld\n",
+                     (unsigned)g_capmode, (long)eff);
+}
+
 static void enterHotWait(uint16_t n_batches)
 {
     bool psocReady;
 
+    if (capmodeIsLive(g_capmode)) {
+        enterHotWaitLive(n_batches);
+        return;
+    }
+    live::close();
     n_batches = clampPsocCaptureBatches(n_batches);
     allocStore(n_batches);
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
@@ -4342,7 +4582,8 @@ static void enterHotWait(uint16_t n_batches)
     }
     n_batches = g_rec_n_batches;
     /* Armar el PSoC por UART: set N y pre-start (queda esperando flanco SYNC). */
-    psocReady = syncPsocSdForCapture(g_psoc_sd_store_active) &&
+    psocReady = syncPsocLiveMode(0u) &&
+                syncPsocSdForCapture(g_psoc_sd_store_active) &&
                 sendAndConfirmPsocSetN(n_batches);
     if (!psocReady) {
         allocStore(0);
@@ -4627,7 +4868,8 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     learnMasterMac(mac);
     g_lastMasterRxMs = millis();   /* para el seguimiento de canal (ver abajo) */
     uint8_t cmd = data[0];
-    if (g_state == SAMPLING && cmd != CMD_STOP && cmd != CMD_ARM) {
+    if (g_state == SAMPLING && cmd != CMD_STOP && cmd != CMD_ARM &&
+        cmd != CMD_STREAM_ACK) {
         /* En debug/test, VER puede interrumpir para evitar race condition */
         if (g_debug_mode && cmd == CMD_VIEW) {
             g_debug_mode = false;
@@ -4653,6 +4895,8 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_start_store_active = false;
         g_start_fallback_sent = false;
         allocStore(0);
+        live::close();
+        g_live_notified = false;
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_state = ARMED;
         scheduleAutoCalibration(0u);
@@ -4660,8 +4904,12 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         sendToMaster((const uint8_t *)&ack, sizeof(ack));
         SLAVE_LOG_PRINTLN("[SLAVE] ARMED");
     }
-    else if (cmd == CMD_PRESTART && len >= (int)sizeof(MsgPrestart) &&
-             g_state != SAMPLING) {
+    else if (cmd == CMD_PRESTART && len >= 3 && g_state != SAMPLING) {
+        /* Un maestro viejo manda 3 bytes: queda el modo que estaba (el banco
+         * puede fijarlo con "capmode"). */
+        if (len >= (int)sizeof(MsgPrestart)) {
+            g_capmode = ((const MsgPrestart *)data)->mode;
+        }
         if (!g_auto_cal_requested && g_auto_cal_due_ms != 0u) {
             serviceAutoCalibration();
         }
@@ -4754,6 +5002,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_start_store_active = (g_rec_n_batches > 0 && storeReadyForHotWait() && !g_view_store_active);
         g_start_fallback_sent = false;
         g_state = SAMPLING;
+        if (live::active()) live::start(g_t_start_us, effectivePsocSampleRateHz());
         radioSilencioAlEntrar();
         SLAVE_LOG_PRINTF("[SLAVE] START_OK target=%u token=%u sync=%d->%d bytes=%lu fill=%u/%u view=%u start=%u\n",
                          (unsigned)targetNode, (unsigned)startToken,
@@ -4767,7 +5016,14 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
              syncBefore, syncAfter, (unsigned)g_view_store_active,
              (unsigned)g_start_store_active);
     }
+    else if (cmd == CMD_STREAM_ACK && len >= (int)sizeof(MsgStreamAck)) {
+        const MsgStreamAck *a = (const MsgStreamAck *)data;
+        if (a->node_id == NODE_ID) live::onMasterAck(a->next_expected, a->sack);
+    }
     else if (cmd == CMD_STOP) {
+        /* En vivo el STOP no tira nada: el PSoC cierra con la bajada de SYNC
+         * y lo pendiente se sigue pasando hasta el aviso de fin. */
+        if (live::active()) live::requestStop();
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_debug_mode = false;
         if (g_view_remaining > 0) {
@@ -4932,6 +5188,13 @@ static void handleReqBatch(const MsgReqBatch *msg)
     if (g_state == SAMPLING) {
         return;   /* No TX ESP-NOW mientras el ADC está capturando. */
     }
+    if (live::active()) {
+        if (!live::serveReq(seq)) {
+            MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
+            sendToMaster((const uint8_t *)&nack, sizeof(nack));
+        }
+        return;
+    }
     if ((g_view_store_active || g_start_store_active) && g_store_fill < g_rec_n_batches) {
         SLAVE_LOG_PRINTF("[SLAVE] REQ_BATCH ignored during capture seq=%u fill=%u/%u state=%d\n",
                          seq, g_store_fill, g_rec_n_batches, (int)g_state);
@@ -5023,6 +5286,11 @@ static void psocBatchToStored(const PsocBatch &batch, SampleBytes *dst)
 static void onBatch(const PsocBatch &batch)
 {
     g_psocConnected = true;
+
+    if (live::active()) {
+        live::onPsocBatch(batch);
+        return;
+    }
 
     if (g_psoc_sd_read_pending) {
         if (batch.seq != g_psoc_sd_read_seq) {
@@ -5269,6 +5537,7 @@ void setup()
     /* UART → PSoC */
     psoc.begin(onBatch);
     psoc.onDiag(onPsocDiag);
+    live::begin(&psoc, sendToMaster, NODE_ID);
     g_psoc_rx_last_level = (uint8_t)digitalRead(PSOC_UART_RX);
     attachInterrupt(digitalPinToInterrupt(PSOC_UART_RX), onPsocRxEdge, CHANGE);
 #if PSOC_RX_SCAN_ENABLE
@@ -5332,6 +5601,8 @@ void loop()
     serviceCompletionAckRetry();
     serviceLocalUi();
     serviceHotWaitWatchdog();
+    live::service();
+    serviceLiveEnd();
 #if SLAVE_LAB_TOOLS_ENABLE
     /* rftest/sdstress/sdprobe/espsd (banco): corren EN
      * PARALELO con una captura (g_state == SAMPLING incluido: este tramo del
@@ -5361,7 +5632,7 @@ void loop()
 
     bool storeCaptureActive = g_view_store_active || g_start_store_active;
     if (g_state == SAMPLING && storeCaptureActive && g_rec_n_batches > 0 &&
-        g_store_fill == 0 && !g_start_fallback_sent) {
+        g_store_fill == 0 && !g_start_fallback_sent && !live::active()) {
         uint32_t elapsedMs = millis() - g_sampling_start_ms;
         uint32_t fallbackMs = expectedCaptureMs(g_rec_n_batches);
         uint32_t bytesNow = psoc.bytesRx();
@@ -5503,7 +5774,9 @@ void loop()
 #endif
             controlStatusForHello(),
             g_pga_code,
-            (g_psoc_hw_class == 0u) ? g_pgaout : (uint8_t)0xFFu
+            (g_psoc_hw_class == 0u) ? g_pgaout : (uint8_t)0xFFu,
+            live::ramCapacityBatches(),
+            live::sdCapacityBatches()
         };
         esp_err_t err = sendToMaster((const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX
