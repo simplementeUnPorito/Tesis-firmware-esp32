@@ -54,6 +54,7 @@ constexpr uint32_t PSOC_RT_RING    = 64;
  * tarjeta, y la memoria que sobra la necesitan la radio y FatFs (con el
  * anillo grande una escritura fallo por falta de heap). */
 constexpr uint32_t SD_RT_RING      = 160;
+constexpr uint32_t SD_READ_BATCHES = 32;
 constexpr size_t   BATCH_BYTES     = (size_t)SPI_BATCH_SAMPLES * sizeof(SampleBytes);
 constexpr size_t   PAGE_BYTES      = (size_t)PAGE_BATCHES * BATCH_BYTES;
 constexpr uint32_t NONE            = 0xFFFFFFFFu;
@@ -119,6 +120,8 @@ SPIClass g_spi(LIVE_SD_SPI_HOST);
 File g_file;
 bool g_sdMounted = false;
 uint64_t g_sdFreeBytes = 0;
+uint32_t g_sdHz = LIVE_SD_HZ;
+uint32_t g_sdMountedHz = 0;
 volatile bool g_sdOpen = false;
 volatile bool g_sdFull = false;
 volatile bool g_sdErr = false;   /* fallo una escritura con lugar libre */
@@ -128,10 +131,13 @@ volatile int g_sdErrno = 0;
 volatile uint32_t g_sdw = 0;
 volatile uint8_t g_sdReadState = 0;     /* 0 libre, 1 pedido, 2 listo, 3 error */
 volatile uint32_t g_sdReadSeq = 0;
+volatile uint32_t g_sdReadCount = 0;
 bool g_sdReadForRt = false;
-SampleBytes g_sdReadBuf[SPI_BATCH_SAMPLES];
+bool g_sdReadPendingSend = false;
+SampleBytes g_sdReadBuf[SD_READ_BATCHES * SPI_BATCH_SAMPLES];
 TaskHandle_t g_sdTask = nullptr;
 SemaphoreHandle_t g_sdMutex = nullptr;
+bool g_radioReady = true;
 
 /* Maestro simulado (banco): recibe las tramas en vez de la radio. */
 bool g_simOn = false;
@@ -148,6 +154,11 @@ SampleBytes *slotPtr(uint32_t seq)
     return g_pages[idx / PAGE_BATCHES] + (size_t)(idx % PAGE_BATCHES) * SPI_BATCH_SAMPLES;
 }
 
+bool streaming()
+{
+    return g_cfg.realtime || (g_cfg.streamDump && g_psocDone);
+}
+
 /* Lote mas viejo que tiene que seguir en la RAM del ESP. */
 uint32_t tailNow()
 {
@@ -160,6 +171,16 @@ uint32_t tailNow()
             t = (sdw < g_mack) ? sdw : g_mack;
         } else if (g_cfg.storage == CAPMODE_STORAGE_PSOC) {
             t = g_txNext;   /* el respaldo es la RAM del PSoC */
+        } else {
+            t = g_mack;
+        }
+    } else if (g_cfg.streamDump) {
+        if (g_cfg.storage == CAPMODE_STORAGE_SD) {
+            t = sdw;
+        } else if (g_cfg.storage == CAPMODE_STORAGE_PSOC) {
+            /* Como en tiempo real: el ESP retiene hasta transmitir y el
+             * PSoC guarda el resto (N <= 512) y los reenvios. */
+            t = g_txNext;
         } else {
             t = g_mack;
         }
@@ -266,9 +287,8 @@ esp_err_t sendRaw(const uint8_t *d, size_t n)
     return err;
 }
 
-/* Un lote son dos tramas de 15 muestras. Tiempo real lleva lote de 32 bits;
- * el volcado asincronico usa la trama clasica para que el maestro actual lo
- * entienda sin cambios. */
+/* Un lote son dos tramas de 15 muestras. El camino stream lleva lote de 32
+ * bits; el volcado asincronico clasico conserva la trama de 16 bits. */
 bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt)
 {
     for (uint8_t part = 0; part < 2; part++) {
@@ -311,8 +331,12 @@ bool sdRemount()
     g_sdRemounts = g_sdRemounts + 1u;
     g_file.close();
     SD.end();
+    g_sdMounted = false;
+    g_sdMountedHz = 0u;
     vTaskDelay(pdMS_TO_TICKS(50));
-    if (!SD.begin(LIVE_SD_CS, g_spi, LIVE_SD_HZ, "/sd", 5, false)) return false;
+    if (!SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false)) return false;
+    g_sdMounted = true;
+    g_sdMountedHz = g_sdHz;
     g_file = SD.open(SD_PATH, "r+");
     return (bool)g_file;
 }
@@ -326,8 +350,17 @@ void sdTaskFn(void *)
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
         if (g_sdOpen && g_file) {
             if (g_sdReadState == 1u) {
-                const bool ok = g_file.seek((uint64_t)g_sdReadSeq * BATCH_BYTES) &&
-                                g_file.read((uint8_t *)g_sdReadBuf, BATCH_BYTES) == BATCH_BYTES;
+                __sync_synchronize();
+                const uint32_t seq = g_sdReadSeq;
+                const uint32_t sdw = g_sdw;
+                const uint32_t avail = (seq < sdw) ? (sdw - seq) : 0u;
+                const uint32_t count = (avail < SD_READ_BATCHES) ? avail : SD_READ_BATCHES;
+                const size_t bytes = (size_t)count * BATCH_BYTES;
+                const bool ok = count > 0u &&
+                                g_file.seek((uint64_t)seq * BATCH_BYTES) &&
+                                g_file.read((uint8_t *)g_sdReadBuf, bytes) == bytes;
+                g_sdReadCount = ok ? count : 0u;
+                __sync_synchronize();
                 g_sdReadState = ok ? 2u : 3u;
             }
             for (int n = 0; n < 8 && !g_sdFull && g_sdw < g_recv; n++) {
@@ -372,12 +405,20 @@ void sdTaskFn(void *)
 
 bool sdMount()
 {
-    if (g_sdMounted) return true;
-    g_spi.begin(LIVE_SD_SCK, LIVE_SD_MISO, LIVE_SD_MOSI, LIVE_SD_CS);
-    g_sdMounted = SD.begin(LIVE_SD_CS, g_spi, LIVE_SD_HZ, "/sd", 5, false);
+    if (g_sdMounted && g_sdMountedHz == g_sdHz) return true;
     if (g_sdMounted) {
+        SD.end();
+        g_sdMounted = false;
+        g_sdMountedHz = 0u;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    g_spi.begin(LIVE_SD_SCK, LIVE_SD_MISO, LIVE_SD_MOSI, LIVE_SD_CS);
+    g_sdMounted = SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false);
+    if (g_sdMounted) {
+        g_sdMountedHz = g_sdHz;
         g_sdFreeBytes = SD.totalBytes() - SD.usedBytes();
     } else {
+        g_sdMountedHz = 0u;
         SD.end();
     }
     return g_sdMounted;
@@ -410,6 +451,54 @@ void allocPages(uint32_t want)
     g_cap = g_npages * PAGE_BATCHES;
 }
 
+bool sdReadContains(uint32_t seq)
+{
+    if (g_sdReadState != 2u || seq < g_sdReadSeq) return false;
+    __sync_synchronize();
+    return (seq - g_sdReadSeq) < g_sdReadCount;
+}
+
+const SampleBytes *sdReadPtr(uint32_t seq)
+{
+    return g_sdReadBuf + (size_t)(seq - g_sdReadSeq) * SPI_BATCH_SAMPLES;
+}
+
+bool requestSdRead(uint32_t seq, bool forRt, bool sendWhenReady)
+{
+    if (seq >= g_sdw) return false;
+    if (sdReadContains(seq)) return true;
+    if (g_sdReadState == 1u || (g_sdReadState == 2u && g_sdReadPendingSend)) return false;
+    g_sdReadSeq = seq;
+    g_sdReadCount = 0u;
+    g_sdReadForRt = forRt;
+    g_sdReadPendingSend = sendWhenReady;
+    __sync_synchronize();
+    g_sdReadState = 1u;
+    if (g_sdTask) xTaskNotifyGive(g_sdTask);
+    return false;
+}
+
+void queuePsocResend(uint32_t seq)
+{
+    if (seq == g_psocResend) return;
+    for (uint32_t i = 0; i < g_psocQn; i++) {
+        if (g_psocQ[i] == seq) return;
+    }
+    if (g_psocQn < PSOC_RESEND_Q) g_psocQ[g_psocQn++] = seq;
+}
+
+bool sendStreamBatch(uint32_t seq)
+{
+    if (seq >= tailNow()) return sendBatch(seq, slotPtr(seq), true);
+    if (g_cfg.storage == CAPMODE_STORAGE_SD) {
+        if (sdReadContains(seq)) return sendBatch(seq, sdReadPtr(seq), true);
+        requestSdRead(seq, true, false);
+    } else if (g_cfg.storage == CAPMODE_STORAGE_PSOC) {
+        queuePsocResend(seq);
+    }
+    return false;
+}
+
 void retransmit(uint32_t seq)
 {
     if (seq >= g_recv) return;
@@ -417,18 +506,10 @@ void retransmit(uint32_t seq)
     if (seq >= tailNow()) {
         sendBatch(seq, slotPtr(seq), true);
     } else if (g_cfg.storage == CAPMODE_STORAGE_SD) {
-        if (seq < g_sdw && g_sdReadState == 0u) {
-            g_sdReadSeq = seq;
-            g_sdReadForRt = true;
-            g_sdReadState = 1u;
-            if (g_sdTask) xTaskNotifyGive(g_sdTask);
-        }
+        if (sdReadContains(seq)) sendBatch(seq, sdReadPtr(seq), true);
+        else requestSdRead(seq, true, true);
     } else if (g_cfg.storage == CAPMODE_STORAGE_PSOC) {
-        if (seq == g_psocResend) return;
-        for (uint32_t i = 0; i < g_psocQn; i++) {
-            if (g_psocQ[i] == seq) return;
-        }
-        if (g_psocQn < PSOC_RESEND_Q) g_psocQ[g_psocQn++] = seq;
+        queuePsocResend(seq);
     }
 }
 
@@ -449,7 +530,8 @@ void servicePsocFlow()
 
 void serviceRealtime()
 {
-    if (!g_cfg.realtime || !g_started) return;
+    if (!streaming() || !g_started) return;
+    if (g_cfg.streamDump && !g_cfg.realtime && !g_radioReady) return;
     const uint32_t now = millis();
 
     /* Reenvios desde la RAM del PSoC: uno en vuelo a la vez. */
@@ -462,10 +544,11 @@ void serviceRealtime()
         g_psoc->liveAck((uint16_t)g_psocResend, PSOC_LIVE_ACK_ONE);
     }
 
-    if (g_sdReadState == 2u && g_sdReadForRt) {
-        sendBatch(g_sdReadSeq, g_sdReadBuf, true);
-        g_sdReadState = 0u;
+    if (g_sdReadState == 2u && g_sdReadForRt && g_sdReadPendingSend) {
+        if (sdReadContains(g_sdReadSeq)) sendBatch(g_sdReadSeq, sdReadPtr(g_sdReadSeq), true);
+        g_sdReadPendingSend = false;
     } else if (g_sdReadState == 3u && g_sdReadForRt) {
+        g_sdReadPendingSend = false;
         g_sdReadState = 0u;
     }
 
@@ -484,7 +567,7 @@ void serviceRealtime()
     for (int budget = 4; budget > 0; budget--) {
         if (g_txNext >= g_recv || (g_txNext - g_mack) >= MASTER_WINDOW) break;
         if (!radioRoom()) break;
-        if (!sendBatch(g_txNext, slotPtr(g_txNext), true)) break;
+        if (!sendStreamBatch(g_txNext)) break;
         g_txNext++;
     }
 }
@@ -510,6 +593,34 @@ void begin(PsocUART *psoc, RawSendFn send, uint8_t nodeId)
     SLAVE_LOG_PRINTF("[LIVE] SD %s libre=%llu MB\n", g_sdMounted ? "ok" : "ausente",
                      (unsigned long long)(g_sdFreeBytes / (1024ull * 1024ull)));
 }
+
+void setSdHz(uint32_t hz)
+{
+    if (hz < 400000u || hz > 20000000u) return;
+    if (!g_sdMutex) {
+        g_sdHz = hz;
+        return;
+    }
+    xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+    g_sdHz = hz;
+    if (g_sdMounted && !g_sdOpen) {
+        SD.end();
+        g_sdMounted = false;
+        g_sdMountedHz = 0u;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        g_sdMounted = SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false);
+        if (g_sdMounted) {
+            g_sdMountedHz = g_sdHz;
+            g_sdFreeBytes = SD.totalBytes() - SD.usedBytes();
+        } else {
+            SD.end();
+        }
+    }
+    xSemaphoreGive(g_sdMutex);
+}
+
+uint32_t sdHz() { return g_sdHz; }
+void setRadioReady(bool ready) { g_radioReady = ready; }
 
 int32_t prepare(const Config &c)
 {
@@ -549,6 +660,8 @@ int32_t prepare(const Config &c)
         g_sdErrno = 0;
         g_sdw = 0;
         g_sdReadState = 0;
+        g_sdReadCount = 0;
+        g_sdReadPendingSend = false;
         g_sdOpen = ok;
         xSemaphoreGive(g_sdMutex);
         if (!ok) {
@@ -581,6 +694,8 @@ int32_t prepare(const Config &c)
     g_rewindMs = 0;
     g_psocResend = NONE;
     g_psocQn = 0;
+    g_sdReadCount = 0;
+    g_sdReadPendingSend = false;
     g_gaps = g_dups = g_retx = g_txOk = g_txFail = g_badRamp = g_noRoom = 0;
     g_simNext = 0;
     g_simRx = g_simDup = g_simDrop = g_simWin = g_simBad = 0;
@@ -630,7 +745,8 @@ void onPsocBatch(const PsocBatch &b)
         if (seq == g_psocResend) {
             SampleBytes tmp[SPI_BATCH_SAMPLES];
             toStored(b, tmp);
-            sendBatch(seq, tmp, true);
+            const bool sent = sendBatch(seq, tmp, true);
+            if (sent && seq == g_txNext) g_txNext++;
             g_psocResend = NONE;
         } else {
             g_dups++;
@@ -678,7 +794,7 @@ void onPsocOverrun() { g_overrun = true; }
 
 void onMasterAck(uint32_t nextExpected, uint32_t sack)
 {
-    if (!g_active || !g_cfg.realtime) return;
+    if (!g_active || !streaming()) return;
     if (nextExpected > g_txNext) nextExpected = g_txNext;
     if (nextExpected > g_mack) {
         g_mack = nextExpected;
@@ -698,12 +814,7 @@ bool serveReq(uint32_t seq)
         return sendBatch(seq, slotPtr(seq), false);
     }
     if (g_cfg.storage == CAPMODE_STORAGE_SD && seq < g_sdw) {
-        if (g_sdReadState == 0u) {
-            g_sdReadSeq = seq;
-            g_sdReadForRt = false;
-            g_sdReadState = 1u;
-            if (g_sdTask) xTaskNotifyGive(g_sdTask);
-        }
+        requestSdRead(seq, false, false);
         return true;   /* sale en service() cuando la tarea lo lea */
     }
     return false;
@@ -713,10 +824,10 @@ void service()
 {
     if (!g_active) return;
     servicePsocFlow();
-    if (!g_cfg.realtime && g_sdReadState == 2u && !g_sdReadForRt) {
-        sendBatch(g_sdReadSeq, g_sdReadBuf, false);
+    if (!streaming() && g_sdReadState == 2u && !g_sdReadForRt) {
+        sendBatch(g_sdReadSeq, sdReadPtr(g_sdReadSeq), false);
         g_sdReadState = 0u;
-    } else if (!g_cfg.realtime && g_sdReadState == 3u && !g_sdReadForRt) {
+    } else if (!streaming() && g_sdReadState == 3u && !g_sdReadForRt) {
         g_sdReadState = 0u;
     }
     serviceRealtime();
@@ -729,7 +840,7 @@ uint32_t total() { return g_total; }
 bool finished()
 {
     if (!g_active || !g_psocDone) return false;
-    if (g_cfg.realtime) return g_mack >= g_total;
+    if (g_cfg.realtime || g_cfg.streamDump) return g_mack >= g_total;
     if (g_cfg.storage == CAPMODE_STORAGE_SD) return g_recv >= g_total && g_sdw >= g_total;
     return true;
 }

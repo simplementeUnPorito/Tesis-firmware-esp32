@@ -232,6 +232,7 @@ struct MsgScopeStart {
 #define CAPMODE_STORAGE_SHARED 1u   /* RAM del PSoC + RAM del ESP */
 #define CAPMODE_STORAGE_SD     2u   /* RAM del PSoC + RAM del ESP + SD del ESP */
 #define CAPMODE_REALTIME       0x04u
+#define CAPMODE_STREAM_DUMP    0x08u /* asincronico: descarga por tiempo real al terminar */
 
 struct MsgPrestart {
     uint8_t  cmd;       /* CMD_PRESTART */

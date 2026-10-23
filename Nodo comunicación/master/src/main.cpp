@@ -318,6 +318,10 @@ static EspNowRx       espnowRx;
 static RtStream       g_rt;
 static uint8_t        g_capMode = 0u;
 static bool capModeRealtime() { return (g_capMode & CAPMODE_REALTIME) != 0u; }
+static bool capModeStreams()
+{
+    return capModeRealtime() || (g_capMode & CAPMODE_STREAM_DUMP) != 0u;
+}
 static MatlabTransport matlab;
 
 struct CachedHello {
@@ -637,7 +641,7 @@ static void onCfgAck(const MsgCfgAck &msg)
             suppressForward = true;   /* retry tardío: ya estamos en DUMPING/ARMED */
         }
         if (msg.node_id > 0 && msg.node_id <= NUM_SLAVES &&
-            msg.ok == 2 && g_state == RUNNING && !g_rt.active()) {
+            msg.ok == 2 && g_state == RUNNING && !capModeStreams()) {
             uint32_t bit = (1UL << msg.node_id);
             if (g_armAckMask & bit) {
                 suppressForward = (g_captureDoneMask & bit) != 0;
@@ -778,7 +782,10 @@ static void onHotWaitAck(const MsgHotWaitAck &msg)
                       (unsigned)g_hotWaitAckMask);
     /* NACK espontáneo del watchdog HOT_WAIT del esclavo con captura en curso:
      * ese nodo ya no va a capturar nada, abortar limpio. */
-    if (!msg.ok && g_state == RUNNING) {
+    /* Un "todavia no listo" (state HOT_WAIT=2 o SAMPLING=3 en el esclavo)
+     * puede llegar tarde, ya en RUNNING: no es un aborto. El aborto real
+     * viene con el esclavo fuera de captura. */
+    if (!msg.ok && g_state == RUNNING && msg.state != 2u && msg.state != 3u) {
         abortCaptureToArmed(msg.node_id, "hotwait_abort");
     }
 }
@@ -1412,14 +1419,14 @@ static void finishPrestartAction()
         }
         g_captureDoneMask = 0;
         matlab.sendReady(g_armedCount);
-        if (capModeRealtime()) {
+        if (capModeStreams()) {
             /* Antes del START: los primeros lotes llegan enseguida. */
             if (!g_rt.start(g_armAckMask)) {
                 MASTER_LOG_PRINTLN("[MASTER] RT sin RAM para las ventanas");
             }
         }
         broadcastStart();
-        if (!capModeRealtime()) scheduleStoreDump(g_rec_n_batches);
+        if (!capModeStreams()) scheduleStoreDump(g_rec_n_batches);
         g_state = RUNNING;
         matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         MASTER_LOG_PRINTF("[MASTER] HOT_WAIT done (ready=%u/armed=%u) -> RUNNING\n",
@@ -1623,8 +1630,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
         }
 
         case 0xA4:   /* STOP */
-            if (g_rt.active()) {
-                /* Tiempo real: los esclavos cortan y siguen pasando lo
+            if (capModeStreams()) {
+                /* Camino stream: los esclavos cortan y siguen pasando lo
                  * pendiente; se cierra con sus STREAM_END, sin volcado. */
                 broadcastStop();
                 matlab.sendAck(0xFF, cmd, 0);
@@ -1644,7 +1651,8 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
 
         case 0xAF:   /* modo de captura: CAPMODE_* */
             if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
-                g_capMode = param & (CAPMODE_STORAGE_MASK | CAPMODE_REALTIME);
+                g_capMode = param & (CAPMODE_STORAGE_MASK | CAPMODE_REALTIME |
+                                     CAPMODE_STREAM_DUMP);
             }
             matlab.sendAck(0xFF, cmd, g_capMode);
             MASTER_LOG_PRINTF("[MASTER] capmode=0x%02X\n", g_capMode);

@@ -4,9 +4,9 @@
  * y el ESP lo guarda (RAM y, si se pide, SD) y/o lo transmite.
  *
  * Almacenamiento (CAPMODE_STORAGE_*):
- *   PSOC    solo la RAM del PSoC (512 lotes). En asincronico es el camino
- *           clasico y no pasa por aca; en tiempo real el PSoC guarda todo y
- *           el ESP le pide de nuevo los lotes que el maestro perdio.
+ *   PSOC    solo la RAM del PSoC (512 lotes). El asincronico clasico no pasa
+ *           por aca; en los modos stream el PSoC guarda todo y el ESP le pide
+ *           de nuevo los lotes que necesita.
  *   SHARED  RAM del PSoC + RAM del ESP. El ESP retiene hasta que el maestro
  *           confirma; sin lugar, el PSoC retiene en su anillo.
  *   SD      ademas, todo queda en /live.bin de la SD del ESP.
@@ -15,7 +15,7 @@
  *   recv    proximo lote que se espera del PSoC; todo lo anterior llego.
  *   tail    lote mas viejo que sigue en la RAM del ESP.
  *   sdw     lotes ya escritos en la SD.
- *   txNext  proximo lote nuevo a transmitir (tiempo real).
+ *   txNext  proximo lote nuevo a transmitir por el camino stream.
  *   mack    proximo lote que el maestro espera; todo lo anterior le llego.
  */
 #include <Arduino.h>
@@ -29,11 +29,15 @@ typedef esp_err_t (*RawSendFn)(const uint8_t *data, size_t len);
 struct Config {
     uint8_t  storage;   /* CAPMODE_STORAGE_* */
     bool     realtime;
+    bool     streamDump;
     uint32_t nBatches;  /* 0 = sin limite (solo tiempo real) */
     bool     ramp;      /* banco: el PSoC manda el indice de muestra */
 };
 
 void begin(PsocUART *psoc, RawSendFn send, uint8_t nodeId);
+void setSdHz(uint32_t hz);
+uint32_t sdHz();
+void setRadioReady(bool ready);
 
 /* Reserva memoria y abre la SD. Devuelve el N efectivo (puede recortar al
  * almacenamiento disponible) o -1 si no hay donde guardar. */

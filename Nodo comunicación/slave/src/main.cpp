@@ -454,6 +454,7 @@ static int16_t  g_psoc_live_known = -1;
 static bool capmodeIsLive(uint8_t mode)
 {
     return (mode & CAPMODE_REALTIME) != 0u ||
+           (mode & CAPMODE_STREAM_DUMP) != 0u ||
            (mode & CAPMODE_STORAGE_MASK) != CAPMODE_STORAGE_PSOC;
 }
 static volatile uint8_t  g_psoc_last_setn_value = 0;
@@ -2078,9 +2079,8 @@ static void serviceBootGains()
     g_boot_gain_step = 0u;
 }
 
-/* Fin de una captura en vivo: aviso al maestro una sola vez. En asincronico
- * es el START_DONE de siempre (el maestro descarga); en tiempo real va ademas
- * el STREAM_END con el total, porque N puede no estar fijado. */
+/* Fin de una captura en vivo: el asincronico clasico manda START_DONE; los
+ * caminos stream mandan STREAM_END con el total. */
 static void serviceLiveEnd()
 {
     if (!live::active()) return;
@@ -2091,8 +2091,9 @@ static void serviceLiveEnd()
     /* STREAM_END se repite: si se pierde, el maestro no cierra nunca. */
     static uint8_t endRetries = 0;
     static uint32_t endMs = 0;
+    const bool streams = live::config().realtime || live::config().streamDump;
     if (g_live_notified) {
-        if (live::config().realtime && endRetries < 20u &&
+        if (streams && endRetries < 20u &&
             (uint32_t)(millis() - endMs) >= 250u) {
             endRetries++;
             endMs = millis();
@@ -2109,12 +2110,12 @@ static void serviceLiveEnd()
     if (g_state == SAMPLING) g_state = STOPPED;
     const uint32_t total = live::total();
     g_store_fill = (total > 0xFFFFu) ? 0xFFFFu : (uint16_t)total;
-    if (live::config().realtime) {
+    if (streams) {
         MsgStreamEnd e = { CMD_STREAM_END, NODE_ID, total, live::endReason() };
         sendToMaster((const uint8_t *)&e, sizeof(e));
     }
-    /* En tiempo real no: el START_DONE hace que el maestro descargue. */
-    if (g_start_store_active && !live::config().realtime) {
+    /* En los caminos stream no: START_DONE dispara el volcado clasico. */
+    if (g_start_store_active && !streams) {
         sendCompletionAckWithRetry(CMD_START);
     }
     g_start_store_active = false;
@@ -3030,6 +3031,7 @@ static void subirSyncConRadioSilencio()
 static void radioApagar()
 {
     if (g_radio_on) {
+        live::setRadioReady(false);
         esp_now_deinit();
         esp_wifi_stop();
         g_radio_on = false;
@@ -3046,6 +3048,7 @@ static void radioPrender()
         const bool ok = transport.begin(g_masterTxMac);
         esp_now_register_recv_cb(onDataRecv);
         g_radio_on = true;
+        live::setRadioReady(true);
         if (!ok) SLAVE_LOG_RAW("#RADIO on: ESP-NOW FAIL\n");
     }
 }
@@ -4152,16 +4155,24 @@ static void handleUsbCommand(const char *cmd)
                usbParseU16Param(cmd, "now", value16)) {
         requestStartNowFromUsb(value16);
     } else if (!strncmp(cmd, "capmode", 7) && (cmd[7] == ' ' || cmd[7] == '\0')) {
-        unsigned st = 0, rt = 0, ramp = 0;
-        const int n = sscanf(cmd + 7, "%u %u %u", &st, &rt, &ramp);
+        unsigned st = 0, rt = 0, ramp = 0, streamDump = 0;
+        const int n = sscanf(cmd + 7, "%u %u %u %u", &st, &rt, &ramp, &streamDump);
         if (n >= 1 && st <= CAPMODE_STORAGE_SD) {
-            g_capmode = (uint8_t)(st | (rt ? CAPMODE_REALTIME : 0u));
+            g_capmode = (uint8_t)(st | (rt ? CAPMODE_REALTIME : 0u) |
+                                  (streamDump ? CAPMODE_STREAM_DUMP : 0u));
             g_capmode_ramp = (ramp != 0u);
         }
-        SLAVE_LOG_RAW("#CAPMODE storage=%u rt=%u ramp=%u\n",
+        SLAVE_LOG_RAW("#CAPMODE storage=%u rt=%u ramp=%u streamdump=%u\n",
                       (unsigned)(g_capmode & CAPMODE_STORAGE_MASK),
                       (unsigned)((g_capmode & CAPMODE_REALTIME) != 0u),
-                      (unsigned)g_capmode_ramp);
+                      (unsigned)g_capmode_ramp,
+                      (unsigned)((g_capmode & CAPMODE_STREAM_DUMP) != 0u));
+    } else if (!strncmp(cmd, "sdhz", 4) && (cmd[4] == ' ' || cmd[4] == '\0')) {
+        unsigned long hz = 0;
+        if (sscanf(cmd + 4, "%lu", &hz) == 1 && hz >= 400000ul && hz <= 20000000ul) {
+            live::setSdHz((uint32_t)hz);
+        }
+        SLAVE_LOG_RAW("#SDHZ %lu\n", (unsigned long)live::sdHz());
     } else if (!strncmp(cmd, "rtsim", 5) && (cmd[5] == ' ' || cmd[5] == '\0')) {
         unsigned loss = 0;
         if (strstr(cmd, "off")) {
@@ -4534,6 +4545,7 @@ static void enterHotWaitLive(uint16_t n_batches)
     live::Config c;
     c.storage  = (uint8_t)(g_capmode & CAPMODE_STORAGE_MASK);
     c.realtime = (g_capmode & CAPMODE_REALTIME) != 0u;
+    c.streamDump = (g_capmode & CAPMODE_STREAM_DUMP) != 0u;
     c.nBatches = n_batches;
     c.ramp     = g_capmode_ramp;
     const int32_t eff = live::prepare(c);
