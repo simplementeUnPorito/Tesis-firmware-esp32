@@ -1554,8 +1554,25 @@ static void rtEmit(uint8_t node, const SampleBytes *s, uint32_t seq)
  * recupera de la copia .geoq, como en el volcado). */
 static bool rtReady()
 {
-    if (!webRelayHasActiveClient()) return true;
-    return webRelayReadyForDumpRequest(false);
+    /* Contrapresion de la web, pero con limite: una pestana en segundo plano
+     * (Chrome la frena) o un socket medio muerto que el maestro cree vivo
+     * congelaban el tiempo real para siempre (2026-10-23). Pasados 10 s sin
+     * poder entregar se sigue igual; la copia .geoq del maestro guarda todo. */
+    static uint32_t s_blockedSinceMs = 0;
+    static bool s_warned = false;
+    if (!webRelayHasActiveClient() || webRelayReadyForDumpRequest(false)) {
+        s_blockedSinceMs = 0;
+        s_warned = false;
+        return true;
+    }
+    const uint32_t now = millis();
+    if (s_blockedSinceMs == 0) s_blockedSinceMs = now | 1u;
+    if ((now - s_blockedSinceMs) < 10000u) return false;
+    if (!s_warned) {
+        s_warned = true;
+        MASTER_LOG_PRINTLN("[MASTER] RT: la web no consume hace 10 s; entrego sin esperarla");
+    }
+    return true;
 }
 
 static void rtAck(uint8_t node, uint32_t next, uint32_t sack)

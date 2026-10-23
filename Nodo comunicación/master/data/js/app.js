@@ -2,17 +2,17 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-35';
-import { WsClient } from './ws_client.js?v=field-study-35';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-35';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-35';
-import { PlotArea } from './plot.js?v=field-study-35';
-import { SpectrumArea } from './spectrum.js?v=field-study-35';
-import { SlavePanel } from './slave_panel.js?v=field-study-35';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-35';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-35';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-35';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-35';
+import * as cfg from './config.js?v=field-study-36';
+import { WsClient } from './ws_client.js?v=field-study-36';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-36';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-36';
+import { PlotArea } from './plot.js?v=field-study-36';
+import { SpectrumArea } from './spectrum.js?v=field-study-36';
+import { SlavePanel } from './slave_panel.js?v=field-study-36';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-36';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-36';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-36';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-36';
 
 const $ = (id) => document.getElementById(id);
 

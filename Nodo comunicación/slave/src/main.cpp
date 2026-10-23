@@ -2136,6 +2136,20 @@ static void serviceLiveEnd()
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         SLAVE_LOG_PRINTLN("[LIVE] SD llena o con error: corto la captura");
     }
+    /* Maestro desaparecido (reiniciado, sin enlace): sin ningun STREAM_ACK en
+     * 30 s con la captura ya cerrada, se abandona la sesion. Antes el esclavo
+     * quedaba esperando para siempre, sin HELLO, y no se podia volver a armar
+     * desde la web (2026-10-23). La SD conserva la captura. */
+    if ((live::config().realtime || live::config().streamDump) && live::psocDone() &&
+        live::msSinceMasterAck() > 30000u) {
+        SLAVE_LOG_PRINTF("[LIVE] maestro sin confirmar hace %lu ms: abandono la sesion\n",
+                         (unsigned long)live::msSinceMasterAck());
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        live::close();
+        g_live_notified = false;
+        g_state = WAIT_ARM;
+        return;
+    }
     /* STREAM_END se repite: si se pierde, el maestro no cierra nunca. */
     static uint8_t endRetries = 0;
     static uint32_t endMs = 0;

@@ -86,6 +86,7 @@ uint32_t g_mack = 0;
 uint32_t g_sack = 0;
 uint32_t g_dumpAck = 0;
 uint32_t g_mackMs = 0;
+uint32_t g_ackRxMs = 0;   /* ultimo STREAM_ACK recibido, avance o no */
 uint32_t g_retxMs = 0;
 uint32_t g_total = NONE;
 uint8_t  g_totalB1 = 0;
@@ -1048,6 +1049,9 @@ void onPsocDone(uint8_t lowByte)
     if (!g_active) return;
     g_total = (uint32_t)lowByte | ((uint32_t)g_totalB1 << 8) | ((uint32_t)g_totalB2 << 16);
     g_psocDone = true;
+    /* El plazo de abandono por maestro ausente cuenta desde aca: la descarga
+     * rapida recien empieza a transmitir ahora. */
+    g_ackRxMs = millis();
     SLAVE_LOG_PRINTF("[LIVE] PSoC cerro: total=%lu recv=%lu\n",
                      (unsigned long)g_total, (unsigned long)g_recv);
 }
@@ -1057,6 +1061,7 @@ void onPsocOverrun() { g_overrun = true; }
 void onMasterAck(uint32_t nextExpected, uint32_t sack)
 {
     if (!g_active || !streaming()) return;
+    g_ackRxMs = millis();
     if (nextExpected > g_txNext) nextExpected = g_txNext;
     if (nextExpected > g_mack) {
         g_mack = nextExpected;
@@ -1102,6 +1107,13 @@ void service()
 }
 
 bool psocDone() { return g_psocDone; }
+
+uint32_t msSinceMasterAck()
+{
+    if (!g_active || !g_started || !streaming()) return 0u;
+    const uint32_t ref = g_ackRxMs ? g_ackRxMs : g_mackMs;
+    return millis() - ref;
+}
 uint32_t total() { return g_total; }
 
 bool finished()

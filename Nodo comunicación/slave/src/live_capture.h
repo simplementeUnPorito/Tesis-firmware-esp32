@@ -63,6 +63,8 @@ bool serveReq(uint32_t seq);
 void service();
 
 bool psocDone();
+/* ms sin ningun STREAM_ACK del maestro mientras se transmite (0 si no aplica). */
+uint32_t msSinceMasterAck();
 uint32_t total();
 bool finished();       /* listo para avisar al maestro */
 uint8_t endReason();   /* STREAM_END_* */

@@ -397,6 +397,21 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
             for (auto &c : server->getClients()) {
                 if (c.id() == client->id() || c.status() != WS_CONNECTED) continue;
                 if (c.remoteIP() == client->remoteIP()) {
+                    /* Mismo equipo: gana SIEMPRE la conexion nueva. Antes se la
+                     * rechazaba mientras el socket viejo pareciera vivo, y
+                     * "Reconectar" habia que apretarlo varias veces; el socket
+                     * viejo suele ser de la misma pestana tras un corte de WiFi.
+                     * La vieja recibe "replaced" y no reintenta sola, asi dos
+                     * pestanas no se pelean el socket (2026-10-23). */
+                    (void)forceSameIpTakeover;
+                    {
+                        MASTER_LOG_PRINTF("[WEB] WS #%u reemplaza #%u (mismo equipo %s)\n",
+                                          client->id(), c.id(),
+                                          client->remoteIP().toString().c_str());
+                        c.text("{\"type\":\"replaced\"}");
+                        c.close(1001, "replaced");
+                        continue;
+                    }
                     if (forceSameIpTakeover) {
                         MASTER_LOG_PRINTF("[WEB] WS takeover explicito #%u reemplaza #%u (%s)\n",
                                           client->id(), c.id(),
