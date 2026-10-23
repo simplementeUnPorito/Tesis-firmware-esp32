@@ -13,6 +13,11 @@
 #include "debug_log.h"
 
 #define ESPNOW_LOG_PRINTLN(...) MASTER_LOG_PRINTLN(__VA_ARGS__)
+
+/* Aviso de "trama salio" (tarea WiFi). Lo usa live_capture para no llenar la
+ * cola de ESP-NOW: con la cola llena esp_now_send falla en cadena. */
+typedef void (*EspNowSentHook)(bool ok);
+inline EspNowSentHook &espnowSentHook() { static EspNowSentHook h = nullptr; return h; }
 #define ESPNOW_LOG_PRINTF(...)  MASTER_LOG_PRINTF(__VA_ARGS__)
 
 class EspNowTransport {
@@ -66,7 +71,7 @@ inline void EspNowTransport::onSendCb(uint8_t *, uint8_t status)
 inline void EspNowTransport::onSendCb(const uint8_t *, esp_now_send_status_t status)
 #endif
 {
-    (void)status;   /* confirmación se maneja por contador en sendBatch */
+    if (espnowSentHook()) espnowSentHook()(status == ESP_NOW_SEND_SUCCESS);
 }
 
 inline bool EspNowTransport::begin(const uint8_t *masterMac)

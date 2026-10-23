@@ -2088,8 +2088,23 @@ static void serviceLiveEnd()
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         SLAVE_LOG_PRINTLN("[LIVE] SD llena: corto la captura");
     }
-    if (g_live_notified || !live::finished()) return;
+    /* STREAM_END se repite: si se pierde, el maestro no cierra nunca. */
+    static uint8_t endRetries = 0;
+    static uint32_t endMs = 0;
+    if (g_live_notified) {
+        if (live::config().realtime && endRetries < 20u &&
+            (uint32_t)(millis() - endMs) >= 250u) {
+            endRetries++;
+            endMs = millis();
+            MsgStreamEnd e = { CMD_STREAM_END, NODE_ID, live::total(), live::endReason() };
+            sendToMaster((const uint8_t *)&e, sizeof(e));
+        }
+        return;
+    }
+    if (!live::finished()) return;
     g_live_notified = true;
+    endRetries = 0;
+    endMs = millis();
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
     if (g_state == SAMPLING) g_state = STOPPED;
     const uint32_t total = live::total();
@@ -2098,10 +2113,11 @@ static void serviceLiveEnd()
         MsgStreamEnd e = { CMD_STREAM_END, NODE_ID, total, live::endReason() };
         sendToMaster((const uint8_t *)&e, sizeof(e));
     }
-    if (g_start_store_active) {
-        g_start_store_active = false;
+    /* En tiempo real no: el START_DONE hace que el maestro descargue. */
+    if (g_start_store_active && !live::config().realtime) {
         sendCompletionAckWithRetry(CMD_START);
     }
+    g_start_store_active = false;
     SLAVE_LOG_RAW("#LIVE_END total=%lu reason=%u\n", (unsigned long)total,
                   (unsigned)live::endReason());
     live::printStatus();

@@ -32,6 +32,8 @@ typedef void (*CfgAckCallback)(const MsgCfgAck &msg);
 typedef void (*HelloCallback)(const MsgHello &msg, const uint8_t senderMac[6]);
 typedef void (*StartAckCallback)(const MsgStartAck &msg);
 typedef void (*HotWaitAckCallback)(const MsgHotWaitAck &msg);
+typedef void (*RtDataCallback)(const uint8_t *data, int len);
+typedef void (*RtEndCallback)(const MsgStreamEnd &msg);
 
 class EspNowRx {
 public:
@@ -48,6 +50,13 @@ public:
     /* Llamar desde el loop() o directamente del callback ESP-NOW */
     static void onRecv(const uint8_t *mac, const uint8_t *data, int len);
 
+    /* Tiempo real (rt_stream.h): tramas MsgData32 y STREAM_END. */
+    void setRtHandlers(RtDataCallback data, RtEndCallback end)
+    {
+        _rtDataCb = data;
+        _rtEndCb = end;
+    }
+
     uint32_t pktsRx()   const { return _pktsRx; }
     uint32_t crcFail()  const { return _crcFail; }
 
@@ -59,6 +68,8 @@ private:
     HelloCallback      _helloCb   = nullptr;
     StartAckCallback   _startAckCb = nullptr;
     HotWaitAckCallback _hotWaitAckCb = nullptr;
+    RtDataCallback     _rtDataCb = nullptr;
+    RtEndCallback      _rtEndCb = nullptr;
     ReassembledBatch   _bufs[MAX_NODES] = {};
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
@@ -113,6 +124,10 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
 
     if (first == DATA_PKT_MARKER && (size_t)len >= sizeof(MsgData)) {
         instance->_handleData((const MsgData *)data);
+    } else if (first == DATA32_PKT_MARKER && (size_t)len >= sizeof(MsgData32)) {
+        if (instance->_rtDataCb) instance->_rtDataCb(data, len);
+    } else if (first == CMD_STREAM_END && (size_t)len >= sizeof(MsgStreamEnd)) {
+        if (instance->_rtEndCb) instance->_rtEndCb(*(const MsgStreamEnd *)data);
     } else if (first == CMD_ARM_ACK && (size_t)len >= sizeof(MsgArmAck)) {
         instance->_handleArmAck((const MsgArmAck *)data);
     } else if (first == CMD_STATUS && (size_t)len >= sizeof(MsgStatus)) {

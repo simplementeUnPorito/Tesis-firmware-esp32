@@ -2,7 +2,9 @@
 
 #include <SD.h>
 #include <SPI.h>
+#include <errno.h>
 #include "debug_log.h"
+#include "espnow_transport.h"
 
 /* Pines de la SD del ESP. Un solo lugar, pensando en el ESP32-S3: ahi el 25 y
  * el 32 no existen y el host SPI se llama distinto. */
@@ -19,7 +21,7 @@
 #define LIVE_SD_CS 25
 #endif
 #ifndef LIVE_SD_HZ
-#define LIVE_SD_HZ 4000000
+#define LIVE_SD_HZ 1000000
 #endif
 #ifndef LIVE_SD_SPI_HOST
 #define LIVE_SD_SPI_HOST HSPI
@@ -39,6 +41,8 @@ constexpr uint32_t MAX_PAGES       = 48;    /* 1536 lotes: mas de lo que entra s
 constexpr uint32_t PSOC_RING       = 512;   /* anillo del PSoC, en lotes */
 constexpr uint32_t PSOC_WINDOW     = 16;    /* LIVE_WINDOW_BATCHES del PSoC */
 constexpr uint32_t MASTER_WINDOW   = 64;    /* lotes en vuelo hacia el maestro */
+constexpr uint32_t RADIO_INFLIGHT  = 6;     /* tramas en la cola de ESP-NOW */
+constexpr uint32_t INFLIGHT_MS     = 50;    /* si no vuelve el aviso, se da por salida */
 constexpr uint32_t RTO_MS          = 150;
 constexpr uint32_t PSOC_ACK_MS     = 50;
 constexpr uint32_t REWIND_MS       = 30;
@@ -46,6 +50,10 @@ constexpr uint32_t PSOC_RESEND_MS  = 20;    /* el PSoC reenvia un lote por pasad
 constexpr uint32_t PSOC_RESEND_Q   = 16;
 constexpr size_t   HEAP_RESERVE    = 36u * 1024u;
 constexpr uint32_t PSOC_RT_RING    = 64;
+/* Con SD el anillo solo cubre el atraso del maestro: lo demas esta en la
+ * tarjeta, y la memoria que sobra la necesitan la radio y FatFs (con el
+ * anillo grande una escritura fallo por falta de heap). */
+constexpr uint32_t SD_RT_RING      = 160;
 constexpr size_t   BATCH_BYTES     = (size_t)SPI_BATCH_SAMPLES * sizeof(SampleBytes);
 constexpr size_t   PAGE_BYTES      = (size_t)PAGE_BATCHES * BATCH_BYTES;
 constexpr uint32_t NONE            = 0xFFFFFFFFu;
@@ -89,6 +97,22 @@ uint32_t g_psocQn = 0;
 
 uint32_t g_gaps = 0, g_dups = 0, g_retx = 0, g_txOk = 0, g_txFail = 0;
 uint32_t g_badRamp = 0, g_noRoom = 0;
+esp_err_t g_lastTxErr = ESP_OK;
+volatile uint32_t g_inflight = 0;
+uint32_t g_inflightMs = 0;
+
+void onRadioSent(bool ok)
+{
+    (void)ok;
+    if (g_inflight > 0u) g_inflight = g_inflight - 1u;
+}
+
+/* Lugar para un lote (dos tramas) en la cola de la radio. */
+bool radioRoom()
+{
+    if (g_inflight > 0u && (millis() - g_inflightMs) >= INFLIGHT_MS) g_inflight = 0u;
+    return g_inflight + 2u <= RADIO_INFLIGHT;
+}
 
 /* SD: la escribe y la lee SOLO la tarea; el lazo pide por banderas. */
 SPIClass g_spi(LIVE_SD_SPI_HOST);
@@ -97,6 +121,10 @@ bool g_sdMounted = false;
 uint64_t g_sdFreeBytes = 0;
 volatile bool g_sdOpen = false;
 volatile bool g_sdFull = false;
+volatile bool g_sdErr = false;   /* fallo una escritura con lugar libre */
+volatile uint32_t g_sdRetries = 0;
+volatile uint32_t g_sdRemounts = 0;
+volatile int g_sdErrno = 0;
 volatile uint32_t g_sdw = 0;
 volatile uint8_t g_sdReadState = 0;     /* 0 libre, 1 pedido, 2 listo, 3 error */
 volatile uint32_t g_sdReadSeq = 0;
@@ -229,7 +257,13 @@ void simService()
 esp_err_t sendRaw(const uint8_t *d, size_t n)
 {
     if (g_simOn) return simReceive(d, n);
-    return g_radio ? g_radio(d, n) : ESP_FAIL;
+    if (!g_radio) return ESP_FAIL;
+    const esp_err_t err = g_radio(d, n);
+    if (err == ESP_OK) {
+        g_inflight = g_inflight + 1u;
+        g_inflightMs = millis();
+    }
+    return err;
 }
 
 /* Un lote son dos tramas de 15 muestras. Tiempo real lleva lote de 32 bits;
@@ -262,13 +296,27 @@ bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt)
             m.crc = xorCrc((const uint8_t *)&m, sizeof(m) - 1);
             err = sendRaw((const uint8_t *)&m, sizeof(m));
         }
-        if (err != ESP_OK) { g_txFail++; return false; }
+        if (err != ESP_OK) { g_txFail++; g_lastTxErr = err; return false; }
     }
     g_txOk++;
     return true;
 }
 
 /* ── Tarea de la SD ────────────────────────────────────────────────────── */
+/* Desmonta, vuelve a montar y reabre /live.bin sin truncar. Si la tarjeta
+ * quedo colgada tras una escritura fallida, esto la reinicia. Corre en la
+ * tarea, con el mutex tomado. */
+bool sdRemount()
+{
+    g_sdRemounts = g_sdRemounts + 1u;
+    g_file.close();
+    SD.end();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!SD.begin(LIVE_SD_CS, g_spi, LIVE_SD_HZ, "/sd", 5, false)) return false;
+    g_file = SD.open(SD_PATH, "r+");
+    return (bool)g_file;
+}
+
 void sdTaskFn(void *)
 {
     uint32_t lastFlushMs = 0;
@@ -285,7 +333,27 @@ void sdTaskFn(void *)
             for (int n = 0; n < 8 && !g_sdFull && g_sdw < g_recv; n++) {
                 const uint64_t pos = (uint64_t)g_sdw * BATCH_BYTES;
                 if (g_file.position() != pos && !g_file.seek(pos)) { g_sdFull = true; break; }
-                if (g_file.write((const uint8_t *)slotPtr(g_sdw), BATCH_BYTES) != BATCH_BYTES) {
+                /* Con la radio transmitiendo alguna escritura falla y la
+                 * siguiente anda: se reintenta antes de darla por perdida. */
+                bool ok = false;
+                for (int intento = 0; intento < 6 && !ok; intento++) {
+                    if (intento > 0) {
+                        g_sdRetries = g_sdRetries + 1u;
+                        /* Del tercer intento en adelante, remontar. */
+                        if (intento >= 3) {
+                            if (!sdRemount()) continue;
+                        } else {
+                            vTaskDelay(pdMS_TO_TICKS(20));
+                        }
+                        if (!g_file.seek(pos)) continue;
+                    }
+                    errno = 0;
+                    ok = g_file.write((const uint8_t *)slotPtr(g_sdw), BATCH_BYTES) == BATCH_BYTES;
+                    if (!ok) g_sdErrno = errno;
+                }
+                if (!ok) {
+                    /* Llena si ya no entra otro lote; si no, fue un error. */
+                    if (pos + 2u * BATCH_BYTES < g_sdFreeBytes) g_sdErr = true;
                     g_sdFull = true;
                     break;
                 }
@@ -401,7 +469,8 @@ void serviceRealtime()
         g_sdReadState = 0u;
     }
 
-    if (g_mack < g_txNext && (now - g_mackMs) >= RTO_MS && (now - g_retxMs) >= RTO_MS) {
+    if (g_mack < g_txNext && (now - g_mackMs) >= RTO_MS && (now - g_retxMs) >= RTO_MS &&
+        radioRoom()) {
         g_retxMs = now;
         retransmit(g_mack);
         int budget = 7;
@@ -414,6 +483,7 @@ void serviceRealtime()
 
     for (int budget = 4; budget > 0; budget--) {
         if (g_txNext >= g_recv || (g_txNext - g_mack) >= MASTER_WINDOW) break;
+        if (!radioRoom()) break;
         if (!sendBatch(g_txNext, slotPtr(g_txNext), true)) break;
         g_txNext++;
     }
@@ -427,11 +497,14 @@ void begin(PsocUART *psoc, RawSendFn send, uint8_t nodeId)
 {
     g_psoc = psoc;
     g_radio = send;
+    espnowSentHook() = onRadioSent;
     g_node = nodeId;
     for (uint32_t i = 0; i < 256; i++) g_simTag[i] = NONE;
     if (!g_sdMutex) g_sdMutex = xSemaphoreCreateMutex();
     if (!g_sdTask) {
-        xTaskCreatePinnedToCore(sdTaskFn, "live_sd", 4096, nullptr, 1, &g_sdTask, 0);
+        /* Nucleo 1, con loop(): en el 0 la tarea WiFi (mas prioritaria) la
+         * dejaba sin CPU en plena transaccion y la SD quedaba en error. */
+        xTaskCreatePinnedToCore(sdTaskFn, "live_sd", 4096, nullptr, 1, &g_sdTask, 1);
     }
     sdMount();
     SLAVE_LOG_PRINTF("[LIVE] SD %s libre=%llu MB\n", g_sdMounted ? "ok" : "ausente",
@@ -446,6 +519,8 @@ int32_t prepare(const Config &c)
     uint32_t want;
     if (c.storage == CAPMODE_STORAGE_PSOC) {
         want = PSOC_RT_RING;
+    } else if (c.storage == CAPMODE_STORAGE_SD) {
+        want = SD_RT_RING;
     } else {
         want = MAX_PAGES * PAGE_BATCHES;
         if (n != 0u && n < want) want = n;
@@ -468,6 +543,10 @@ int32_t prepare(const Config &c)
         g_file = SD.open(SD_PATH, "w+");
         const bool ok = (bool)g_file;
         g_sdFull = false;
+        g_sdErr = false;
+        g_sdRetries = 0;
+        g_sdRemounts = 0;
+        g_sdErrno = 0;
         g_sdw = 0;
         g_sdReadState = 0;
         g_sdOpen = ok;
@@ -657,6 +736,7 @@ bool finished()
 
 uint8_t endReason()
 {
+    if (g_sdErr) return STREAM_END_ERROR;
     if (g_sdFull) return STREAM_END_SD_FULL;
     if (g_overrun) return STREAM_END_NO_MEMORY;
     if (g_stopReq) return STREAM_END_STOP;
@@ -689,7 +769,7 @@ void printStatus()
     LIVE_RAW("#LIVE act=%u st=%u rt=%u n=%lu cap=%lu recv=%lu tail=%lu sdw=%lu tx=%lu mack=%lu "
              "total=%ld done=%u ovr=%u sdfull=%u gaps=%lu dups=%lu noroom=%lu retx=%lu "
              "txok=%lu txfail=%lu badramp=%lu sim=%u srx=%lu snext=%lu sdup=%lu sdrop=%lu "
-             "swin=%lu sbad=%lu heap=%u\n",
+             "swin=%lu sbad=%lu heap=%u txerr=0x%x inflight=%lu sdretry=%lu remount=%lu errno=%d\n",
              (unsigned)g_active, (unsigned)g_cfg.storage, (unsigned)g_cfg.realtime,
              (unsigned long)g_cfg.nBatches, (unsigned long)g_cap,
              (unsigned long)g_recv, (unsigned long)(g_active ? tailNow() : 0u),
@@ -700,7 +780,9 @@ void printStatus()
              (unsigned long)g_retx, (unsigned long)g_txOk, (unsigned long)g_txFail,
              (unsigned long)g_badRamp, (unsigned)g_simOn, (unsigned long)g_simRx,
              (unsigned long)g_simNext, (unsigned long)g_simDup, (unsigned long)g_simDrop,
-             (unsigned long)g_simWin, (unsigned long)g_simBad, (unsigned)ESP.getFreeHeap());
+             (unsigned long)g_simWin, (unsigned long)g_simBad, (unsigned)ESP.getFreeHeap(), (unsigned)g_lastTxErr,
+             (unsigned long)g_inflight, (unsigned long)g_sdRetries,
+             (unsigned long)g_sdRemounts, g_sdErrno);
 }
 
 void simMaster(bool on, uint8_t lossPct)

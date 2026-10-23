@@ -15,6 +15,7 @@
  *     cmd 0xA5: request status  param: ignorado
  *     cmd 0xA7: debug broadcast param: 0/1
  *     cmd 0xB0: scope multi-start param: n_batches, 0=cancelar
+ *     cmd 0xAF: modo de captura   param: CAPMODE_* (sync_protocol.h)
  *
  *   Comando "set N" 16 bits (5 bytes):
  *     [0xAB][cmd][n_lo][n_hi][cmd^n_lo^n_hi]
