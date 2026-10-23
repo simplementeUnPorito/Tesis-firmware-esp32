@@ -1,9 +1,9 @@
 // data_store.js — per-node circular sample buffers and acquisition stats.
 // Mirrors python/geophone_scope/data_store.py (NodeData/DataStore). Buffers
-// are backed by a fixed-capacity RingBuffer (Float64Array) instead of a
-// maxlen-deque, since JS has no built-in bounded queue with O(1) push+evict.
+// use fixed-capacity rings for live plotting and optional chunked stores for
+// the complete unlimited capture.
 
-import * as cfg from './config.js?v=field-study-31';
+import * as cfg from './config.js?v=field-study-32';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -59,6 +59,51 @@ export class RingBuffer {
   }
 }
 
+/** Growable Float64 storage in bounded chunks, used only by unlimited captures. */
+export class ChunkedFloat64Store {
+  constructor(chunkSize = 1_000_000) {
+    this.chunkSize = Math.max(1, chunkSize | 0);
+    this.chunks = [];
+    this.length = 0;
+  }
+
+  push(value) {
+    const offset = this.length % this.chunkSize;
+    if (offset === 0) this.chunks.push(new Float64Array(this.chunkSize));
+    this.chunks[this.chunks.length - 1][offset] = value;
+    this.length++;
+  }
+
+  append(values) {
+    let sourceAt = 0;
+    while (sourceAt < values.length) {
+      const offset = this.length % this.chunkSize;
+      if (offset === 0) this.chunks.push(new Float64Array(this.chunkSize));
+      const count = Math.min(this.chunkSize - offset, values.length - sourceAt);
+      this.chunks[this.chunks.length - 1].set(values.subarray(sourceAt, sourceAt + count), offset);
+      sourceAt += count;
+      this.length += count;
+    }
+  }
+
+  toArray() {
+    const out = new Float64Array(this.length);
+    let at = 0;
+    for (const chunk of this.chunks) {
+      const count = Math.min(chunk.length, this.length - at);
+      if (count <= 0) break;
+      out.set(count === chunk.length ? chunk : chunk.subarray(0, count), at);
+      at += count;
+    }
+    return out;
+  }
+
+  clear() {
+    this.chunks = [];
+    this.length = 0;
+  }
+}
+
 function meanStd(arr) {
   const n = arr.length;
   let sum = 0;
@@ -82,6 +127,8 @@ export class NodeData {
     // Voltage sample buffers
     this.rawBuf = new RingBuffer(maxBuf);
     this.filtBuf = new RingBuffer(maxBuf);
+    this.fullRawStore = null;
+    this.fullFiltStore = null;
     this.rawSum = 0;
 
     // FIR filter state (populated by signal_proc.js — Phase 4)
@@ -124,6 +171,8 @@ export class NodeData {
     this.ctlStatus = 0xFF; // lazo del PSoC I2C: bit0 en banda, bits1-3 estado, bit4 perfil
     this.sdPresent = false; // FAT/SD detectada por el PSoC (solo esclavos GEO, ver plan_2929_decimation_sd.md)
     this.sdEnabled = false; // estado del toggle SD confirmado por ACK (0xC0)
+    this.ramBatches = null; // capacidad HELLO 0x0C; null hasta recibirla
+    this.sdBatches = null;  // capacidad HELLO 0x0D; 0 significa sin SD
 
     // ADC sample rate — depends on the analog front-end / PSoC programming
     // (and can be reconfigured), so it must ALWAYS come from the hardware
@@ -179,6 +228,33 @@ export class NodeData {
     for (let i = 0; i < raw.length; i++) this.rawSum += raw[i];
   }
 
+  setFullCaptureEnabled(enabled) {
+    if (enabled) {
+      this.fullRawStore = new ChunkedFloat64Store();
+      this.fullFiltStore = new ChunkedFloat64Store();
+    } else {
+      this.fullRawStore = null;
+      this.fullFiltStore = null;
+    }
+  }
+
+  get fullCaptureEnabled() { return this.fullRawStore !== null; }
+  get captureRawLength() { return this.fullRawStore?.length ?? this.rawBuf.length; }
+  get captureFiltLength() { return this.fullFiltStore?.length ?? this.filtBuf.length; }
+  captureRawArray() { return this.fullRawStore ? this.fullRawStore.toArray() : this.rawBuf.toArray(); }
+  captureFiltArray() { return this.fullFiltStore ? this.fullFiltStore.toArray() : this.filtBuf.toArray(); }
+
+  pushRaw(value) {
+    if (this.fullRawStore) this.fullRawStore.push(value);
+    return this.rawBuf.push(value);
+  }
+
+  setFullFiltered(values) {
+    if (!this.fullFiltStore) return;
+    this.fullFiltStore.clear();
+    this.fullFiltStore.append(values);
+  }
+
   /** Marcas de SD relativas a un arreglo de `length` muestras que termina en la última recibida. */
   sdMarksFor(length) {
     const first = this.totalSamples - length;
@@ -191,6 +267,8 @@ export class NodeData {
   clear() {
     this.rawBuf.clear();
     this.filtBuf.clear();
+    if (this.fullRawStore) this.fullRawStore.clear();
+    if (this.fullFiltStore) this.fullFiltStore.clear();
     this.rawSum = 0;
     this.filtZi = null;
     this.batchCount = 0;
@@ -246,6 +324,10 @@ export class DataStore {
   /** Resize every node's buffer. */
   resizeAll(newMax) {
     for (const nd of this.nodes) nd.resizeBuf(newMax);
+  }
+
+  setFullCaptureEnabled(enabled) {
+    for (let i = 1; i < this.nodes.length; i++) this.nodes[i].setFullCaptureEnabled(enabled);
   }
 }
 

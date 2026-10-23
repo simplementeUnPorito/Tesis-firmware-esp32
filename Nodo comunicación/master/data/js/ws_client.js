@@ -4,8 +4,8 @@
 // (packet_received / connection_changed / log_message signals) using
 // CustomEvents instead of Qt signals.
 
-import { decodePacket } from './protocol.js';
-import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-31';
+import { decodePacket } from './protocol.js?v=field-study-32';
+import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-32';
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;

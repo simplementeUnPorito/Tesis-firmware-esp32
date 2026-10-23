@@ -40,6 +40,7 @@
  *   [0x56][node_id][type][b2][b1][b0]
  *   node_id : 0x00 = maestro (martillo), 0x01-0x0N = esclavos
  *   type    : 0x00 dato, 0x01 heartbeat, 0x07 ACK, 0xFC START RTT/2 us,
+ *             0xFD STATUS/HELLO (b2=subtipo; 0x0C=RAM, 0x0D=SD, uint16 BE),
  *             0xFE ready (n_nodes)
  */
 
@@ -79,7 +80,8 @@ public:
                         uint16_t fs = 0, uint8_t hw_class = 0xFF,
                         uint8_t sd_present = 0xFF, uint8_t link_model = 0xFF,
                         uint8_t ctl_status = 0xFF, uint8_t pga_code = 0xFF,
-                        uint8_t pgaout_code = 0xFF);
+                        uint8_t pgaout_code = 0xFF, uint32_t ram_batches = 0,
+                        uint32_t sd_batches = 0);
 
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
@@ -225,7 +227,8 @@ inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)
 inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6],
                                             uint16_t fs, uint8_t hw_class, uint8_t sd_present,
                                             uint8_t link_model, uint8_t ctl_status,
-                                            uint8_t pga_code, uint8_t pgaout_code)
+                                             uint8_t pga_code, uint8_t pgaout_code,
+                                             uint32_t ram_batches, uint32_t sd_batches)
 {
     /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
     uint8_t fs_code = (fs >= 100u) ? (uint8_t)((fs + 50u) / 100u) : 0u;
@@ -273,6 +276,16 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
         uint8_t pgaoutPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0B, pgaout_code, 0x00 };
         _emit(pgaoutPkt);
     }
+    /* b2=0x0C/0x0D: capacidades HELLO uint16 big-endian (saturadas a 65535),
+     * con el mismo layout que Fs exacta (0x05). SD=0 significa sin SD. */
+    const uint16_t ram16 = (ram_batches > 0xFFFFu) ? 0xFFFFu : (uint16_t)ram_batches;
+    const uint16_t sd16 = (sd_batches > 0xFFFFu) ? 0xFFFFu : (uint16_t)sd_batches;
+    uint8_t ramPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0C,
+                          (uint8_t)((ram16 >> 8) & 0xFFu), (uint8_t)(ram16 & 0xFFu) };
+    uint8_t sdCapPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0D,
+                            (uint8_t)((sd16 >> 8) & 0xFFu), (uint8_t)(sd16 & 0xFFu) };
+    _emit(ramPkt);
+    _emit(sdCapPkt);
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */
         uint8_t m0[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x02, mac[0], mac[1] };

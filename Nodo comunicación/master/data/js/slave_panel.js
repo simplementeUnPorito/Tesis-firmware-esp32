@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-study-31';
+import * as cfg from './config.js?v=field-study-32';
 
 // -- DOM helpers -------------------------------------------------------------
 

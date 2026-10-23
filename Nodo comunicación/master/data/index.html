@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-study-31">
+  <link rel="stylesheet" href="/css/style.css?v=field-study-32">
 </head>
 <body>
   <header>
@@ -66,10 +66,27 @@
             <span id="decim-fs-preview" class="status-text">2604 Hz</span>
           </div>
           <div class="row">
-            <label>Duración GEOs <input id="capture-secs" type="number" min="0.1" max="3600" step="0.01" value="3.0" title="Duración GEO; la señal completa se guarda en la SD del PSoC"> s</label>
-            <label>Duración HAMMER <input id="capture-secs-hammer" type="number" min="0" max="3600" step="0.1" value="" placeholder="= GEOs" title="HAMMER usa RAM y se limita automáticamente a 512 lotes"> s</label>
-            <button id="btn-max-ram" title="Fija GEO al máximo de RAM sin SD (416 lotes)">Máx RAM (416)</button>
-            <button id="btn-max-batches" title="Fija GEO al máximo de la SD del PSoC">Máx SD (60000)</button>
+            <label>Modo de captura
+              <select id="capture-mode">
+                <option value="async">Asincrónico</option>
+                <option value="realtime-limited">Tiempo real con límite</option>
+                <option value="realtime-unlimited">Tiempo real sin límite</option>
+              </select>
+            </label>
+            <label>Almacenamiento
+              <select id="capture-storage">
+                <option value="0">RAM del PSoC</option>
+                <option value="1">RAM compartida (PSoC + ESP)</option>
+                <option value="2">RAM + SD</option>
+              </select>
+            </label>
+            <label id="capture-fast-wrap"><input id="capture-fast" type="checkbox"> Descarga rápida</label>
+          </div>
+          <div class="row">
+            <label class="capture-duration-control">Duración GEOs <input id="capture-secs" type="number" min="0.1" max="3600" step="0.01" value="3.0"> s</label>
+            <label class="capture-duration-control">Duración HAMMER <input id="capture-secs-hammer" type="number" min="0" max="3600" step="0.1" value="" placeholder="= GEOs"> s</label>
+            <button class="capture-duration-control" id="btn-max-ram" title="Fija GEO al máximo de RAM">Máx RAM</button>
+            <button class="capture-duration-control" id="btn-max-batches" title="Fija GEO al máximo de SD">Máx SD</button>
             <button id="btn-start">START</button>
             <button id="btn-preserve">Descontar</button>
             <span id="capture-batches" class="status-text">--</span>
@@ -180,6 +197,6 @@
     </div>
   </div>
 
-  <script type="module" src="/js/app.js?v=field-study-31"></script>
+  <script type="module" src="/js/app.js?v=field-study-32"></script>
 </body>
 </html>

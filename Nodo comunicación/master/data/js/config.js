@@ -22,6 +22,7 @@ export const CMD_START = 0xA3;
 export const CMD_STOP = 0xA4;
 export const CMD_STATUS = 0xA5;
 export const CMD_DEBUG = 0xA7;
+export const CMD_CAPTURE_MODE = 0xAF;
 export const CMD_SET_RECLEN = 0xAE;
 export const CMD_SET_RECLEN_HAMMER = 0xAD;  /* largo propio de nodos HAMMER; 0 = mismo que GEO */
 
@@ -83,6 +84,7 @@ export const PSOC_CAPTURE_MAX_BATCHES = 60000;
 // medido 2026-10-16: segun el heap entran 416 a 448; 416 es el valor seguro. El PSoC aguanta 512, pero el cuello es
 // el ESP; pedir 512 sin SD lo dejaba trabado. Por encima, el esclavo recorta.
 export const PSOC_RAM_CAPTURE_MAX_BATCHES = 416;
+export const PSOC_LOCAL_RAM_CAPTURE_MAX_BATCHES = 512;
 export const MAX_CAPTURE_SECONDS = 3600;
 export const TEST_DEFAULT_SECONDS = 0.2;
 // Placeholder sample counts for buffer/display sizing before any slave's

@@ -2,16 +2,16 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-31';
-import { WsClient } from './ws_client.js?v=field-study-31';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-31';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-31';
-import { PlotArea } from './plot.js?v=field-study-31';
-import { SpectrumArea } from './spectrum.js?v=field-study-31';
-import { SlavePanel } from './slave_panel.js?v=field-study-31';
-import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-31';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-31';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-31';
+import * as cfg from './config.js?v=field-study-32';
+import { WsClient } from './ws_client.js?v=field-study-32';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-32';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-32';
+import { PlotArea } from './plot.js?v=field-study-32';
+import { SpectrumArea } from './spectrum.js?v=field-study-32';
+import { SlavePanel } from './slave_panel.js?v=field-study-32';
+import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-32';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-32';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-32';
 
 const $ = (id) => document.getElementById(id);
 
@@ -52,6 +52,9 @@ let currentCaptureSignature = '';
 let pendingStart = null;
 
 const START_AUTO_ARM_TIMEOUT_MS = 4500;
+const UNLIMITED_SAMPLE_BUDGET = 150_000_000;
+let unlimitedSamplesStored = 0;
+let unlimitedStopSent = false;
 
 const SETTINGS_PREFIX = 'geophone_scope_web.';
 // Versionar la Fs evita restaurar valores derivados de la antigua base
@@ -66,6 +69,15 @@ const SHOW_ENV_FILT_KEY = `${SETTINGS_PREFIX}show_env_filt`;
 const SHOW_HILBERT_KEY = `${SETTINGS_PREFIX}show_hilbert`;
 const DISPLAY_DC_REMOVE_KEY = `${SETTINGS_PREFIX}display_dc_remove`;
 const WS_TOKEN_KEY  = `${SETTINGS_PREFIX}ws_token`;
+const CAPTURE_MODE_KEY = `${SETTINGS_PREFIX}capture_mode_v1`;
+const CAPTURE_STORAGE_KEY = `${SETTINGS_PREFIX}capture_storage_v1`;
+const CAPTURE_FAST_KEY = `${SETTINGS_PREFIX}capture_fast_v1`;
+const CAPTURE_MODE_ASYNC = 'async';
+const CAPTURE_MODE_RT_LIMITED = 'realtime-limited';
+const CAPTURE_MODE_RT_UNLIMITED = 'realtime-unlimited';
+const STORAGE_PSOC_RAM = 0;
+const STORAGE_SHARED_RAM = 1;
+const STORAGE_ESP_SD = 2;
 
 const CURVE_SOURCE_DEFS = [
   { key: 'raw', checkboxId: 'chk-show-raw', label: 'Cruda', color: cfg.RAW_COLOR },
@@ -389,8 +401,8 @@ function buildSpectrumSources(raw, filt) {
 
 function nodeConnectedForCapture(nd, index) {
   return index > 0
-    && (nd.visible || nd.rawBuf.length > 0 || nd.filtBuf.length > 0)
-    && (nd.fsKnown || !!nd.mac || nd.hwClass !== 0xFF || nd.rawBuf.length > 0 || nd.filtBuf.length > 0);
+    && (nd.visible || nd.captureRawLength > 0 || nd.captureFiltLength > 0)
+    && (nd.fsKnown || !!nd.mac || nd.hwClass !== 0xFF || nd.captureRawLength > 0 || nd.captureFiltLength > 0);
 }
 
 function nodeRole(nd) {
@@ -410,7 +422,7 @@ function offsetFromHammer(nd) {
 }
 
 function nodeSnapshot(nd, index, options = {}) {
-  const rawOrig = nd.rawBuf.toArray();
+  const rawOrig = nd.captureRawArray();
   const filtOrig = filteredArrayForSnapshot(index, rawOrig);
   const storeDcRemoved = !!options.storeDcRemoved;
   const rawDc = signalMean(rawOrig);
@@ -765,6 +777,71 @@ function captureSeconds() {
   return clamp(secs, 0.1, cfg.MAX_CAPTURE_SECONDS);
 }
 
+function captureMode() {
+  return $('capture-mode')?.value || CAPTURE_MODE_ASYNC;
+}
+
+function captureStorage() {
+  return clamp(parseInt($('capture-storage')?.value, 10) || 0, STORAGE_PSOC_RAM, STORAGE_ESP_SD);
+}
+
+function captureIsRealtime() {
+  return captureMode() !== CAPTURE_MODE_ASYNC;
+}
+
+function captureIsUnlimited() {
+  return captureMode() === CAPTURE_MODE_RT_UNLIMITED;
+}
+
+function captureModeByte() {
+  let mode = captureStorage();
+  if (captureIsRealtime()) mode |= 0x04;
+  if (captureMode() === CAPTURE_MODE_ASYNC && $('capture-fast')?.checked) mode |= 0x08;
+  return mode;
+}
+
+function capacityNodes(role) {
+  const out = [];
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    const nd = data.nodes[i];
+    const connected = nd.visible && (!!nd.mac || nd.psocOk !== null || nd.hwClass !== 0xFF);
+    if (connected && nodeRole(nd) === role) out.push(nd);
+  }
+  return out;
+}
+
+function geoCapacityInfo(storage = captureStorage()) {
+  if (storage === STORAGE_PSOC_RAM) {
+    const max = captureMode() === CAPTURE_MODE_ASYNC
+      ? cfg.PSOC_RAM_CAPTURE_MAX_BATCHES
+      : cfg.PSOC_LOCAL_RAM_CAPTURE_MAX_BATCHES;
+    return { max, reported: true };
+  }
+  const field = storage === STORAGE_SHARED_RAM ? 'ramBatches' : 'sdBatches';
+  const reported = capacityNodes('geo')
+    .map((nd) => nd[field])
+    .filter((value) => value !== null && value !== undefined);
+  if (reported.length) {
+    const max = Math.min(...reported, storage === STORAGE_ESP_SD ? 0xFFFF : Number.MAX_SAFE_INTEGER);
+    return { max, reported: true };
+  }
+  return {
+    max: storage === STORAGE_SHARED_RAM
+      ? cfg.PSOC_RAM_CAPTURE_MAX_BATCHES
+      : cfg.PSOC_CAPTURE_MAX_BATCHES,
+    reported: false,
+  };
+}
+
+function hammerCapacityInfo() {
+  const reported = capacityNodes('hammer')
+    .map((nd) => nd.ramBatches)
+    .filter((value) => value !== null && value !== undefined && value > 0);
+  return reported.length
+    ? { max: Math.min(...reported), reported: true }
+    : { max: cfg.PSOC_LOCAL_RAM_CAPTURE_MAX_BATCHES, reported: false };
+}
+
 /* Duración propia de los nodos HAMMER. null = campo vacío/0 ⇒ usar la misma
  * que los GEOs (el maestro recibe 0xAD=0 y vuelve al largo único legado). */
 function hammerCaptureSeconds() {
@@ -775,13 +852,14 @@ function hammerCaptureSeconds() {
 }
 
 function hammerCaptureBatches() {
+  if (captureIsUnlimited()) return 0;
+  const max = hammerCapacityInfo().max;
   const secs = hammerCaptureSeconds();
   if (secs === null) {
     const geoBatches = captureBatches();
-    return geoBatches > cfg.PSOC_RAM_CAPTURE_MAX_BATCHES
-      ? cfg.PSOC_RAM_CAPTURE_MAX_BATCHES : 0;
+    return geoBatches > max ? max : 0;
   }
-  return Math.min(batchesForSeconds(secs), cfg.PSOC_RAM_CAPTURE_MAX_BATCHES);
+  return Math.min(batchesForSeconds(secs), max);
 }
 
 /* Manda al maestro el largo HAMMER (0xAD) antes de cualquier RECLEN/START.
@@ -799,20 +877,23 @@ function batchesForSeconds(seconds) {
   return clamp(Math.max(1, batches), 1, cfg.PSOC_CAPTURE_MAX_BATCHES);
 }
 
-function captureLimitInfo(seconds) {
+function captureLimitInfo(seconds, role = 'geo') {
   const fs = currentFsHz();
   if (!fs) return { n: 0, actualSecs: 0, capped: false };
   const requested = Math.max(1, Math.ceil((seconds * fs) / cfg.SAMPLES_PER_BATCH));
-  const n = clamp(requested, 1, cfg.PSOC_CAPTURE_MAX_BATCHES);
+  const capacity = role === 'hammer' ? hammerCapacityInfo() : geoCapacityInfo();
+  const n = capacity.max > 0 ? clamp(requested, 1, capacity.max) : 0;
   return {
     n,
     actualSecs: secondsForBatches(n),
     capped: requested > n,
+    max: capacity.max,
+    reported: capacity.reported,
   };
 }
 
 function captureBatches() {
-  return batchesForSeconds(captureSeconds());
+  return captureIsUnlimited() ? 0 : captureLimitInfo(captureSeconds()).n;
 }
 
 function secondsForBatches(nBatches) {
@@ -828,23 +909,28 @@ function updateCapturePreview() {
     el.textContent = 'esperando Fs del esclavo (HELLO)…';
     return;
   }
+  if (captureIsUnlimited()) {
+    el.textContent = 'Sin límite · termina con STOP · tope del navegador: 150 millones de muestras';
+    return;
+  }
   const secs = captureSeconds();
   const info = captureLimitInfo(secs);
   const capped = info.capped ? ` (max; pedido ${secs.toFixed(2)} s)` : '';
   const hSecs = hammerCaptureSeconds();
   let hammerTxt = '';
+  const hCapacity = hammerCapacityInfo();
   if (hSecs !== null) {
-    const hInfo = captureLimitInfo(hSecs);
-    hammerTxt = ` · HAMMER ${hInfo.n} lotes / ${hInfo.actualSecs.toFixed(2)} s`;
+    const hInfo = captureLimitInfo(hSecs, 'hammer');
+    hammerTxt = ` · HAMMER ${hInfo.n} lotes / ${hInfo.actualSecs.toFixed(2)} s` +
+      (hInfo.capped ? ` (máx ${secondsForBatches(hCapacity.max).toFixed(2)} s)` : '');
+  } else if (info.n > hCapacity.max) {
+    hammerTxt = ` · HAMMER ${hCapacity.max} lotes / ` +
+      `${secondsForBatches(hCapacity.max).toFixed(2)} s (máx)`;
   }
-  // Tope sin SD: 512 lotes de muestras YA decimadas, asi que crece con N
-  // (decim 2 => el doble de segundos, decim 3 => el triple).
-  const maxRamSecs = (cfg.PSOC_RAM_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fs;
-  const usaSd = info.n > cfg.PSOC_RAM_CAPTURE_MAX_BATCHES;
-  const sdTxt = usaSd
-    ? ` · USA SD (sin SD hasta ${maxRamSecs.toFixed(2)} s)`
-    : ` · sin SD (tope ${maxRamSecs.toFixed(2)} s)`;
-  el.textContent = `GEO ${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}${hammerTxt}${sdTxt}`;
+  const fallback = info.reported ? '' : ' · capacidad predeterminada (sin HELLO)';
+  const maxSecs = secondsForBatches(info.max);
+  el.textContent = `GEO ${info.n} lotes / real ${info.actualSecs.toFixed(2)} s${capped}` +
+    `${hammerTxt} · máx ${info.max} lotes / ${maxSecs.toFixed(2)} s${fallback}`;
 }
 
 /* W1 (auditoría 2026-07-11): fija Duración GEOs al techo de RAM (512 lotes)
@@ -855,14 +941,18 @@ function setCaptureToMaxRamBatches() {
     appendLog('Max RAM cancelado: esperando Fs del esclavo');
     return;
   }
-  const secs = (cfg.PSOC_RAM_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fs;
+  if (captureStorage() === STORAGE_ESP_SD) $('capture-storage').value = String(STORAGE_SHARED_RAM);
+  saveSetting(CAPTURE_STORAGE_KEY, captureStorage());
+  const capacity = geoCapacityInfo();
+  const secs = secondsForBatches(capacity.max);
   const el = $('capture-secs');
   // floor: con ceil el redondeo (5.90 s) recomputaba 513 lotes y el esclavo
   // clampaba a 512 — cosmético pero confuso (W6, visto en E10).
   if (el) el.value = (Math.floor(secs * 100) / 100).toFixed(2);
   updateCapturePreview();
   syncDisplayWindowToCaptureDuration();
-  appendLog(`Duracion fijada al maximo RAM: ${cfg.PSOC_RAM_CAPTURE_MAX_BATCHES} lotes (~${secs.toFixed(2)} s)`);
+  appendLog(`Duración fijada al máximo RAM: ${capacity.max} lotes (~${secs.toFixed(2)} s)` +
+            (capacity.reported ? '' : ' usando el valor predeterminado; falta HELLO'));
 }
 
 function setCaptureToMaxBatches() {
@@ -871,13 +961,45 @@ function setCaptureToMaxBatches() {
     appendLog('Max paquetes cancelado: esperando Fs del esclavo');
     return;
   }
-  const secs = (cfg.PSOC_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fs;
+  $('capture-storage').value = String(STORAGE_ESP_SD);
+  saveSetting(CAPTURE_STORAGE_KEY, captureStorage());
+  const capacity = geoCapacityInfo();
+  if (capacity.max <= 0) {
+    appendLog('Máx SD cancelado: un GEO conectado informa sin SD');
+    updateCaptureModeControls();
+    return;
+  }
+  const secs = secondsForBatches(capacity.max);
   const roundedUp = Math.ceil(secs * 100) / 100;
   const el = $('capture-secs');
   if (el) el.value = roundedUp.toFixed(2);
   updateCapturePreview();
   syncDisplayWindowToCaptureDuration();
-  appendLog(`Duracion fijada al maximo: ${cfg.PSOC_CAPTURE_MAX_BATCHES} lotes (~${secs.toFixed(2)} s)`);
+  appendLog(`Duración fijada al máximo SD: ${capacity.max} lotes (~${secs.toFixed(2)} s)` +
+            (capacity.reported ? '' : ' usando el valor predeterminado; falta HELLO'));
+}
+
+function updateCaptureModeControls(logCorrection = false) {
+  const mode = captureMode();
+  const storageEl = $('capture-storage');
+  const psocOption = storageEl?.querySelector('option[value="0"]');
+  const unlimited = mode === CAPTURE_MODE_RT_UNLIMITED;
+  if (psocOption) psocOption.disabled = unlimited;
+  if (unlimited && captureStorage() === STORAGE_PSOC_RAM) {
+    storageEl.value = String(STORAGE_SHARED_RAM);
+    if (logCorrection) appendLog('Tiempo real sin límite: almacenamiento cambiado a RAM compartida');
+  }
+  const fastWrap = $('capture-fast-wrap');
+  if (fastWrap) fastWrap.hidden = mode !== CAPTURE_MODE_ASYNC;
+  for (const control of document.querySelectorAll('.capture-duration-control')) {
+    control.hidden = unlimited;
+    const input = control.matches('input,button,select') ? control : control.querySelector('input,button,select');
+    if (input) input.disabled = unlimited;
+  }
+  saveSetting(CAPTURE_MODE_KEY, mode);
+  saveSetting(CAPTURE_STORAGE_KEY, captureStorage());
+  saveSetting(CAPTURE_FAST_KEY, $('capture-fast')?.checked ? 1 : 0);
+  updateCapturePreview();
 }
 
 function syncDisplayWindowToCaptureDuration() {
@@ -1103,9 +1225,27 @@ function clearPendingStart() {
 }
 
 function makeStartRequestInfo() {
+  const modeByte = captureModeByte();
+  if (captureIsUnlimited()) {
+    return {
+      requestedSecs: 0,
+      info: { n: 0, actualSecs: 0, capped: false },
+      n: 0,
+      unlimited: true,
+      streams: true,
+      modeByte,
+    };
+  }
   const requestedSecs = captureSeconds();
   const info = captureLimitInfo(requestedSecs);
-  return { requestedSecs, info, n: info.n };
+  return {
+    requestedSecs,
+    info,
+    n: info.n,
+    unlimited: false,
+    streams: captureIsRealtime() || !!(modeByte & 0x08),
+    modeByte,
+  };
 }
 
 // Aviso de recorte: pedir mas de 512 lotes sin la SD del PSoC activa hace que
@@ -1122,20 +1262,29 @@ function warnIfRamClamp(n, chIndex) {
 
 // Lotes pedidos en el ultimo START: para avisar si el volcado llega corto.
 let lastStartBatches = 0;
+let lastStartUnlimited = false;
+let lastStartStreams = false;
 
 function runStartCapture(req, source = '') {
   clearPendingStart();
   lastStartBatches = req.n;
+  lastStartUnlimited = req.unlimited;
+  lastStartStreams = req.streams;
+  unlimitedSamplesStored = 0;
+  unlimitedStopSent = false;
   currentCaptureSignature = '';
-  for (let i = 1; i < cfg.MAX_NODES; i++) {
-    if (nodeConnectedForCapture(data.nodes[i], i)) warnIfRamClamp(req.n, i);
-  }
   resizePresentCaptureBuffers(req.n);
+  data.setFullCaptureEnabled(req.unlimited);
   data.clearAll();
   plotArea.clearAll();
   spectrumArea.clearAll();
+  sendStd(cfg.CMD_CAPTURE_MODE, req.modeByte);
   sendHammerRecLen();
   sendStd16(cfg.CMD_START, req.n);
+  if (req.unlimited) {
+    appendLog(`START${source ? ` (${source})` : ''}: tiempo real sin límite; termina con STOP`);
+    return;
+  }
   const capped = req.info.capped ? `, max; pedido ${req.requestedSecs.toFixed(2)} s` : '';
   const suffix = source ? ` (${source})` : '';
   const nHammer = hammerCaptureBatches();
@@ -1304,12 +1453,16 @@ function renderNodeRow(i) {
   const raw = tail.length ? tail[0] : null;
   row.querySelector('.raw').textContent = (raw === null) ? '--' : `${raw.toFixed(4)} V`;
   row.querySelector('.stats').textContent = `${nd.batchCount} lotes / ${nd.totalSamples} muestras`;
+  const capacityText = nd.ramBatches === null && nd.sdBatches === null
+    ? ''
+    : ` RAM ${nd.ramBatches ?? '--'} lotes · ` +
+      (nd.sdBatches === null ? 'SD --' : (nd.sdBatches ? `SD ${nd.sdBatches} lotes` : 'sin SD'));
   row.querySelector('.cfg').textContent =
     `pga=${cfg.GAIN_NAMES[nd.pgaCode] ?? nd.pgaCode}` +
     ` adc=${adcConfigForCode(nd.adcConfigCode).label}` +
     (nd.decimationFactor > 1 ? ` decim=${nd.decimationFactor}` : '') +
     (nd.notchEnabled ? ` notch=N${nd.notchHarm}` : '') +
-    (nd.psocOk === null ? '' : ` psoc=${nd.psocOk ? 'ok' : 'no'}`);
+    (nd.psocOk === null ? '' : ` psoc=${nd.psocOk ? 'ok' : 'no'}`) + capacityText;
 }
 
 function updateSlavePanelStats(chIndex) {
@@ -1344,7 +1497,13 @@ function handleData(nd, pkt) {
     nd.tFirst = performance.now() / 1000;
   }
 
-  const evicted = nd.rawBuf.push(rawVal);
+  let evicted;
+  if (nd.fullCaptureEnabled && unlimitedSamplesStored >= UNLIMITED_SAMPLE_BUDGET) {
+    evicted = nd.rawBuf.push(rawVal);
+  } else {
+    evicted = nd.pushRaw(rawVal);
+    if (nd.fullCaptureEnabled) unlimitedSamplesStored++;
+  }
   nd.rawSum += rawVal - (evicted ?? 0);
   nd.totalSamples++;
   if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
@@ -1355,15 +1514,22 @@ function handleData(nd, pkt) {
   nd.filterDirty = true;
   nd.filterReady = false;
   if (nd.filtBuf.length) nd.filtBuf.clear();
+  if (nd.fullFiltStore?.length) nd.fullFiltStore.clear();
+  if (nd.fullCaptureEnabled && unlimitedSamplesStored >= UNLIMITED_SAMPLE_BUDGET && !unlimitedStopSent) {
+    unlimitedStopSent = true;
+    sendStd(cfg.CMD_STOP, 0);
+    appendLog('memoria del navegador llena');
+  }
 }
 
 function fillRingBuffer(ring, arr) {
   ring.clear();
-  for (let i = 0; i < arr.length; i++) ring.push(arr[i]);
+  const start = Math.max(0, arr.length - ring.capacity);
+  for (let i = start; i < arr.length; i++) ring.push(arr[i]);
 }
 
 function filteredArrayForNode(nd, rawArray = null) {
-  const raw = rawArray || nd.rawBuf.toArray();
+  const raw = rawArray || nd.captureRawArray();
   if (!raw.length) return new Float64Array(0);
   let arr = nd.filtB ? filtFilt(nd.filtB, raw) : new Float64Array(raw);
   if (nd.dcRemove && arr.length > 1) arr = dcRemove(arr);
@@ -1379,7 +1545,7 @@ function filteredArrayForNode(nd, rawArray = null) {
 }
 
 function storedFilteredArray(nd) {
-  return nd && nd.filtBuf.length ? nd.filtBuf.toArray() : new Float64Array(0);
+  return nd && nd.captureFiltLength ? nd.captureFiltArray() : new Float64Array(0);
 }
 
 function filteredArrayForSnapshot(chIndex, rawArray = null) {
@@ -1399,9 +1565,10 @@ function syncZeroPhaseFiltBuffers() {
 
 function reprocessFiltBuf(chIndex, options = {}) {
   const nd = data.nodes[chIndex];
-  const raw = nd.rawBuf.toArray();
+  const raw = nd.captureRawArray();
   if (!raw.length) {
     nd.filtBuf.clear();
+    if (nd.fullFiltStore) nd.fullFiltStore.clear();
     nd.filtZi = null;
     nd.filterDirty = false;
     nd.filterReady = false;
@@ -1419,13 +1586,14 @@ function reprocessFiltBuf(chIndex, options = {}) {
   const arr = filteredArrayForNode(nd, raw);
   nd.filtZi = null;
   fillRingBuffer(nd.filtBuf, arr);
+  nd.setFullFiltered(arr);
   nd.filterDirty = false;
   nd.filterReady = true;
 }
 
 function finalizeNodeFilter(chIndex, reason = '') {
   const nd = data.nodes[chIndex];
-  if (!nd || !nd.rawBuf.length) return false;
+  if (!nd || !nd.captureRawLength) return false;
   nd.captureActive = false;
   reprocessFiltBuf(chIndex, { force: true });
   const panel = panelFor(chIndex);
@@ -1488,16 +1656,27 @@ let finalizeRecovering = false;
 function finalizeCompletedRaw(reason = '') {
   // Los paquetes de muestra no llevan numero de secuencia: si se pierde un
   // tramo, lo que sigue se empalma y el eje de tiempo se acorta sin aviso.
+  if (lastStartUnlimited) {
+    finalizeCompletedRawNow(reason);
+    return;
+  }
   const expected = lastStartBatches * cfg.SAMPLES_PER_BATCH;
   const short = [];
   if (lastStartBatches > 0) {
     for (let i = 1; i < cfg.MAX_NODES; i++) {
-      const got = data.nodes[i].rawBuf.length;
+      const got = data.nodes[i].captureRawLength;
       if (got > 0 && got < expected) short.push([i, got]);
     }
   }
   if (!short.length || finalizeRecovering) {
     finalizeCompletedRawNow(reason);
+    return;
+  }
+  if (lastStartStreams) {
+    for (const [i, got] of short) {
+      appendLog(`AVISO S${i}: llegaron ${got} de ${expected} muestras por WebSocket; captura INCOMPLETA`);
+    }
+    finalizeCompletedRawNow('stream INCOMPLETO');
     return;
   }
   for (const [i, got] of short) {
@@ -1526,7 +1705,7 @@ function finalizeCompletedRawNow(reason = '') {
   let count = 0;
   for (let i = 1; i < cfg.MAX_NODES; i++) {
     const nd = data.nodes[i];
-    if (!nd.rawBuf.length || (!nd.filterDirty && nd.filterReady)) continue;
+    if (!nd.captureRawLength || (!nd.filterDirty && nd.filterReady)) continue;
     if (finalizeNodeFilter(i, reason)) count++;
   }
   if (count) {
@@ -1538,7 +1717,7 @@ function finalizeCompletedRawNow(reason = '') {
 function markNodeFilterDirty(chIndex) {
   const nd = data.nodes[chIndex];
   if (!nd) return;
-  nd.filterDirty = nd.rawBuf.length > 0;
+  nd.filterDirty = nd.captureRawLength > 0;
   nd.filterReady = false;
   nd.filtBuf.clear();
   if (!nd.captureActive) reprocessFiltBuf(chIndex, { force: true });
@@ -1718,6 +1897,7 @@ function scheduleSdEnableLockTimeout(chIndex, expectedEnabled) {
 
 function prepareNodeCapture(chIndex) {
   const nd = data.nodes[chIndex];
+  nd.setFullCaptureEnabled(false);
   nd.clear();
   rebalanceSlaveVisibility(chIndex);
   plotArea.clearNode(chIndex);
@@ -1829,7 +2009,7 @@ function onVerRequested(chIndex) {
     appendLog(`VER Slave ${chIndex} cancelado: esperando Fs real del esclavo (HELLO no recibido aun)`);
     return;
   }
-  const n = captureBatches();
+  const n = captureLimitInfo(captureSeconds()).n;
   const secs = secondsForBatches(n);
   warnIfRamClamp(n, chIndex);
   resizePresentCaptureBuffers(n, chIndex);
@@ -2620,6 +2800,17 @@ function handleStatus(pkt, idx) {
     return;
   }
 
+  if (pkt.helloMacSub === 0x0C || pkt.helloMacSub === 0x0D) {
+    const nd = data.nodes[idx];
+    const value = pkt.helloCapacityBatches;
+    if (pkt.helloMacSub === 0x0C) nd.ramBatches = value;
+    else nd.sdBatches = value;
+    renderNodeRow(idx);
+    updateCapturePreview();
+    appendLog(`HELLO slave=${idx} ${pkt.helloMacSub === 0x0C ? 'ram' : 'sd'}=${value} lotes`);
+    return;
+  }
+
   if (pkt.helloMacSub === 0x0A || pkt.helloMacSub === 0x0B) {
     /* Ganancia real del PSoC. Pisa lo guardado en el navegador, salvo que el
      * usuario tenga un cambio en vuelo para esa etapa. */
@@ -2980,6 +3171,10 @@ $('btn-start').addEventListener('click', () => {
     return;
   }
   const req = makeStartRequestInfo();
+  if (!req.unlimited && req.n <= 0) {
+    appendLog('START cancelado: el almacenamiento elegido no tiene capacidad disponible');
+    return;
+  }
   if (activeSlaveCount > 0 || masterState === cfg.MASTER_STATE_ARMED) {
     runStartCapture(req);
     return;
@@ -3246,14 +3441,31 @@ function restoreHammerDuration() {
   el.value = Number.isFinite(secs) && secs > 0 ? String(secs) : '';
 }
 
+function restoreCaptureModeControls() {
+  const savedMode = loadSetting(CAPTURE_MODE_KEY);
+  if ([CAPTURE_MODE_ASYNC, CAPTURE_MODE_RT_LIMITED, CAPTURE_MODE_RT_UNLIMITED].includes(savedMode)) {
+    $('capture-mode').value = savedMode;
+  }
+  const savedStorage = parseInt(loadSetting(CAPTURE_STORAGE_KEY), 10);
+  if (Number.isFinite(savedStorage) && savedStorage >= STORAGE_PSOC_RAM && savedStorage <= STORAGE_ESP_SD) {
+    $('capture-storage').value = String(savedStorage);
+  }
+  $('capture-fast').checked = loadBoolSetting(CAPTURE_FAST_KEY, false);
+  updateCaptureModeControls(true);
+}
+
 $('disp-secs').addEventListener('input', applyDisplayWindow);
 $('disp-secs').addEventListener('change', applyDisplayWindow);
 $('capture-secs').addEventListener('input', onCaptureDurationEdited);
 $('capture-secs').addEventListener('change', onCaptureDurationEdited);
 $('capture-secs-hammer').addEventListener('input', updateCapturePreview);
 $('capture-secs-hammer').addEventListener('change', onHammerDurationEdited);
+$('capture-mode').addEventListener('change', () => updateCaptureModeControls(true));
+$('capture-storage').addEventListener('change', () => updateCaptureModeControls(true));
+$('capture-fast').addEventListener('change', () => updateCaptureModeControls(false));
 $('btn-max-batches').addEventListener('click', setCaptureToMaxBatches);
 $('btn-max-ram').addEventListener('click', setCaptureToMaxRamBatches);
+restoreCaptureModeControls();
 restoreHammerDuration();
 syncDisplayWindowToCaptureDuration();
 

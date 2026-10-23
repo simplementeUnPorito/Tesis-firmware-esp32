@@ -2,7 +2,7 @@
 // commands as the flat JSON the firmware's web_relay.h expects.
 // Mirrors python/geophone_scope/protocol.py — keep field names/semantics in sync.
 
-import * as cfg from './config.js?v=field-study-31';
+import * as cfg from './config.js?v=field-study-32';
 
 /** Parsed 6-byte packet from the master (0x56 header). Mirrors protocol.Packet. */
 export class Packet {
@@ -57,6 +57,8 @@ export class Packet {
   get helloCtlStatus() { return this.b1; }
   /** sub 0x0A / 0x0B: código de PGA / PGAout aplicado en el PSoC. */
   get helloGainCode() { return this.b1; }
+  /** sub 0x0C / 0x0D: capacidad en lotes, uint16 big-endian. */
+  get helloCapacityBatches() { return ((this.b1 << 8) | this.b0) >>> 0; }
   get helloMacSub() { return this.b2; }
   get helloMacHi() { return this.b1; }
   get helloMacLo() { return this.b0; }
