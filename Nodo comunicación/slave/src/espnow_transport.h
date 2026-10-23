@@ -71,6 +71,11 @@ inline void EspNowTransport::onSendCb(uint8_t *, uint8_t status)
 inline void EspNowTransport::onSendCb(const uint8_t *, esp_now_send_status_t status)
 #endif
 {
+#if defined(ESP8266)
+    live::noteRadioTxDone((uint64_t)micros());
+#else
+    live::noteRadioTxDone((uint64_t)esp_timer_get_time());
+#endif
     if (espnowSentHook()) espnowSentHook()(status == ESP_NOW_SEND_SUCCESS);
 }
 

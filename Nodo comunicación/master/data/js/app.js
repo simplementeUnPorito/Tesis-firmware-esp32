@@ -2,16 +2,17 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-32';
-import { WsClient } from './ws_client.js?v=field-study-32';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-32';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-32';
-import { PlotArea } from './plot.js?v=field-study-32';
-import { SpectrumArea } from './spectrum.js?v=field-study-32';
-import { SlavePanel } from './slave_panel.js?v=field-study-32';
-import { compileFirCmd, dcRemove, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-32';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-32';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-32';
+import * as cfg from './config.js?v=field-study-34';
+import { WsClient } from './ws_client.js?v=field-study-34';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-34';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-34';
+import { PlotArea } from './plot.js?v=field-study-34';
+import { SpectrumArea } from './spectrum.js?v=field-study-34';
+import { SlavePanel } from './slave_panel.js?v=field-study-34';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-34';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-34';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-34';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-34';
 
 const $ = (id) => document.getElementById(id);
 
@@ -72,12 +73,19 @@ const WS_TOKEN_KEY  = `${SETTINGS_PREFIX}ws_token`;
 const CAPTURE_MODE_KEY = `${SETTINGS_PREFIX}capture_mode_v1`;
 const CAPTURE_STORAGE_KEY = `${SETTINGS_PREFIX}capture_storage_v1`;
 const CAPTURE_FAST_KEY = `${SETTINGS_PREFIX}capture_fast_v1`;
+const SIGNATURES_KEY = `${SETTINGS_PREFIX}noise_signatures_v1`;
 const CAPTURE_MODE_ASYNC = 'async';
 const CAPTURE_MODE_RT_LIMITED = 'realtime-limited';
 const CAPTURE_MODE_RT_UNLIMITED = 'realtime-unlimited';
 const STORAGE_PSOC_RAM = 0;
 const STORAGE_SHARED_RAM = 1;
 const STORAGE_ESP_SD = 2;
+let noiseSignatures = {
+  schema_version: 1,
+  placa: 'placeholder',
+  fecha: 'sin calibrar',
+  types: {},
+};
 
 const CURVE_SOURCE_DEFS = [
   { key: 'raw', checkboxId: 'chk-show-raw', label: 'Cruda', color: cfg.RAW_COLOR },
@@ -179,6 +187,69 @@ function saveSetting(key, value) {
     localStorage.setItem(key, String(value));
   } catch (_) {
     // localStorage can be disabled on some phone browser/privacy modes.
+  }
+}
+
+function validSignatures(value) {
+  if (!value || typeof value !== 'object' || !value.types || typeof value.types !== 'object') return false;
+  for (const spec of Object.values(value.types)) {
+    if (!spec || typeof spec !== 'object') return false;
+    for (const field of ['onset_template', 'offset_template']) {
+      const values = spec[field];
+      if (values === undefined) continue;
+      if (!Array.isArray(values) || values.length > 10000 ||
+          values.some((sample) => !Number.isFinite(Number(sample)))) return false;
+    }
+  }
+  return true;
+}
+
+function showLoadedSignatures() {
+  const label = signatureLabel(noiseSignatures);
+  for (const panel of slavePanels) if (panel) panel.setSignaturesInfo(label);
+}
+
+function applySignatures(value, source, persist = false) {
+  if (!validSignatures(value)) throw new Error('JSON sin objeto types');
+  noiseSignatures = value;
+  for (const nd of data.nodes) {
+    nd.noiseSignaturesPlaca = value.placa || null;
+    nd.noiseSignaturesFecha = value.fecha || null;
+  }
+  if (persist) saveSetting(SIGNATURES_KEY, JSON.stringify(value));
+  showLoadedSignatures();
+  for (let i = 1; i < cfg.MAX_NODES; i++) markNodeFilterDirty(i);
+  appendLog(`Firmas cargadas (${source}): ${signatureLabel(value)}`);
+}
+
+async function loadNoiseSignatures() {
+  let bundled = null;
+  try {
+    const response = await fetch('/firmas.json', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    bundled = await response.json();
+    applySignatures(bundled, 'LittleFS');
+  } catch (error) {
+    showLoadedSignatures();
+    appendLog(`No se pudo cargar /firmas.json: ${error.message}`);
+  }
+  const stored = loadSetting(SIGNATURES_KEY);
+  if (!stored) return;
+  try {
+    applySignatures(JSON.parse(stored), 'localStorage');
+  } catch (error) {
+    appendLog(`Firmas guardadas inválidas: ${error.message}`);
+    if (bundled) applySignatures(bundled, 'LittleFS');
+  }
+}
+
+async function onSignaturesFileSelected(file) {
+  try {
+    if (file.size > 5_000_000) throw new Error('archivo mayor que 5 MB');
+    const parsed = JSON.parse(await file.text());
+    applySignatures(parsed, file.name, true);
+  } catch (error) {
+    appendLog(`No se cargaron firmas: ${error.message}`);
   }
 }
 
@@ -485,6 +556,12 @@ function nodeSnapshot(nd, index, options = {}) {
     dc_removed_on_preserve: storeDcRemoved,
     notch_enabled: !!nd.notchEnabled,
     notch_harm: nd.notchHarm | 0,
+    clean_i2c: !!nd.cleanI2c,
+    clean_sd: !!nd.cleanSd,
+    clean_radio_tx: !!nd.cleanRadio,
+    clean_beacon: !!nd.cleanBeacon,
+    noise_signatures_placa: noiseSignatures.placa || null,
+    noise_signatures_fecha: noiseSignatures.fecha || null,
     raw_dc_v: rawDc,
     filt_dc_v: filtDc,
     invert_signal: !!nd.invertSignal,
@@ -1540,16 +1617,31 @@ function fillRingBuffer(ring, arr) {
 function filteredArrayForNode(nd, rawArray = null) {
   const raw = rawArray || nd.captureRawArray();
   if (!raw.length) return new Float64Array(0);
-  let arr = nd.filtB ? filtFilt(nd.filtB, raw) : new Float64Array(raw);
-  if (nd.dcRemove && arr.length > 1) arr = dcRemove(arr);
-  // Cancelación de ruido de línea: LS de armónicos de 50 Hz sobre la ventana
-  // completa, y(n)−f(n). Último paso de la cadena (FIR → DC → notch), igual
-  // que el scope Python; queda también en snapshots/export, flageado en
-  // metadata como notch_enabled/notch_harm.
+  // Cadena deliberadamente fija: offset → línea → interferencias marcadas → FIR.
+  // "Filtrada" siempre queda sin offset; el toggle DC global sigue afectando
+  // solamente la presentación de "Cruda".
+  let arr = removeMedianOffset(raw);
   if (nd.notchEnabled && arr.length > 1) {
     const fs = nd.fs > 0 ? nd.fs : currentFsHz();
     arr = harmonicNotch(arr, fs, cfg.LINE_NOTCH_F0, nd.notchHarm, cfg.LINE_NOTCH_SEARCH_HZ);
   }
+  const flags = flagsFromMarks(nd.sdMarksFor(raw.length), raw.length);
+  const countsPerVolt = nd.countsPerVolt || cfg.ADC_COUNTS_PER_VOLT;
+  if (nd.cleanI2c) {
+    arr = cleanMarkedNoise(arr, flags, NOISE_BITS.I2C, noiseSignatures, 'I2C', countsPerVolt);
+  }
+  if (nd.cleanSd) {
+    arr = cleanMarkedNoise(arr, flags, NOISE_BITS.SD_IO, noiseSignatures, 'SD_IO', countsPerVolt);
+    arr = cleanMarkedNoise(arr, flags, NOISE_BITS.SD_SYNC, noiseSignatures, 'SD_SYNC', countsPerVolt);
+  }
+  if (nd.cleanRadio) {
+    arr = cleanMarkedNoise(arr, flags, NOISE_BITS.RADIO_TX, noiseSignatures, 'RADIO_TX', countsPerVolt);
+  }
+  if (nd.cleanBeacon) {
+    arr = cleanMarkedNoise(arr, flags, NOISE_BITS.AP_BEACON, noiseSignatures, 'AP_BEACON', countsPerVolt);
+    arr = cleanMarkedNoise(arr, flags, NOISE_BITS.MASTER_RX, noiseSignatures, 'MASTER_RX', countsPerVolt);
+  }
+  if (nd.filtB) arr = filtFilt(nd.filtB, arr);
   return arr;
 }
 
@@ -2313,6 +2405,23 @@ function onLineNotchChanged(chIndex, enabled, nHarm) {
   appendLog(`S${chIndex} ruido linea ${nd.notchEnabled ? 'ON' : 'OFF'} N=${nd.notchHarm}`);
 }
 
+const NOISE_CLEANING_SETTINGS = {
+  i2c: ['cleanI2c', 'clean_i2c', 'I2C'],
+  sd: ['cleanSd', 'clean_sd', 'SD'],
+  radio: ['cleanRadio', 'clean_radio_tx', 'transmisión'],
+  beacon: ['cleanBeacon', 'clean_beacon', 'beacon'],
+};
+
+function onNoiseCleaningChanged(chIndex, kind, enabled) {
+  const setting = NOISE_CLEANING_SETTINGS[kind];
+  if (!setting) return;
+  const nd = data.nodes[chIndex];
+  nd[setting[0]] = !!enabled;
+  markNodeFilterDirty(chIndex);
+  saveSlaveSetting(chIndex, setting[1], enabled ? 1 : 0);
+  appendLog(`S${chIndex} limpieza ${setting[2]} ${enabled ? 'ON' : 'OFF'}`);
+}
+
 function loadSlavePanelState(chIndex, panel) {
   const nd = data.nodes[chIndex];
   clearSlaveSetting(chIndex, 'alias');
@@ -2354,6 +2463,11 @@ function loadSlavePanelState(chIndex, panel) {
   nd.notchEnabled = loadSlaveBool(chIndex, 'notch_enabled', legacyNotchEnabled);
   nd.notchHarm = loadSlaveInt(chIndex, 'notch_harm', legacyNotchHarm, 1, cfg.LINE_NOTCH_MAX_HARM);
   panel.setLineNotch(nd.notchEnabled, nd.notchHarm);
+  for (const [kind, setting] of Object.entries(NOISE_CLEANING_SETTINGS)) {
+    nd[setting[0]] = loadSlaveBool(chIndex, setting[1], false);
+    panel.setNoiseCleaning(kind, nd[setting[0]]);
+  }
+  panel.setSignaturesInfo(signatureLabel(noiseSignatures));
   panel.updateStats(0, 0, null, nd.formatDriftStats(), nd.formatLatencyStats(), nd.psocOk);
 }
 
@@ -2371,6 +2485,12 @@ function wireSlavePanel(chIndex, panel) {
     !!ev.detail.enabled,
     ev.detail.nHarm,
   ));
+  panel.addEventListener('noise-cleaning-changed', (ev) => onNoiseCleaningChanged(
+    chIndex,
+    ev.detail.kind,
+    !!ev.detail.enabled,
+  ));
+  panel.addEventListener('signatures-file-selected', (ev) => onSignaturesFileSelected(ev.detail.file));
   panel.addEventListener('test-requested', () => onTestRequested(chIndex));
   panel.addEventListener('ver-requested', () => onVerRequested(chIndex));
   panel.addEventListener('send-all-requested', () => onSendAll(chIndex));
@@ -2984,6 +3104,7 @@ initTabs();
 initEnlaceTab(appendLog);
 buildNodeRows();
 buildSlavePanels();
+loadNoiseSignatures();
 renderPreservedList();
 restoreFsFromLocalCache();
 setConnIndicator(false);

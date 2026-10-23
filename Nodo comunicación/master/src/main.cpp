@@ -1491,10 +1491,7 @@ static void onBatchReady(const ReassembledBatch &batch)
                     | ((int32_t)s.digi1 << 8)
                     | ((int32_t)s.digi2 << 16);
         if (val & 0x800000) val |= (int32_t)0xFF000000;
-        if (s.flags & (SAMPLE_FLAG_SD_WRITE | SAMPLE_FLAG_SD_SYNC)) {
-            matlab.sendSampleMark(batch.node_id,
-                                  s.flags & (SAMPLE_FLAG_SD_WRITE | SAMPLE_FLAG_SD_SYNC));
-        }
+        if (s.flags != 0u) matlab.sendSampleMark(batch.node_id, s.flags);
         matlab.sendSample(batch.node_id, val);
         samplePulse();
     }
@@ -1541,6 +1538,7 @@ static void rtEmit(uint8_t node, const SampleBytes *s, uint32_t seq)
         int32_t val = (int32_t)s[i].digi0 | ((int32_t)s[i].digi1 << 8) |
                       ((int32_t)s[i].digi2 << 16);
         if (val & 0x800000) val |= (int32_t)0xFF000000;
+        if (s[i].flags != 0u) matlab.sendSampleMark(node, s[i].flags);
         matlab.sendSample(node, val);
     }
 }
@@ -2193,8 +2191,7 @@ void loop()
         const uint32_t limitMs = capModeRealtime() ? 15000u
                                : (uint32_t)g_rec_n_batches * 30u + 20000u;
         if ((g_rtStopReqMs != 0u && quiet > 5000u) || quiet > limitMs) {
-            MASTER_LOG_PRINTF("[MASTER] RT sin progreso %lu ms (stop=%u) -> ARMED
-",
+            MASTER_LOG_PRINTF("[MASTER] RT sin progreso %lu ms (stop=%u) -> ARMED\n",
                               (unsigned long)quiet, (unsigned)(g_rtStopReqMs != 0u));
             g_rt.printStats(Serial);
             g_rt.stop();

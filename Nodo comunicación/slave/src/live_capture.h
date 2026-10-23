@@ -47,6 +47,10 @@ bool active();
 const Config &config();
 
 void start(uint64_t tStartUs, uint32_t fsHz);
+/* Convierte el intervalo de reloj ESP a muestras. Seguro desde callbacks y tareas. */
+void noteEvent(uint8_t bits, uint64_t t0Us, uint64_t t1Us);
+void noteRadioTxStart(size_t len);
+void noteRadioTxDone(uint64_t t1Us);
 void onPsocBatch(const PsocBatch &b);
 void onPsocTotalByte(uint8_t index, uint8_t value);  /* 1 y 2: TOTAL1/TOTAL2 */
 void onPsocDone(uint8_t lowByte);

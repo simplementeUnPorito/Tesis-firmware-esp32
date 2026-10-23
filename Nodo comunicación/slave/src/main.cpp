@@ -184,6 +184,32 @@ static uint8_t g_masterTxMac[6] = {
  * aleatorias de otro equipo; el ARM_ACK se iba a ellas y START se cancelaba). */
 static uint8_t g_masterApBssid[6] = {0};
 static bool    g_masterApKnown = false;
+static bool    g_beaconMarks = true;
+
+#if !defined(ESP8266)
+static void beaconPromiscCb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!g_beaconMarks || !g_masterApKnown || type != WIFI_PKT_MGMT || buf == nullptr) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    if (pkt->rx_ctrl.sig_len < 22u || frame[0] != 0x80u ||
+        memcmp(frame + 16, g_masterApBssid, 6) != 0) return;
+    const uint64_t now = (uint64_t)esp_timer_get_time();
+    const uint64_t airtime = (uint64_t)pkt->rx_ctrl.sig_len * 8ULL;
+    live::noteEvent(SAMPLE_FLAG_AP_BEACON, now - airtime, now);
+}
+
+static void applyBeaconMarks()
+{
+    wifi_promiscuous_filter_t filter = {};
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(beaconPromiscCb);
+    esp_wifi_set_promiscuous(g_beaconMarks);
+}
+#else
+static void applyBeaconMarks() {}
+#endif
 
 /* Pines GPIO hardware sync. platformio.ini es la fuente de verdad; estos
  * defaults solo evitan romper builds viejos que no definan las macros. */
@@ -3054,6 +3080,9 @@ static void radioApagar()
 {
     if (g_radio_on) {
         live::setRadioReady(false);
+#if !defined(ESP8266)
+        esp_wifi_set_promiscuous(false);
+#endif
         esp_now_deinit();
         esp_wifi_stop();
         g_radio_on = false;
@@ -3069,6 +3098,7 @@ static void radioPrender()
         esp_wifi_set_channel(g_masterChannel, WIFI_SECOND_CHAN_NONE);
         const bool ok = transport.begin(g_masterTxMac);
         esp_now_register_recv_cb(onDataRecv);
+        applyBeaconMarks();
         g_radio_on = true;
         live::setRadioReady(true);
         if (!ok) SLAVE_LOG_RAW("#RADIO on: ESP-NOW FAIL\n");
@@ -4206,6 +4236,17 @@ static void handleUsbCommand(const char *cmd)
         SLAVE_LOG_RAW("#RTSIM on=%u loss=%u\n", (unsigned)live::simEnabled(), loss);
     } else if (usbCommandEquals(cmd, "livestat")) {
         live::printStatus();
+    } else if (usbCommandEquals(cmd, "marcas")) {
+        live::printStatus();
+        SLAVE_LOG_RAW("#MARCAS beacon=%s\n", g_beaconMarks ? "on" : "off");
+    } else if (usbCommandEquals(cmd, "marcas beacon on")) {
+        g_beaconMarks = true;
+        applyBeaconMarks();
+        SLAVE_LOG_RAW("#MARCAS beacon=on\n");
+    } else if (usbCommandEquals(cmd, "marcas beacon off")) {
+        g_beaconMarks = false;
+        applyBeaconMarks();
+        SLAVE_LOG_RAW("#MARCAS beacon=off\n");
     } else if (!strncmp(cmd, "livedump", 8) && (cmd[8] == ' ' || cmd[8] == '\0')) {
         live::dumpUsb(strstr(cmd, "hex") != nullptr);
     } else if (!strncmp(cmd, "livecap", 7) && (cmd[7] == ' ' || cmd[7] == '\0')) {
@@ -4912,6 +4953,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 #endif
 {
     if (len < 1) return;
+    const int radioLen = len;
 #if SLAVE_LAB_TOOLS_ENABLE
     if (rfrxOnFrame(data, len)) return;   /* rafaga de banco: no es protocolo */
 #endif
@@ -4934,6 +4976,11 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
                              data[0], (int)len);
         }
         return;
+    }
+    {
+        const uint64_t now = (uint64_t)esp_timer_get_time();
+        const uint64_t airtime = (uint64_t)(radioLen + 40) * 8ULL;
+        live::noteEvent(SAMPLE_FLAG_MASTER_RX, now - airtime, now);
     }
     learnMasterMac(mac);
     g_lastMasterRxMs = millis();   /* para el seguimiento de canal (ver abajo) */
@@ -5602,6 +5649,7 @@ void setup()
         while (true) { delay(1000); }
     }
     esp_now_register_recv_cb(onDataRecv);
+    applyBeaconMarks();
 
     /* (El LED de identificación es el del PSoC; el ESP ya no maneja ningún LED.) */
 

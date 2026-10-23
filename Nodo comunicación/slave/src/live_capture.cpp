@@ -3,6 +3,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <errno.h>
+#include <esp_timer.h>
 #include "debug_log.h"
 #include "espnow_transport.h"
 
@@ -58,6 +59,8 @@ constexpr uint32_t SD_READ_BATCHES = 32;
 constexpr size_t   BATCH_BYTES     = (size_t)SPI_BATCH_SAMPLES * sizeof(SampleBytes);
 constexpr size_t   PAGE_BYTES      = (size_t)PAGE_BATCHES * BATCH_BYTES;
 constexpr uint32_t NONE            = 0xFFFFFFFFu;
+constexpr uint16_t MARK_RING       = 256u;
+constexpr uint8_t  RADIO_TIME_RING = 16u;
 const char *const  SD_PATH         = "/live.bin";
 
 PsocUART *g_psoc = nullptr;
@@ -150,6 +153,117 @@ SampleBytes g_sdReadBuf[SD_READ_BATCHES * SPI_BATCH_SAMPLES];
 TaskHandle_t g_sdTask = nullptr;
 SemaphoreHandle_t g_sdMutex = nullptr;
 bool g_radioReady = true;
+
+struct NoiseMark {
+    uint32_t s0;
+    uint32_t s1;
+    uint8_t bits;
+};
+NoiseMark g_marks[MARK_RING];
+uint16_t g_markHead = 0;
+uint16_t g_markTail = 0;
+uint32_t g_markApplied[6] = {};
+uint32_t g_radioAirtimeUs[RADIO_TIME_RING] = {};
+uint8_t g_radioTimeHead = 0;
+uint8_t g_radioTimeTail = 0;
+bool g_havePrevAnchor = false;
+uint32_t g_prevAnchor = 0;
+uint64_t g_prevRxUs = 0;
+bool g_havePair = false;
+uint32_t g_pairSample = 0;
+uint64_t g_pairUs = 0;
+uint32_t g_pairCount = 0;
+uint32_t g_fitSample = 0;
+uint64_t g_fitUs = 0;
+uint32_t g_fsEstimate = 2604;
+uint32_t g_highestStored = 0;
+portMUX_TYPE g_markMux = portMUX_INITIALIZER_UNLOCKED;
+
+void pushMarkLocked(uint32_t s0, uint32_t s1, uint8_t bits)
+{
+    if (bits == 0u) return;
+    if (s1 < s0) {
+        const uint32_t t = s0;
+        s0 = s1;
+        s1 = t;
+    }
+    const uint16_t next = (uint16_t)((g_markHead + 1u) % MARK_RING);
+    if (next == g_markTail) g_markTail = (uint16_t)((g_markTail + 1u) % MARK_RING);
+    g_marks[g_markHead] = {s0, s1, bits};
+    g_markHead = next;
+}
+
+uint32_t sampleForTimeLocked(uint64_t t)
+{
+    const int64_t dt = (t >= g_pairUs) ? (int64_t)(t - g_pairUs)
+                                       : -(int64_t)(g_pairUs - t);
+    const int64_t ds = (dt * (int64_t)g_fsEstimate) / 1000000LL;
+    const int64_t sample = (int64_t)g_pairSample + ds;
+    if (sample <= 0) return 0u;
+    if (sample >= (int64_t)UINT32_MAX) return UINT32_MAX;
+    return (uint32_t)sample;
+}
+
+void processAnchor(const PsocBatch &b)
+{
+    if (!b.hasAnchor) return;
+    portENTER_CRITICAL(&g_markMux);
+    if (g_havePrevAnchor && b.prevEnd != NONE) {
+        const uint64_t pairUs = g_prevRxUs;
+        pushMarkLocked(g_prevAnchor, b.prevEnd, SAMPLE_FLAG_I2C);
+        if (g_havePair && pairUs > g_fitUs &&
+            (pairUs - g_fitUs) >= 1000000ULL && b.prevEnd > g_fitSample) {
+            uint32_t measured = (uint32_t)(((uint64_t)(b.prevEnd - g_fitSample) * 1000000ULL) /
+                                           (pairUs - g_fitUs));
+            const uint32_t lo = (g_fs * 97u) / 100u;
+            const uint32_t hi = (g_fs * 103u + 99u) / 100u;
+            if (measured < lo) measured = lo;
+            if (measured > hi) measured = hi;
+            g_fsEstimate = (3u * g_fsEstimate + measured + 2u) / 4u;
+            g_fitSample = b.prevEnd;
+            g_fitUs = pairUs;
+        } else if (!g_havePair) {
+            g_fitSample = b.prevEnd;
+            g_fitUs = pairUs;
+        }
+        g_pairSample = b.prevEnd;
+        g_pairUs = pairUs;
+        g_havePair = true;
+        g_pairCount++;
+        if (g_pairCount == 1u) {
+            g_fitSample = g_pairSample;
+            g_fitUs = g_pairUs;
+        }
+    }
+    g_prevAnchor = b.anchorStart;
+    g_prevRxUs = b.rxUs;
+    g_havePrevAnchor = true;
+    portEXIT_CRITICAL(&g_markMux);
+}
+
+void applyMarks(SampleBytes *dst, uint32_t firstSample, uint32_t batch)
+{
+    portENTER_CRITICAL(&g_markMux);
+    if (batch > g_highestStored) g_highestStored = batch;
+    for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+        const uint32_t sample = firstSample + (uint32_t)i;
+        uint8_t bits = 0u;
+        for (uint16_t p = g_markTail; p != g_markHead; p = (uint16_t)((p + 1u) % MARK_RING)) {
+            if (g_marks[p].s0 <= sample && sample <= g_marks[p].s1) bits |= g_marks[p].bits;
+        }
+        dst[i].flags |= bits;
+        for (uint8_t bit = 0; bit < 6u; bit++) {
+            if ((bits & (1u << bit)) != 0u) g_markApplied[bit]++;
+        }
+    }
+    const uint32_t keepFrom = (g_highestStored > 64u)
+                            ? (g_highestStored * SPI_BATCH_SAMPLES - 64u * SPI_BATCH_SAMPLES)
+                            : 0u;
+    while (g_markTail != g_markHead && g_marks[g_markTail].s1 < keepFrom) {
+        g_markTail = (uint16_t)((g_markTail + 1u) % MARK_RING);
+    }
+    portEXIT_CRITICAL(&g_markMux);
+}
 
 /* Maestro simulado (banco): recibe las tramas en vez de la radio. */
 bool g_simOn = false;
@@ -398,9 +512,12 @@ void sdTaskFn(void *)
                 const uint32_t avail = (seq < sdw) ? (sdw - seq) : 0u;
                 const uint32_t count = (avail < SD_READ_BATCHES) ? avail : SD_READ_BATCHES;
                 const size_t bytes = (size_t)count * BATCH_BYTES;
-                const bool ok = count > 0u &&
-                                g_file.seek((uint64_t)seq * BATCH_BYTES) &&
-                                g_file.read((uint8_t *)g_sdReadBuf, bytes) == bytes;
+                bool ok = count > 0u && g_file.seek((uint64_t)seq * BATCH_BYTES);
+                if (ok) {
+                    const uint64_t t0 = (uint64_t)esp_timer_get_time();
+                    ok = g_file.read((uint8_t *)g_sdReadBuf, bytes) == bytes;
+                    noteEvent(SAMPLE_FLAG_SD_IO, t0, (uint64_t)esp_timer_get_time());
+                }
                 g_sdReadCount = ok ? count : 0u;
                 __sync_synchronize();
                 g_sdReadState = ok ? 2u : 3u;
@@ -428,7 +545,12 @@ void sdTaskFn(void *)
                     /* El seek tambien falla con la SD en error: va por el mismo reintento. */
                     if (!g_file || (g_file.position() != pos && !g_file.seek(pos))) continue;
                     errno = 0;
-                    ok = g_file && g_file.write((const uint8_t *)slotPtr(g_sdw), BATCH_BYTES) == BATCH_BYTES;
+                    if (g_file) {
+                        const uint64_t writeStart = (uint64_t)esp_timer_get_time();
+                        ok = g_file.write((const uint8_t *)slotPtr(g_sdw), BATCH_BYTES) == BATCH_BYTES;
+                        noteEvent(SAMPLE_FLAG_SD_IO, writeStart,
+                                  (uint64_t)esp_timer_get_time());
+                    }
                     if (!ok) g_sdErrno = errno;
                 }
                 if (!ok) {
@@ -443,7 +565,10 @@ void sdTaskFn(void *)
             if (dirty && (millis() - lastFlushMs) >= 500u) {
                 const uint32_t upTo = g_sdw;
                 errno = 0;
+                const uint64_t flushStart = (uint64_t)esp_timer_get_time();
                 g_file.flush();
+                noteEvent(SAMPLE_FLAG_SD_SYNC, flushStart,
+                          (uint64_t)esp_timer_get_time());
                 if (errno == 0) g_sdSynced = upTo;
                 else g_sdErrno = errno;
                 dirty = false;
@@ -697,6 +822,15 @@ int32_t prepare(const Config &c)
 {
     close();
     g_cfg = c;
+    portENTER_CRITICAL(&g_markMux);
+    g_markHead = g_markTail = 0u;
+    g_radioTimeHead = g_radioTimeTail = 0u;
+    g_havePrevAnchor = false;
+    g_havePair = false;
+    g_pairCount = 0u;
+    g_highestStored = 0u;
+    for (uint8_t i = 0; i < 6u; i++) g_markApplied[i] = 0u;
+    portEXIT_CRITICAL(&g_markMux);
     uint32_t n = c.nBatches;
     uint32_t want;
     if (c.storage == CAPMODE_STORAGE_PSOC) {
@@ -784,6 +918,10 @@ int32_t prepare(const Config &c)
 
 void close()
 {
+    portENTER_CRITICAL(&g_markMux);
+    g_started = false;
+    g_active = false;
+    portEXIT_CRITICAL(&g_markMux);
     if (g_sdMutex) {
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
         if (g_sdOpen) {
@@ -794,8 +932,6 @@ void close()
         xSemaphoreGive(g_sdMutex);
     }
     freePages();
-    g_active = false;
-    g_started = false;
 }
 
 bool active() { return g_active; }
@@ -805,20 +941,71 @@ void start(uint64_t tStartUs, uint32_t fsHz)
 {
     if (!g_active) return;
     g_t0 = tStartUs;
+    portENTER_CRITICAL(&g_markMux);
     g_fs = fsHz ? fsHz : 2604u;
+    g_fsEstimate = g_fs;
     g_started = true;
+    portEXIT_CRITICAL(&g_markMux);
     g_mackMs = g_retxMs = millis();
+}
+
+void noteEvent(uint8_t bits, uint64_t t0Us, uint64_t t1Us)
+{
+    portENTER_CRITICAL(&g_markMux);
+    if (g_active && g_started && g_havePair) {
+        uint32_t s0 = sampleForTimeLocked(t0Us);
+        uint32_t s1 = sampleForTimeLocked(t1Us);
+        if (s1 < s0) {
+            const uint32_t t = s0;
+            s0 = s1;
+            s1 = t;
+        }
+        pushMarkLocked(s0, s1, bits);
+    }
+    portEXIT_CRITICAL(&g_markMux);
+}
+
+void noteRadioTxStart(size_t len)
+{
+    const uint32_t airtimeUs = (uint32_t)((len + 50u) * 8u + 300u);
+    portENTER_CRITICAL(&g_markMux);
+    const uint8_t next = (uint8_t)((g_radioTimeHead + 1u) % RADIO_TIME_RING);
+    if (next == g_radioTimeTail) {
+        g_radioTimeTail = (uint8_t)((g_radioTimeTail + 1u) % RADIO_TIME_RING);
+    }
+    g_radioAirtimeUs[g_radioTimeHead] = airtimeUs;
+    g_radioTimeHead = next;
+    portEXIT_CRITICAL(&g_markMux);
+}
+
+void noteRadioTxDone(uint64_t t1Us)
+{
+    uint32_t airtimeUs = 0u;
+    bool found = false;
+    portENTER_CRITICAL(&g_markMux);
+    if (g_radioTimeTail != g_radioTimeHead) {
+        airtimeUs = g_radioAirtimeUs[g_radioTimeTail];
+        g_radioTimeTail = (uint8_t)((g_radioTimeTail + 1u) % RADIO_TIME_RING);
+        found = true;
+    }
+    portEXIT_CRITICAL(&g_markMux);
+    if (found) {
+        const uint64_t t0Us = t1Us > airtimeUs ? t1Us - airtimeUs : 0u;
+        noteEvent(SAMPLE_FLAG_RADIO_TX, t0Us, t1Us);
+    }
 }
 
 void onPsocBatch(const PsocBatch &b)
 {
     if (!g_active) return;
+    processAnchor(b);
     const uint32_t recv = g_recv;
     const uint32_t seq = recv + (uint32_t)(int32_t)(int16_t)(uint16_t)(b.seq - (uint16_t)recv);
     if (seq < recv) {
         if (seq == g_psocResend) {
             SampleBytes tmp[SPI_BATCH_SAMPLES];
             toStored(b, tmp);
+            applyMarks(tmp, seq * SPI_BATCH_SAMPLES, seq);
             const bool sent = sendBatch(seq, tmp, true);
             if (sent && seq == g_txNext) g_txNext++;
             g_psocResend = NONE;
@@ -843,6 +1030,7 @@ void onPsocBatch(const PsocBatch &b)
     }
     SampleBytes *dst = slotPtr(seq);
     toStored(b, dst);
+    applyMarks(dst, seq * SPI_BATCH_SAMPLES, seq);
     if (g_cfg.ramp) g_badRamp += rampErrors(dst, seq * SPI_BATCH_SAMPLES, SPI_BATCH_SAMPLES);
     __sync_synchronize();   /* el lote completo antes que el contador (tarea SD) */
     g_recv = recv + 1u;
@@ -965,7 +1153,8 @@ void printStatus()
     LIVE_RAW("#LIVE act=%u st=%u rt=%u n=%lu cap=%lu recv=%lu tail=%lu sdw=%lu tx=%lu mack=%lu "
              "total=%ld done=%u ovr=%u sdfull=%u gaps=%lu dups=%lu noroom=%lu retx=%lu "
              "txok=%lu txfail=%lu badramp=%lu sim=%u srx=%lu snext=%lu sdup=%lu sdrop=%lu "
-             "swin=%lu sbad=%lu heap=%u txerr=0x%x inflight=%lu sdretry=%lu remount=%lu errno=%d\n",
+             "swin=%lu sbad=%lu heap=%u txerr=0x%x inflight=%lu sdretry=%lu remount=%lu errno=%d "
+             "marks=%lu/%lu/%lu/%lu/%lu/%lu pairs=%lu\n",
              (unsigned)g_active, (unsigned)g_cfg.storage, (unsigned)g_cfg.realtime,
              (unsigned long)g_cfg.nBatches, (unsigned long)g_cap,
              (unsigned long)g_recv, (unsigned long)(g_active ? tailNow() : 0u),
@@ -978,7 +1167,11 @@ void printStatus()
              (unsigned long)g_simNext, (unsigned long)g_simDup, (unsigned long)g_simDrop,
              (unsigned long)g_simWin, (unsigned long)g_simBad, (unsigned)ESP.getFreeHeap(), (unsigned)g_lastTxErr,
              (unsigned long)g_inflight, (unsigned long)g_sdRetries,
-             (unsigned long)g_sdRemounts, g_sdErrno);
+             (unsigned long)g_sdRemounts, g_sdErrno,
+             (unsigned long)g_markApplied[0], (unsigned long)g_markApplied[1],
+             (unsigned long)g_markApplied[2], (unsigned long)g_markApplied[3],
+             (unsigned long)g_markApplied[4], (unsigned long)g_markApplied[5],
+             (unsigned long)g_pairCount);
 }
 
 void simMaster(bool on, uint8_t lossPct)

@@ -199,8 +199,8 @@ inline void MatlabTransport::sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val)
 
 inline void MatlabTransport::sendSampleMark(uint8_t nodeId, uint8_t flags)
 {
-    /* type 0xFB: b2=flags (bit0 escritura SD, bit1 f_sync). Va justo antes de
-     * la muestra marcada; los clientes que no lo conocen lo ignoran. */
+    /* type 0xFB: b2=flags. bit0 SD I/O, bit1 SD sync, bit2 radio TX,
+     * bit3 I2C, bit4 beacon AP, bit5 RX maestro. Va antes de la muestra. */
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFB, flags, 0x00, 0x00 };
     _emit(pkt);
 }

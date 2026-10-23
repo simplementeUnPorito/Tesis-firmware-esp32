@@ -1,8 +1,29 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-32';
+import * as cfg from './config.js?v=field-study-34';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-32';
+import { effectiveFs } from './data_store.js?v=field-study-34';
+
+const MARK_BITS = [
+  [0x01, 'SD_IO'],
+  [0x02, 'SD_SYNC'],
+  [0x04, 'RADIO_TX'],
+  [0x08, 'I2C'],
+  [0x10, 'AP_BEACON'],
+  [0x20, 'MASTER_RX'],
+];
+
+function noiseMarksCsv(marks) {
+  const lines = ['sample_index,flags,flags_hex,bit_names'];
+  for (const mark of Array.isArray(marks) ? marks : []) {
+    const sample = Number(mark?.[0]);
+    const flags = Number(mark?.[1]) & 0xFF;
+    if (!Number.isFinite(sample) || flags === 0) continue;
+    const names = MARK_BITS.filter(([bit]) => (flags & bit) !== 0).map(([, name]) => name).join('|');
+    lines.push(csvRow([Math.round(sample), flags, `0x${flags.toString(16).toUpperCase().padStart(2, '0')}`, names]));
+  }
+  return lines.join('\n') + '\n';
+}
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -264,6 +285,7 @@ function nodeMetadata(nd, index, paths, connected) {
     filt_file: paths ? paths.filt : null,
     raw_csv_file: paths ? paths.rawCsv : null,
     filt_csv_file: paths ? paths.filtCsv : null,
+    noise_marks_file: paths ? paths.marksCsv : null,
     raw_count: nd.captureRawLength,
     filt_count: nd.captureFiltLength,
     batch_count: nd.batchCount,
@@ -301,6 +323,12 @@ function nodeMetadata(nd, index, paths, connected) {
     dc_remove: !!nd.dcRemove,
     notch_enabled: !!nd.notchEnabled,
     notch_harm: nd.notchHarm | 0,
+    clean_i2c: !!nd.cleanI2c,
+    clean_sd: !!nd.cleanSd,
+    clean_radio_tx: !!nd.cleanRadio,
+    clean_beacon: !!nd.cleanBeacon,
+    noise_signatures_placa: nd.noiseSignaturesPlaca || null,
+    noise_signatures_fecha: nd.noiseSignaturesFecha || null,
     invert_signal: !!nd.invertSignal,
     display_y_offset_v: nd.yOffsetV || 0,
     drift_hist: nd.driftHist.slice(),
@@ -338,6 +366,7 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     filt_file: paths ? paths.filt : null,
     raw_csv_file: paths ? paths.rawCsv : null,
     filt_csv_file: paths ? paths.filtCsv : null,
+    noise_marks_file: paths ? paths.marksCsv : null,
     raw_count: raw.length,
     filt_count: filt.length,
     batch_count: node?.batch_count ?? 0,
@@ -353,8 +382,7 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     decimation_factor: decimationFactorForNode(node),
     sd_present: sdPresentForNode(node),
     sd_enabled: sdEnabledForNode(node),
-    // [indice en raw, flags]: bit0 escritura a SD, bit1 f_sync. La interferencia
-    // empieza en esa muestra; ver quitar_ruido_sd.py.
+    // [indice en raw, flags]: bits de interferencia conocida para esa muestra.
     sd_marks: Array.isArray(node?.sd_marks) ? node.sd_marks : [],
     vdac_byte: node?.vdac_byte ?? 128,
     cal_vdacs: calVdacsForNode(node),
@@ -376,6 +404,12 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     dc_removed_on_preserve: !!node?.dc_removed_on_preserve,
     notch_enabled: !!node?.notch_enabled,
     notch_harm: node?.notch_harm ?? 0,
+    clean_i2c: !!node?.clean_i2c,
+    clean_sd: !!node?.clean_sd,
+    clean_radio_tx: !!node?.clean_radio_tx,
+    clean_beacon: !!node?.clean_beacon,
+    noise_signatures_placa: node?.noise_signatures_placa || null,
+    noise_signatures_fecha: node?.noise_signatures_fecha || null,
     raw_dc_v: node?.raw_dc_v ?? null,
     filt_dc_v: node?.filt_dc_v ?? null,
     invert_signal: !!node?.invert_signal,
@@ -694,6 +728,7 @@ export function buildCaptureZip(dataStore, options = {}) {
       filt: `${dir}/filt_f32le.bin`,
       rawCsv: `${dir}/raw.csv`,
       filtCsv: `${dir}/filt.csv`,
+      marksCsv: `${dir}/noise_marks.csv`,
     };
     pathsByNode.set(i, paths);
     files.push({ name: paths.raw, data: float32Bytes(raw) });
@@ -705,6 +740,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     // guessed/nominal constant - so the CSV time column matches reality.
     files.push({ name: paths.rawCsv, data: csvText(raw, nd.fs, 0) });
     files.push({ name: paths.filtCsv, data: csvText(filt, nd.fs, 0) });
+    files.push({ name: paths.marksCsv, data: noiseMarksCsv(nd.sdMarksFor(raw.length)) });
 
     visibleNodes.push(i);
     exportedNodes.push(i);
@@ -747,11 +783,13 @@ export function buildCaptureZip(dataStore, options = {}) {
           filt: `${dir}/filt_f32le.bin`,
           rawCsv: `${dir}/raw.csv`,
           filtCsv: `${dir}/filt.csv`,
+          marksCsv: `${dir}/noise_marks.csv`,
         };
         files.push({ name: paths.raw, data: float32Bytes(raw) });
         files.push({ name: paths.filt, data: float32Bytes(filt) });
         files.push({ name: paths.rawCsv, data: csvText(raw, node.fs || capture.fs || 0, captureOffset) });
         files.push({ name: paths.filtCsv, data: csvText(filt, node.fs || capture.fs || 0, captureOffset) });
+        files.push({ name: paths.marksCsv, data: noiseMarksCsv(node.sd_marks) });
       }
 
       capNodeMetas.push(captureNodeMetadata(node, index, paths, connected, captureOffset));
@@ -806,7 +844,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-32',
+    web_app_version: 'field-study-34',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,

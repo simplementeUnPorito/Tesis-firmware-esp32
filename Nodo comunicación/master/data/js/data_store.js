@@ -3,7 +3,7 @@
 // use fixed-capacity rings for live plotting and optional chunked stores for
 // the complete unlimited capture.
 
-import * as cfg from './config.js?v=field-study-32';
+import * as cfg from './config.js?v=field-study-34';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -144,6 +144,12 @@ export class NodeData {
     // de notch_enabled/notch_harm del scope Python; f0 en cfg.LINE_NOTCH_F0).
     this.notchEnabled = false;
     this.notchHarm = cfg.LINE_NOTCH_DEFAULT_HARM;
+    this.cleanI2c = false;
+    this.cleanSd = false;
+    this.cleanRadio = false;
+    this.cleanBeacon = false;
+    this.noiseSignaturesPlaca = null;
+    this.noiseSignaturesFecha = null;
 
     // Full-capture filter state. Raw samples may stream/dump incrementally, but
     // FIR/filtFilt and line-noise LS must run only after the node's raw capture

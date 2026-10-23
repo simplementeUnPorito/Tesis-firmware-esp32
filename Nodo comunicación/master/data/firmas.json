@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "placa": "placeholder",
+  "fecha": "sin calibrar",
+  "comment": "Reemplazar con firmas_<placa>.json; hasta entonces se interpola con margen 2.",
+  "types": {
+    "I2C": { "method": "interp", "margin": 2 },
+    "SD_IO": { "method": "interp", "margin": 2 },
+    "SD_SYNC": { "method": "interp", "margin": 2 },
+    "RADIO_TX": { "method": "interp", "margin": 2 },
+    "AP_BEACON": { "method": "interp", "margin": 2 },
+    "MASTER_RX": { "method": "interp", "margin": 2 }
+  }
+}

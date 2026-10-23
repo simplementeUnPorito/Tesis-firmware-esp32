@@ -85,8 +85,10 @@
 #endif
 
 #define PSOC_FRAME_MARKER 0xAB
+#define PSOC_LIVE_FRAME  0x9E
 #define SPI_BATCH_SAMPLES 30                              /* muestras por lote */
 #define PSOC_FRAME_BYTES  (4 + SPI_BATCH_SAMPLES * 3 + 1) /* 95 */
+#define PSOC_LIVE_FRAME_BYTES (PSOC_FRAME_BYTES + 8)      /* 103 */
 #define PSOC_CTRL_ACK_BYTES 5
 #define PSOC_CTRL_DIAG_BYTES 6
 #define PSOC_CTRL_ST_RESULT  0xC5
@@ -274,6 +276,10 @@ struct PsocBatch {
     uint8_t    n_samples;
     PsocSample samples[SPI_BATCH_SAMPLES];
     uint64_t   timestamp_us;
+    bool       hasAnchor;
+    uint32_t   anchorStart;
+    uint32_t   prevEnd;
+    uint64_t   rxUs;
 };
 
 /* Una medicion o reporte del autotest del PSoC. Los dos int32 significan
@@ -435,7 +441,7 @@ private:
     BatchCallback   _cb        = nullptr;
     DiagCallback    _diagCb    = nullptr;
     SelfTestCallback _stCb     = nullptr;
-    uint8_t         _buf[PSOC_FRAME_BYTES];
+    uint8_t         _buf[PSOC_LIVE_FRAME_BYTES];
     uint16_t        _idx       = 0;
     bool            _lastOK    = false;
     uint32_t        _batchesOK = 0;
@@ -466,6 +472,18 @@ private:
     static volatile uint16_t _i2cHead;
     static volatile uint16_t _i2cTail;
     static volatile uint32_t _i2cOverruns;
+    struct I2cRxStamp {
+        uint64_t us;
+        uint32_t endBytes;
+    };
+    static constexpr uint8_t I2C_STAMP_RING = 16u;
+    static volatile I2cRxStamp _i2cStamps[I2C_STAMP_RING];
+    static volatile uint8_t  _i2cStampHead;
+    static volatile uint8_t  _i2cStampTail;
+    static volatile uint32_t _i2cBytesEnqueued;
+    static volatile uint32_t _i2cBytesConsumed;
+    static volatile uint32_t _i2cStampOverruns;
+    uint64_t _rxByteUs = 0;
     static void _onI2cReceive(int count);
 
     bool _rxAvailable();

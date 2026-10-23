@@ -105,9 +105,14 @@ struct MsgDebug {
 
 #define DATA_PKT_MARKER  0xBC
 
-/* SampleBytes.flags: marcas de interferencia conocida (ver PSoC sd_mark). */
-#define SAMPLE_FLAG_SD_WRITE 0x01u   /* el PSoC empezó una escritura a SD */
-#define SAMPLE_FLAG_SD_SYNC  0x02u   /* el PSoC hizo f_sync (FAT + directorio) */
+/* SampleBytes.flags: interferencias conocidas durante captura en vivo. */
+#define SAMPLE_FLAG_SD_IO      0x01u   /* acceso SPI a la SD del ESP esclavo */
+#define SAMPLE_FLAG_SD_WRITE   SAMPLE_FLAG_SD_IO
+#define SAMPLE_FLAG_SD_SYNC    0x02u   /* flush de la SD del ESP esclavo */
+#define SAMPLE_FLAG_RADIO_TX   0x04u   /* transmision ESP-NOW del esclavo */
+#define SAMPLE_FLAG_I2C        0x08u   /* trama I2C del PSoC al ESP */
+#define SAMPLE_FLAG_AP_BEACON  0x10u   /* beacon del AP GeoNetwork */
+#define SAMPLE_FLAG_MASTER_RX  0x20u   /* trama ESP-NOW recibida del maestro */
 #define SAMPLES_PER_PART 15
 
 struct SampleBytes {

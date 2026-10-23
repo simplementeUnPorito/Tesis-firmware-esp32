@@ -9,6 +9,11 @@
 #include <Arduino.h>
 #include "sync_protocol.h"
 
+namespace live {
+void noteRadioTxStart(size_t len);
+void noteRadioTxDone(uint64_t t1Us);
+}
+
 #if defined(ESP8266)
   #include <ESP8266WiFi.h>
   extern "C" {
@@ -48,11 +53,14 @@
       uint8_t buf[ESPNOW_MAX_PAYLOAD];
       const int n = geonetWrap(buf, data, (int)len);
       if (n == 0) return 1;
-      return esp_now_send((uint8_t *)mac, buf, (uint8_t)n);
+      const esp_err_t err = esp_now_send((uint8_t *)mac, buf, (uint8_t)n);
+      if (err == ESP_OK) live::noteRadioTxStart(len);
+      return err;
   }
 #else
   #include <WiFi.h>
   #include <esp_now.h>
+  #include <esp_timer.h>
 
   static inline uint8_t espnowCurrentChannel()
   {
@@ -84,6 +92,8 @@
       uint8_t buf[ESPNOW_MAX_PAYLOAD];
       const int n = geonetWrap(buf, data, (int)len);
       if (n == 0) return ESP_ERR_INVALID_ARG;
-      return esp_now_send(mac, buf, (size_t)n);
+      const esp_err_t err = esp_now_send(mac, buf, (size_t)n);
+      if (err == ESP_OK) live::noteRadioTxStart(len);
+      return err;
   }
 #endif
