@@ -676,6 +676,11 @@ static bool     g_linkStaWasUp = false;
 static bool     g_linkStaRetryPending = false;
 static bool     g_linkStaBegun = false;
 static bool     g_linkStaForce = false;   /* intento pedido por el usuario */
+/* Captura en marcha: no reintentar la STA. Cada WiFi.begin escanea canales con
+ * la unica radio y saca al maestro del canal de los esclavos hasta 8 s: sus
+ * envios fallaban en rafagas (ESPNOW_NO_MEM) y el tiempo real se cortaba por
+ * memoria (2026-10-23). Lo fija el loop del maestro. */
+static bool     g_linkStaHold = false;
 static bool     g_linkStaUserTry = false; /* el intento en curso fue pedido por el usuario */
 static volatile bool g_linkStaAborting = false; /* el disconnect lo pidio el propio maestro */
 
@@ -764,6 +769,19 @@ inline void linkStaService()
         }
     }
     if (up) { g_linkStaBegun = false; g_linkLastError[0] = '\0'; return; }
+
+    if (g_linkStaHold) {
+        /* Un intento automatico en curso se corta ya; el pedido por el
+         * usuario (Guardar) se respeta. */
+        if (g_linkStaBegun && !g_linkStaUserTry) {
+            g_linkStaAborting = true;
+            WiFi.disconnect(false, false);
+            g_linkStaBegun = false;
+            MASTER_LOG_PRINTLN("[ENLACE] intento STA cortado: captura en marcha");
+        }
+        if (!g_linkStaBegun) g_linkStaTryMs = millis();   /* reintento recien 20 s despues */
+        return;
+    }
 
     /* Un intento que no engancha sigue reescaneando solo (autoreconnect del core)
      * y con una unica radio el AP pierde beacons (canal saltando 1/14, pings

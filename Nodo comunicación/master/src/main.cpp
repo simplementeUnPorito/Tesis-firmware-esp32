@@ -2026,7 +2026,10 @@ void loop()
     linkRssiLoop();
     /* Mantiene la STA asociada a la red del cliente sin bajar el AP ni ESP-NOW:
      * el maestro habita las dos redes. Ver linkStaService() para la letra chica
-     * del canal compartido. */
+     * del canal compartido. Con captura en marcha no se reintenta. */
+    g_linkStaHold = g_rt.active() || g_state == ARMING || g_state == PRESTART ||
+                    g_state == RUNNING || g_state == STOPPING || g_state == DUMPING ||
+                    g_state == SCOPE_MULTI;
     linkStaService();
 
     if (g_webReplayCachedState) {

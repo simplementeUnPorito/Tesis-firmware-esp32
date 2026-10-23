@@ -106,48 +106,32 @@ function interpolateMarked(values, flags, bit, margin, cubic) {
 function templateValues(spec, which, voltsPerCount) {
   const direct = spec?.[`${which}_template`];
   const nested = spec?.[which]?.template;
-  const source = Array.isArray(direct) ? direct : (Array.isArray(nested) ? nested : []);
+  const compact = spec?.[which];
+  const source = Array.isArray(direct) ? direct
+    : (Array.isArray(compact) ? compact : (Array.isArray(nested) ? nested : []));
   return Float64Array.from(source, (value) => {
     const numeric = Number(value);
     return (Number.isFinite(numeric) ? numeric : 0) * voltsPerCount;
   });
 }
 
-function subtractOne(out, center, template, pre, alignment) {
+function subtractOne(out, center, template, pre) {
   if (!template.length) return;
-  let bestShift = 0;
-  let bestScore = -Infinity;
-  for (let shift = -alignment; shift <= alignment; shift++) {
-    const lo = center + shift - pre;
-    if (lo < 0 || lo + template.length > out.length) continue;
-    let score = 0;
-    for (let i = 0; i < template.length; i++) score += out[lo + i] * template[i];
-    if (Math.abs(score) > bestScore) {
-      bestScore = Math.abs(score);
-      bestShift = shift;
-    }
-  }
-  const lo = center + bestShift - pre;
+  const lo = center - pre;
   if (lo < 0 || lo + template.length > out.length) return;
-  let numerator = 0;
-  let denominator = 0;
-  for (let i = 0; i < template.length; i++) {
-    numerator += out[lo + i] * template[i];
-    denominator += template[i] * template[i];
-  }
-  const amplitude = denominator > 0 ? Math.max(0, Math.min(2, numerator / denominator)) : 0;
-  for (let i = 0; i < template.length; i++) out[lo + i] -= amplitude * template[i];
+  // X@c ya contiene la amplitud estimada conjunta: no reajustar por evento.
+  for (let i = 0; i < template.length; i++) out[lo + i] -= template[i];
 }
 
-function subtractTemplates(values, flags, bit, spec, voltsPerCount, params, aligned) {
+function subtractTemplates(values, flags, bit, spec, voltsPerCount, params) {
   const out = new Float64Array(values);
-  const pre = Math.max(0, Number(spec?.pre) || 20);
+  const preValue = Number(spec?.pre);
+  const pre = Math.max(0, Number.isFinite(preValue) ? preValue : 20);
   const onset = templateValues(spec, 'onset', voltsPerCount);
   const offset = templateValues(spec, 'offset', voltsPerCount);
-  const alignment = aligned ? Math.max(0, Number(params?.align) || 2) : 0;
   for (const [start, end] of runs(flags, bit)) {
-    subtractOne(out, start, onset, pre, alignment);
-    if (params?.offset !== false && offset.length) subtractOne(out, end, offset, pre, alignment);
+    subtractOne(out, start, onset, pre);
+    if (params?.offset !== false && offset.length) subtractOne(out, end, offset, pre);
   }
   return out;
 }
@@ -169,10 +153,10 @@ export function cleanMarkedNoise(values, flags, bit, signatures, typeName, count
   const rec = recommendation(spec);
   const params = rec.parameters || {};
   const voltsPerCount = countsPerVolt > 0 ? 1 / countsPerVolt : 1;
+  if (rec.method === 'none') return values;
   if ((rec.method === 'template' || rec.method === 'template_xcorr') &&
-      (Array.isArray(spec.onset_template) || Array.isArray(spec?.onset?.template))) {
-    return subtractTemplates(values, flags, bit, spec, voltsPerCount, params,
-                             rec.method === 'template_xcorr' || Number(params.align) > 0);
+      (Array.isArray(spec.onset) || Array.isArray(spec.onset_template) || Array.isArray(spec?.onset?.template))) {
+    return subtractTemplates(values, flags, bit, spec, voltsPerCount, params);
   }
   const margin = Math.max(0, Number(params.margin ?? spec.margin ?? 2) || 0);
   const cubic = rec.method === 'cubic' || params.kind === 'cubic';

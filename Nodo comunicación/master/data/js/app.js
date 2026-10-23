@@ -194,9 +194,9 @@ function validSignatures(value) {
   if (!value || typeof value !== 'object' || !value.types || typeof value.types !== 'object') return false;
   for (const spec of Object.values(value.types)) {
     if (!spec || typeof spec !== 'object') return false;
-    for (const field of ['onset_template', 'offset_template']) {
+    for (const field of ['onset', 'offset', 'onset_template', 'offset_template']) {
       const values = spec[field];
-      if (values === undefined) continue;
+      if (values === undefined || values === null) continue;
       if (!Array.isArray(values) || values.length > 10000 ||
           values.some((sample) => !Number.isFinite(Number(sample)))) return false;
     }
