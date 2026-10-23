@@ -178,6 +178,12 @@ static uint8_t g_masterTxMac[6] = {
     MASTER_MAC0, MASTER_MAC1, MASTER_MAC2,
     MASTER_MAC3, MASTER_MAC4, MASTER_MAC5
 };
+/* BSSID del AP del maestro, del escaneo de canal. El ESP-NOW del maestro sale
+ * por su STA, que difiere del BSSID solo en el ultimo byte. Sin esto el esclavo
+ * aprendia como maestro cualquier trama ESP-NOW del aire (2026-10-23: MACs
+ * aleatorias de otro equipo; el ARM_ACK se iba a ellas y START se cancelaba). */
+static uint8_t g_masterApBssid[6] = {0};
+static bool    g_masterApKnown = false;
 
 /* Pines GPIO hardware sync. platformio.ini es la fuente de verdad; estos
  * defaults solo evitan romper builds viejos que no definan las macros. */
@@ -628,6 +634,20 @@ static bool usableUnicastMac(const uint8_t mac[6])
 static bool masterMacIsDefaultBroadcast()
 {
     return !usableUnicastMac(MASTER_MAC_DEFAULT);
+}
+
+/* true si la trama puede venir del maestro: mismo equipo que el AP escaneado
+ * (STA y softAP del ESP32 difieren en pocas unidades). Sin escaneo, se acepta. */
+static bool macIsMaster(const uint8_t mac[6])
+{
+    if (!g_masterApKnown) return true;
+    uint64_t a = 0, b = 0;
+    for (int i = 0; i < 6; i++) {
+        a = (a << 8) | mac[i];
+        b = (b << 8) | g_masterApBssid[i];
+    }
+    const uint64_t d = (a > b) ? (a - b) : (b - a);
+    return d <= 3u;
 }
 
 static void learnMasterMac(const uint8_t mac[6])
@@ -1808,7 +1828,9 @@ static bool sendAndConfirmPsocSetN(uint16_t n_batches)
 {
     const uint8_t expected = (n_batches > 255u) ? 255u : (uint8_t)n_batches;
 
-    for (int intento = 0; intento < 2; intento++) {
+    /* 2026-10-23: en modo vivo se perdieron los dos intentos seguidos y la
+     * captura se aborto; cuatro intentos (~2 s) cuestan menos que eso. */
+    for (int intento = 0; intento < 4; intento++) {
         const uint32_t startMs = millis();
         const uint32_t startSeq = g_psoc_setn_seq;
 
@@ -1827,9 +1849,9 @@ static bool sendAndConfirmPsocSetN(uint16_t n_batches)
             }
             delay(1);
         }
-        if (intento == 0) {
-            SLAVE_LOG_PRINTF("[SLAVE] SETN sin ack n=%u; reintento\n",
-                             (unsigned)n_batches);
+        if (intento < 3) {
+            SLAVE_LOG_PRINTF("[SLAVE] SETN sin ack n=%u; reintento %d\n",
+                             (unsigned)n_batches, intento + 1);
         }
     }
 
@@ -2086,7 +2108,7 @@ static void serviceLiveEnd()
     if (!live::active()) return;
     if (live::wantsStop() && digitalRead(SYNC_TO_PSOC_PIN) == HIGH) {
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
-        SLAVE_LOG_PRINTLN("[LIVE] SD llena: corto la captura");
+        SLAVE_LOG_PRINTLN("[LIVE] SD llena o con error: corto la captura");
     }
     /* STREAM_END se repite: si se pierde, el maestro no cierra nunca. */
     static uint8_t endRetries = 0;
@@ -4893,6 +4915,26 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 #if SLAVE_LAB_TOOLS_ENABLE
     if (rfrxOnFrame(data, len)) return;   /* rafaga de banco: no es protocolo */
 #endif
+    if (!geonetTagged(data, len)) {
+        static uint32_t s_untaggedLogMs = 0;
+        if (millis() - s_untaggedLogMs > 10000u) {
+            s_untaggedLogMs = millis();
+            SLAVE_LOG_PRINTF("[SLAVE] ESP-NOW sin marca de red ignorado %02X:%02X:%02X:%02X:%02X:%02X len=%d\n",
+                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (int)len);
+        }
+        return;
+    }
+    len -= GEONET_TAG_LEN;
+    if (!macIsMaster(mac)) {
+        static uint32_t s_foreignLogMs = 0;
+        if (millis() - s_foreignLogMs > 10000u) {
+            s_foreignLogMs = millis();
+            SLAVE_LOG_PRINTF("[SLAVE] ESP-NOW ajeno ignorado %02X:%02X:%02X:%02X:%02X:%02X cmd=0x%02X len=%d\n",
+                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                             data[0], (int)len);
+        }
+        return;
+    }
     learnMasterMac(mac);
     g_lastMasterRxMs = millis();   /* para el seguimiento de canal (ver abajo) */
     uint8_t cmd = data[0];
@@ -5444,7 +5486,11 @@ static uint8_t findMasterChannel(uint8_t fallback)
     for (int i = 0; i < n; i++) {
         if (WiFi.SSID(i) != MASTER_AP_SSID) continue;
         /* Puede haber más de un maestro al alcance: quedarse con el más fuerte. */
-        if (WiFi.RSSI(i) > best) { best = WiFi.RSSI(i); ch = WiFi.channel(i); }
+        if (WiFi.RSSI(i) > best) {
+            best = WiFi.RSSI(i);
+            ch = WiFi.channel(i);
+            memcpy(g_masterApBssid, WiFi.BSSID(i), 6);
+        }
     }
     WiFi.scanDelete();
     if (ch == 0) {
@@ -5452,8 +5498,11 @@ static uint8_t findMasterChannel(uint8_t fallback)
                          MASTER_AP_SSID, n, fallback);
         return fallback;
     }
-    SLAVE_LOG_PRINTF("[SLAVE] AP '%s' en canal %u (%d dBm)\n",
-                     MASTER_AP_SSID, ch, (int)best);
+    g_masterApKnown = true;
+    SLAVE_LOG_PRINTF("[SLAVE] AP '%s' en canal %u (%d dBm) BSSID %02X:%02X:%02X:%02X:%02X:%02X\n",
+                     MASTER_AP_SSID, ch, (int)best,
+                     g_masterApBssid[0], g_masterApBssid[1], g_masterApBssid[2],
+                     g_masterApBssid[3], g_masterApBssid[4], g_masterApBssid[5]);
     return ch;
 }
 

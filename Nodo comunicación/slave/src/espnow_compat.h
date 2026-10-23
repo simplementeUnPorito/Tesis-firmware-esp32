@@ -7,6 +7,7 @@
  */
 
 #include <Arduino.h>
+#include "sync_protocol.h"
 
 #if defined(ESP8266)
   #include <ESP8266WiFi.h>
@@ -44,7 +45,10 @@
 
   static inline esp_err_t espnowSend(const uint8_t *mac, const uint8_t *data, size_t len)
   {
-      return esp_now_send((uint8_t *)mac, (uint8_t *)data, (uint8_t)len);
+      uint8_t buf[ESPNOW_MAX_PAYLOAD];
+      const int n = geonetWrap(buf, data, (int)len);
+      if (n == 0) return 1;
+      return esp_now_send((uint8_t *)mac, buf, (uint8_t)n);
   }
 #else
   #include <WiFi.h>
@@ -74,8 +78,12 @@
       return esp_now_add_peer(&peer) == ESP_OK;
   }
 
+  /* Toda trama sale con la marca de red (sync_protocol.h). */
   static inline esp_err_t espnowSend(const uint8_t *mac, const uint8_t *data, size_t len)
   {
-      return esp_now_send(mac, data, len);
+      uint8_t buf[ESPNOW_MAX_PAYLOAD];
+      const int n = geonetWrap(buf, data, (int)len);
+      if (n == 0) return ESP_ERR_INVALID_ARG;
+      return esp_now_send(mac, buf, (size_t)n);
   }
 #endif

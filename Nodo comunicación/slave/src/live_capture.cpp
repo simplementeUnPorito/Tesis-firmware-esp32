@@ -73,6 +73,9 @@ uint32_t g_fs = 2604;
 SampleBytes *g_pages[MAX_PAGES] = {};
 uint32_t g_npages = 0;
 uint32_t g_cap = 0;
+/* Paginas que consiguio la ultima captura compartida que quiso mas de las que
+ * entraron. 0 = todavia no se midio. El HELLO no puede anunciar mas que eso. */
+uint32_t g_lastSharedPages = 0;
 
 volatile uint32_t g_recv = 0;
 uint32_t g_txNext = 0;
@@ -126,9 +129,18 @@ volatile bool g_sdOpen = false;
 volatile bool g_sdFull = false;
 volatile bool g_sdErr = false;   /* fallo una escritura con lugar libre */
 volatile uint32_t g_sdRetries = 0;
+constexpr uint32_t SD_RETRY_MS = 2500u;
+/* Lecturas de la SD fallidas seguidas para el stream; con muchas se cierra. */
+uint32_t g_sdReadFails = 0;
+constexpr uint32_t SD_READ_FAIL_MAX = 20u;
 volatile uint32_t g_sdRemounts = 0;
 volatile int g_sdErrno = 0;
 volatile uint32_t g_sdw = 0;
+/* Lotes que un flush sin error dejo en la tarjeta. Lo escrito despues vive en
+ * el cache de FatFs y se pierde si la SD se remonta: la RAM solo se libera
+ * hasta aca, y un remontaje vuelve g_sdw a este punto y reescribe (2026-10-23:
+ * sin esto, tras un EIO se releian clusters viejos de otra captura). */
+volatile uint32_t g_sdSynced = 0;
 volatile uint8_t g_sdReadState = 0;     /* 0 libre, 1 pedido, 2 listo, 3 error */
 volatile uint32_t g_sdReadSeq = 0;
 volatile uint32_t g_sdReadCount = 0;
@@ -163,12 +175,22 @@ bool streaming()
 uint32_t tailNow()
 {
     uint32_t t;
-    const uint32_t sdw = g_sdw;
+    const uint32_t sdw = g_sdSynced;
     if (g_cfg.realtime) {
         if (g_cfg.storage == CAPMODE_STORAGE_SD) {
             /* Retiene hasta que el maestro confirma, como el compartido: los
-             * reenvios salen de la RAM. Leerlos de la SD frenaba todo. */
+             * reenvios salen de la RAM. Leerlos de la SD frenaba todo.
+             * Pero si la radio se traba y la RAM se llena, se suelta lo que ya
+             * esta en la SD y esos reenvios se leen de ahi: sin esto, 8 s de
+             * radio parada (ESPNOW_NO_MEM, 2026-10-23) cortaban la captura por
+             * memoria con la SD guardando todo. Los dos terminos crecen solos,
+             * asi que la cola nunca retrocede. */
             t = (sdw < g_mack) ? sdw : g_mack;
+            const uint32_t keep = (g_cap > 2u * PSOC_WINDOW) ? g_cap - PSOC_WINDOW : g_cap / 2u;
+            const uint32_t r0 = g_recv;
+            const uint32_t press = (r0 > keep) ? r0 - keep : 0u;
+            const uint32_t onSd = (press < sdw) ? press : sdw;
+            if (onSd > t) t = onSd;
         } else if (g_cfg.storage == CAPMODE_STORAGE_PSOC) {
             t = g_txNext;   /* el respaldo es la RAM del PSoC */
         } else {
@@ -326,6 +348,17 @@ bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt)
 /* Desmonta, vuelve a montar y reabre /live.bin sin truncar. Si la tarjeta
  * quedo colgada tras una escritura fallida, esto la reinicia. Corre en la
  * tarea, con el mutex tomado. */
+/* Mas de 74 ciclos de reloj con CS alto: el procedimiento del estandar SD para
+ * que una tarjeta colgada en medio de un comando vuelva a escuchar. */
+void sdWake()
+{
+    pinMode(LIVE_SD_CS, OUTPUT);
+    digitalWrite(LIVE_SD_CS, HIGH);
+    g_spi.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+    for (int i = 0; i < 20; i++) g_spi.transfer(0xFF);
+    g_spi.endTransaction();
+}
+
 bool sdRemount()
 {
     g_sdRemounts = g_sdRemounts + 1u;
@@ -334,10 +367,12 @@ bool sdRemount()
     g_sdMounted = false;
     g_sdMountedHz = 0u;
     vTaskDelay(pdMS_TO_TICKS(50));
+    sdWake();
     if (!SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false)) return false;
     g_sdMounted = true;
     g_sdMountedHz = g_sdHz;
     g_file = SD.open(SD_PATH, "r+");
+    if (g_file && g_sdw > g_sdSynced) g_sdw = g_sdSynced;
     return (bool)g_file;
 }
 
@@ -348,6 +383,13 @@ void sdTaskFn(void *)
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
+        /* Un remontaje fallido deja g_file invalido: sin esto el pedido de
+         * lectura quedaba en 1 para siempre y la descarga se colgaba. */
+        if (g_sdOpen && !g_file && g_sdReadState == 1u && !sdRemount()) {
+            g_sdReadCount = 0u;
+            __sync_synchronize();
+            g_sdReadState = 3u;
+        }
         if (g_sdOpen && g_file) {
             if (g_sdReadState == 1u) {
                 __sync_synchronize();
@@ -364,24 +406,29 @@ void sdTaskFn(void *)
                 g_sdReadState = ok ? 2u : 3u;
             }
             for (int n = 0; n < 8 && !g_sdFull && g_sdw < g_recv; n++) {
-                const uint64_t pos = (uint64_t)g_sdw * BATCH_BYTES;
-                if (g_file.position() != pos && !g_file.seek(pos)) { g_sdFull = true; break; }
+                uint64_t pos = (uint64_t)g_sdw * BATCH_BYTES;
                 /* Con la radio transmitiendo alguna escritura falla y la
                  * siguiente anda: se reintenta antes de darla por perdida. */
+                /* El EIO aparece aun con la radio callada (2026-10-23) y a
+                 * veces un remontaje no alcanza. Se insiste ~2,5 s, remontando
+                 * cada 3 fallas: las RAM del ESP y del PSoC aguantan ese atraso. */
                 bool ok = false;
-                for (int intento = 0; intento < 6 && !ok; intento++) {
+                const uint32_t t0 = millis();
+                for (int intento = 0; !ok; intento++) {
                     if (intento > 0) {
+                        if ((millis() - t0) > SD_RETRY_MS) break;
                         g_sdRetries = g_sdRetries + 1u;
-                        /* Del tercer intento en adelante, remontar. */
-                        if (intento >= 3) {
-                            if (!sdRemount()) continue;
+                        if ((intento % 3) == 0) {
+                            if (!sdRemount()) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+                            pos = (uint64_t)g_sdw * BATCH_BYTES;   /* rebobino al ultimo flush */
                         } else {
-                            vTaskDelay(pdMS_TO_TICKS(20));
+                            vTaskDelay(pdMS_TO_TICKS(30));
                         }
-                        if (!g_file.seek(pos)) continue;
                     }
+                    /* El seek tambien falla con la SD en error: va por el mismo reintento. */
+                    if (!g_file || (g_file.position() != pos && !g_file.seek(pos))) continue;
                     errno = 0;
-                    ok = g_file.write((const uint8_t *)slotPtr(g_sdw), BATCH_BYTES) == BATCH_BYTES;
+                    ok = g_file && g_file.write((const uint8_t *)slotPtr(g_sdw), BATCH_BYTES) == BATCH_BYTES;
                     if (!ok) g_sdErrno = errno;
                 }
                 if (!ok) {
@@ -393,8 +440,12 @@ void sdTaskFn(void *)
                 g_sdw = g_sdw + 1u;
                 dirty = true;
             }
-            if (dirty && (millis() - lastFlushMs) >= 1000u) {
+            if (dirty && (millis() - lastFlushMs) >= 500u) {
+                const uint32_t upTo = g_sdw;
+                errno = 0;
                 g_file.flush();
+                if (errno == 0) g_sdSynced = upTo;
+                else g_sdErrno = errno;
                 dirty = false;
                 lastFlushMs = millis();
             }
@@ -413,7 +464,17 @@ bool sdMount()
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     g_spi.begin(LIVE_SD_SCK, LIVE_SD_MISO, LIVE_SD_MOSI, LIVE_SD_CS);
-    g_sdMounted = SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false);
+    /* 2026-10-23: tras un reset del ESP en plena transaccion la tarjeta queda
+     * colgada y el primer SD.begin falla ("SD ausente"). Se insiste, despertandola
+     * antes de cada intento. */
+    for (int intento = 0; intento < 4 && !g_sdMounted; intento++) {
+        if (intento > 0) {
+            SD.end();
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        sdWake();
+        g_sdMounted = SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false);
+    }
     if (g_sdMounted) {
         g_sdMountedHz = g_sdHz;
         g_sdFreeBytes = SD.totalBytes() - SD.usedBytes();
@@ -547,9 +608,19 @@ void serviceRealtime()
     if (g_sdReadState == 2u && g_sdReadForRt && g_sdReadPendingSend) {
         if (sdReadContains(g_sdReadSeq)) sendBatch(g_sdReadSeq, sdReadPtr(g_sdReadSeq), true);
         g_sdReadPendingSend = false;
+        g_sdReadFails = 0u;
     } else if (g_sdReadState == 3u && g_sdReadForRt) {
         g_sdReadPendingSend = false;
         g_sdReadState = 0u;
+        /* La SD no devuelve lo viejo: antes de colgar la descarga, se cierra
+         * en lo ya confirmado y el fin sale con motivo de error. */
+        if (++g_sdReadFails >= SD_READ_FAIL_MAX && g_psocDone && g_total != NONE) {
+            SLAVE_LOG_PRINTF("[LIVE] SD ilegible: cierro el stream en %lu de %lu\n",
+                             (unsigned long)g_mack, (unsigned long)g_total);
+            g_sdErr = true;
+            g_total = g_mack;
+            if (g_txNext > g_total) g_txNext = g_total;
+        }
     }
 
     if (g_mack < g_txNext && (now - g_mackMs) >= RTO_MS && (now - g_retxMs) >= RTO_MS &&
@@ -638,6 +709,7 @@ int32_t prepare(const Config &c)
     }
     if (want < 2u * PSOC_WINDOW) want = 2u * PSOC_WINDOW;
     allocPages(want);
+    if (c.storage == CAPMODE_STORAGE_SHARED && g_cap < want) g_lastSharedPages = g_npages;
     if (g_cap < 2u * PSOC_WINDOW) {
         freePages();
         SLAVE_LOG_PRINTLN("[LIVE] sin RAM para el anillo");
@@ -654,11 +726,13 @@ int32_t prepare(const Config &c)
         g_file = SD.open(SD_PATH, "w+");
         const bool ok = (bool)g_file;
         g_sdFull = false;
+        g_sdReadFails = 0u;
         g_sdErr = false;
         g_sdRetries = 0;
         g_sdRemounts = 0;
         g_sdErrno = 0;
         g_sdw = 0;
+        g_sdSynced = 0;
         g_sdReadState = 0;
         g_sdReadCount = 0;
         g_sdReadPendingSend = false;
@@ -814,7 +888,11 @@ bool serveReq(uint32_t seq)
         return sendBatch(seq, slotPtr(seq), false);
     }
     if (g_cfg.storage == CAPMODE_STORAGE_SD && seq < g_sdw) {
-        requestSdRead(seq, false, false);
+        /* La tarea lee bloques de 32 lotes: el pedido siguiente casi siempre
+         * ya esta en el buffer. Antes se mandaba uno y se tiraba el resto, y
+         * la descarga clasica desde SD iba a 4 lotes/s (2026-10-23). */
+        if (!g_sdReadForRt && sdReadContains(seq)) return sendBatch(seq, sdReadPtr(seq), false);
+        requestSdRead(seq, false, true);
         return true;   /* sale en service() cuando la tarea lo lea */
     }
     return false;
@@ -824,10 +902,11 @@ void service()
 {
     if (!g_active) return;
     servicePsocFlow();
-    if (!streaming() && g_sdReadState == 2u && !g_sdReadForRt) {
+    if (!streaming() && g_sdReadState == 2u && !g_sdReadForRt && g_sdReadPendingSend) {
         sendBatch(g_sdReadSeq, sdReadPtr(g_sdReadSeq), false);
-        g_sdReadState = 0u;
+        g_sdReadPendingSend = false;   /* el bloque queda para los pedidos siguientes */
     } else if (!streaming() && g_sdReadState == 3u && !g_sdReadForRt) {
+        g_sdReadPendingSend = false;
         g_sdReadState = 0u;
     }
     serviceRealtime();
@@ -841,7 +920,7 @@ bool finished()
 {
     if (!g_active || !g_psocDone) return false;
     if (g_cfg.realtime || g_cfg.streamDump) return g_mack >= g_total;
-    if (g_cfg.storage == CAPMODE_STORAGE_SD) return g_recv >= g_total && g_sdw >= g_total;
+    if (g_cfg.storage == CAPMODE_STORAGE_SD) return g_recv >= g_total && g_sdSynced >= g_total;
     return true;
 }
 
@@ -864,6 +943,12 @@ uint32_t ramCapacityBatches()
     }
     const size_t freeHeap = ESP.getFreeHeap();
     uint32_t pages = (freeHeap > HEAP_RESERVE) ? (uint32_t)((freeHeap - HEAP_RESERVE) / PAGE_BYTES) : 0u;
+    /* El heap libre total no es lo que despues reserva prepare(): la cabecera
+     * de cada malloc y lo que se toma entre ARM y PRESTART se comen ~2 paginas
+     * (2026-10-23: el HELLO decia 848 y prepare consiguio 784). Si la web pide
+     * mas de lo que entra, el esclavo recorta y la captura llega incompleta. */
+    pages = (pages > 2u) ? pages - 2u : 0u;
+    if (g_lastSharedPages != 0u && pages > g_lastSharedPages) pages = g_lastSharedPages;
     if (pages > MAX_PAGES) pages = MAX_PAGES;
     return pages * PAGE_BATCHES + PSOC_RING - PSOC_WINDOW;
 }

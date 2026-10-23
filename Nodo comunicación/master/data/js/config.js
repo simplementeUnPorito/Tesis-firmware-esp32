@@ -85,6 +85,8 @@ export const PSOC_CAPTURE_MAX_BATCHES = 60000;
 // el ESP; pedir 512 sin SD lo dejaba trabado. Por encima, el esclavo recorta.
 export const PSOC_RAM_CAPTURE_MAX_BATCHES = 416;
 export const PSOC_LOCAL_RAM_CAPTURE_MAX_BATCHES = 512;
+/* Anillo del PSoC que ram_batches suma en compartido: 512 - ventana de 16. */
+export const PSOC_SHARED_RING_BATCHES = 496;
 export const MAX_CAPTURE_SECONDS = 3600;
 export const TEST_DEFAULT_SECONDS = 0.2;
 // Placeholder sample counts for buffer/display sizing before any slave's

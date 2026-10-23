@@ -11,6 +11,15 @@
 #include "sync_protocol.h"
 #include "master_log.h"
 
+/* Unica salida ESP-NOW del maestro: agrega la marca de red (sync_protocol.h). */
+static inline esp_err_t geonetSend(const uint8_t *dst, const uint8_t *data, size_t len)
+{
+    uint8_t buf[ESPNOW_MAX_PAYLOAD];
+    const int n = geonetWrap(buf, data, (int)len);
+    if (n == 0) return ESP_ERR_INVALID_ARG;
+    return esp_now_send(dst, buf, (size_t)n);
+}
+
 #define MAX_NODES 9
 
 /* Un batch reensamblado */
@@ -59,6 +68,7 @@ public:
 
     uint32_t pktsRx()   const { return _pktsRx; }
     uint32_t crcFail()  const { return _crcFail; }
+    uint32_t foreignRx() const { return _foreignRx; }  /* tramas sin marca de red */
 
 private:
     BatchReadyCallback _cb = nullptr;
@@ -73,6 +83,7 @@ private:
     ReassembledBatch   _bufs[MAX_NODES] = {};
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
+    volatile uint32_t  _foreignRx = 0;
 
     void _handleData(const MsgData *msg);
     void _handleStatus(const MsgStatus *msg);
@@ -120,6 +131,9 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
 inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
     if (!instance || len < 1) return;
+    /* Solo tramas de esta red (marca al final, sync_protocol.h). */
+    if (!geonetTagged(data, len)) { instance->_foreignRx++; return; }
+    len -= GEONET_TAG_LEN;
     uint8_t first = data[0];
 
     if (first == DATA_PKT_MARKER && (size_t)len >= sizeof(MsgData)) {

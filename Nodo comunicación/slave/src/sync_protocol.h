@@ -288,3 +288,28 @@ struct MsgSelectStream {
 };
 
 #pragma pack(pop)
+
+/* Marca de red: toda trama ESP-NOW del sistema lleva al final estos 2 bytes
+ * (FNV-1a de "GeoNetwork", 0x1E5746E0). El que recibe descarta lo que no la
+ * tiene y la saca antes de procesar, asi los structs no cambian. Sin esto, el
+ * ESP-NOW de otro equipo al alcance se tomaba como maestro o como esclavo
+ * (2026-10-23: un "esclavo 4" fantasma y el ARM_ACK mandado a una MAC ajena). */
+#define GEONET_TAG0    0xE0u
+#define GEONET_TAG1    0x46u
+#define GEONET_TAG_LEN 2
+#define ESPNOW_MAX_PAYLOAD 250
+
+static inline bool geonetTagged(const uint8_t *d, int len)
+{
+    return len > GEONET_TAG_LEN && d[len - 2] == GEONET_TAG0 && d[len - 1] == GEONET_TAG1;
+}
+
+/* Copia la trama a buf con la marca; devuelve el largo o 0 si no entra. */
+static inline int geonetWrap(uint8_t *buf, const uint8_t *data, int len)
+{
+    if (len < 0 || len + GEONET_TAG_LEN > ESPNOW_MAX_PAYLOAD) return 0;
+    for (int i = 0; i < len; i++) buf[i] = data[i];
+    buf[len] = GEONET_TAG0;
+    buf[len + 1] = GEONET_TAG1;
+    return len + GEONET_TAG_LEN;
+}

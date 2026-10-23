@@ -812,10 +812,19 @@ function capacityNodes(role) {
 
 function geoCapacityInfo(storage = captureStorage()) {
   if (storage === STORAGE_PSOC_RAM) {
-    const max = captureMode() === CAPTURE_MODE_ASYNC
-      ? cfg.PSOC_RAM_CAPTURE_MAX_BATCHES
-      : cfg.PSOC_LOCAL_RAM_CAPTURE_MAX_BATCHES;
-    return { max, reported: true };
+    const classic = captureMode() === CAPTURE_MODE_ASYNC && !$('capture-fast')?.checked;
+    if (!classic) return { max: cfg.PSOC_LOCAL_RAM_CAPTURE_MAX_BATCHES, reported: true };
+    // Asincronico clasico: el PSoC vuelca todo al final y el ESP lo tiene que
+    // guardar entero. Entra la parte del ESP de ram_batches (que suma el anillo
+    // del PSoC menos su ventana, 496 lotes), con tope en la RAM del PSoC.
+    const esp = capacityNodes('geo')
+      .map((nd) => nd.ramBatches)
+      .filter((value) => value !== null && value !== undefined)
+      .map((value) => Math.max(0, value - cfg.PSOC_SHARED_RING_BATCHES));
+    if (esp.length) {
+      return { max: Math.min(...esp, cfg.PSOC_LOCAL_RAM_CAPTURE_MAX_BATCHES), reported: true };
+    }
+    return { max: cfg.PSOC_RAM_CAPTURE_MAX_BATCHES, reported: false };
   }
   const field = storage === STORAGE_SHARED_RAM ? 'ramBatches' : 'sdBatches';
   const reported = capacityNodes('geo')
@@ -3063,7 +3072,8 @@ ws.addEventListener('packet', (ev) => {
         finalizeCompletedRaw('dump completo');
       } else if (prevState === cfg.MASTER_STATE_RUNNING &&
                  ![cfg.MASTER_STATE_RUNNING, cfg.MASTER_STATE_STOPPING, cfg.MASTER_STATE_DUMPING].includes(masterState)) {
-        finalizeCompletedRaw('stream detenido');
+        // En tiempo real y descarga rapida el fin normal es RUNNING -> ARMED.
+        finalizeCompletedRaw(lastStartStreams ? 'tiempo real completo' : 'stream detenido');
       }
     } else {
       const panel = panelFor(idx);

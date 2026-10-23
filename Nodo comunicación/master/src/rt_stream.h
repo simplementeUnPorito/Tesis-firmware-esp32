@@ -60,6 +60,7 @@ public:
         }
         if (_q) xQueueReset(_q);
         _qDrop = 0;
+        _lastProgressMs = millis();
         _active = true;
         return true;
     }
@@ -75,6 +76,9 @@ public:
     }
 
     bool active() const { return _active; }
+    /* ms desde el ultimo lote nuevo o STREAM_END: el vigia del maestro cierra
+     * si un esclavo desaparece (reset, sin enlace) y nunca manda su fin. */
+    uint32_t msSinceProgress() const { return millis() - _lastProgressMs; }
 
     /* Tarea WiFi: solo encolar. */
     void onFrame(const uint8_t *data, int len)
@@ -91,6 +95,7 @@ public:
         d.total = e.total;
         d.reason = e.reason;
         d.ended = true;
+        _lastProgressMs = millis();
     }
 
     void service()
@@ -186,7 +191,7 @@ private:
         if (d.parts[slot] & (1u << m.part)) { d.dup++; return; }
         memcpy(&d.s[((size_t)slot * 2u + m.part) * SAMPLES_PER_PART], m.samples, sizeof(m.samples));
         d.parts[slot] |= (uint8_t)(1u << m.part);
-        if (d.parts[slot] == 3u) d.rx++;
+        if (d.parts[slot] == 3u) { d.rx++; _lastProgressMs = millis(); }
     }
 
     EmitFn _emit = nullptr;
@@ -195,5 +200,6 @@ private:
     QueueHandle_t _q = nullptr;
     volatile uint32_t _qDrop = 0;
     bool _active = false;
+    volatile uint32_t _lastProgressMs = 0;
     Node _nodes[RT_MAX_NODES];
 };
