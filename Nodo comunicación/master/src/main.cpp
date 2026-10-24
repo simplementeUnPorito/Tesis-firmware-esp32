@@ -1951,6 +1951,39 @@ static bool requestEnlace(const char **why)
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
 /* Apoyo de ota_master.h. */
+/* FIR del PSoC desde la web: 128 taps de 3 bytes (hex) -> dos tramas de 64 y
+ * el cierre. El ACK vuelve como CFG_ACK sub 0xCB del nodo. */
+static void sendFirToNode(uint8_t node, uint8_t action, const String &hex)
+{
+    if (!g_espnowReady || node == 0 || node > NUM_SLAVES) return;
+    const uint8_t *dst = espnowDstForSlave(node);
+    uint8_t bytes[FIR_HW_TAPS * 3] = {0};
+    uint16_t sum = 0;
+    if (action != 0u) {
+        if (hex.length() != FIR_HW_TAPS * 6) {
+            MASTER_LOG_PRINTF("[FIR] largo hex %u invalido\n", (unsigned)hex.length());
+            return;
+        }
+        for (int i = 0; i < FIR_HW_TAPS * 3; i++) {
+            bytes[i] = (uint8_t)strtoul(hex.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+            sum = (uint16_t)(sum + bytes[i]);
+        }
+        for (int first = 0; first < FIR_HW_TAPS; first += FIR_HW_CHUNK) {
+            MsgFirCoeffs m = {};
+            m.cmd = CMD_FIR_COEFFS;
+            m.node_id = node;
+            m.first = (uint8_t)first;
+            m.count = FIR_HW_CHUNK;
+            memcpy(m.coef, &bytes[first * 3], FIR_HW_CHUNK * 3);
+            geonetSend(dst, (const uint8_t *)&m, sizeof(m));
+            delay(5);
+        }
+    }
+    MsgFirCommit c = { CMD_FIR_COMMIT, node, action, sum };
+    geonetSend(dst, (const uint8_t *)&c, sizeof(c));
+    MASTER_LOG_PRINTF("[FIR] S%u accion %u suma %u\n", (unsigned)node, (unsigned)action, (unsigned)sum);
+}
+
 static bool otaSendToNode(uint8_t node, const uint8_t *data, size_t len)
 {
     if (!g_espnowReady || node == 0 || node > NUM_SLAVES) return false;
@@ -2052,6 +2085,7 @@ void setup()
     espnowRx.setOtaHandler(otam::onStatus);
     webRelaySetFillHook(rtarc::pushFill);
     webRelaySetDropTestHook(setDropTest);
+    webRelaySetFirHook(sendFirToNode);
     if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck,
                         onHello, onStartAck, onHotWaitAck)) {
         MASTER_LOG_PRINTLN("[MASTER] ESP-NOW FAIL - USB test continues");

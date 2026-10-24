@@ -21,6 +21,7 @@ export function defaultGroupState() {
     notchEnabled: false, notchHarm: 3,
     clean: { i2c: false, sd: false, radio: false, beacon: false },
     firHw: 0,
+    psocFir: { active: false, type: 'lp', f1: 200, f2: 400 },
   };
 }
 
@@ -29,7 +30,8 @@ export function loadGroupState(group) {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_PREFIX + group) || 'null');
     if (saved && typeof saved === 'object') {
-      return { ...base, ...saved, clean: { ...base.clean, ...(saved.clean || {}) } };
+      return { ...base, ...saved, clean: { ...base.clean, ...(saved.clean || {}) },
+        psocFir: { ...base.psocFir, ...(saved.psocFir || {}) } };
     }
   } catch (_) { /* sin almacenamiento: valores por defecto */ }
   return base;
@@ -154,8 +156,53 @@ export function mountFilterTab(container, { onChange, onSignatures, maxHarm = 12
     });
     const hwRow = document.createElement('div');
     hwRow.className = 'row';
-    hwRow.append(labeled('FIR hardware del PSoC', firHw));
+    hwRow.append(labeled('Mandar la salida del FIR del PSoC', firHw));
     box.append(hwRow);
+
+    // Coeficientes del bloque Filter del PSoC (128 taps, a la tasa del ADC)
+    const pf = st.psocFir;
+    const pType = document.createElement('select');
+    for (const [v, t] of [['lp', 'Pasa bajos'], ['hp', 'Pasa altos'], ['bp', 'Pasa banda'], ['bs', 'Rechaza banda']]) {
+      pType.appendChild(new Option(t, v));
+    }
+    pType.value = pf.type;
+    const pF1 = num(pf.f1, 1, 0);
+    const pF2 = num(pf.f2, 1, 0);
+    const pLoad = document.createElement('button');
+    pLoad.type = 'button';
+    pLoad.textContent = 'Cargar en los PSoC';
+    const pFactory = document.createElement('button');
+    pFactory.type = 'button';
+    pFactory.textContent = 'FIR de fábrica';
+    const pStatus = document.createElement('span');
+    pStatus.className = 'filter-status';
+    const refreshPsoc = () => {
+      pF2.disabled = pType.value === 'lp' || pType.value === 'hp';
+      pStatus.textContent = pf.active
+        ? `FIR del PSoC: ${pf.type} ${pf.f1}${pf.type === 'lp' || pf.type === 'hp' ? '' : '-' + pf.f2} Hz`
+        : 'FIR del PSoC: de fábrica';
+    };
+    pType.addEventListener('change', refreshPsoc);
+    pLoad.addEventListener('click', () => {
+      pf.type = pType.value;
+      pf.f1 = parseFloat(pF1.value) || 0;
+      pf.f2 = parseFloat(pF2.value) || 0;
+      pf.active = true;
+      saveGroupState(group, st);
+      refreshPsoc();
+      onChange(group, st, 'firpsoc');
+    });
+    pFactory.addEventListener('click', () => {
+      pf.active = false;
+      saveGroupState(group, st);
+      refreshPsoc();
+      onChange(group, st, 'firpsoc');
+    });
+    const psocRow = document.createElement('div');
+    psocRow.className = 'row';
+    psocRow.append(labeled('FIR del PSoC', pType), labeled('F1 Hz', pF1), labeled('F2 Hz', pF2), pLoad, pFactory);
+    box.append(psocRow, pStatus);
+    refreshPsoc();
 
     refreshFir();
     container.append(box);

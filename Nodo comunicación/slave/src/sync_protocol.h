@@ -405,3 +405,27 @@ static inline uint8_t dataZCrc(const struct MsgDataZ *m)
     for (int i = 0; i < m->len; i++) c ^= m->data[i];
     return c;
 }
+
+/* ── FIR del bloque Filter del PSoC cargado desde la web ─────────────────────
+ * 128 taps Q1.23 (3 bytes LE cada uno) en dos tramas de 64 y un cierre con la
+ * suma de los 384 bytes. El esclavo los pasa al PSoC fuera de captura y
+ * responde con CMD_CFG_ACK sub 0xCB. action 0 = volver al FIR de fabrica. */
+#define CMD_FIR_COEFFS  0x76   /* maestro -> esclavo */
+#define CMD_FIR_COMMIT  0x77   /* maestro -> esclavo */
+#define FIR_HW_TAPS     128
+#define FIR_HW_CHUNK    64
+#pragma pack(push, 1)
+struct MsgFirCoeffs {
+    uint8_t cmd;          /* CMD_FIR_COEFFS */
+    uint8_t node_id;
+    uint8_t first;        /* primer tap del bloque */
+    uint8_t count;        /* taps en este bloque (<= FIR_HW_CHUNK) */
+    uint8_t coef[FIR_HW_CHUNK * 3];
+};
+struct MsgFirCommit {
+    uint8_t  cmd;         /* CMD_FIR_COMMIT */
+    uint8_t  node_id;
+    uint8_t  action;      /* 1 = cargar lo recibido, 0 = FIR de fabrica */
+    uint16_t sum;         /* suma de los 384 bytes */
+};
+#pragma pack(pop)

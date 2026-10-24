@@ -393,6 +393,25 @@ public:
     }
     void sdCapture(uint8_t enable);  /* modo captura a SD del PSoC (0xBE) */
     void liveMode(uint8_t mode)      { _sendCmd1(PSOC_CMD_LIVE_MODE, mode); }
+    /* FIR del bloque Filter: tap (3 bytes Q1.23 LE) y cierre con la suma. */
+    void firTap(uint8_t idx, uint8_t b0, uint8_t b1, uint8_t b2)
+    {
+        if (_ser == nullptr) { return; }
+        const uint8_t lo[6] = { PSOC_FRAME_MARKER, 0xC9u, idx, b0, b1,
+                                (uint8_t)(0xC9u ^ idx ^ b0 ^ b1) };
+        const uint8_t hi[6] = { PSOC_FRAME_MARKER, 0xCAu, idx, b2, 0x00u,
+                                (uint8_t)(0xCAu ^ idx ^ b2) };
+        _ser->write(lo, sizeof(lo));
+        _ser->write(hi, sizeof(hi));
+    }
+    void firCommit(uint8_t action, uint16_t sum)
+    {
+        if (_ser == nullptr) { return; }
+        const uint8_t l = (uint8_t)(sum & 0xFFu), h = (uint8_t)(sum >> 8);
+        const uint8_t f[6] = { PSOC_FRAME_MARKER, 0xCBu, action, l, h,
+                               (uint8_t)(0xCBu ^ action ^ l ^ h) };
+        _ser->write(f, sizeof(f));
+    }
     void liveAck(uint16_t batch, uint8_t flags)
     {
         if (_ser == nullptr) { return; }

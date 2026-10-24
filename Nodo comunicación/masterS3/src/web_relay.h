@@ -190,6 +190,8 @@ static inline uint8_t webRelayHexByte(const String &hex)
 static void (*g_webFillHook)(uint8_t node, uint32_t seq, uint16_t count) = nullptr;
 inline void webRelaySetFillHook(void (*hook)(uint8_t, uint32_t, uint16_t)) { g_webFillHook = hook; }
 static void (*g_webDropTestHook)(uint32_t every) = nullptr;
+static void (*g_webFirHook)(uint8_t node, uint8_t action, const String &hex) = nullptr;
+inline void webRelaySetFirHook(void (*hook)(uint8_t, uint8_t, const String &)) { g_webFirHook = hook; }
 inline void webRelaySetDropTestHook(void (*hook)(uint32_t)) { g_webDropTestHook = hook; }
 
 /* Texto a la web (avisos como fill_miss). */
@@ -202,6 +204,15 @@ static void webRelayDecodeCmd(const String &json)
 {
     String cmdStr;
     if (!webRelayJsonStr(json, "cmd", cmdStr)) return;
+    if (cmdStr == "FIRHW") {   /* {"cmd":"FIRHW","node":n,"action":1,"taps":"hex 768"} */
+        long node = 0, action = 1;
+        String hex;
+        webRelayJsonInt(json, "node", node);
+        webRelayJsonInt(json, "action", action);
+        webRelayJsonStr(json, "taps", hex);
+        if (g_webFirHook && node > 0) g_webFirHook((uint8_t)node, (uint8_t)action, hex);
+        return;
+    }
     if (cmdStr == "DROPTEST") {   /* banco: no mandar 1 de cada N lotes RT */
         long every = 0;
         webRelayJsonInt(json, "every", every);

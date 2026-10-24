@@ -31,6 +31,13 @@
 #include "espnow_transport.h"
 #include "live_capture.h"
 #include "ota_slave.h"
+
+/* FIR del PSoC en transito (ver serviceFirUpload). */
+static uint8_t  g_firBuf[FIR_HW_TAPS * 3];
+static uint32_t g_firGot[(FIR_HW_TAPS + 31) / 32];
+static volatile bool g_firCommitPending = false;
+static volatile uint8_t g_firAction = 0;
+static volatile uint16_t g_firSum = 0;
 #include "sync_protocol.h"
 #include "debug_log.h"
 #include "sd_storage.h"
@@ -5158,6 +5165,22 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         const MsgStreamAck *a = (const MsgStreamAck *)data;
         if (a->node_id == NODE_ID) live::onMasterAck(a->next_expected, a->sack);
     }
+    else if (cmd == CMD_FIR_COEFFS && len >= 4) {
+        const MsgFirCoeffs *m = (const MsgFirCoeffs *)data;
+        if (m->node_id == NODE_ID && m->count <= FIR_HW_CHUNK &&
+            (int)m->first + m->count <= FIR_HW_TAPS && len >= 4 + 3 * (int)m->count) {
+            memcpy(&g_firBuf[(size_t)m->first * 3u], m->coef, (size_t)m->count * 3u);
+            for (int i = 0; i < m->count; i++) g_firGot[(m->first + i) / 32] |= 1u << ((m->first + i) % 32);
+        }
+    }
+    else if (cmd == CMD_FIR_COMMIT && len >= (int)sizeof(MsgFirCommit)) {
+        const MsgFirCommit *m = (const MsgFirCommit *)data;
+        if (m->node_id == NODE_ID) {
+            g_firAction = m->action;
+            g_firSum = m->sum;
+            g_firCommitPending = true;   /* lo manda loop(): la UART no va en la tarea WiFi */
+        }
+    }
     else if (cmd == CMD_OTA_OFFER && len >= (int)sizeof(MsgOtaOffer)) {
         ota::onOffer(*(const MsgOtaOffer *)data,
                      g_state == SAMPLING || g_state == HOT_WAIT || live::active());
@@ -5711,8 +5734,39 @@ void setup()
 
 /* ── Loop ────────────────────────────────────────────────────────────────── */
 
+/* FIR del PSoC recibido de la web: se pasa por UART fuera de captura y el ACK
+ * del PSoC (0xCB) vuelve al maestro como cualquier configuracion. */
+static void serviceFirUpload()
+{
+    if (!g_firCommitPending) return;
+    if (g_state == SAMPLING || g_state == HOT_WAIT || g_cfg_waiting) return;
+    g_firCommitPending = false;
+    if (g_firAction != 0u) {
+        uint16_t sum = 0;
+        bool complete = true;
+        for (int i = 0; i < FIR_HW_TAPS; i++) {
+            if (!(g_firGot[i / 32] & (1u << (i % 32)))) complete = false;
+            sum = (uint16_t)(sum + g_firBuf[i * 3] + g_firBuf[i * 3 + 1] + g_firBuf[i * 3 + 2]);
+        }
+        if (!complete || sum != g_firSum) {
+            SLAVE_LOG_PRINTF("[FIR] incompleto o suma distinta (%u vs %u)\n", sum, g_firSum);
+            sendCfgAck(0xCBu, 0u);
+            return;
+        }
+        for (int i = 0; i < FIR_HW_TAPS; i++) {
+            psoc.firTap((uint8_t)i, g_firBuf[i * 3], g_firBuf[i * 3 + 1], g_firBuf[i * 3 + 2]);
+            if ((i & 15) == 15) delay(2);   /* no desbordar la RX del PSoC */
+        }
+    }
+    psoc.firCommit(g_firAction, g_firSum);
+    waitForPsocConfigAck(0xCBu, 1u);
+    memset(g_firGot, 0, sizeof(g_firGot));
+    SLAVE_LOG_PRINTF("[FIR] enviado al PSoC (accion %u)\n", (unsigned)g_firAction);
+}
+
 void loop()
 {
+    serviceFirUpload();
     ota::service();   /* una descarga OTA bloquea y termina reiniciando */
     servicePsocResetRequest();
     serviceRadioSilencio(true);

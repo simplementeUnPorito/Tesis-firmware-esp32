@@ -2,19 +2,19 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-39';
-import { WsClient } from './ws_client.js?v=field-study-39';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-39';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-39';
-import { PlotArea } from './plot.js?v=field-study-39';
-import { SpectrumArea } from './spectrum.js?v=field-study-39';
-import { SlavePanel } from './slave_panel.js?v=field-study-39';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-39';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-39';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-39';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-39';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-39';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-39';
+import * as cfg from './config.js?v=field-study-40';
+import { WsClient } from './ws_client.js?v=field-study-40';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-40';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-40';
+import { PlotArea } from './plot.js?v=field-study-40';
+import { SpectrumArea } from './spectrum.js?v=field-study-40';
+import { SlavePanel } from './slave_panel.js?v=field-study-40';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-40';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-40';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-40';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-40';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-40';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-40';
 
 const $ = (id) => document.getElementById(id);
 
@@ -249,12 +249,59 @@ function applyFilterGroupToNode(chIndex, what = 'all') {
     nd.cleanRadio = !!st.clean.radio;
     nd.cleanBeacon = !!st.clean.beacon;
   }
+  if ((what === 'all' || what === 'firpsoc') && ws.connected &&
+      (what === 'firpsoc' || st.psocFir?.active)) {
+    sendPsocFir(chIndex, st.psocFir);
+  }
   if ((what === 'all' || what === 'firhw') && ws.connected) {
     sendDirected(chIndex, cfg.SUBCMD_SELECT_STREAM, st.firHw ? 1 : 0);
   }
   if (what === 'fir' || what === 'all') reprocessFiltBuf(chIndex);
   else markNodeFilterDirty(chIndex);
   return true;
+}
+
+/* FIR del bloque Filter del PSoC: 127 taps de fase lineal (retardo 63, el que
+ * ya compensa el firmware) + un cero, cuantizados a Q1.23 y en hex. */
+function psocFirHex(spec, fs) {
+  if (!spec?.active) return '';
+  const cmd = (spec.type === 'lp' || spec.type === 'hp')
+    ? `numtaps 127 ${spec.type} ${spec.f1}`
+    : `numtaps 127 ${spec.type} ${spec.f1} ${spec.f2}`;
+  const b = compileFirCmd(cmd, fs);
+  if (!b) return null;
+  let hex = '';
+  for (let i = 0; i < 128; i++) {
+    const v = i < b.length ? b[i] : 0;
+    let q = Math.round(v * 8388608);
+    q = Math.max(-8388608, Math.min(8388607, q));
+    const u = q & 0xFFFFFF;
+    for (const byte of [u & 0xFF, (u >> 8) & 0xFF, (u >> 16) & 0xFF]) {
+      hex += byte.toString(16).padStart(2, '0');
+    }
+  }
+  return hex;
+}
+
+function sendPsocFir(chIndex, spec) {
+  const nd = data.nodes[chIndex];
+  const fs = nd.fs > 0 ? nd.fs : currentFsHz();
+  if (!spec?.active) {
+    ws.send(JSON.stringify({ cmd: 'FIRHW', node: chIndex, action: 0 }));
+    return;
+  }
+  const hex = psocFirHex(spec, fs);
+  if (!hex) {
+    appendLog(`S${chIndex} FIR del PSoC inválido: ${lastFirError() || ''}`);
+    return;
+  }
+  // 127 taps a la tasa del ADC: la transición mide ~3,3·fs/127 (Hamming)
+  const trans = 3.3 * fs / 127;
+  const edges = [spec.f1, spec.type === 'bp' || spec.type === 'bs' ? spec.f2 : null].filter((f) => f != null);
+  if (edges.some((f) => f < trans)) {
+    appendLog(`S${chIndex} FIR del PSoC: con 127 taps a ${fs.toFixed(0)} Hz la transición mide ~${trans.toFixed(0)} Hz; bordes por debajo quedan imprecisos`);
+  }
+  ws.send(JSON.stringify({ cmd: 'FIRHW', node: chIndex, action: 1, taps: hex }));
 }
 
 function onFilterGroupChanged(group, st, what) {
@@ -267,6 +314,7 @@ function onFilterGroupChanged(group, st, what) {
     notch: st.notchEnabled ? `línea N=${st.notchHarm}` : 'línea OFF',
     clean: Object.entries(st.clean).filter(([, v]) => v).map(([k]) => k).join(',') || 'sin limpieza',
     firhw: st.firHw ? 'FIR hardware' : 'ADC crudo',
+    firpsoc: st.psocFir?.active ? `FIR del PSoC ${st.psocFir.type} ${st.psocFir.f1} Hz` : 'FIR del PSoC de fábrica',
   }[what] || what;
   appendLog(`Filtros ${group.toUpperCase()}: ${detail} (${n} nodo(s))`);
 }
