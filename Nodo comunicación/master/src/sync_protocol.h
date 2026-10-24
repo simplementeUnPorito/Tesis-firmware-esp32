@@ -303,3 +303,59 @@ static inline int geonetWrap(uint8_t *buf, const uint8_t *data, int len)
     buf[len + 1] = GEONET_TAG1;
     return len + GEONET_TAG_LEN;
 }
+
+/* ── OTA de esclavos ────────────────────────────────────────────────────────
+ * El maestro guarda el .bin en su LittleFS y ofrece la actualizacion por
+ * ESP-NOW; el esclavo se asocia como STA al AP del maestro, baja la imagen por
+ * HTTP, verifica tamano y SHA-256 y reinicia en el slot nuevo. La imagen nueva
+ * se confirma recien cuando vuelve a hablar con el maestro (si no, rollback).
+ * Nunca durante una captura. */
+#define CMD_OTA_OFFER   0x7A   /* maestro -> esclavo unicast */
+#define CMD_OTA_STATUS  0x7B   /* esclavo -> maestro */
+#define CMD_OTA_CONTROL 0x7C   /* maestro -> esclavo: abortar */
+
+#define OTA_ST_IDLE        0u
+#define OTA_ST_JOINING     1u   /* asociandose al AP del maestro */
+#define OTA_ST_DOWNLOADING 2u
+#define OTA_ST_VERIFYING   3u
+#define OTA_ST_REBOOTING   4u
+#define OTA_ST_PENDING     5u   /* imagen nueva corriendo, sin confirmar */
+#define OTA_ST_CONFIRMED   6u
+#define OTA_ST_FAILED      7u
+
+#define OTA_ERR_NONE      0u
+#define OTA_ERR_BUSY      1u   /* captura en curso */
+#define OTA_ERR_WIFI      2u   /* no se pudo asociar al AP */
+#define OTA_ERR_HTTP      3u
+#define OTA_ERR_SIZE      4u
+#define OTA_ERR_SHA       5u
+#define OTA_ERR_FLASH     6u   /* Update.begin/write/end */
+#define OTA_ERR_ABORTED   7u
+
+#pragma pack(push, 1)
+struct MsgOtaOffer {
+    uint8_t  cmd;          /* CMD_OTA_OFFER */
+    uint8_t  node_id;
+    uint32_t session;      /* identifica la actualizacion en los estados */
+    uint32_t size;         /* bytes del .bin */
+    uint8_t  sha256[32];
+    char     path[32];     /* ruta HTTP en el maestro, terminada en 0 */
+};
+
+struct MsgOtaStatus {
+    uint8_t  cmd;          /* CMD_OTA_STATUS */
+    uint8_t  node_id;
+    uint32_t session;
+    uint8_t  state;        /* OTA_ST_* */
+    uint8_t  error;        /* OTA_ERR_* */
+    uint32_t received;     /* bytes escritos */
+    uint32_t size;
+};
+
+struct MsgOtaControl {
+    uint8_t  cmd;          /* CMD_OTA_CONTROL */
+    uint8_t  node_id;
+    uint32_t session;
+    uint8_t  action;       /* 1 = abortar */
+};
+#pragma pack(pop)

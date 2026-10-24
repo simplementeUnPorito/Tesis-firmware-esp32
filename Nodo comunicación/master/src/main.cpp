@@ -30,6 +30,7 @@
 #include <esp_wifi.h>
 #include "sync_protocol.h"
 #include "espnow_rx.h"
+#include "ota_master.h"
 #include "matlab_transport.h"
 #include "master_log.h"
 #include "debug_log.h"
@@ -1901,6 +1902,25 @@ static bool requestEnlace(const char **why)
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
+/* Apoyo de ota_master.h. */
+static bool otaSendToNode(uint8_t node, const uint8_t *data, size_t len)
+{
+    if (!g_espnowReady || node == 0 || node > NUM_SLAVES) return false;
+    return geonetSend(espnowDstForSlave(node), data, len) == ESP_OK;
+}
+
+static bool otaCaptureBusy()
+{
+    return g_rt.active() || g_state == ARMING || g_state == PRESTART ||
+           g_state == RUNNING || g_state == STOPPING || g_state == DUMPING ||
+           g_state == SCOPE_MULTI;
+}
+
+static bool otaNodeSeen(uint8_t node)
+{
+    return node >= 1 && node <= NUM_SLAVES && g_cachedHello[node].valid;
+}
+
 void setup()
 {
     matlab.begin();
@@ -1966,6 +1986,8 @@ void setup()
          * SPA, por eso va después de webServerBegin() (que hace el mount). */
         linkModeBegin();
         linkSetEnterHook(requestEnlace);   /* habilita POST /enlace/now */
+        /* OTA de esclavos: el .bin vive en este LittleFS. */
+        otam::begin(webServer, otaSendToNode, otaCaptureBusy, otaNodeSeen);
     }
 
     /* mDNS: el maestro queda alcanzable como http://geo.local desde las dos
@@ -1979,6 +2001,7 @@ void setup()
     /* ESP-NOW (convive con AP mode) */
     g_rt.begin(rtEmit, rtReady, rtAck);
     espnowRx.setRtHandlers(rtOnData, rtOnEnd);
+    espnowRx.setOtaHandler(otam::onStatus);
     if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck,
                         onHello, onStartAck, onHotWaitAck)) {
         MASTER_LOG_PRINTLN("[MASTER] ESP-NOW FAIL - USB test continues");

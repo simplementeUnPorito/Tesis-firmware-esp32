@@ -1,0 +1,9 @@
+# ESP32-S3 N16R8 con OTA: dos slots de 4 MiB y LittleFS grande (el maestro
+# guarda ahi el .bin de los esclavos). Cambiar la tabla exige grabar por USB.
+# Name,   Type, SubType,  Offset,   Size
+nvs,      data, nvs,      0x9000,   0x5000
+otadata,  data, ota,      0xe000,   0x2000
+app0,     app,  ota_0,    0x10000,  0x400000
+app1,     app,  ota_1,    0x410000, 0x400000
+spiffs,   data, spiffs,   0x810000, 0x7E0000
+coredump, data, coredump, 0xFF0000, 0x10000

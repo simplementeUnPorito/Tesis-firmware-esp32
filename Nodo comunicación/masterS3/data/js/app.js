@@ -2,17 +2,18 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-37';
-import { WsClient } from './ws_client.js?v=field-study-37';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-37';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-37';
-import { PlotArea } from './plot.js?v=field-study-37';
-import { SpectrumArea } from './spectrum.js?v=field-study-37';
-import { SlavePanel } from './slave_panel.js?v=field-study-37';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-37';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-37';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-37';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-37';
+import * as cfg from './config.js?v=field-study-38';
+import { WsClient } from './ws_client.js?v=field-study-38';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-38';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-38';
+import { PlotArea } from './plot.js?v=field-study-38';
+import { SpectrumArea } from './spectrum.js?v=field-study-38';
+import { SlavePanel } from './slave_panel.js?v=field-study-38';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-38';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-38';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-38';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-38';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-38';
 
 const $ = (id) => document.getElementById(id);
 
@@ -3684,3 +3685,6 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 ws.start();
+
+// OTA de esclavos, en la pestaña Esclavos.
+mountOtaPanel(document.getElementById('tab-slaves'), appendLog);

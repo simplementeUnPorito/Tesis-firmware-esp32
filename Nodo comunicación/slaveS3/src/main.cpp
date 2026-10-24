@@ -30,6 +30,7 @@
 #include "psoc_uart.h"
 #include "espnow_transport.h"
 #include "live_capture.h"
+#include "ota_slave.h"
 #include "sync_protocol.h"
 #include "debug_log.h"
 #include "sd_storage.h"
@@ -238,6 +239,9 @@ static void applyBeaconMarks() {}
  * escucha la radio. */
 #ifndef MASTER_AP_SSID
 #define MASTER_AP_SSID  "GeoNetwork"
+#endif
+#ifndef MASTER_AP_PASS
+#define MASTER_AP_PASS  "geophone2026"   /* el mismo del AP del maestro; solo OTA */
 #endif
 #ifndef MASTER_CH_FALLBACK
 #define MASTER_CH_FALLBACK  1
@@ -4224,6 +4228,8 @@ static void handleUsbCommand(const char *cmd)
         SLAVE_LOG_RAW("#RTSIM on=%u loss=%u\n", (unsigned)live::simEnabled(), loss);
     } else if (usbCommandEquals(cmd, "livestat")) {
         live::printStatus();
+    } else if (usbCommandEquals(cmd, "ota")) {
+        ota::printStatus();
     } else if (usbCommandEquals(cmd, "marcas")) {
         live::printStatus();
         SLAVE_LOG_RAW("#MARCAS beacon=%s\n", g_beaconMarks ? "on" : "off");
@@ -4971,6 +4977,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         live::noteEvent(SAMPLE_FLAG_MASTER_RX, now - airtime, now);
     }
     learnMasterMac(mac);
+    ota::onMasterAlive();   /* confirma una imagen OTA pendiente */
     g_lastMasterRxMs = millis();   /* para el seguimiento de canal (ver abajo) */
     uint8_t cmd = data[0];
     /* La rampa ESP es una prueba de radio: admitir DEBUG=0 para que
@@ -5132,6 +5139,13 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     else if (cmd == CMD_STREAM_ACK && len >= (int)sizeof(MsgStreamAck)) {
         const MsgStreamAck *a = (const MsgStreamAck *)data;
         if (a->node_id == NODE_ID) live::onMasterAck(a->next_expected, a->sack);
+    }
+    else if (cmd == CMD_OTA_OFFER && len >= (int)sizeof(MsgOtaOffer)) {
+        ota::onOffer(*(const MsgOtaOffer *)data,
+                     g_state == SAMPLING || g_state == HOT_WAIT || live::active());
+    }
+    else if (cmd == CMD_OTA_CONTROL && len >= (int)sizeof(MsgOtaControl)) {
+        ota::onControl(*(const MsgOtaControl *)data);
     }
     else if (cmd == CMD_STOP) {
         /* En vivo el STOP no tira nada: el PSoC cierra con la bajada de SYNC
@@ -5660,6 +5674,7 @@ void setup()
     psoc.begin(onBatch);
     psoc.onDiag(onPsocDiag);
     live::begin(&psoc, sendToMaster, NODE_ID);
+    ota::begin(sendToMaster, NODE_ID, MASTER_AP_SSID, MASTER_AP_PASS);
     g_psoc_rx_last_level = (uint8_t)digitalRead(PSOC_UART_RX);
     attachInterrupt(digitalPinToInterrupt(PSOC_UART_RX), onPsocRxEdge, CHANGE);
 #if PSOC_RX_SCAN_ENABLE
@@ -5681,6 +5696,7 @@ void setup()
 
 void loop()
 {
+    ota::service();   /* una descarga OTA bloquea y termina reiniciando */
     servicePsocResetRequest();
     serviceRadioSilencio(true);
     if (g_state != SAMPLING) {
