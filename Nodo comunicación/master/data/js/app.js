@@ -2,19 +2,19 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-38';
-import { WsClient } from './ws_client.js?v=field-study-38';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-38';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-38';
-import { PlotArea } from './plot.js?v=field-study-38';
-import { SpectrumArea } from './spectrum.js?v=field-study-38';
-import { SlavePanel } from './slave_panel.js?v=field-study-38';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-38';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-38';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-38';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-38';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-38';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-38';
+import * as cfg from './config.js?v=field-study-39';
+import { WsClient } from './ws_client.js?v=field-study-39';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-39';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-39';
+import { PlotArea } from './plot.js?v=field-study-39';
+import { SpectrumArea } from './spectrum.js?v=field-study-39';
+import { SlavePanel } from './slave_panel.js?v=field-study-39';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-39';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-39';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-39';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-39';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-39';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-39';
 
 const $ = (id) => document.getElementById(id);
 
@@ -1650,8 +1650,163 @@ function adcCountsToVolts(counts, nd) {
   return counts / (nd?.countsPerVolt || cfg.ADC_COUNTS_PER_VOLT);
 }
 
+/* ── Lotes numerados: cero perdida entre el maestro y la web ───────────────
+ * Cada lote del tiempo real llega con su numero (0xFA). Si salta, se dejan los
+ * lugares en NaN y se piden con FILL; si llega uno viejo que faltaba, se
+ * escribe en su lugar. Al cerrar se espera a que no queden huecos. */
+const FILL_RETRY_MS = 3000;
+const FILL_WAIT_MAX_MS = 20000;
+
+function appendPlaceholders(nd, count) {
+  for (let i = 0; i < count; i++) {
+    const evicted = nd.pushRaw(NaN);
+    if (Number.isFinite(evicted)) nd.rawSum -= evicted;
+    nd.totalSamples++;
+    if (nd.fullCaptureEnabled) unlimitedSamplesStored++;
+    if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
+  }
+}
+
+function onBatchHeader(nd, seq) {
+  if (!nd.missingBatches) nd.resetBatchTracking();
+  if (seq === nd.seqNext) {
+    nd.rxMode = 'append';
+    nd.seqNext++;
+  } else if (seq > nd.seqNext) {
+    const gap = Math.min(seq - nd.seqNext, 200000);
+    for (let s = nd.seqNext; s < nd.seqNext + gap; s++) nd.missingBatches.add(s);
+    appendPlaceholders(nd, gap * cfg.SAMPLES_PER_BATCH);
+    nd.seqNext = seq + 1;
+    nd.rxMode = 'append';
+  } else if (nd.missingBatches.has(seq)) {
+    nd.missingBatches.delete(seq);
+    nd.fillAsked.delete(seq);
+    nd.rxMode = 'fill';
+    nd.fillPos = seq * cfg.SAMPLES_PER_BATCH;
+    nd.fillRemain = cfg.SAMPLES_PER_BATCH;
+  } else {
+    nd.rxMode = 'skip';   /* duplicado: ya estaba */
+    nd.fillRemain = cfg.SAMPLES_PER_BATCH;
+  }
+}
+
+function onBatchEnd(nd, total) {
+  if (!nd.missingBatches) nd.resetBatchTracking();
+  if (total > nd.seqNext) {
+    const gap = Math.min(total - nd.seqNext, 200000);
+    for (let s = nd.seqNext; s < nd.seqNext + gap; s++) nd.missingBatches.add(s);
+    appendPlaceholders(nd, gap * cfg.SAMPLES_PER_BATCH);
+    nd.seqNext = total;
+  }
+}
+
+/* Pide los huecos al maestro, de a tramos, sin repetir antes de 3 s. Durante la
+ * captura pide poco: el relleno no puede frenar el tiempo real. */
+function requestBatchFills() {
+  if (!ws.connected) return;
+  const running = masterState === cfg.MASTER_STATE_RUNNING;
+  let runsLeft = running ? 1 : 6;
+  const maxCount = running ? 16 : 64;
+  const now = Date.now();
+  for (let i = 1; i < cfg.MAX_NODES && runsLeft > 0; i++) {
+    const nd = data.nodes[i];
+    if (!nd.missingBatches || nd.missingBatches.size === 0) continue;
+    const seqs = [...nd.missingBatches]
+      .filter((s) => now - (nd.fillAsked.get(s) || 0) > FILL_RETRY_MS)
+      .sort((a, b) => a - b);
+    let k = 0;
+    while (k < seqs.length && runsLeft > 0) {
+      const start = seqs[k];
+      let count = 1;
+      while (k + count < seqs.length && seqs[k + count] === start + count && count < maxCount) count++;
+      ws.send(JSON.stringify({ cmd: 'FILL', node: i, seq: start, count }));
+      for (let s = start; s < start + count; s++) nd.fillAsked.set(s, now);
+      k += count;
+      runsLeft--;
+    }
+  }
+}
+setInterval(requestBatchFills, 500);
+
+function missingBatchCount() {
+  let n = 0;
+  for (let i = 1; i < cfg.MAX_NODES; i++) n += data.nodes[i].missingBatches?.size || 0;
+  return n;
+}
+
+/* Cierre del tiempo real: espera a que se rellenen los huecos (o se declaren
+ * perdidos) antes de filtrar y guardar. */
+function finalizeWhenGapsFilled(reason) {
+  const t0 = Date.now();
+  const initial = missingBatchCount();
+  if (initial === 0) { finalizeCompletedRaw(reason); return; }
+  appendLog(`Recuperando ${initial} lote(s) que no llegaron por WebSocket…`);
+  requestBatchFills();
+  const timer = setInterval(() => {
+    const left = missingBatchCount();
+    if (left === 0 || Date.now() - t0 > FILL_WAIT_MAX_MS) {
+      clearInterval(timer);
+      if (left > 0) {
+        for (let i = 1; i < cfg.MAX_NODES; i++) {
+          const nd = data.nodes[i];
+          for (const s of nd.missingBatches || []) nd.lostBatches.add(s);
+          nd.missingBatches?.clear();
+        }
+        appendLog(`AVISO: ${left} lote(s) no se pudieron recuperar; quedan como huecos declarados`);
+      } else {
+        appendLog(`Huecos recuperados: ${initial} lote(s)`);
+      }
+      finalizeCompletedRaw(reason);
+    }
+  }, 500);
+}
+
+ws.addEventListener('fill-miss', (ev) => {
+  const nd = data.nodes[ev.detail?.node];
+  if (!nd?.missingBatches) return;
+  const seq = Number(ev.detail.seq);
+  if (nd.missingBatches.delete(seq)) nd.lostBatches.add(seq);
+});
+
+/* Los NaN de un lote perdido no pueden entrar al filtrado: se interpolan solo
+ * en la copia que se filtra; el crudo exportado conserva el hueco. */
+function interpolateGaps(arr) {
+  let bad = false;
+  for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) { bad = true; break; }
+  if (!bad) return arr;
+  const out = new Float64Array(arr);
+  let last = -1;
+  for (let i = 0; i <= out.length; i++) {
+    if (i < out.length && !Number.isFinite(out[i])) continue;
+    if (i - last > 1) {
+      const a = last >= 0 ? out[last] : (i < out.length ? out[i] : 0);
+      const b = i < out.length ? out[i] : a;
+      for (let k = last + 1; k < i; k++) out[k] = a + (b - a) * (k - last) / (i - last);
+    }
+    last = i;
+  }
+  return out;
+}
+
 function handleData(nd, pkt) {
   const rawVal = adcCountsToVolts(pkt.value24, nd);
+
+  if (nd.rxMode === 'fill') {
+    if (nd.pendingMarkFlags) {
+      nd.sdMarks.push([nd.fillPos, nd.pendingMarkFlags]);
+      nd.pendingMarkFlags = 0;
+    }
+    nd.setRawAt(nd.fillPos, rawVal);
+    nd.fillPos++;
+    if (--nd.fillRemain <= 0) nd.rxMode = 'append';
+    nd.filterDirty = true;
+    return;
+  }
+  if (nd.rxMode === 'skip') {
+    nd.pendingMarkFlags = 0;
+    if (--nd.fillRemain <= 0) nd.rxMode = 'append';
+    return;
+  }
 
   if (!nd.gotFirst) {
     nd.gotFirst = true;
@@ -1680,7 +1835,7 @@ function handleData(nd, pkt) {
       appendLog('CAPTURA TRUNCADA: se alcanzó el tope duro de 12,6 millones de muestras');
     }
   }
-  nd.rawSum += rawVal - (evicted ?? 0);
+  nd.rawSum += rawVal - (Number.isFinite(evicted) ? evicted : 0);
   nd.totalSamples++;
   if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
 
@@ -1709,7 +1864,7 @@ function filteredArrayForNode(nd, rawArray = null) {
   // Cadena deliberadamente fija: offset → línea → interferencias marcadas → FIR.
   // "Filtrada" siempre queda sin offset; el toggle DC global sigue afectando
   // solamente la presentación de "Cruda".
-  let arr = removeMedianOffset(raw);
+  let arr = removeMedianOffset(interpolateGaps(raw));
   if (nd.notchEnabled && arr.length > 1) {
     const fs = nd.fs > 0 ? nd.fs : currentFsHz();
     arr = harmonicNotch(arr, fs, cfg.LINE_NOTCH_F0, nd.notchHarm, cfg.LINE_NOTCH_SEARCH_HZ);
@@ -3324,6 +3479,10 @@ ws.addEventListener('packet', (ev) => {
 
   if (pkt.isData) {
     handleData(nd, pkt);
+  } else if (pkt.isBatch) {
+    onBatchHeader(nd, pkt.value24u);
+  } else if (pkt.isBatchEnd) {
+    onBatchEnd(nd, pkt.value24u);
   } else if (pkt.isMark) {
     nd.pendingMarkFlags |= pkt.markFlags;
   } else if (pkt.isHeartbeat) {
@@ -3338,7 +3497,8 @@ ws.addEventListener('packet', (ev) => {
       } else if (prevState === cfg.MASTER_STATE_RUNNING &&
                  ![cfg.MASTER_STATE_RUNNING, cfg.MASTER_STATE_STOPPING, cfg.MASTER_STATE_DUMPING].includes(masterState)) {
         // En tiempo real y descarga rapida el fin normal es RUNNING -> ARMED.
-        finalizeCompletedRaw(lastStartStreams ? 'tiempo real completo' : 'stream detenido');
+        if (lastStartStreams) finalizeWhenGapsFilled('tiempo real completo');
+        else finalizeCompletedRaw('stream detenido');
       }
     } else {
       const panel = panelFor(idx);

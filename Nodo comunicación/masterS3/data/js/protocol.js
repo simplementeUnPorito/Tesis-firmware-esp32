@@ -2,7 +2,7 @@
 // commands as the flat JSON the firmware's web_relay.h expects.
 // Mirrors python/geophone_scope/protocol.py — keep field names/semantics in sync.
 
-import * as cfg from './config.js?v=field-study-38';
+import * as cfg from './config.js?v=field-study-39';
 
 /** Parsed 6-byte packet from the master (0x56 header). Mirrors protocol.Packet. */
 export class Packet {
@@ -25,6 +25,8 @@ export class Packet {
   get isReady() { return this.ptype === cfg.PTYPE_READY; }
   get isLatency() { return this.ptype === cfg.PTYPE_LATENCY; }
   get isMark() { return this.ptype === cfg.PTYPE_MARK; }
+  get isBatch() { return this.ptype === cfg.PTYPE_BATCH; }
+  get isBatchEnd() { return this.ptype === cfg.PTYPE_BATCH_END; }
   get markFlags() { return this.b2; }
   get isStatus() { return this.ptype === cfg.PTYPE_STATUS; }
 

@@ -4,8 +4,8 @@
 // order control. Plain <canvas> + 2D context — no charting library, keeps the
 // phone payload small and the edit→uploadfs→reload loop dependency-free.
 
-import * as cfg from './config.js?v=field-study-38';
-import { hilbertEnvelope } from './signal_proc.js?v=field-study-38';
+import * as cfg from './config.js?v=field-study-39';
+import { hilbertEnvelope } from './signal_proc.js?v=field-study-39';
 
 const CURSOR_STYLES = [
   { label: 'C1', line: 'rgba(255,230,80,0.9)', stroke: 'rgba(255,230,80,0.65)', text: '#ffe980' },
@@ -458,6 +458,8 @@ class ChannelPlot {
         // not at its own raw index, or the curve ends up shifted right by an
         // extra trimSamp samples on top of the filter's own group delay.
         const px = xTo(xOffsetS + ((xStartSamp + i - trimSamp) / fsForCurve));
+        // Un lote que todavia no llego (NaN) corta la linea: el hueco se ve.
+        if (!Number.isFinite(data[i])) { started = false; continue; }
         const py = yTo(data[i]);
         if (!started) { ctx.moveTo(px, py); started = true; }
         else ctx.lineTo(px, py);

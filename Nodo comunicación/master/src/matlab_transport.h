@@ -73,6 +73,10 @@ public:
     void sendStartLatency(uint8_t nodeId, uint32_t tofUs);
     /* Marca de interferencia conocida sobre la PRÓXIMA muestra de ese nodo. */
     void sendSampleMark(uint8_t nodeId, uint8_t flags);
+    /* type 0xFA: numero de lote (24 bits) antes de sus 30 muestras.
+     * type 0xF9: fin de la captura del nodo, b2..b0 = total de lotes. */
+    void sendBatchHeader(uint8_t nodeId, uint32_t seq);
+    void sendBatchEnd(uint8_t nodeId, uint32_t total);
     /* Diagnóstico: estado ESP-NOW del maestro al arrancar */
     void sendStatus(uint8_t espnow_ok, uint8_t ap_ch);
     /* Diagnóstico: maestro recibió HELLO de un esclavo (incluye estado PSoC + MAC + FS) */
@@ -203,6 +207,20 @@ inline void MatlabTransport::sendSampleMark(uint8_t nodeId, uint8_t flags)
     /* type 0xFB: b2=flags. bit0 SD I/O, bit1 SD sync, bit2 radio TX,
      * bit3 I2C, bit4 beacon AP, bit5 RX maestro. Va antes de la muestra. */
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFB, flags, 0x00, 0x00 };
+    _emit(pkt);
+}
+
+inline void MatlabTransport::sendBatchHeader(uint8_t nodeId, uint32_t seq)
+{
+    uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFA, (uint8_t)((seq >> 16) & 0xFFu),
+                       (uint8_t)((seq >> 8) & 0xFFu), (uint8_t)(seq & 0xFFu) };
+    _emit(pkt);
+}
+
+inline void MatlabTransport::sendBatchEnd(uint8_t nodeId, uint32_t total)
+{
+    uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xF9, (uint8_t)((total >> 16) & 0xFFu),
+                       (uint8_t)((total >> 8) & 0xFFu), (uint8_t)(total & 0xFFu) };
     _emit(pkt);
 }
 

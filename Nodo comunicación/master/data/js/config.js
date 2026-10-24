@@ -11,6 +11,8 @@ export const PTYPE_DATA = 0x00;
 export const PTYPE_HEARTBEAT = 0x01;
 export const PTYPE_ACK = 0x07;  // b2=cmd, b1=status/eco low8, b0 reservado
 export const PTYPE_LATENCY = 0xFC;
+export const PTYPE_BATCH = 0xFA;     // b2..b0 = numero de lote (24 bits); siguen sus 30 muestras
+export const PTYPE_BATCH_END = 0xF9; // b2..b0 = total de lotes del nodo al cerrar el tiempo real
 export const PTYPE_MARK = 0xFB;    // b2 = flags de la próxima muestra (bit0 escritura SD, bit1 f_sync)
 export const PTYPE_STATUS = 0xFD;
 export const PTYPE_READY = 0xFE;

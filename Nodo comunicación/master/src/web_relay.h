@@ -185,10 +185,40 @@ static inline uint8_t webRelayHexByte(const String &hex)
 }
 
 /* Decodifica un mensaje JSON plano del navegador a RxCmd y lo encola */
+/* Pedido de relleno de la web: {"cmd":"FILL","node":n,"seq":s,"count":k}.
+ * Lo atiende main.cpp (rt_archive.h) cuando la web puede recibir. */
+static void (*g_webFillHook)(uint8_t node, uint32_t seq, uint16_t count) = nullptr;
+inline void webRelaySetFillHook(void (*hook)(uint8_t, uint32_t, uint16_t)) { g_webFillHook = hook; }
+static void (*g_webDropTestHook)(uint32_t every) = nullptr;
+inline void webRelaySetDropTestHook(void (*hook)(uint32_t)) { g_webDropTestHook = hook; }
+
+/* Texto a la web (avisos como fill_miss). */
+inline void webRelayText(const char *text)
+{
+    if (ws.count() > 0) ws.textAll(text);
+}
+
 static void webRelayDecodeCmd(const String &json)
 {
     String cmdStr;
     if (!webRelayJsonStr(json, "cmd", cmdStr)) return;
+    if (cmdStr == "DROPTEST") {   /* banco: no mandar 1 de cada N lotes RT */
+        long every = 0;
+        webRelayJsonInt(json, "every", every);
+        if (g_webDropTestHook) g_webDropTestHook((uint32_t)(every < 0 ? 0 : every));
+        return;
+    }
+    if (cmdStr == "FILL") {
+        long node = 0, seq = 0, count = 0;
+        webRelayJsonInt(json, "node", node);
+        webRelayJsonInt(json, "seq", seq);
+        webRelayJsonInt(json, "count", count);
+        if (g_webFillHook && node > 0 && seq >= 0 && count > 0) {
+            g_webFillHook((uint8_t)node, (uint32_t)seq,
+                          (uint16_t)(count > 256 ? 256 : count));
+        }
+        return;
+    }
     uint8_t cmd = webRelayHexByte(cmdStr);
 
     MatlabTransport::RxCmd r = {0, 0, 0, 0, 0, true, 0, false};

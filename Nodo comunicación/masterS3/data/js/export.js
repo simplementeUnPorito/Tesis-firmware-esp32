@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-38';
+import * as cfg from './config.js?v=field-study-39';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-38';
+import { effectiveFs } from './data_store.js?v=field-study-39';
 
 const MARK_BITS = [
   [0x01, 'SD_IO'],
@@ -292,6 +292,8 @@ function nodeMetadata(nd, index, paths, connected) {
     total_samples: nd.totalSamples,
     capture_truncated: !!nd.captureTruncated,
     dropped_samples: nd.droppedSamples || 0,
+    // Lotes que no llegaron y no se pudieron recuperar: en el crudo son NaN.
+    lost_batches: nd.lostBatches ? [...nd.lostBatches].sort((a, b) => a - b) : [],
     filter_scope: nd.filterScope || 'full',
     filter_start_index: nd.filterStartIndex || 0,
     pga_code: nd.pgaCode,
@@ -845,7 +847,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-38',
+    web_app_version: 'field-study-39',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,

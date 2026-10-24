@@ -3,7 +3,7 @@
 // use fixed-capacity rings for live plotting and optional chunked stores for
 // the complete unlimited capture.
 
-import * as cfg from './config.js?v=field-study-38';
+import * as cfg from './config.js?v=field-study-39';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -27,6 +27,13 @@ export class RingBuffer {
       this._start = (this._start + 1) % this._cap;
     }
     return evicted;
+  }
+
+  /** Escribe la muestra i (0 = la mas vieja); para rellenar huecos. */
+  setAt(i, value) {
+    if (i < 0 || i >= this._len) return false;
+    this._buf[(this._start + i) % this._cap] = value;
+    return true;
   }
 
   /** Most recent `n` samples (or all if n >= length), oldest-first, as a new Float64Array. */
@@ -84,6 +91,12 @@ export class ChunkedFloat64Store {
       sourceAt += count;
       this.length += count;
     }
+  }
+
+  setAt(i, value) {
+    if (i < 0 || i >= this.length) return false;
+    this.chunks[Math.floor(i / this.chunkSize)][i % this.chunkSize] = value;
+    return true;
   }
 
   toArray() {
@@ -271,6 +284,26 @@ export class NodeData {
   captureRawArray() { return this.fullRawStore ? this.fullRawStore.toArray() : this.rawBuf.toArray(); }
   captureFiltArray() { return this.fullFiltStore ? this.fullFiltStore.toArray() : this.filtBuf.toArray(); }
 
+  /** Escribe la muestra de posicion absoluta abs de la captura (relleno). */
+  setRawAt(abs, value) {
+    let ok = false;
+    if (this.fullRawStore) ok = this.fullRawStore.setAt(abs, value);
+    const first = this.totalSamples - this.rawBuf.length;
+    if (abs >= first) ok = this.rawBuf.setAt(abs - first, value) || ok;
+    return ok;
+  }
+
+  /** Estado de los lotes numerados (cero perdida): huecos y relleno. */
+  resetBatchTracking() {
+    this.seqNext = 0;
+    this.missingBatches = new Set();
+    this.lostBatches = new Set();
+    this.fillAsked = new Map();
+    this.rxMode = 'append';
+    this.fillPos = 0;
+    this.fillRemain = 0;
+  }
+
   pushRaw(value) {
     if (this.fullRawStore) this.fullRawStore.push(value);
     return this.rawBuf.push(value);
@@ -293,6 +326,7 @@ export class NodeData {
 
   /** Clear sample buffers and reset filter state. */
   clear() {
+    this.resetBatchTracking();
     this.rawBuf.clear();
     this.filtBuf.clear();
     if (this.fullRawStore) this.fullRawStore.clear();

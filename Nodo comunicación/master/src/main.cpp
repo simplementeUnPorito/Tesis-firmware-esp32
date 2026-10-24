@@ -31,6 +31,7 @@
 #include "sync_protocol.h"
 #include "espnow_rx.h"
 #include "ota_master.h"
+#include "rt_archive.h"
 #include "matlab_transport.h"
 #include "master_log.h"
 #include "debug_log.h"
@@ -1445,6 +1446,7 @@ static void finishPrestartAction()
         if (capModeStreams()) {
             /* Antes del START: los primeros lotes llegan enseguida. */
             g_rtStopReqMs = 0;
+            rtarc::start(g_armAckMask);
             if (!g_rt.start(g_armAckMask)) {
                 MASTER_LOG_PRINTLN("[MASTER] RT sin RAM: captura cancelada");
                 abortCaptureToArmed(0, "rt_no_ram");
@@ -1547,9 +1549,10 @@ static void onBatchReady(const ReassembledBatch &batch)
 /* ── Tiempo real ─────────────────────────────────────────────────────────── */
 
 /* Mismo envio que onBatchReady: 30 muestras de 24 bits por lote. */
-static void rtEmit(uint8_t node, const SampleBytes *s, uint32_t seq)
+/* Un lote con su numero; tambien lo usa el relleno de huecos (FILL). */
+static void emitNumberedBatch(uint8_t node, const SampleBytes *s, uint32_t seq)
 {
-    (void)seq;
+    matlab.sendBatchHeader(node, seq);
     for (int i = 0; i < SAMPLES_PER_PART * 2; i++) {
         int32_t val = (int32_t)s[i].digi0 | ((int32_t)s[i].digi1 << 8) |
                       ((int32_t)s[i].digi2 << 16);
@@ -1557,6 +1560,51 @@ static void rtEmit(uint8_t node, const SampleBytes *s, uint32_t seq)
         if (s[i].flags != 0u) matlab.sendSampleMark(node, s[i].flags);
         matlab.sendSample(node, val);
     }
+}
+
+/* Fin del tiempo real: cada nodo avisa cuantos lotes tuvo, asi la web
+ * detecta tambien los que faltan al final. */
+static void rtSendEnds()
+{
+    for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
+        if (g_rt.nodeOn(n)) matlab.sendBatchEnd(n, g_rt.delivered(n));
+    }
+}
+
+/* Atiende los FILL de la web desde la copia, sin ahogar el tiempo real. */
+static void serviceWebFills()
+{
+    rtarc::Fill f;
+    if (!rtarc::peekFill(f)) return;
+    const uint16_t budget = g_rt.active() ? 2u : 16u;
+    uint16_t done = 0;
+    static SampleBytes buf[SAMPLES_PER_PART * 2];
+    while (done < f.count && done < budget) {
+        if (!webRelayReadyForDumpRequest(false)) break;
+        const uint32_t seq = f.seq + done;
+        if (rtarc::get(f.node, seq, buf)) {
+            emitNumberedBatch(f.node, buf, seq);
+        } else {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "{\"type\":\"fill_miss\",\"node\":%u,\"seq\":%lu}",
+                     (unsigned)f.node, (unsigned long)seq);
+            webRelayText(msg);
+        }
+        done++;
+    }
+    if (done) rtarc::advanceFill(done);
+}
+
+/* Banco: 1 de cada N lotes RT no sale (queda en la copia) para probar el
+ * relleno de huecos de la web. 0 = apagado. */
+static uint32_t g_dropTestEvery = 0;
+static void setDropTest(uint32_t every) { g_dropTestEvery = every; }
+
+static void rtEmit(uint8_t node, const SampleBytes *s, uint32_t seq)
+{
+    rtarc::put(node, seq, s);
+    if (g_dropTestEvery > 1u && (seq % g_dropTestEvery) == (g_dropTestEvery - 1u)) return;
+    emitNumberedBatch(node, s, seq);
 }
 
 /* Contrapresion solo si hay un navegador recibiendo: uno conectado pero
@@ -2002,6 +2050,8 @@ void setup()
     g_rt.begin(rtEmit, rtReady, rtAck);
     espnowRx.setRtHandlers(rtOnData, rtOnEnd);
     espnowRx.setOtaHandler(otam::onStatus);
+    webRelaySetFillHook(rtarc::pushFill);
+    webRelaySetDropTestHook(setDropTest);
     if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck,
                         onHello, onStartAck, onHotWaitAck)) {
         MASTER_LOG_PRINTLN("[MASTER] ESP-NOW FAIL - USB test continues");
@@ -2078,6 +2128,7 @@ void loop()
         handleMatlabCmd(webRelayPopCmd(), true);
     }
     webRelayService();
+    serviceWebFills();   /* huecos que pide la web, desde la copia */
     linkRssiLoop();
     /* Mantiene la STA asociada a la red del cliente sin bajar el AP ni ESP-NOW:
      * el maestro habita las dos redes. Ver linkStaService() para la letra chica
@@ -2252,6 +2303,7 @@ void loop()
             MASTER_LOG_PRINTF("[MASTER] RT sin progreso %lu ms (stop=%u) -> ARMED\n",
                               (unsigned long)quiet, (unsigned)(g_rtStopReqMs != 0u));
             g_rt.printStats(Serial);
+            rtSendEnds();
             g_rt.stop();
             g_rtStopReqMs = 0;
             syncOutWrite(LOW);
@@ -2263,6 +2315,7 @@ void loop()
     if (g_rt.active()) {
         if (g_rt.allDone()) {
             g_rtStopReqMs = 0;
+            rtSendEnds();
             g_rt.stop();
             syncOutWrite(LOW);
             g_state = ARMED;
