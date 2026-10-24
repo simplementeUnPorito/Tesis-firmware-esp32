@@ -725,29 +725,24 @@ export function buildCaptureZip(dataStore, options = {}) {
     connectedByNode.set(i, connected);
     if (!connected) continue;
 
+    // Solo lo que no se puede recuperar: el crudo (float32 en V recupera las
+    // cuentas del ADC de 20 bits exactas), las marcas y los metadatos. Filtrado,
+    // limpieza y CSV de senales se rehacen en el servidor con la configuracion
+    // que queda en los metadatos.
     const raw = nd.captureRawArray();
-    const filt = nd.captureFiltArray();
     const pcbId = pcbIdForNode(i, nd.slaveId);
     const dirBase = dirBaseForNode(nd.alias || cfg.NODE_NAMES[i], pcbId, `slave${i}`);
     const dir = uniqueDir(dirBase, usedDirs, i);
     const paths = {
       dir,
       raw: `${dir}/raw_f32le.bin`,
-      filt: `${dir}/filt_f32le.bin`,
-      rawCsv: `${dir}/raw.csv`,
-      filtCsv: `${dir}/filt.csv`,
+      filt: null,
+      rawCsv: null,
+      filtCsv: null,
       marksCsv: `${dir}/noise_marks.csv`,
     };
     pathsByNode.set(i, paths);
     files.push({ name: paths.raw, data: float32Bytes(raw) });
-    files.push({ name: paths.filt, data: float32Bytes(filt) });
-
-    // CSV is always saved alongside the binary dump (no opt-out): it's the
-    // human-readable record needed to reconstruct/study a capture later.
-    // nd.fs is only ever the value reported by the slave's HELLO - never a
-    // guessed/nominal constant - so the CSV time column matches reality.
-    files.push({ name: paths.rawCsv, data: csvText(raw, nd.fs, 0) });
-    files.push({ name: paths.filtCsv, data: csvText(filt, nd.fs, 0) });
     files.push({ name: paths.marksCsv, data: noiseMarksCsv(nd.sdMarksFor(raw.length)) });
 
     visibleNodes.push(i);
@@ -776,8 +771,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     for (const node of sortedNodes) {
       const index = node.index ?? 0;
       const raw = signalValues(node, 'raw');
-      const filt = signalValues(node, 'filt');
-      const hasData = raw.length > 0 || filt.length > 0;
+      const hasData = raw.length > 0;
       const connected = index > 0 && (!!node.connected || hasData);
       let paths = null;
 
@@ -788,15 +782,12 @@ export function buildCaptureZip(dataStore, options = {}) {
         paths = {
           dir,
           raw: `${dir}/raw_f32le.bin`,
-          filt: `${dir}/filt_f32le.bin`,
-          rawCsv: `${dir}/raw.csv`,
-          filtCsv: `${dir}/filt.csv`,
+          filt: null,
+          rawCsv: null,
+          filtCsv: null,
           marksCsv: `${dir}/noise_marks.csv`,
         };
         files.push({ name: paths.raw, data: float32Bytes(raw) });
-        files.push({ name: paths.filt, data: float32Bytes(filt) });
-        files.push({ name: paths.rawCsv, data: csvText(raw, node.fs || capture.fs || 0, captureOffset) });
-        files.push({ name: paths.filtCsv, data: csvText(filt, node.fs || capture.fs || 0, captureOffset) });
         files.push({ name: paths.marksCsv, data: noiseMarksCsv(node.sd_marks) });
       }
 
@@ -836,12 +827,11 @@ export function buildCaptureZip(dataStore, options = {}) {
     captureMetas.push(capMeta);
   });
 
-  const combinedSignalsPath = captureMetas.length ? 'combined/signals.csv' : null;
+  const combinedSignalsPath = null;   // recuperable del crudo: no viaja
   const captureSummaryPath = captureMetas.length ? 'combined/captures.csv' : null;
   const nodeSummaryPath = 'combined/nodes.csv';
   const captureNodeSummaryPath = captureMetas.length ? 'combined/capture_nodes.csv' : null;
   if (captureMetas.length) {
-    files.push({ name: combinedSignalsPath, data: buildCombinedSignalsCsv(exportCaptures) });
     files.push({ name: captureSummaryPath, data: buildCaptureSummaryCsv(captureMetas) });
     files.push({ name: captureNodeSummaryPath, data: buildCaptureNodeSummaryCsv(captureMetas) });
   }
@@ -849,6 +839,8 @@ export function buildCaptureZip(dataStore, options = {}) {
 
   const metadata = {
     schema: 'geophone_scope_web_zip_v4',
+    payload: 'raw_metadata_only',
+    payload_note: 'Solo crudo, marcas y metadatos: el filtrado y la limpieza se rehacen con la configuracion de cada nodo.',
     schema_target: 'geophone_scope_mat_node_prefix_v1',
     created_at: now.toISOString(),
     save_time: stamp,

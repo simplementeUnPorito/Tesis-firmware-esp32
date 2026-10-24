@@ -14,6 +14,7 @@ import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signa
 import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-38';
 import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-38';
 import { mountOtaPanel } from './ota_panel.js?v=field-study-38';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-38';
 
 const $ = (id) => document.getElementById(id);
 
@@ -214,6 +215,60 @@ function validSignatures(value) {
 function showLoadedSignatures() {
   const label = signatureLabel(noiseSignatures);
   for (const panel of slavePanels) if (panel) panel.setSignaturesInfo(label);
+  if (filterTab) filterTab.setSignatureInfo(`Firmas: ${label}`);
+}
+
+/* ── Pestaña Filtros: una configuracion por grupo (GEO / HAMMER) ───────────── */
+let filterTab = null;
+
+/* Copia la configuracion del grupo del nodo a sus campos. what: 'fir' |
+ * 'notch' | 'clean' | 'firhw' | 'all'. El FIR hardware es un comando por
+ * radio: solo se manda cuando cambia o cuando el nodo se identifica. */
+function applyFilterGroupToNode(chIndex, what = 'all') {
+  const nd = data.nodes[chIndex];
+  const role = nodeRole(nd);
+  if (!filterTab || (role !== 'geo' && role !== 'hammer')) return false;
+  const st = filterTab.state(role);
+  if (what === 'all' || what === 'fir') {
+    const cmd = firCommand(st);
+    const b = st.firActive ? compileFirCmd(cmd, nd.fs) : null;
+    nd.filtB = b;
+    nd.filtZi = null;
+    nd.filtCmd = b ? cmd : '';
+    if (st.firActive && !b) {
+      filterTab.setFirStatus(role, `FIR inválido: ${lastFirError() || cmd}`.slice(0, 80));
+    }
+  }
+  if (what === 'all' || what === 'notch') {
+    nd.notchEnabled = !!st.notchEnabled;
+    nd.notchHarm = clampLineNotchHarm(st.notchHarm);
+  }
+  if (what === 'all' || what === 'clean') {
+    nd.cleanI2c = !!st.clean.i2c;
+    nd.cleanSd = !!st.clean.sd;
+    nd.cleanRadio = !!st.clean.radio;
+    nd.cleanBeacon = !!st.clean.beacon;
+  }
+  if ((what === 'all' || what === 'firhw') && ws.connected) {
+    sendDirected(chIndex, cfg.SUBCMD_SELECT_STREAM, st.firHw ? 1 : 0);
+  }
+  if (what === 'fir' || what === 'all') reprocessFiltBuf(chIndex);
+  else markNodeFilterDirty(chIndex);
+  return true;
+}
+
+function onFilterGroupChanged(group, st, what) {
+  let n = 0;
+  for (let i = 1; i < cfg.MAX_NODES; i++) {
+    if (nodeRole(data.nodes[i]) === group && applyFilterGroupToNode(i, what)) n++;
+  }
+  const detail = {
+    fir: st.firActive ? firCommand(st) : 'sin FIR',
+    notch: st.notchEnabled ? `línea N=${st.notchHarm}` : 'línea OFF',
+    clean: Object.entries(st.clean).filter(([, v]) => v).map(([k]) => k).join(',') || 'sin limpieza',
+    firhw: st.firHw ? 'FIR hardware' : 'ADC crudo',
+  }[what] || what;
+  appendLog(`Filtros ${group.toUpperCase()}: ${detail} (${n} nodo(s))`);
 }
 
 function applySignatures(value, source, persist = false) {
@@ -2958,6 +3013,14 @@ function handleStatus(pkt, idx) {
 
   if (pkt.helloMacSub === 0x06) {
     applyReportedSlaveType(idx, pkt.helloHwClass);
+    {
+      // Un nodo recien identificado toma la configuracion de su grupo.
+      const nd = data.nodes[idx];
+      const role = nodeRole(nd);
+      if (nd.filterGroupApplied !== role && applyFilterGroupToNode(idx, 'all')) {
+        nd.filterGroupApplied = role;
+      }
+    }
     updateSlavePanelStats(idx);
     renderNodeRow(idx);
     appendLog(`HELLO slave=${idx} tipo=${slaveHwClassName(pkt.helloHwClass)}`);
@@ -3178,6 +3241,13 @@ initTabs();
 initEnlaceTab(appendLog);
 buildNodeRows();
 buildSlavePanels();
+filterTab = mountFilterTab($('tab-filters'), {
+  onChange: onFilterGroupChanged,
+  onSignatures: onSignaturesFileSelected,
+  maxHarm: cfg.LINE_NOTCH_MAX_HARM,
+});
+for (const panel of slavePanels) if (panel) panel.hideFilterControls();
+for (let i = 1; i < cfg.MAX_NODES; i++) applyFilterGroupToNode(i, 'all');
 loadNoiseSignatures();
 renderPreservedList();
 restoreFsFromLocalCache();

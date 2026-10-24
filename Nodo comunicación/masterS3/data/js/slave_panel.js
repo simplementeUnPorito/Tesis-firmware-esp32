@@ -496,6 +496,14 @@ export class SlavePanel extends EventTarget {
     this._syncFirFields();
   }
 
+  /* La pestaña Filtros reemplaza los filtros por nodo: se ocultan aca. */
+  hideFilterControls() {
+    const box = this._ddFirType?.closest('.filter-box');
+    if (box) box.style.display = 'none';
+    const hwRow = this._cbFirHw?.closest('.row');
+    if (hwRow) hwRow.style.display = 'none';
+  }
+
   setFirStatus(status) {
     this._lblFirStatus.textContent = status;
     this._firActive = status !== 'No filter';
