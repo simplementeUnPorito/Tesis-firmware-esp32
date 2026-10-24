@@ -377,3 +377,31 @@ struct MsgOtaControl {
     uint8_t  action;       /* 1 = abortar */
 };
 #pragma pack(pop)
+
+/* ── Lote comprimido sin perdida (geo_codec.h) ───────────────────────────────
+ * Una sola trama por lote en tiempo real y descarga rapida: 30 muestras de 24
+ * bits + marcas, ~24 B de datos contra 334 B de MsgData32. Se manda con largo
+ * variable: MSG_DATAZ_HEADER + len bytes. crc = xor de cabecera (sin el crc)
+ * y datos. */
+#define DATAZ_PKT_MARKER 0xBE
+#define MSG_DATAZ_HEADER 8
+#define MSG_DATAZ_MAX    160
+#pragma pack(push, 1)
+struct MsgDataZ {
+    uint8_t  marker;      /* DATAZ_PKT_MARKER */
+    uint8_t  node_id;
+    uint32_t seq;
+    uint8_t  crc;
+    uint8_t  len;         /* bytes de data */
+    uint8_t  data[MSG_DATAZ_MAX];
+};
+#pragma pack(pop)
+
+static inline uint8_t dataZCrc(const struct MsgDataZ *m)
+{
+    const uint8_t *p = (const uint8_t *)m;
+    uint8_t c = 0;
+    for (int i = 0; i < MSG_DATAZ_HEADER; i++) if (i != 6) c ^= p[i];
+    for (int i = 0; i < m->len; i++) c ^= m->data[i];
+    return c;
+}

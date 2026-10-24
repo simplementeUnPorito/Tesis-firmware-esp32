@@ -141,6 +141,8 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
 
     if (first == DATA_PKT_MARKER && (size_t)len >= sizeof(MsgData)) {
         instance->_handleData((const MsgData *)data);
+    } else if (first == DATAZ_PKT_MARKER && len >= MSG_DATAZ_HEADER) {
+        if (instance->_rtDataCb) instance->_rtDataCb(data, len);
     } else if (first == DATA32_PKT_MARKER && (size_t)len >= sizeof(MsgData32)) {
         if (instance->_rtDataCb) instance->_rtDataCb(data, len);
     } else if (first == CMD_STREAM_END && (size_t)len >= sizeof(MsgStreamEnd)) {

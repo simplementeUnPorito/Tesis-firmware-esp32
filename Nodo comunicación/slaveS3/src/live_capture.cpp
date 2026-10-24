@@ -1,4 +1,5 @@
 #include "live_capture.h"
+#include "geo_codec.h"
 
 #include <SD.h>
 #include <SPI.h>
@@ -104,6 +105,7 @@ uint32_t g_psocQ[PSOC_RESEND_Q];   /* reenvios esperando turno */
 uint32_t g_psocQn = 0;
 
 uint32_t g_gaps = 0, g_dups = 0, g_retx = 0, g_txOk = 0, g_txFail = 0;
+uint32_t g_txBytes = 0;   /* bytes de datos enviados por radio (para medir la compresion) */
 uint32_t g_badRamp = 0, g_noRoom = 0;
 esp_err_t g_lastTxErr = ESP_OK;
 volatile uint32_t g_inflight = 0;
@@ -375,6 +377,34 @@ uint8_t xorCrc(const uint8_t *d, size_t n)
 /* ── Maestro simulado ──────────────────────────────────────────────────── */
 esp_err_t simReceive(const uint8_t *data, size_t len)
 {
+    if (len >= MSG_DATAZ_HEADER && data[0] == DATAZ_PKT_MARKER) {
+        /* Lote comprimido: decodificar como lo haria el maestro. */
+        if ((esp_random() % 100u) < g_simLoss) { g_simDrop++; return ESP_OK; }
+        const MsgDataZ *z = (const MsgDataZ *)data;
+        int32_t x[SPI_BATCH_SAMPLES];
+        uint8_t fl[SPI_BATCH_SAMPLES];
+        if (len != (size_t)MSG_DATAZ_HEADER + z->len || dataZCrc(z) != z->crc ||
+            !geoz_decode(z->data, z->len, x, fl)) { g_simBad++; return ESP_OK; }
+        const uint32_t seq = z->seq;
+        if (seq < g_simNext) { g_simDup++; return ESP_OK; }
+        if (seq >= g_simNext + MASTER_WINDOW) { g_simWin++; return ESP_OK; }
+        const uint32_t slot = seq & 0xFFu;
+        if (g_simTag[slot] == seq && g_simParts[slot] == 3u) { g_simDup++; return ESP_OK; }
+        if (g_cfg.ramp) {
+            for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+                if (((uint32_t)x[i] & 0x00FFFFFFu) != ((seq * SPI_BATCH_SAMPLES + (uint32_t)i) & 0x00FFFFFFu)) g_simBad++;
+            }
+        }
+        g_simTag[slot] = seq;
+        g_simParts[slot] = 3u;
+        g_simRx++;
+        while (g_simTag[g_simNext & 0xFFu] == g_simNext && g_simParts[g_simNext & 0xFFu] == 3u) {
+            g_simParts[g_simNext & 0xFFu] = 0;
+            g_simTag[g_simNext & 0xFFu] = NONE;
+            g_simNext++;
+        }
+        return ESP_OK;
+    }
     if (len != sizeof(MsgData32) || data[0] != DATA32_PKT_MARKER) return ESP_OK;
     if ((esp_random() % 100u) < g_simLoss) { g_simDrop++; return ESP_OK; }
     const MsgData32 *m = (const MsgData32 *)data;
@@ -426,8 +456,42 @@ esp_err_t sendRaw(const uint8_t *d, size_t n)
 
 /* Un lote son dos tramas de 15 muestras. El camino stream lleva lote de 32
  * bits; el volcado asincronico clasico conserva la trama de 16 bits. */
+#ifndef LIVE_COMPRESS
+#define LIVE_COMPRESS 1
+#endif
+
+/* Las 30 muestras de 24 bits y sus marcas de un lote. */
+static void batchValues(const SampleBytes *s, int32_t *x, uint8_t *flags)
+{
+    for (int i = 0; i < SPI_BATCH_SAMPLES; i++) {
+        uint32_t v = (uint32_t)s[i].digi0 | ((uint32_t)s[i].digi1 << 8) |
+                     ((uint32_t)s[i].digi2 << 16);
+        x[i] = (v & 0x800000u) ? (int32_t)(v | 0xFF000000u) : (int32_t)v;
+        flags[i] = s[i].flags;
+    }
+}
+
 bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt)
 {
+#if LIVE_COMPRESS
+    if (rt) {
+        /* Una sola trama comprimida por lote (geo_codec.h). */
+        MsgDataZ m;
+        int32_t x[SPI_BATCH_SAMPLES];
+        uint8_t fl[SPI_BATCH_SAMPLES];
+        batchValues(s, x, fl);
+        m.marker = DATAZ_PKT_MARKER;
+        m.node_id = g_node;
+        m.seq = seq;
+        m.len = (uint8_t)geoz_encode(x, fl, m.data);
+        m.crc = dataZCrc(&m);
+        const esp_err_t err = sendRaw((const uint8_t *)&m, MSG_DATAZ_HEADER + m.len);
+        if (err != ESP_OK) { g_txFail++; g_lastTxErr = err; return false; }
+        g_txOk++;
+        g_txBytes += MSG_DATAZ_HEADER + m.len;
+        return true;
+    }
+#endif
     for (uint8_t part = 0; part < 2; part++) {
         esp_err_t err;
         if (rt) {
@@ -906,6 +970,7 @@ int32_t prepare(const Config &c)
     g_sdReadCount = 0;
     g_sdReadPendingSend = false;
     g_gaps = g_dups = g_retx = g_txOk = g_txFail = g_badRamp = g_noRoom = 0;
+    g_txBytes = 0;
     g_simNext = 0;
     g_simRx = g_simDup = g_simDrop = g_simWin = g_simBad = 0;
     for (uint32_t i = 0; i < 256; i++) { g_simTag[i] = NONE; g_simParts[i] = 0; }
@@ -1166,7 +1231,7 @@ void printStatus()
              "total=%ld done=%u ovr=%u sdfull=%u gaps=%lu dups=%lu noroom=%lu retx=%lu "
              "txok=%lu txfail=%lu badramp=%lu sim=%u srx=%lu snext=%lu sdup=%lu sdrop=%lu "
              "swin=%lu sbad=%lu heap=%u txerr=0x%x inflight=%lu sdretry=%lu remount=%lu errno=%d "
-             "marks=%lu/%lu/%lu/%lu/%lu/%lu pairs=%lu\n",
+             "marks=%lu/%lu/%lu/%lu/%lu/%lu pairs=%lu txbytes=%lu\n",
              (unsigned)g_active, (unsigned)g_cfg.storage, (unsigned)g_cfg.realtime,
              (unsigned long)g_cfg.nBatches, (unsigned long)g_cap,
              (unsigned long)g_recv, (unsigned long)(g_active ? tailNow() : 0u),
@@ -1183,7 +1248,7 @@ void printStatus()
              (unsigned long)g_markApplied[0], (unsigned long)g_markApplied[1],
              (unsigned long)g_markApplied[2], (unsigned long)g_markApplied[3],
              (unsigned long)g_markApplied[4], (unsigned long)g_markApplied[5],
-             (unsigned long)g_pairCount);
+             (unsigned long)g_pairCount, (unsigned long)g_txBytes);
 }
 
 void simMaster(bool on, uint8_t lossPct)

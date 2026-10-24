@@ -18,6 +18,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include "sync_protocol.h"
+#include "geo_codec.h"
 
 #define RT_WINDOW     64u
 #define RT_MAX_NODES  9u
@@ -36,7 +37,7 @@ public:
         _emit = emit;
         _ready = ready;
         _ack = ack;
-        if (!_q) _q = xQueueCreate(RT_QUEUE, sizeof(MsgData32));
+        if (!_q) _q = xQueueCreate(RT_QUEUE, sizeof(Frame));
     }
 
     /* nodeMask: bit n = nodo n esta en la captura. */
@@ -84,8 +85,11 @@ public:
     /* Tarea WiFi: solo encolar. */
     void onFrame(const uint8_t *data, int len)
     {
-        if (!_active || !_q || len < (int)sizeof(MsgData32)) return;
-        if (xQueueSend(_q, data, 0) != pdTRUE) _qDrop++;
+        if (!_active || !_q || len < MSG_DATAZ_HEADER || len > (int)sizeof(Frame::d)) return;
+        Frame f;
+        f.len = (uint16_t)len;
+        memcpy(f.d, data, (size_t)len);
+        if (xQueueSend(_q, &f, 0) != pdTRUE) _qDrop++;
     }
 
     void onEnd(const MsgStreamEnd &e)
@@ -102,8 +106,11 @@ public:
     void service()
     {
         if (!_active) return;
-        MsgData32 m;
-        for (int k = 0; k < 32 && xQueueReceive(_q, &m, 0) == pdTRUE; k++) _take(m);
+        Frame f;
+        for (int k = 0; k < 32 && xQueueReceive(_q, &f, 0) == pdTRUE; k++) {
+            if (f.d[0] == DATAZ_PKT_MARKER) _takeZ(f);
+            else if (f.len >= sizeof(MsgData32)) _take(*(const MsgData32 *)f.d);
+        }
         const uint32_t now = millis();
         for (uint8_t n = 1; n < RT_MAX_NODES; n++) {
             Node &d = _nodes[n];
@@ -177,6 +184,42 @@ private:
         volatile uint8_t reason = 0;
         uint32_t rx = 0, dup = 0, win = 0, crc = 0;
     };
+
+    /* Trama cruda en la cola: MsgData32 (167 B) o MsgDataZ (8 + len). */
+    struct Frame { uint16_t len; uint8_t d[sizeof(MsgData32) > MSG_DATAZ_HEADER + MSG_DATAZ_MAX ?
+                                            sizeof(MsgData32) : MSG_DATAZ_HEADER + MSG_DATAZ_MAX]; };
+
+    /* Lote comprimido: se decodifica entero y ocupa las dos mitades. */
+    void _takeZ(const Frame &f)
+    {
+        const MsgDataZ *z = (const MsgDataZ *)f.d;
+        if (z->node_id == 0 || z->node_id >= RT_MAX_NODES) return;
+        Node &d = _nodes[z->node_id];
+        if (!d.on) return;
+        int32_t x[GEOZ_SAMPLES];
+        uint8_t fl[GEOZ_SAMPLES];
+        if (f.len != MSG_DATAZ_HEADER + z->len || dataZCrc(z) != z->crc ||
+            !geoz_decode(z->data, z->len, x, fl)) { d.crc++; return; }
+        if (z->seq < d.next) { d.dup++; return; }
+        if (z->seq >= d.next + RT_WINDOW) { d.win++; return; }
+        const uint32_t slot = z->seq % RT_WINDOW;
+        if (d.tag[slot] == z->seq && d.parts[slot] == 3u) { d.dup++; return; }
+        SampleBytes *s = &d.s[(size_t)slot * 2u * SAMPLES_PER_PART];
+        for (int i = 0; i < GEOZ_SAMPLES; i++) {
+            const uint32_t v = (uint32_t)x[i] & 0xFFFFFFu;
+            memset(&s[i], 0, sizeof(SampleBytes));
+            s[i].digi0 = (uint8_t)(v & 0xFFu);
+            s[i].digi1 = (uint8_t)((v >> 8) & 0xFFu);
+            s[i].digi2 = (uint8_t)((v >> 16) & 0xFFu);
+            s[i].raw_lo = s[i].digi0;
+            s[i].raw_hi = s[i].digi1;
+            s[i].flags = fl[i];
+        }
+        d.tag[slot] = z->seq;
+        d.parts[slot] = 3u;
+        d.rx++;
+        _lastProgressMs = millis();
+    }
 
     void _take(const MsgData32 &m)
     {
