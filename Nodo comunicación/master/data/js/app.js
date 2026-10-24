@@ -2,17 +2,17 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-36';
-import { WsClient } from './ws_client.js?v=field-study-36';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-36';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-36';
-import { PlotArea } from './plot.js?v=field-study-36';
-import { SpectrumArea } from './spectrum.js?v=field-study-36';
-import { SlavePanel } from './slave_panel.js?v=field-study-36';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-36';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-36';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-36';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-36';
+import * as cfg from './config.js?v=field-study-37';
+import { WsClient } from './ws_client.js?v=field-study-37';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-37';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-37';
+import { PlotArea } from './plot.js?v=field-study-37';
+import { SpectrumArea } from './spectrum.js?v=field-study-37';
+import { SlavePanel } from './slave_panel.js?v=field-study-37';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-37';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-37';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-37';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-37';
 
 const $ = (id) => document.getElementById(id);
 
@@ -53,9 +53,13 @@ let currentCaptureSignature = '';
 let pendingStart = null;
 
 const START_AUTO_ARM_TIMEOUT_MS = 4500;
-const UNLIMITED_SAMPLE_BUDGET = 150_000_000;
+const UNLIMITED_SAMPLE_BUDGET = 12_000_000;
+const UNLIMITED_STOP_SAMPLES = Math.floor(UNLIMITED_SAMPLE_BUDGET * 0.95);
+const UNLIMITED_HARD_CAP = Math.floor(UNLIMITED_SAMPLE_BUDGET * 1.05);
+const LARGE_CAPTURE_SAMPLES = 4_000_000;
 let unlimitedSamplesStored = 0;
 let unlimitedStopSent = false;
+let unlimitedTruncationLogged = false;
 
 const SETTINGS_PREFIX = 'geophone_scope_web.';
 // Versionar la Fs evita restaurar valores derivados de la antigua base
@@ -500,7 +504,13 @@ function nodeSnapshot(nd, index, options = {}) {
   const storeDcRemoved = !!options.storeDcRemoved;
   const rawDc = signalMean(rawOrig);
   const filtDc = signalMean(filtOrig);
-  const raw = storeDcRemoved ? transformSignalForView(rawOrig, { removeDc: true }) : rawOrig;
+  let raw = rawOrig;
+  if (storeDcRemoved && rawOrig.length > LARGE_CAPTURE_SAMPLES) {
+    // La copia de snapshot ya es propia: quitar DC in-place evita otra copia completa.
+    for (let i = 0; i < rawOrig.length; i++) rawOrig[i] -= rawDc;
+  } else if (storeDcRemoved) {
+    raw = transformSignalForView(rawOrig, { removeDc: true });
+  }
   const filt = storeDcRemoved ? transformSignalForView(filtOrig, { removeDc: true }) : filtOrig;
   const role = nodeRole(nd);
   const offsetM = offsetFromHammer(nd);
@@ -525,6 +535,10 @@ function nodeSnapshot(nd, index, options = {}) {
     filt_count: filt.length,
     batch_count: nd.batchCount,
     total_samples: nd.totalSamples,
+    capture_truncated: !!nd.captureTruncated,
+    dropped_samples: nd.droppedSamples || 0,
+    filter_scope: nd.filterScope || 'full',
+    filter_start_index: nd.filterStartIndex || 0,
     pga_code: nd.pgaCode,
     pga_gain: gainValue(nd.pgaCode),
     pgaout_code: nd.pgaoutCode,
@@ -659,6 +673,7 @@ function makeCaptureSnapshot(label, options = {}) {
     active_node_indices: orderedSlaveIndices(true),
     nodes,
   };
+  capture.truncated = nodes.some((node) => node.capture_truncated);
   capture.raw_count = captureSampleCount(capture, 'raw');
   capture.filt_count = captureSampleCount(capture, 'filt');
   capture.signature = captureSignature(nodes);
@@ -998,7 +1013,10 @@ function updateCapturePreview() {
     return;
   }
   if (captureIsUnlimited()) {
-    el.textContent = 'Sin límite · termina con STOP · tope del navegador: 150 millones de muestras';
+    const nodes = Math.max(1, visibleSlaveCount());
+    const minutes = UNLIMITED_SAMPLE_BUDGET / (fs * nodes * 60);
+    el.textContent = `Sin límite · termina con STOP · presupuesto: 12 millones de muestras total ` +
+      `(~${minutes.toFixed(1)} min con ${nodes} nodo${nodes === 1 ? '' : 's'} a ${fs.toFixed(0)} Hz)`;
     return;
   }
   const secs = captureSeconds();
@@ -1360,6 +1378,7 @@ function runStartCapture(req, source = '') {
   lastStartStreams = req.streams;
   unlimitedSamplesStored = 0;
   unlimitedStopSent = false;
+  unlimitedTruncationLogged = false;
   currentCaptureSignature = '';
   resizePresentCaptureBuffers(req.n);
   data.setFullCaptureEnabled(req.unlimited);
@@ -1577,38 +1596,48 @@ function adcCountsToVolts(counts, nd) {
 
 function handleData(nd, pkt) {
   const rawVal = adcCountsToVolts(pkt.value24, nd);
-  if (nd.pendingMarkFlags) {
-    nd.sdMarks.push([nd.totalSamples, nd.pendingMarkFlags]);
-    nd.pendingMarkFlags = 0;
-  }
 
   if (!nd.gotFirst) {
     nd.gotFirst = true;
     nd.tFirst = performance.now() / 1000;
   }
 
+  const storeFull = !nd.fullCaptureEnabled || unlimitedSamplesStored < UNLIMITED_HARD_CAP;
+  if (nd.pendingMarkFlags) {
+    if (storeFull) {
+      const markIndex = nd.fullCaptureEnabled ? nd.captureRawLength : nd.totalSamples;
+      nd.sdMarks.push([markIndex, nd.pendingMarkFlags]);
+    }
+    nd.pendingMarkFlags = 0;
+  }
+
   let evicted;
-  if (nd.fullCaptureEnabled && unlimitedSamplesStored >= UNLIMITED_SAMPLE_BUDGET) {
-    evicted = nd.rawBuf.push(rawVal);
-  } else {
+  if (storeFull) {
     evicted = nd.pushRaw(rawVal);
     if (nd.fullCaptureEnabled) unlimitedSamplesStored++;
+  } else {
+    evicted = nd.rawBuf.push(rawVal);
+    nd.captureTruncated = true;
+    nd.droppedSamples++;
+    if (!unlimitedTruncationLogged) {
+      unlimitedTruncationLogged = true;
+      appendLog('CAPTURA TRUNCADA: se alcanzó el tope duro de 12,6 millones de muestras');
+    }
   }
   nd.rawSum += rawVal - (evicted ?? 0);
   nd.totalSamples++;
   if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
 
-  // The filtered signal is a full-capture product: keep it blank/dirty while
-  // raw is still arriving so FIR/filtFilt and harmonic LS see the whole signal.
+  // Filtrar al cerrar: captura normal completa; captura grande, solo su cola.
   nd.captureActive = true;
   nd.filterDirty = true;
   nd.filterReady = false;
   if (nd.filtBuf.length) nd.filtBuf.clear();
   if (nd.fullFiltStore?.length) nd.fullFiltStore.clear();
-  if (nd.fullCaptureEnabled && unlimitedSamplesStored >= UNLIMITED_SAMPLE_BUDGET && !unlimitedStopSent) {
+  if (nd.fullCaptureEnabled && unlimitedSamplesStored >= UNLIMITED_STOP_SAMPLES && !unlimitedStopSent) {
     unlimitedStopSent = true;
     sendStd(cfg.CMD_STOP, 0);
-    appendLog('memoria del navegador llena');
+    appendLog('Presupuesto de memoria al 95 %: STOP enviado; drenando muestras pendientes');
   }
 }
 
@@ -1670,7 +1699,10 @@ function syncZeroPhaseFiltBuffers() {
 
 function reprocessFiltBuf(chIndex, options = {}) {
   const nd = data.nodes[chIndex];
-  const raw = nd.captureRawArray();
+  const largeCapture = nd.captureRawLength > LARGE_CAPTURE_SAMPLES;
+  const raw = largeCapture
+    ? nd.fullRawStore.tail(nd.rawBuf.capacity)
+    : nd.captureRawArray();
   if (!raw.length) {
     nd.filtBuf.clear();
     if (nd.fullFiltStore) nd.fullFiltStore.clear();
@@ -1691,7 +1723,15 @@ function reprocessFiltBuf(chIndex, options = {}) {
   const arr = filteredArrayForNode(nd, raw);
   nd.filtZi = null;
   fillRingBuffer(nd.filtBuf, arr);
-  nd.setFullFiltered(arr);
+  if (largeCapture) {
+    if (nd.fullFiltStore) nd.fullFiltStore.clear();
+    nd.filterScope = 'display_tail';
+    nd.filterStartIndex = Math.max(0, nd.captureRawLength - raw.length);
+  } else {
+    nd.setFullFiltered(arr);
+    nd.filterScope = 'full';
+    nd.filterStartIndex = 0;
+  }
   nd.filterDirty = false;
   nd.filterReady = true;
 }
@@ -1701,6 +1741,9 @@ function finalizeNodeFilter(chIndex, reason = '') {
   if (!nd || !nd.captureRawLength) return false;
   nd.captureActive = false;
   reprocessFiltBuf(chIndex, { force: true });
+  if (nd.filterScope === 'display_tail') {
+    appendLog(`S${chIndex}: captura larga; limpieza/notch/FIR aplicada solo a la ventana de visualización`);
+  }
   const panel = panelFor(chIndex);
   if (panel && nd.filtB && nd.filtCmd && nd.filterReady) panel.setFirStatus(`${nd.filtB.length} taps ${nd.filtCmd}`);
   return nd.filterReady;

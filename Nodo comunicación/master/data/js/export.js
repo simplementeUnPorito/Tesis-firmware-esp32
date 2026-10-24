@@ -1,8 +1,8 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-36';
+import * as cfg from './config.js?v=field-study-37';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-36';
+import { effectiveFs } from './data_store.js?v=field-study-37';
 
 const MARK_BITS = [
   [0x01, 'SD_IO'],
@@ -290,6 +290,10 @@ function nodeMetadata(nd, index, paths, connected) {
     filt_count: nd.captureFiltLength,
     batch_count: nd.batchCount,
     total_samples: nd.totalSamples,
+    capture_truncated: !!nd.captureTruncated,
+    dropped_samples: nd.droppedSamples || 0,
+    filter_scope: nd.filterScope || 'full',
+    filter_start_index: nd.filterStartIndex || 0,
     pga_code: nd.pgaCode,
     pga_gain: gainValue(nd.pgaCode),
     pgaout_code: nd.pgaoutCode,
@@ -371,6 +375,10 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     filt_count: filt.length,
     batch_count: node?.batch_count ?? 0,
     total_samples: node?.total_samples ?? raw.length,
+    capture_truncated: !!node?.capture_truncated,
+    dropped_samples: node?.dropped_samples ?? 0,
+    filter_scope: node?.filter_scope || 'full',
+    filter_start_index: node?.filter_start_index ?? 0,
     pga_code: node?.pga_code ?? 0,
     pga_gain: node?.pga_gain ?? gainValue(node?.pga_code ?? 0),
     pgaout_code: node?.pgaout_code ?? 0,
@@ -813,6 +821,7 @@ export function buildCaptureZip(dataStore, options = {}) {
       y_offset_mv: capture.y_offset_mv ?? 0,
       dc_removed_on_preserve: !!capture.dc_removed_on_preserve,
       notch_f0: capture.notch_f0 ?? cfg.LINE_NOTCH_F0,
+      truncated: !!capture.truncated || capNodeMetas.some((node) => node.capture_truncated),
       active_node_indices: Array.isArray(capture.active_node_indices)
         ? capture.active_node_indices.slice()
         : [],
@@ -844,7 +853,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-36',
+    web_app_version: 'field-study-37',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,
@@ -869,6 +878,8 @@ export function buildCaptureZip(dataStore, options = {}) {
     exported_pcb_ids: exportedNodes.map((i) => pcbIdForNode(i, dataStore.nodes[i]?.slaveId)),
     capture_count: captureMetas.length || (exportedNodes.length ? 1 : 0),
     preserved_count: preservedCaptures.length,
+    truncated: nodes.some((node) => node.capture_truncated) ||
+      captureMetas.some((capture) => capture.truncated),
     combined_csv_file: combinedSignalsPath,
     capture_summary_csv_file: captureSummaryPath,
     node_summary_csv_file: nodeSummaryPath,

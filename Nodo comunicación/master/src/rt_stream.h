@@ -43,6 +43,7 @@ public:
     bool start(uint32_t nodeMask)
     {
         stop();
+        if (!_q) return false;
         for (uint8_t n = 1; n < RT_MAX_NODES; n++) {
             if ((nodeMask & (1u << n)) == 0u) continue;
             Node &d = _nodes[n];
@@ -58,7 +59,7 @@ public:
             d.rx = d.dup = d.win = d.crc = 0;
             d.on = true;
         }
-        if (_q) xQueueReset(_q);
+        xQueueReset(_q);
         _qDrop = 0;
         _lastProgressMs = millis();
         _active = true;

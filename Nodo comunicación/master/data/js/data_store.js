@@ -3,7 +3,7 @@
 // use fixed-capacity rings for live plotting and optional chunked stores for
 // the complete unlimited capture.
 
-import * as cfg from './config.js?v=field-study-36';
+import * as cfg from './config.js?v=field-study-37';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -98,6 +98,23 @@ export class ChunkedFloat64Store {
     return out;
   }
 
+  /** Últimas `n` muestras sin materializar el prefijo completo. */
+  tail(n) {
+    const count = Math.min(Math.max(0, n | 0), this.length);
+    const out = new Float64Array(count);
+    let dst = count;
+    let remaining = count;
+    for (let i = this.chunks.length - 1; i >= 0 && remaining > 0; i--) {
+      const chunkStart = i * this.chunkSize;
+      const used = Math.min(this.chunkSize, this.length - chunkStart);
+      const take = Math.min(used, remaining);
+      dst -= take;
+      out.set(this.chunks[i].subarray(used - take, used), dst);
+      remaining -= take;
+    }
+    return out;
+  }
+
   clear() {
     this.chunks = [];
     this.length = 0;
@@ -157,6 +174,10 @@ export class NodeData {
     this.captureActive = false;
     this.filterDirty = false;
     this.filterReady = false;
+    this.filterScope = 'full';
+    this.filterStartIndex = 0;
+    this.captureTruncated = false;
+    this.droppedSamples = 0;
 
     // Per-node config (updated from heartbeat / ACK packets)
     this.pgaCode = 0;
@@ -261,11 +282,12 @@ export class NodeData {
     this.fullFiltStore.append(values);
   }
 
-  /** Marcas de SD relativas a un arreglo de `length` muestras que termina en la última recibida. */
+  /** Marcas relativas a un arreglo que termina en la última muestra almacenada. */
   sdMarksFor(length) {
-    const first = this.totalSamples - length;
+    const stored = this.fullRawStore ? this.fullRawStore.length : this.totalSamples;
+    const first = Math.max(0, stored - length);
     return this.sdMarks
-      .filter(([i]) => i >= first && i < this.totalSamples)
+      .filter(([i]) => i >= first && i < stored)
       .map(([i, f]) => [i - first, f]);
   }
 
@@ -286,6 +308,10 @@ export class NodeData {
     this.captureActive = false;
     this.filterDirty = false;
     this.filterReady = false;
+    this.filterScope = 'full';
+    this.filterStartIndex = 0;
+    this.captureTruncated = false;
+    this.droppedSamples = 0;
   }
 
   addDrift(value, maxHist = 50) {

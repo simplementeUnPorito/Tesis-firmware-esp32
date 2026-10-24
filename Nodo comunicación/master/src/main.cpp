@@ -815,11 +815,18 @@ static void requestBatch(uint8_t nodeId, uint16_t seq)
 
 static uint16_t effectiveSampleRateHz()
 {
+    uint16_t minFs = 0;
     for (uint8_t i = 1; i <= NUM_SLAVES; i++) {
-        if (g_cachedHello[i].valid && g_cachedHello[i].sample_rate > 0)
-            return g_cachedHello[i].sample_rate;
+        if ((g_armAckMask & (1UL << i)) == 0u) continue;
+        if (g_cachedHello[i].valid && g_cachedHello[i].sample_rate > 0 &&
+            (minFs == 0u || g_cachedHello[i].sample_rate < minFs)) {
+            minFs = g_cachedHello[i].sample_rate;
+        }
     }
-    return ADC_SAMPLE_RATE_HZ;
+    if (minFs != 0u) return minFs;
+    const uint8_t decim = (g_wantDecim >= 1u) ? g_wantDecim : 1u;
+    const uint16_t fallback = (uint16_t)(ADC_SAMPLE_RATE_HZ / decim);
+    return (fallback != 0u) ? fallback : 1u;
 }
 
 static uint32_t captureDurationMs(uint16_t nBatches)
@@ -1438,7 +1445,9 @@ static void finishPrestartAction()
             /* Antes del START: los primeros lotes llegan enseguida. */
             g_rtStopReqMs = 0;
             if (!g_rt.start(g_armAckMask)) {
-                MASTER_LOG_PRINTLN("[MASTER] RT sin RAM para las ventanas");
+                MASTER_LOG_PRINTLN("[MASTER] RT sin RAM: captura cancelada");
+                abortCaptureToArmed(0, "rt_no_ram");
+                return;
             }
         }
         broadcastStart();
@@ -2210,12 +2219,12 @@ void loop()
     if (g_rt.active()) {
         g_rt.service();
         /* Vigia: un esclavo que se resetea o pierde el enlace nunca manda su
-         * STREAM_END y el maestro quedaba en RUNNING para siempre (2026-10-23).
-         * La descarga rapida calla durante toda la captura: su limite es la
-         * duracion pedida (a 1 kHz, peor caso con decimacion) mas 20 s. */
+         * STREAM_END. La descarga rapida puede callar durante toda la captura:
+         * usar la duracion a la menor Fs efectiva armada, con 20 % de margen. */
         const uint32_t quiet = g_rt.msSinceProgress();
+        const uint32_t captureMs = captureDurationMs(g_rec_n_batches);
         const uint32_t limitMs = capModeRealtime() ? 15000u
-                               : (uint32_t)g_rec_n_batches * 30u + 20000u;
+                               : ((captureMs * 12u + 9u) / 10u) + 20000u;
         if ((g_rtStopReqMs != 0u && quiet > 5000u) || quiet > limitMs) {
             MASTER_LOG_PRINTF("[MASTER] RT sin progreso %lu ms (stop=%u) -> ARMED\n",
                               (unsigned long)quiet, (unsigned)(g_rtStopReqMs != 0u));
