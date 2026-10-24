@@ -1742,10 +1742,31 @@ static bool rtReady()
     return true;
 }
 
+/* STREAM_ACK que no salio por la cola de TX llena (ESPNOW_NO_MEM, la ocupa el
+ * WebSocket): se reintenta desde loop(). Sin esto el esclavo no veia avanzar
+ * la confirmacion, se le llenaba la ventana y frenaba: con la web conectada
+ * el tiempo real no pasaba de ~16 lotes/s por nodo (2026-10-24). */
+static MsgStreamAck g_ackPending[NUM_SLAVES + 1];
+static bool         g_ackPendingOn[NUM_SLAVES + 1];
+
 static void rtAck(uint8_t node, uint32_t next, uint32_t sack)
 {
+    if (node == 0 || node > NUM_SLAVES) return;
     MsgStreamAck a = { CMD_STREAM_ACK, node, next, sack };
-    if (g_espnowReady) geonetSend(espnowDstForSlave(node), (uint8_t *)&a, sizeof(a));
+    esp_err_t err = ESP_FAIL;
+    if (g_espnowReady) err = geonetSend(espnowDstForSlave(node), (uint8_t *)&a, sizeof(a));
+    g_ackPending[node] = a;
+    g_ackPendingOn[node] = (err == ESP_ERR_ESPNOW_NO_MEM);
+}
+
+static void serviceAckResend()
+{
+    for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
+        if (!g_ackPendingOn[n] || !g_espnowReady) continue;
+        const esp_err_t err = geonetSend(espnowDstForSlave(n), (uint8_t *)&g_ackPending[n],
+                                         sizeof(g_ackPending[n]));
+        g_ackPendingOn[n] = (err == ESP_ERR_ESPNOW_NO_MEM);
+    }
 }
 
 static void rtOnData(const uint8_t *data, int len) { g_rt.onFrame(data, len); }
@@ -2237,6 +2258,7 @@ void setup()
 
 void loop()
 {
+    serviceAckResend();
     if (g_reqResendPending && (int32_t)(millis() - g_reqResendDueMs) >= 0) {
         if (g_state == DUMPING && g_reqResendNode == g_dumpSlaveIdx &&
             g_reqResendSeq == g_dumpBatchSeq) {
@@ -2457,6 +2479,18 @@ void loop()
     /* Tiempo real: entrega en orden y cierre por STREAM_END. */
     if (g_rt.active()) {
         g_rt.service();
+#if DBG_ENABLE
+        {   /* Diagnostico del tiempo real, una linea por segundo. */
+            static uint32_t lastDiagMs = 0;
+            if (millis() - lastDiagMs >= 1000u) {
+                lastDiagMs = millis();
+                g_rt.printStats(Serial);
+                MASTER_LOG_PRINTF("[RTDIAG] txack=%lu/%lu ackpend=%u/%u\n",
+                                  (unsigned long)espnowTxAckOk(), (unsigned long)espnowTxAckFail(),
+                                  (unsigned)g_ackPendingOn[2], (unsigned)g_ackPendingOn[4]);
+            }
+        }
+#endif
         /* Vigia: un esclavo que se resetea o pierde el enlace nunca manda su
          * STREAM_END. La descarga rapida puede callar durante toda la captura:
          * usar la duracion a la menor Fs efectiva armada, con 20 % de margen. */

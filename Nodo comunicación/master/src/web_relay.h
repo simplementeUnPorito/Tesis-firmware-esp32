@@ -48,10 +48,12 @@ static uint32_t g_wsOwnerId    = 0;       /* cliente aceptado actual */
 static uint32_t g_wsAliveMs    = 0;       /* ultima actividad del dueño */
 
 static constexpr size_t WEB_RELAY_PKT_LEN = 6;
-static constexpr size_t WEB_RELAY_TX_PKTS = 300;
+/* 1200 paquetes = 7,2 KB por mensaje: varios segmentos TCP, asi Windows
+ * confirma enseguida (ACK cada dos segmentos) en vez de a los 200 ms. */
+static constexpr size_t WEB_RELAY_TX_PKTS = 1200;
 static constexpr size_t WEB_RELAY_TX_BYTES = WEB_RELAY_TX_PKTS * WEB_RELAY_PKT_LEN;
 static constexpr size_t WEB_RELAY_DUMP_BATCH_BYTES = 30 * WEB_RELAY_PKT_LEN;
-static constexpr size_t WEB_RELAY_QUEUE_SOFT_MAX = 12;
+static constexpr size_t WEB_RELAY_QUEUE_SOFT_MAX = 6;   /* x 7,2 KB */
 static constexpr uint32_t WEB_RELAY_FLUSH_MS = 8u;
 static constexpr uint32_t WEB_RELAY_PING_MS = 1000u;
 static constexpr uint32_t WEB_RELAY_ALIVE_MS = 2500u;
@@ -271,7 +273,7 @@ static void webRelayDecodeCmd(const String &json)
  */
 static void webRelayFlush()
 {
-    uint8_t out[WEB_RELAY_TX_BYTES];
+    static uint8_t out[WEB_RELAY_TX_BYTES];   /* 7,2 KB: fuera de la pila del loop */
     size_t len = 0;
 
     webRelayTxLock();
@@ -295,7 +297,13 @@ static void webRelayFlush()
         return;
     }
 
-    if (!ws.availableForWriteAll()) {
+    /* Freno por largo de cola del cliente, no por "puede escribir ya": eso
+     * esperaba el ACK de cada mensaje y el relay no pasaba de ~6 KB/s. */
+    bool full = false;
+    for (auto &c : ws.getClients()) {
+        if (c.status() == WS_CONNECTED && c.queueLen() >= WEB_RELAY_QUEUE_SOFT_MAX) full = true;
+    }
+    if (full) {
         webRelayTxLock();
         if (g_webRelayTxLen == 0 && len <= WEB_RELAY_TX_BYTES) {
             memcpy(g_webRelayTxBuf, out, len);
@@ -367,7 +375,6 @@ inline bool webRelayReadyForDumpRequest(bool requireClient = false)
         webRelayFlush();
         return false;
     }
-    if (!ws.availableForWriteAll()) return false;
 
     for (auto &c : ws.getClients()) {
         if (c.status() == WS_CONNECTED && c.queueLen() >= WEB_RELAY_QUEUE_SOFT_MAX) {
@@ -408,7 +415,12 @@ static void webRelayPacket(const uint8_t pkt[6])
         return;
     }
 
-    if (pkt[2] != 0x00) webRelayFlush();
+    /* Los de control (ACK, READY, estado...) salen ya; los del flujo de datos
+     * (muestra 0x00, cabecera de lote 0xFA, marca 0xFB, fin 0xF9) se agrupan.
+     * Antes la cabecera y cada marca vaciaban el buffer: mensajes de 22 B en
+     * promedio y la web no pasaba de ~32 lotes/s (2026-10-24). */
+    const uint8_t t = pkt[2];
+    if (t != 0x00 && t != 0xFA && t != 0xFB && t != 0xF9) webRelayFlush();
 }
 
 /* ── Eventos WebSocket ─────────────────────────────────────────────────────  */
@@ -424,6 +436,10 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
              * de aceptación puede pedir ?takeover=1; sólo se honra contra un
              * dueño de la MISMA IP, para automatizar el banco sin expulsar a
              * un operador conectado desde otro equipo. */
+            /* Sin Nagle: con el ACK diferido de Windows (hasta 200 ms) cada
+             * mensaje chico esperaba al anterior y el relay no pasaba de
+             * ~6 KB/s, contra los ~35 KB/s por nodo del tiempo real. */
+            if (client != nullptr && client->client() != nullptr) client->client()->setNoDelay(true);
             AsyncWebServerRequest *request = (AsyncWebServerRequest *)arg;
             bool forceSameIpTakeover = false;
             if (request != nullptr && request->hasParam("takeover")) {
