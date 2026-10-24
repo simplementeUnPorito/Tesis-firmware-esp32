@@ -171,8 +171,12 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         instance->_handleStartAck((const MsgStartAck *)data);
     } else if (first == CMD_OTA_STATUS && (size_t)len >= sizeof(MsgOtaStatus)) {
         if (instance->_otaCb) instance->_otaCb(*(const MsgOtaStatus *)data);
-    } else if (first == CMD_FTM_REPORT && (size_t)len >= sizeof(MsgFtmReport)) {
-        if (instance->_ftmCb) instance->_ftmCb(*(const MsgFtmReport *)data);
+    } else if (first == CMD_FTM_REPORT && (size_t)len >= offsetof(MsgFtmReport, init_err)) {
+        /* Esclavos anteriores no mandan los campos de error: quedan en cero. */
+        MsgFtmReport r = {};
+        r.ev_status = 0xFFu;
+        memcpy(&r, data, ((size_t)len < sizeof(r)) ? (size_t)len : sizeof(r));
+        if (instance->_ftmCb) instance->_ftmCb(r);
     } else if (first == CMD_HOTWAIT_ACK && (size_t)len >= sizeof(MsgHotWaitAck)) {
         instance->_handleHotWaitAck((const MsgHotWaitAck *)data);
     }

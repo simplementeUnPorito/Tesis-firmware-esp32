@@ -32,6 +32,9 @@
 #include "live_capture.h"
 #include "ota_slave.h"
 #include "ftm_slave.h"
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+#include "sim_psoc.h"
+#endif
 
 /* FIR del PSoC en transito (ver serviceFirUpload). */
 static uint8_t  g_firBuf[FIR_HW_TAPS * 3];
@@ -685,6 +688,12 @@ static bool masterMacIsDefaultBroadcast()
 static bool macIsMaster(const uint8_t mac[6])
 {
     if (!g_masterApKnown) return true;
+    /* El S3 arma la MAC del AP prendiendo el bit de administrada localmente
+     * sobre la de la STA (e2:.. contra e0:..), en vez de sumar uno al final. */
+    if (((mac[0] ^ g_masterApBssid[0]) & ~0x02u) == 0u &&
+        memcmp(&mac[1], &g_masterApBssid[1], 5) == 0) {
+        return true;
+    }
     uint64_t a = 0, b = 0;
     for (int i = 0; i < 6; i++) {
         a = (a << 8) | mac[i];
@@ -4222,6 +4231,23 @@ static void handleUsbCommand(const char *cmd)
     if (cmd[0] == '\0') {
         return;
     }
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+    if (usbCommandEquals(cmd, "sim")) {
+        simPsocPrintState();
+    } else if (usbCommandEquals(cmd, "sim off")) {
+        simPsocSetEnabled(false);
+        g_psocConnected = false;
+        g_psoc_hw_class = SLAVE_HW_UNKNOWN;
+        g_psoc_sd_status = 0u;
+        g_psoc_sd_known = false;
+        SLAVE_LOG_PRINTLN("[SIM] PSoC off");
+    } else if (usbCommandEquals(cmd, "sim on")) {
+        simPsocSetEnabled(true);
+        psoc.poll();
+        g_psocConnected = true;
+        SLAVE_LOG_PRINTLN("[SIM] PSoC on");
+    } else
+#endif
     if (usbCommandEquals(cmd, "resetlow")) {
         g_psocResetActive = false;
         drivePsocResetRequestPin(false);
@@ -4525,6 +4551,9 @@ static void handleUsbCommand(const char *cmd)
         }
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+        SLAVE_LOG_PRINTF("[USB] simulator: sim, sim on, sim off\n");
+#endif
 #if SLAVE_LAB_TOOLS_ENABLE
         SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, dumpusb [desde] [hasta], rftest ms periodo_ms bytes [b], sdstress ms periodo_ms, espsd ms cada_lotes, sdprobe ms periodo_ms modo [div] [slew], ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #else

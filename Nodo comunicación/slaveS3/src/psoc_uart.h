@@ -389,7 +389,7 @@ public:
             PSOC_FRAME_MARKER, PSOC_CMD_SD_PROBE, modo, div, slew,
             (uint8_t)(PSOC_CMD_SD_PROBE ^ modo ^ div ^ slew)
         };
-        _ser->write(f, sizeof(f));
+        _write(f, sizeof(f));
     }
     void sdCapture(uint8_t enable);  /* modo captura a SD del PSoC (0xBE) */
     void liveMode(uint8_t mode)      { _sendCmd1(PSOC_CMD_LIVE_MODE, mode); }
@@ -401,8 +401,8 @@ public:
                                 (uint8_t)(0xC9u ^ idx ^ b0 ^ b1) };
         const uint8_t hi[6] = { PSOC_FRAME_MARKER, 0xCAu, idx, b2, 0x00u,
                                 (uint8_t)(0xCAu ^ idx ^ b2) };
-        _ser->write(lo, sizeof(lo));
-        _ser->write(hi, sizeof(hi));
+        _write(lo, sizeof(lo));
+        _write(hi, sizeof(hi));
     }
     void firCommit(uint8_t action, uint16_t sum)
     {
@@ -410,7 +410,7 @@ public:
         const uint8_t l = (uint8_t)(sum & 0xFFu), h = (uint8_t)(sum >> 8);
         const uint8_t f[6] = { PSOC_FRAME_MARKER, 0xCBu, action, l, h,
                                (uint8_t)(0xCBu ^ action ^ l ^ h) };
-        _ser->write(f, sizeof(f));
+        _write(f, sizeof(f));
     }
     void liveAck(uint16_t batch, uint8_t flags)
     {
@@ -420,7 +420,7 @@ public:
             PSOC_FRAME_MARKER, PSOC_CMD_LIVE_ACK, lo, hi, flags,
             (uint8_t)(PSOC_CMD_LIVE_ACK ^ lo ^ hi ^ flags)
         };
-        _ser->write(f, sizeof(f));
+        _write(f, sizeof(f));
     }
     void sdReadBatch(uint16_t index);/* lectura bajo demanda desde GEOLAST.BIN (0xBF) */
     void adcSnapshot();
@@ -449,6 +449,10 @@ public:
     bool     hasLastByte() const { return _lastByteSeen; }
     uint32_t lastByteAgeMs() const { return _lastByteSeen ? (millis() - _lastByteMs) : 0xFFFFFFFFu; }
     uint32_t i2cOverruns() const { return _i2cOverruns; }
+
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+    static void simInjectRx(const uint8_t *data, size_t len);
+#endif
 
 private:
     int32_t _controlLive[512] = {};
@@ -516,5 +520,6 @@ private:
     void _noteRxByte(uint8_t b);
     void _sendCmd1(uint8_t cmd, uint8_t p);
     void _sendCmd2(uint8_t cmd, uint8_t p1, uint8_t p2);
+    void _write(const uint8_t *data, size_t len);
     static int32_t _sign24(uint8_t b0, uint8_t b1, uint8_t b2);
 };

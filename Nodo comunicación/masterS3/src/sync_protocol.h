@@ -357,7 +357,7 @@ struct MsgOtaControl {
     uint8_t  cmd;          /* CMD_OTA_CONTROL */
     uint8_t  node_id;
     uint32_t session;
-    uint8_t  action;       /* 1 = abortar */
+    uint8_t  action;       /* 1 = abortar, 2 = el maestro te oye (confirma la imagen) */
 };
 #pragma pack(pop)
 
@@ -452,5 +452,7 @@ struct MsgFtmReport {
     uint32_t resid_ns;     /* dispersion del desfasaje alrededor de la recta */
     uint32_t age_ms;       /* desde la ultima trama valida; 0xFFFFFFFF = nunca */
     uint8_t  channel;
+    int16_t  init_err;     /* esp_err_t de la ultima esp_wifi_ftm_initiate_session; aditivo */
+    uint8_t  ev_status;    /* wifi_ftm_status_t crudo del ultimo reporte; aditivo */
 };
 #pragma pack(pop)

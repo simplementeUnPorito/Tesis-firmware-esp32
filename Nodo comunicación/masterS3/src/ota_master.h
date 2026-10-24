@@ -43,6 +43,7 @@ struct NodeState {
     uint32_t size = 0;
     uint32_t lastMs = 0;
     bool     offered = false;
+    bool     ackPending = false;   /* imagen nueva sin confirmar: contestarle */
 };
 
 static SendToNodeFn g_sendTo = nullptr;
@@ -269,6 +270,21 @@ inline void onStatus(const MsgOtaStatus &m)
     if (m.size) st.size = m.size;
     st.lastMs = millis();
     st.offered = true;
+    if (m.state == OTA_ST_PENDING) st.ackPending = true;
+}
+
+/* Desde loop(): el esclavo confirma la imagen nueva cuando oye al maestro, y en
+ * reposo el maestro no le manda nada; sin esto volvia a la anterior a los 180 s. */
+inline void service()
+{
+    if (!g_sendTo) return;
+    for (uint8_t n = 1; n < OTA_MAX_NODES; n++) {
+        NodeState &st = g_nodes[n];
+        if (!st.ackPending) continue;
+        st.ackPending = false;
+        MsgOtaControl c = { CMD_OTA_CONTROL, n, st.session, 2u };
+        g_sendTo(n, (const uint8_t *)&c, sizeof(c));
+    }
 }
 
 }  // namespace otam

@@ -1,5 +1,9 @@
 #include "psoc_uart.h"
 
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+#include "sim_psoc.h"
+#endif
+
 #if !defined(ESP8266)
 #include <driver/gpio.h>
 #include <esp_timer.h>
@@ -21,6 +25,34 @@ volatile uint8_t  PsocUART::_i2cStampTail = 0;
 volatile uint32_t PsocUART::_i2cBytesEnqueued = 0;
 volatile uint32_t PsocUART::_i2cBytesConsumed = 0;
 volatile uint32_t PsocUART::_i2cStampOverruns = 0;
+
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+void PsocUART::simInjectRx(const uint8_t *data, size_t len)
+{
+    uint16_t headBytes = _i2cHead;
+    uint32_t added = 0u;
+    for (size_t i = 0u; i < len; ++i) {
+        const uint16_t next = (uint16_t)((headBytes + 1u) % PSOC_I2C_RX_RING);
+        if (next == _i2cTail) { _i2cOverruns++; continue; }
+        _i2cRing[headBytes] = data[i];
+        headBytes = next;
+        added++;
+    }
+    if (added != 0u) {
+        const uint8_t head = _i2cStampHead;
+        const uint8_t next = (uint8_t)((head + 1u) % I2C_STAMP_RING);
+        _i2cBytesEnqueued += added;
+        if (next == _i2cStampTail) {
+            _i2cStampTail = (uint8_t)((_i2cStampTail + 1u) % I2C_STAMP_RING);
+            _i2cStampOverruns++;
+        }
+        _i2cStamps[head].us = (uint64_t)esp_timer_get_time();
+        _i2cStamps[head].endBytes = _i2cBytesEnqueued;
+        _i2cStampHead = next;
+        _i2cHead = headBytes;
+    }
+}
+#endif
 
 #if PSOC_I2C_ENABLE
 void PsocUART::_onI2cReceive(int count)
@@ -159,6 +191,9 @@ void PsocUART::begin(BatchCallback cb, HardwareSerial *serial)
 #endif
 
     _idx = 0;
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+    simPsocBegin();
+#endif
 }
 
 void PsocUART::onDiag(DiagCallback cb)
@@ -177,6 +212,10 @@ void PsocUART::_noteRxByte(uint8_t b)
 void PsocUART::poll()
 {
     if (_ser == nullptr) { return; }
+
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+    simPsocService();
+#endif
 
     uint8_t b;
     while (_rxRead(b)) {
@@ -202,7 +241,7 @@ void PsocUART::poll()
                     PSOC_FRAME_MARKER, PSOC_CTRL_PONG, 0x00u,
                     (uint8_t)(PSOC_CTRL_PONG ^ 0x00u)
                 };
-                _ser->write(pong, sizeof(pong));
+                _write(pong, sizeof(pong));
             } else if (_buf[1] == PSOC_CTRL_CFG_ACK) {
                 continue;   /* frame corto: [AB][C2][cmd][val][crc] */
             } else if (_buf[1] == PSOC_CTRL_FS_REPORT) {
@@ -375,6 +414,10 @@ void PsocUART::_parseFrame()
         s.sample_flags = 0;
     }
 
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+    simPsocDecorateBatch(batch);
+#endif
+
     _lastOK = true;
     _batchesOK++;
     if (_cb) { _cb(batch); }
@@ -419,14 +462,23 @@ void PsocUART::_sendCmd1(uint8_t cmd, uint8_t p)
 {
     if (_ser == nullptr) { return; }
     uint8_t f[4] = { PSOC_FRAME_MARKER, cmd, p, (uint8_t)(cmd ^ p) };
-    _ser->write(f, 4);
+    _write(f, 4);
 }
 
 void PsocUART::_sendCmd2(uint8_t cmd, uint8_t p1, uint8_t p2)
 {
     if (_ser == nullptr) { return; }
     uint8_t f[5] = { PSOC_FRAME_MARKER, cmd, p1, p2, (uint8_t)(cmd ^ p1 ^ p2) };
-    _ser->write(f, 5);
+    _write(f, 5);
+}
+
+void PsocUART::_write(const uint8_t *data, size_t len)
+{
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+    simPsocWrite(data, len);
+#else
+    _ser->write(data, len);
+#endif
 }
 
 void PsocUART::setN(uint16_t n)        { _sendCmd2(PSOC_CMD_SETN, (uint8_t)(n & 0xFF), (uint8_t)(n >> 8)); }

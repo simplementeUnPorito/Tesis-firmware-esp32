@@ -1,12 +1,22 @@
 #include "live_capture.h"
 #include "geo_codec.h"
 
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+#include "sim_sd.h"
+#define LIVE_FS SimSD
+#else
 #include <SD.h>
+#define LIVE_FS SD
+#endif
 #include <SPI.h>
 #include <errno.h>
 #include <esp_timer.h>
 #include "debug_log.h"
 #include "espnow_transport.h"
+
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+#include "sim_psoc.h"
+#endif
 
 /* Pines de la SD del ESP. Un solo lugar, pensando en el ESP32-S3: ahi el 25 y
  * el 32 no existen y el host SPI se llama distinto. */
@@ -255,6 +265,9 @@ void applyMarks(SampleBytes *dst, uint32_t firstSample, uint32_t batch)
             if (g_marks[p].s0 <= sample && sample <= g_marks[p].s1) bits |= g_marks[p].bits;
         }
         dst[i].flags |= bits;
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+        simPsocApplyNoiseArtifact(dst[i], bits, sample);
+#endif
         for (uint8_t bit = 0; bit < 6u; bit++) {
             if ((bits & (1u << bit)) != 0u) g_markApplied[bit]++;
         }
@@ -531,26 +544,30 @@ bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt)
  * que una tarjeta colgada en medio de un comando vuelva a escuchar. */
 void sdWake()
 {
+#if defined(SIM_SIN_HW) && SIM_SIN_HW
+    return;
+#else
     pinMode(LIVE_SD_CS, OUTPUT);
     digitalWrite(LIVE_SD_CS, HIGH);
     g_spi.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
     for (int i = 0; i < 20; i++) g_spi.transfer(0xFF);
     g_spi.endTransaction();
+#endif
 }
 
 bool sdRemount()
 {
     g_sdRemounts = g_sdRemounts + 1u;
     g_file.close();
-    SD.end();
+    LIVE_FS.end();
     g_sdMounted = false;
     g_sdMountedHz = 0u;
     vTaskDelay(pdMS_TO_TICKS(50));
     sdWake();
-    if (!SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false)) return false;
+    if (!LIVE_FS.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false)) return false;
     g_sdMounted = true;
     g_sdMountedHz = g_sdHz;
-    g_file = SD.open(SD_PATH, "r+");
+    g_file = LIVE_FS.open(SD_PATH, "r+");
     if (g_file && g_sdw > g_sdSynced) g_sdw = g_sdSynced;
     return (bool)g_file;
 }
@@ -648,29 +665,31 @@ bool sdMount()
 {
     if (g_sdMounted && g_sdMountedHz == g_sdHz) return true;
     if (g_sdMounted) {
-        SD.end();
+        LIVE_FS.end();
         g_sdMounted = false;
         g_sdMountedHz = 0u;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+#if !(defined(SIM_SIN_HW) && SIM_SIN_HW)
     g_spi.begin(LIVE_SD_SCK, LIVE_SD_MISO, LIVE_SD_MOSI, LIVE_SD_CS);
+#endif
     /* 2026-10-23: tras un reset del ESP en plena transaccion la tarjeta queda
      * colgada y el primer SD.begin falla ("SD ausente"). Se insiste, despertandola
      * antes de cada intento. */
     for (int intento = 0; intento < 4 && !g_sdMounted; intento++) {
         if (intento > 0) {
-            SD.end();
+            LIVE_FS.end();
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         sdWake();
-        g_sdMounted = SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false);
+        g_sdMounted = LIVE_FS.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false);
     }
     if (g_sdMounted) {
         g_sdMountedHz = g_sdHz;
-        g_sdFreeBytes = SD.totalBytes() - SD.usedBytes();
+        g_sdFreeBytes = LIVE_FS.totalBytes() - LIVE_FS.usedBytes();
     } else {
         g_sdMountedHz = 0u;
-        SD.end();
+        LIVE_FS.end();
     }
     return g_sdMounted;
 }
@@ -865,16 +884,16 @@ void setSdHz(uint32_t hz)
     xSemaphoreTake(g_sdMutex, portMAX_DELAY);
     g_sdHz = hz;
     if (g_sdMounted && !g_sdOpen) {
-        SD.end();
+        LIVE_FS.end();
         g_sdMounted = false;
         g_sdMountedHz = 0u;
         vTaskDelay(pdMS_TO_TICKS(50));
-        g_sdMounted = SD.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false);
+        g_sdMounted = LIVE_FS.begin(LIVE_SD_CS, g_spi, g_sdHz, "/sd", 5, false);
         if (g_sdMounted) {
             g_sdMountedHz = g_sdHz;
-            g_sdFreeBytes = SD.totalBytes() - SD.usedBytes();
+            g_sdFreeBytes = LIVE_FS.totalBytes() - LIVE_FS.usedBytes();
         } else {
-            SD.end();
+            LIVE_FS.end();
         }
     }
     xSemaphoreGive(g_sdMutex);
@@ -922,7 +941,7 @@ int32_t prepare(const Config &c)
             return -1;
         }
         xSemaphoreTake(g_sdMutex, portMAX_DELAY);
-        g_file = SD.open(SD_PATH, "w+");
+        g_file = LIVE_FS.open(SD_PATH, "w+");
         const bool ok = (bool)g_file;
         g_sdFull = false;
         g_sdReadFails = 0u;
@@ -993,7 +1012,7 @@ void close()
         if (g_sdOpen) {
             g_sdOpen = false;
             g_file.close();
-            if (g_sdMounted) g_sdFreeBytes = SD.totalBytes() - SD.usedBytes();
+            if (g_sdMounted) g_sdFreeBytes = LIVE_FS.totalBytes() - LIVE_FS.usedBytes();
         }
         xSemaphoreGive(g_sdMutex);
     }

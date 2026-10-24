@@ -405,6 +405,10 @@ static void addPeerIfNeeded(const uint8_t mac[6])
     memcpy(peer.peer_addr, mac, 6);
     peer.channel = 0;
     peer.encrypt = false;
+    /* Salir por el AP: el origen es entonces el BSSID que los esclavos ya
+     * filtran. En el S3 la MAC de la STA no es BSSID-1 (difiere en el bit de
+     * administrada localmente) y los esclavos descartaban todo. */
+    peer.ifidx = WIFI_IF_AP;
     esp_now_add_peer(&peer);
 }
 
@@ -880,13 +884,13 @@ static void serviceFtmReports()
                  "\"sessions\":%u,\"frames_total\":%u,\"frames_valid\":%u,\"window\":%u,"
                  "\"rtt_med_ps\":%lu,\"rtt_mad_ps\":%lu,\"rtt_p95_ps\":%lu,\"rssi_med\":%d,"
                  "\"dist_sdk_cm\":%lu,\"skew_ppb\":%ld,\"resid_ns\":%lu,\"age_ms\":%lu,"
-                 "\"channel\":%u}",
+                 "\"channel\":%u,\"init_err\":%d,\"ev_status\":%u}",
                  (unsigned)n, (unsigned)m.status, (unsigned)m.sync_mode,
                  (unsigned)m.sessions, (unsigned)m.frames_total, (unsigned)m.frames_valid,
                  (unsigned)m.window, (unsigned long)m.rtt_med_ps, (unsigned long)m.rtt_mad_ps,
                  (unsigned long)m.rtt_p95_ps, (int)m.rssi_med, (unsigned long)m.dist_est_cm,
                  (long)m.skew_ppb, (unsigned long)m.resid_ns, (unsigned long)m.age_ms,
-                 (unsigned)m.channel);
+                 (unsigned)m.channel, (int)m.init_err, (unsigned)m.ev_status);
         webRelayText(js);
     }
 }
@@ -2188,6 +2192,7 @@ void loop()
 {
     debugEspHardwareService();
     serviceFtmReports();
+    otam::service();
     serviceRfBurst();
 
     /* Fase ENLACE: ESP-NOW esta abajo (no hay esclavos que atender) pero la SPA

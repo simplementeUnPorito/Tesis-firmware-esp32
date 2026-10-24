@@ -56,6 +56,8 @@ static uint16_t s_framesValid = 0;
 static uint8_t  s_status = FTM_ST_IDLE;
 static uint32_t s_distEstCm = 0;
 static uint8_t  s_channel = 0;
+static int16_t  s_initErr = 0;
+static uint8_t  s_evStatus = 0xFF;
 static bool     s_newReport = false;
 static wifi_ftm_report_entry_t s_last[MAX_ENTRIES];
 static uint8_t  s_lastCount = 0;
@@ -102,6 +104,7 @@ static void absorb()
     s_busy = false;
     memcpy(s_last, raw, (size_t)n * sizeof(wifi_ftm_report_entry_t));
     s_lastCount = n;
+    s_evStatus = st;
     if (st != FTM_STATUS_SUCCESS) {
         s_status = (st == FTM_STATUS_UNSUPPORTED) ? FTM_ST_UNSUPPORTED_PEER
                  : (st == FTM_STATUS_NO_RESPONSE) ? FTM_ST_NO_RESPONSE : FTM_ST_FAIL;
@@ -155,11 +158,14 @@ void service(bool allowed, const uint8_t responder[6], uint8_t channel)
     cfg.burst_period = 2;   /* 200 ms */
     s_lastSessionMs = now;
     s_channel = channel;
-    if (esp_wifi_ftm_initiate_session(&cfg) == ESP_OK) {
+    const esp_err_t err = esp_wifi_ftm_initiate_session(&cfg);
+    s_initErr = (int16_t)err;
+    if (err == ESP_OK) {
         s_busy = true;
         s_sessionStartMs = now;
     } else {
         s_status = FTM_ST_FAIL;
+        s_newReport = true;
     }
 }
 
@@ -251,6 +257,8 @@ bool takeReport(MsgFtmReport &out, uint8_t nodeId, uint8_t syncMode)
     out.resid_ns = (uint32_t)s.resid_ns;
     out.age_ms = s_lastValidMs ? millis() - s_lastValidMs : 0xFFFFFFFFu;
     out.channel = s_channel;
+    out.init_err = s_initErr;
+    out.ev_status = s_evStatus;
     return true;
 }
 
@@ -258,11 +266,12 @@ void printStatus(bool raw)
 {
     const Stats s = compute();
     SLAVE_LOG_RAW("#FTM st=%u ses=%u tramas=%u/%u ventana=%d rtt_med=%lld ps mad=%lld p95=%lld "
-                  "rssi=%d dist_sdk=%lu cm skew=%.0f ppb resid=%.1f ns periodo=%lu ms\n",
+                  "rssi=%d dist_sdk=%lu cm skew=%.0f ppb resid=%.1f ns periodo=%lu ms err=%d ev=%u\n",
                   (unsigned)s_status, (unsigned)s_sessions, (unsigned)s_framesValid,
                   (unsigned)s_framesTotal, s.n, (long long)s.rtt_med, (long long)s.rtt_mad,
                   (long long)s.rtt_p95, (int)s.rssi_med, (unsigned long)s_distEstCm,
-                  s.skew_ppb, s.resid_ns, (unsigned long)s_periodMs);
+                  s.skew_ppb, s.resid_ns, (unsigned long)s_periodMs, (int)s_initErr,
+                  (unsigned)s_evStatus);
     if (!raw) return;
     /* Para medir el origen de T1/T4: se imprime junto al esp_timer y al TSF. */
     SLAVE_LOG_RAW("#FTMRAW esp_timer=%lld tsf_sta=%lld n=%u\n", (long long)esp_timer_get_time(),
