@@ -44,6 +44,7 @@ typedef void (*HotWaitAckCallback)(const MsgHotWaitAck &msg);
 typedef void (*RtDataCallback)(const uint8_t *data, int len);
 typedef void (*RtEndCallback)(const MsgStreamEnd &msg);
 typedef void (*OtaStatusCallback)(const MsgOtaStatus &msg);
+typedef void (*FtmReportCallback)(const MsgFtmReport &msg);
 
 class EspNowRx {
 public:
@@ -62,6 +63,7 @@ public:
 
     /* Tiempo real (rt_stream.h): tramas MsgData32 y STREAM_END. */
     void setOtaHandler(OtaStatusCallback cb) { _otaCb = cb; }
+    void setFtmHandler(FtmReportCallback cb) { _ftmCb = cb; }
     void setRtHandlers(RtDataCallback data, RtEndCallback end)
     {
         _rtDataCb = data;
@@ -83,6 +85,7 @@ private:
     RtDataCallback     _rtDataCb = nullptr;
     RtEndCallback      _rtEndCb = nullptr;
     OtaStatusCallback  _otaCb = nullptr;
+    FtmReportCallback  _ftmCb = nullptr;
     ReassembledBatch   _bufs[MAX_NODES] = {};
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
@@ -168,6 +171,8 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         instance->_handleStartAck((const MsgStartAck *)data);
     } else if (first == CMD_OTA_STATUS && (size_t)len >= sizeof(MsgOtaStatus)) {
         if (instance->_otaCb) instance->_otaCb(*(const MsgOtaStatus *)data);
+    } else if (first == CMD_FTM_REPORT && (size_t)len >= sizeof(MsgFtmReport)) {
+        if (instance->_ftmCb) instance->_ftmCb(*(const MsgFtmReport *)data);
     } else if (first == CMD_HOTWAIT_ACK && (size_t)len >= sizeof(MsgHotWaitAck)) {
         instance->_handleHotWaitAck((const MsgHotWaitAck *)data);
     }

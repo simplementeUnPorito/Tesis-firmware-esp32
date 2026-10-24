@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-study-40">
+  <link rel="stylesheet" href="/css/style.css?v=field-study-41">
 </head>
 <body>
   <header>
@@ -82,6 +82,13 @@
               </select>
             </label>
             <label id="capture-fast-wrap"><input id="capture-fast" type="checkbox"> Descarga rápida</label>
+            <label title="Qué hace la radio de los esclavos mientras muestrean">Sincronización durante captura
+              <select id="sync-mode">
+                <option value="0">FTM activo</option>
+                <option value="1">FTM pausado (solo asincrónico)</option>
+                <option value="2">Radio apagada (solo asincrónico con límite)</option>
+              </select>
+            </label>
           </div>
           <div class="row">
             <label class="capture-duration-control">Duración GEOs <input id="capture-secs" type="number" min="0.1" max="3600" step="0.01" value="3.0"> s</label>
@@ -200,6 +207,6 @@
     </div>
   </div>
 
-  <script type="module" src="/js/app.js?v=field-study-40"></script>
+  <script type="module" src="/js/app.js?v=field-study-41"></script>
 </body>
 </html>

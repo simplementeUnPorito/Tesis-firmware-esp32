@@ -246,6 +246,7 @@ struct MsgPrestart {
     uint8_t  cmd;       /* CMD_PRESTART */
     uint16_t n_batches; /* 0 en tiempo real = sin limite */
     uint8_t  mode;      /* CAPMODE_*; aditivo */
+    uint8_t  sync_mode; /* SYNCMODE_*; aditivo */
 };
 
 struct MsgHotWaitQuery {
@@ -409,5 +410,47 @@ struct MsgFirCommit {
     uint8_t  node_id;
     uint8_t  action;      /* 1 = cargar lo recibido, 0 = FIR de fabrica */
     uint16_t sum;         /* suma de los 384 bytes */
+};
+#pragma pack(pop)
+
+/* ── Sincronizacion durante la captura ──────────────────────────────────────
+ * Modo que viaja al final de PRESTART (un PRESTART viejo llega sin el byte y
+ * queda en FTM activo, el comportamiento de siempre):
+ *   FTM activo   radio prendida; sesiones FTM antes y durante la captura.
+ *   FTM pausado  el esclavo no transmite nada mientras muestrea (solo
+ *                asincronico); el maestro sigue con su beacon.
+ *   Radio apagada  el esclavo apaga el WiFi entre START y el fin de la
+ *                captura (solo asincronico y con limite). */
+#define SYNCMODE_FTM_ACTIVE  0u
+#define SYNCMODE_FTM_PAUSED  1u
+#define SYNCMODE_RADIO_OFF   2u
+
+/* Resumen de las sesiones FTM del esclavo contra el AP del maestro. */
+#define CMD_FTM_REPORT  0x79   /* esclavo -> maestro */
+#define FTM_ST_IDLE             0u   /* todavia sin sesiones */
+#define FTM_ST_OK               1u
+#define FTM_ST_UNSUPPORTED      2u   /* esta placa no tiene FTM (ESP32 clasico) */
+#define FTM_ST_UNSUPPORTED_PEER 3u   /* el maestro no responde FTM (maestro clasico) */
+#define FTM_ST_NO_RESPONSE      4u
+#define FTM_ST_FAIL             5u
+#pragma pack(push, 1)
+struct MsgFtmReport {
+    uint8_t  cmd;          /* CMD_FTM_REPORT */
+    uint8_t  node_id;
+    uint8_t  status;       /* FTM_ST_* de la ultima sesion */
+    uint8_t  sync_mode;    /* SYNCMODE_* vigente en el esclavo */
+    uint16_t sessions;     /* sesiones con exito desde el arranque */
+    uint16_t frames_total; /* tramas recibidas desde el arranque */
+    uint16_t frames_valid; /* tramas con RTT fisico */
+    uint8_t  window;       /* tramas validas en la ventana de las estadisticas */
+    uint32_t rtt_med_ps;   /* RTT = (T4-T1)-(T3-T2), mediana de la ventana */
+    uint32_t rtt_mad_ps;
+    uint32_t rtt_p95_ps;
+    int8_t   rssi_med;
+    uint32_t dist_est_cm;  /* estimacion propia del SDK, para comparar */
+    int32_t  skew_ppb;     /* deriva del reloj MAC local contra el del maestro */
+    uint32_t resid_ns;     /* dispersion del desfasaje alrededor de la recta */
+    uint32_t age_ms;       /* desde la ultima trama valida; 0xFFFFFFFF = nunca */
+    uint8_t  channel;
 };
 #pragma pack(pop)

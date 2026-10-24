@@ -31,6 +31,7 @@
 #include "espnow_transport.h"
 #include "live_capture.h"
 #include "ota_slave.h"
+#include "ftm_slave.h"
 
 /* FIR del PSoC en transito (ver serviceFirUpload). */
 static uint8_t  g_firBuf[FIR_HW_TAPS * 3];
@@ -268,6 +269,12 @@ static volatile SlaveState g_state       = WAIT_ARM;
 static bool                g_radio_silencio = false;
 static volatile bool       g_radio_silencio_pedido = false;
 static uint16_t            g_radio_silencio_ms = 0;
+/* Modo de sincronizacion de la captura en curso (SYNCMODE_*, llega en
+ * PRESTART). RADIO_OFF reusa el mecanismo de radiosil para una sola captura;
+ * FTM_PAUSED calla toda transmision mientras se muestrea. */
+static uint8_t             g_syncMode = SYNCMODE_FTM_ACTIVE;
+static uint32_t            g_syncPausedDrops = 0;
+static const uint16_t      RADIO_OFF_SYNC_DELAY_MS = 300u;
 static bool                g_psocConnected = false;  /* resultado de probe() en setup */
 /* GPIO configurado en platformio.ini -> PSoC P1[4] (esp_reset).
  * Sin pull-up externo: el ESP entrega 3V3 en reposo y 0V al pedir reset.
@@ -681,8 +688,14 @@ static void serviceRadioSilencio(bool desdeLoop);
 static void iniciarTimerSyncRadioSilencio();
 static void subirSyncConRadioSilencio();
 
+static bool syncModeLive();
 static esp_err_t sendToMaster(const uint8_t *data, size_t len)
 {
+    /* FTM pausado: nada sale al aire mientras se muestrea. */
+    if (g_syncMode == SYNCMODE_FTM_PAUSED && g_state == SAMPLING && !syncModeLive()) {
+        g_syncPausedDrops++;
+        return ESP_OK;
+    }
     /* El ACK de fin de captura sale apenas se deja SAMPLING, antes de que el
        loop vuelva a prender la radio callada por radiosil. */
     serviceRadioSilencio(false);
@@ -3058,10 +3071,27 @@ static void iniciarTimerSyncRadioSilencio()
     }
 }
 
+/* El tiempo real necesita la radio: anula los modos silenciosos. */
+static bool syncModeLive()
+{
+    return live::active() && live::config().realtime;
+}
+
+/* radiosil (banco, por USB) o el modo "radio apagada" de esta captura. */
+static bool radioSilActiva()
+{
+    return g_radio_silencio || (g_syncMode == SYNCMODE_RADIO_OFF && !syncModeLive());
+}
+
+static uint16_t radioSilDelayMs()
+{
+    if (g_radio_silencio) return g_radio_silencio_ms;
+    return RADIO_OFF_SYNC_DELAY_MS;
+}
+
 static void subirSyncConRadioSilencio()
 {
-    if (!g_radio_silencio || g_radio_silencio_ms == 0u ||
-        (live::active() && live::config().realtime)) {
+    if (!radioSilActiva() || radioSilDelayMs() == 0u || syncModeLive()) {
         digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
         return;
     }
@@ -3072,7 +3102,7 @@ static void subirSyncConRadioSilencio()
     }
     esp_timer_stop(g_radio_silencio_sync_timer);
     if (esp_timer_start_once(g_radio_silencio_sync_timer,
-                             (uint64_t)g_radio_silencio_ms * 1000u) != ESP_OK) {
+                             (uint64_t)radioSilDelayMs() * 1000u) != ESP_OK) {
         digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
     }
 }
@@ -3109,21 +3139,21 @@ static void radioPrender()
 static void radioSilencioAlEntrar()
 {
     /* En tiempo real la radio tiene que quedar prendida. */
-    if (live::active() && live::config().realtime) return;
-    if (g_radio_silencio) g_radio_silencio_pedido = true;
+    if (syncModeLive()) return;
+    if (radioSilActiva()) g_radio_silencio_pedido = true;
 }
 
 static void serviceRadioSilencio(bool desdeLoop)
 {
     if (desdeLoop && g_radio_silencio_pedido) {
-        if (g_radio_silencio && g_radio_on &&
+        if (radioSilActiva() && g_radio_on &&
             (g_state == HOT_WAIT || g_state == SAMPLING)) {
             radioApagar();
             g_radio_apagada_por_silencio = true;
         }
         g_radio_silencio_pedido = false;
     }
-    if (g_radio_silencio && g_radio_apagada_por_silencio &&
+    if (g_radio_apagada_por_silencio &&
         g_state != SAMPLING && g_state != HOT_WAIT) {
         radioPrender();
         g_radio_apagada_por_silencio = false;
@@ -4363,6 +4393,19 @@ static void handleUsbCommand(const char *cmd)
         requestRadioFromUsb(false);
     } else if (usbCommandEquals(cmd, "radio on")) {
         requestRadioFromUsb(true);
+    } else if (usbCommandEquals(cmd, "ftm")) {
+        ftm::printStatus(false);
+        SLAVE_LOG_RAW("#SYNC modo=%u drops_pausado=%lu\n", (unsigned)g_syncMode,
+                      (unsigned long)g_syncPausedDrops);
+    } else if (usbCommandEquals(cmd, "ftm raw")) {
+        ftm::printStatus(true);
+    } else if (!strncmp(cmd, "ftm periodo ", 12)) {
+        ftm::setPeriodMs((uint32_t)strtoul(cmd + 12, nullptr, 10));
+        ftm::printStatus(false);
+    } else if (!strncmp(cmd, "syncmode ", 9)) {
+        const unsigned long m = strtoul(cmd + 9, nullptr, 10);
+        if (m <= SYNCMODE_RADIO_OFF) g_syncMode = (uint8_t)m;
+        SLAVE_LOG_RAW("#SYNC modo=%u\n", (unsigned)g_syncMode);
     } else if (usbCommandEquals(cmd, "radiosil off")) {
         requestRadioSilencioFromUsb(false);
     } else if (!strncmp(cmd, "radiosil on", 11) &&
@@ -5034,8 +5077,17 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
     else if (cmd == CMD_PRESTART && len >= 3 && g_state != SAMPLING) {
         /* Un maestro viejo manda 3 bytes: queda el modo que estaba (el banco
          * puede fijarlo con "capmode"). */
-        if (len >= (int)sizeof(MsgPrestart)) {
+        if (len >= (int)offsetof(MsgPrestart, sync_mode)) {
             g_capmode = ((const MsgPrestart *)data)->mode;
+        }
+        {
+            const uint8_t sm = (len >= (int)sizeof(MsgPrestart))
+                ? ((const MsgPrestart *)data)->sync_mode : (uint8_t)SYNCMODE_FTM_ACTIVE;
+            if (sm != g_syncMode) {
+                SLAVE_LOG_PRINTF("[SYNC] modo %u -> %u\n", (unsigned)g_syncMode, (unsigned)sm);
+            }
+            g_syncMode = (sm <= SYNCMODE_RADIO_OFF) ? sm : (uint8_t)SYNCMODE_FTM_ACTIVE;
+            g_syncPausedDrops = 0;
         }
         if (!g_auto_cal_requested && g_auto_cal_due_ms != 0u) {
             serviceAutoCalibration();
@@ -5698,6 +5750,7 @@ void setup()
     psoc.onDiag(onPsocDiag);
     live::begin(&psoc, sendToMaster, NODE_ID);
     ota::begin(sendToMaster, NODE_ID, MASTER_AP_SSID, MASTER_AP_PASS);
+    ftm::begin();
     g_psoc_rx_last_level = (uint8_t)digitalRead(PSOC_UART_RX);
     attachInterrupt(digitalPinToInterrupt(PSOC_UART_RX), onPsocRxEdge, CHANGE);
 #if PSOC_RX_SCAN_ENABLE
@@ -5747,12 +5800,32 @@ static void serviceFirUpload()
     SLAVE_LOG_PRINTF("[FIR] enviado al PSoC (accion %u)\n", (unsigned)g_firAction);
 }
 
+/* Sesiones FTM contra el AP del maestro y su resumen cada 2 s. Durante la
+ * captura solo en FTM activo; nunca con la radio apagada ni durante una OTA. */
+static void serviceFtm()
+{
+    const bool capturing = (g_state == SAMPLING || g_state == HOT_WAIT);
+    const bool allowed = g_radio_on && g_masterApKnown && !ota::busy() &&
+                         (!capturing || g_syncMode == SYNCMODE_FTM_ACTIVE);
+    ftm::service(allowed, g_masterApBssid, g_masterChannel);
+    static uint32_t lastReportMs = 0;
+    const uint32_t now = millis();
+    if (now - lastReportMs < 2000u) return;
+    if (capturing && g_syncMode != SYNCMODE_FTM_ACTIVE) return;
+    lastReportMs = now;
+    MsgFtmReport r;
+    if (ftm::takeReport(r, NODE_ID, g_syncMode)) {
+        sendToMaster((const uint8_t *)&r, sizeof(r));
+    }
+}
+
 void loop()
 {
     serviceFirUpload();
     ota::service();   /* una descarga OTA bloquea y termina reiniciando */
     servicePsocResetRequest();
     serviceRadioSilencio(true);
+    serviceFtm();
     if (g_state != SAMPLING) {
         debugEspHardwareService();
         /* Reengancharse al canal del maestro si dejo de hablar. No corre durante

@@ -4,8 +4,8 @@
 // (packet_received / connection_changed / log_message signals) using
 // CustomEvents instead of Qt signals.
 
-import { decodePacket } from './protocol.js?v=field-study-40';
-import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-40';
+import { decodePacket } from './protocol.js?v=field-study-41';
+import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-41';
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
@@ -195,6 +195,8 @@ export class WsClient extends EventTarget {
             }
           } else if (msg?.type === 'fill_miss') {
             this.dispatchEvent(new CustomEvent('fill-miss', { detail: msg }));
+          } else if (msg?.type === 'ftm') {
+            this.dispatchEvent(new CustomEvent('ftm', { detail: msg }));
           } else if (msg?.type === 'link') {
             this.dispatchEvent(new CustomEvent('link-rssi', { detail: msg }));
           }

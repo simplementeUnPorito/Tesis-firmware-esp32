@@ -1,8 +1,9 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-40';
+import * as cfg from './config.js?v=field-study-41';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-40';
+import { effectiveFs } from './data_store.js?v=field-study-41';
+import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-41';
 
 const MARK_BITS = [
   [0x01, 'SD_IO'],
@@ -294,6 +295,7 @@ function nodeMetadata(nd, index, paths, connected) {
     dropped_samples: nd.droppedSamples || 0,
     // Lotes que no llegaron y no se pudieron recuperar: en el crudo son NaN.
     lost_batches: nd.lostBatches ? [...nd.lostBatches].sort((a, b) => a - b) : [],
+    sync: syncNodeMetadata(index),
     filter_scope: nd.filterScope || 'full',
     filter_start_index: nd.filterStartIndex || 0,
     pga_code: nd.pgaCode,
@@ -847,7 +849,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-40',
+    web_app_version: 'field-study-41',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,
@@ -868,6 +870,8 @@ export function buildCaptureZip(dataStore, options = {}) {
     display_secs: options.displaySecs ?? null,
     max_buf_secs: options.maxBufSecs ?? cfg.MAX_BUF_S,
     visible_nodes: visibleNodes,
+    // Modo de sincronizacion y estado FTM congelados al START.
+    sync: syncCaptureMetadata(),
     exported_nodes: exportedNodes,
     exported_pcb_ids: exportedNodes.map((i) => pcbIdForNode(i, dataStore.nodes[i]?.slaveId)),
     capture_count: captureMetas.length || (exportedNodes.length ? 1 : 0),

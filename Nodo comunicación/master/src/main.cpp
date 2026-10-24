@@ -322,6 +322,8 @@ static EspNowRx       espnowRx;
 static RtStream       g_rt;
 static uint32_t       g_rtStopReqMs = 0;   /* STOP pedido en modo stream; 0 = no */
 static uint8_t        g_capMode = 0u;
+/* SYNCMODE_* de la proxima captura (web: comando 0xB8). Viaja en PRESTART. */
+static uint8_t        g_syncMode = SYNCMODE_FTM_ACTIVE;
 static bool capModeRealtime() { return (g_capMode & CAPMODE_REALTIME) != 0u; }
 static bool capModeStreams()
 {
@@ -838,6 +840,55 @@ static uint32_t captureDurationMs(uint16_t nBatches)
     return (samples * 1000UL + (fs - 1)) / fs;
 }
 
+/* El softAP responde FTM para que los esclavos S3 midan RTT y desfasaje. En
+ * el ESP32 clasico no existe y no se toca nada. */
+static void apEnableFtmResponder()
+{
+#if defined(CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT) && CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT
+    wifi_config_t ap_cfg = {};
+    if (esp_wifi_get_config(WIFI_IF_AP, &ap_cfg) != ESP_OK) return;
+    if (ap_cfg.ap.ftm_responder) return;
+    ap_cfg.ap.ftm_responder = true;
+    const esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    MASTER_LOG_PRINTF("[MASTER] FTM responder err=%d\n", (int)err);
+#endif
+}
+
+/* Ultimo reporte FTM de cada esclavo: el callback ESP-NOW lo copia y loop()
+ * lo pasa a la web como JSON {"type":"ftm",...}. */
+static MsgFtmReport  g_ftmLast[NUM_SLAVES + 1];
+static volatile bool g_ftmNew[NUM_SLAVES + 1];
+
+static void onFtmReport(const MsgFtmReport &m)
+{
+    if (m.node_id == 0 || m.node_id > NUM_SLAVES) return;
+    g_ftmLast[m.node_id] = m;
+    g_ftmNew[m.node_id] = true;
+}
+
+static void serviceFtmReports()
+{
+    for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
+        if (!g_ftmNew[n]) continue;
+        g_ftmNew[n] = false;
+        const MsgFtmReport m = g_ftmLast[n];
+        char js[384];
+        snprintf(js, sizeof(js),
+                 "{\"type\":\"ftm\",\"node\":%u,\"status\":%u,\"sync_mode\":%u,"
+                 "\"sessions\":%u,\"frames_total\":%u,\"frames_valid\":%u,\"window\":%u,"
+                 "\"rtt_med_ps\":%lu,\"rtt_mad_ps\":%lu,\"rtt_p95_ps\":%lu,\"rssi_med\":%d,"
+                 "\"dist_sdk_cm\":%lu,\"skew_ppb\":%ld,\"resid_ns\":%lu,\"age_ms\":%lu,"
+                 "\"channel\":%u}",
+                 (unsigned)n, (unsigned)m.status, (unsigned)m.sync_mode,
+                 (unsigned)m.sessions, (unsigned)m.frames_total, (unsigned)m.frames_valid,
+                 (unsigned)m.window, (unsigned long)m.rtt_med_ps, (unsigned long)m.rtt_mad_ps,
+                 (unsigned long)m.rtt_p95_ps, (int)m.rssi_med, (unsigned long)m.dist_est_cm,
+                 (long)m.skew_ppb, (unsigned long)m.resid_ns, (unsigned long)m.age_ms,
+                 (unsigned)m.channel);
+        webRelayText(js);
+    }
+}
+
 static void setApBeaconInterval(uint16_t intervalTu, const char *reason)
 {
     wifi_config_t ap_cfg = {};
@@ -1225,7 +1276,12 @@ static void abortDump(const char *reason)
 
 static void broadcastPrestart(uint16_t nBatches)
 {
-    MsgPrestart msg = { CMD_PRESTART, nBatches, g_capMode };
+    /* Los modos silenciosos no conviven con el tiempo real: el esclavo los
+     * anula igual, pero se avisa aca para que quede en el log. */
+    if (g_syncMode != SYNCMODE_FTM_ACTIVE && capModeRealtime()) {
+        MASTER_LOG_PRINTF("[SYNC] modo %u ignorado en tiempo real\n", (unsigned)g_syncMode);
+    }
+    MsgPrestart msg = { CMD_PRESTART, nBatches, g_capMode, g_syncMode };
     if (g_espnowReady) {
         geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
@@ -1237,7 +1293,7 @@ static void broadcastPrestart(uint16_t nBatches)
     for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
         uint16_t n = nBatchesForNode(node);
         if (n == nBatches) continue;
-        MsgPrestart m = { CMD_PRESTART, n, g_capMode };
+        MsgPrestart m = { CMD_PRESTART, n, g_capMode, g_syncMode };
         geonetSend(espnowDstForSlave(node), (uint8_t *)&m, sizeof(m));
         MASTER_LOG_PRINTF("[MASTER] PRESTART node=%u n=%u (hammer)\n", node, n);
     }
@@ -1748,6 +1804,15 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
             MASTER_LOG_PRINTF("[MASTER] capmode=0x%02X\n", g_capMode);
             break;
 
+        case 0xB8:   /* modo de sincronizacion: SYNCMODE_* */
+            if ((g_state == IDLE || g_state == ARMED || g_state == ARMING) &&
+                param <= SYNCMODE_RADIO_OFF) {
+                g_syncMode = (uint8_t)param;
+            }
+            matlab.sendAck(0xFF, cmd, g_syncMode);
+            MASTER_LOG_PRINTF("[MASTER] syncmode=%u\n", (unsigned)g_syncMode);
+            break;
+
         case 0xA5:   /* STATUS */
             sendCachedStateToWeb();
             break;
@@ -1865,6 +1930,7 @@ static void radioBringUpCapture()
                       IPAddress(255, 255, 255, 0));
     bool apOk = WiFi.softAP(AP_SSID, AP_PASS, 1);   /* canal 1 fijo */
     esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+    if (apOk) apEnableFtmResponder();
     if (apOk) {
         dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
     }
@@ -2031,6 +2097,7 @@ void setup()
                       IPAddress(255, 255, 255, 0));
     bool apOk = WiFi.softAP(AP_SSID, AP_PASS, 1);   /* canal 1 fijo */
     esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+    if (apOk) apEnableFtmResponder();
     MASTER_LOG_PRINTF("[MASTER] softAP %s\n", apOk ? "OK" : "FAIL");
     if (apOk) {
         dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
@@ -2083,6 +2150,7 @@ void setup()
     g_rt.begin(rtEmit, rtReady, rtAck);
     espnowRx.setRtHandlers(rtOnData, rtOnEnd);
     espnowRx.setOtaHandler(otam::onStatus);
+    espnowRx.setFtmHandler(onFtmReport);
     webRelaySetFillHook(rtarc::pushFill);
     webRelaySetDropTestHook(setDropTest);
     webRelaySetFirHook(sendFirToNode);
@@ -2117,6 +2185,7 @@ void setup()
 void loop()
 {
     debugEspHardwareService();
+    serviceFtmReports();
     serviceRfBurst();
 
     /* Fase ENLACE: ESP-NOW esta abajo (no hay esclavos que atender) pero la SPA

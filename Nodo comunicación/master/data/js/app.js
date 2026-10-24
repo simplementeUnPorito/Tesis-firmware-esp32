@@ -2,19 +2,20 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-40';
-import { WsClient } from './ws_client.js?v=field-study-40';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-40';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-40';
-import { PlotArea } from './plot.js?v=field-study-40';
-import { SpectrumArea } from './spectrum.js?v=field-study-40';
-import { SlavePanel } from './slave_panel.js?v=field-study-40';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-40';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-40';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-40';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-40';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-40';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-40';
+import * as cfg from './config.js?v=field-study-41';
+import { WsClient } from './ws_client.js?v=field-study-41';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-41';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-41';
+import { PlotArea } from './plot.js?v=field-study-41';
+import { SpectrumArea } from './spectrum.js?v=field-study-41';
+import { SlavePanel } from './slave_panel.js?v=field-study-41';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-41';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-41';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-41';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-41';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-41';
+import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart } from './sync_panel.js?v=field-study-41';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-41';
 
 const $ = (id) => document.getElementById(id);
 
@@ -1189,7 +1190,26 @@ function setCaptureToMaxBatches() {
             (capacity.reported ? '' : ' usando el valor predeterminado; falta HELLO'));
 }
 
+function captureSyncMode() {
+  const v = parseInt($('sync-mode')?.value, 10);
+  return v >= 0 && v <= 2 ? v : 0;
+}
+
+/* Los modos silenciosos solo admiten captura asincrónica (y con límite). */
+function enforceSyncModeOnCapture(logCorrection) {
+  const silent = captureSyncMode() !== 0;
+  const modeEl = $('capture-mode');
+  for (const opt of modeEl?.options || []) {
+    if (opt.value !== CAPTURE_MODE_ASYNC) opt.disabled = silent;
+  }
+  if (silent && captureMode() !== CAPTURE_MODE_ASYNC) {
+    modeEl.value = CAPTURE_MODE_ASYNC;
+    if (logCorrection) appendLog('Sincronización silenciosa: modo de captura cambiado a asincrónico');
+  }
+}
+
 function updateCaptureModeControls(logCorrection = false) {
+  enforceSyncModeOnCapture(logCorrection);
   const mode = captureMode();
   const storageEl = $('capture-storage');
   const psocOption = storageEl?.querySelector('option[value="0"]');
@@ -1490,6 +1510,8 @@ function runStartCapture(req, source = '') {
   plotArea.clearAll();
   spectrumArea.clearAll();
   sendStd(cfg.CMD_CAPTURE_MODE, req.modeByte);
+  sendStd(cfg.CMD_SYNC_MODE, captureSyncMode());
+  syncSnapshotForStart(captureSyncMode());
   sendHammerRecLen();
   sendStd16(cfg.CMD_START, req.n);
   if (req.unlimited) {
@@ -3934,6 +3956,7 @@ function restoreCaptureModeControls() {
     $('capture-storage').value = String(savedStorage);
   }
   $('capture-fast').checked = loadBoolSetting(CAPTURE_FAST_KEY, false);
+  $('sync-mode').value = String(loadSyncMode());
   updateCaptureModeControls(true);
 }
 
@@ -3944,6 +3967,11 @@ $('capture-secs').addEventListener('change', onCaptureDurationEdited);
 $('capture-secs-hammer').addEventListener('input', updateCapturePreview);
 $('capture-secs-hammer').addEventListener('change', onHammerDurationEdited);
 $('capture-mode').addEventListener('change', () => updateCaptureModeControls(true));
+$('sync-mode').addEventListener('change', () => {
+  saveSyncMode(captureSyncMode());
+  updateCaptureModeControls(true);
+  if (ws.connected) sendStd(cfg.CMD_SYNC_MODE, captureSyncMode());
+});
 $('capture-storage').addEventListener('change', () => updateCaptureModeControls(true));
 $('capture-fast').addEventListener('change', () => updateCaptureModeControls(false));
 $('btn-max-batches').addEventListener('click', setCaptureToMaxBatches);
@@ -3966,3 +3994,6 @@ ws.start();
 
 // OTA de esclavos, en la pestaña Esclavos.
 mountOtaPanel(document.getElementById('tab-slaves'), appendLog);
+// Sincronización FTM y distancia, también en Esclavos.
+const syncPanel = mountSyncPanel(document.getElementById('tab-slaves'), appendLog);
+ws.addEventListener('ftm', (ev) => syncPanel?.onReport(ev.detail));

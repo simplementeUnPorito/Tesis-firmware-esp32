@@ -25,6 +25,7 @@ export const CMD_STOP = 0xA4;
 export const CMD_STATUS = 0xA5;
 export const CMD_DEBUG = 0xA7;
 export const CMD_CAPTURE_MODE = 0xAF;
+export const CMD_SYNC_MODE = 0xB8;   /* SYNCMODE_*: 0 FTM activo, 1 pausado, 2 radio apagada */
 export const CMD_SET_RECLEN = 0xAE;
 export const CMD_SET_RECLEN_HAMMER = 0xAD;  /* largo propio de nodos HAMMER; 0 = mismo que GEO */
 
