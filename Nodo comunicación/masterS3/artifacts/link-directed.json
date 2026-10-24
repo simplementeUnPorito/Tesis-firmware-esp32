@@ -1,0 +1,47 @@
+{
+  "checks": {
+    "slave_debug_ack": true,
+    "slave_radio_data": true,
+    "ramp_contiguous": true,
+    "debug_stops": true,
+    "slave_console": true,
+    "slave_stopped": true,
+    "no_crash": true
+  },
+  "passed": true,
+  "seconds": 10,
+  "slave_samples": 28608,
+  "discontinuities": 0,
+  "first_samples": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "last_samples": [
+    28598,
+    28599,
+    28600,
+    28601,
+    28602,
+    28603,
+    28604,
+    28605,
+    28606,
+    28607
+  ],
+  "packet_counts": {
+    "00:01": 6,
+    "ff:07": 3,
+    "01:fd": 28,
+    "01:07": 3,
+    "01:00": 28620
+  },
+  "slave_log": "[6807973][S1] [SLAVE] AP 'GeoNetwork' en canal 1 (-10 dBm)\n[6808802][S1] [SLAVE] MAC: E0:72:A1:F7:01:18  ch=1 (maestro)\n[6809204][S1] [SLAVE] WiFi ps=off tx=78 qdBm\n[6819805][S1] [ESPNOW] ready ch=1\n[6821939][S1] [PSoC] reset solicitado (arranque del esclavo), GPIO16 nivel=0 esperado=0\n[6822287][S1] [SLAVE 1] listo, reseteando PSoC antes de esperar ARM\n[7321152][S1] [PSoC] reset liberado, GPIO16 nivel=1 esperado=1\n[7463036][S1] [SLAVE] master MAC learned E0:72:A1:F4:99:90 (auto)\n[7463491][S1] [SLAVE] debug_node=1\n[18465034][S1] [18464752][S1] [SLAVE] debug_node=0\n[SLAVE 1] volviendo a WAIT_ARM\n[21534196][S1] [SLAVE 1] USB_STATUS bOK=0 bBad=0 uartBytes=0 mark=0 drop=0 badLen=0 ping=0 diag=0 rx=1 edge=0/1 last=none txOK=1908 txFail=0 state=0 fill=954/0 fs=0\n[22500600][S1] [SLAVE] debug_node=0\n"
+}

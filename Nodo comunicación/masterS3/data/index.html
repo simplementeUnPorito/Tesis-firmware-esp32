@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Geophone Scope — Maestro</title>
+  <link rel="stylesheet" href="/css/style.css?v=field-study-31">
+</head>
+<body>
+  <header>
+    <h1>Geophone Scope</h1>
+    <div class="status-bar">
+      <span>WS: <strong id="conn-status" class="bad">desconectado</strong></span>
+      <span>Estado: <strong id="master-state">--</strong></span>
+      <span>Fs: <strong id="global-fs">esperando…</strong></span>
+      <span title="Intensidad de señal WiFi entre esta interfaz y el maestro (se pausa durante captura)">WiFi interfaz: <strong id="wifi-rssi">--</strong></span>
+      <button id="btn-connect">Reconectar</button>
+      <button id="btn-theme">Modo claro</button>
+    </div>
+  </header>
+
+  <main class="app-layout">
+    <section class="panel plot-panel">
+      <h2>Gráficas</h2>
+      <div class="row plot-toolbar">
+        <label>Ventana <input id="disp-secs" type="number" min="1" max="10" step="1" value="3"> s</label>
+        <span class="plot-tools">
+          <button id="btn-plot-zoom-out" title="Alejar">−</button>
+          <button id="btn-plot-zoom-in" title="Acercar">+</button>
+          <button id="btn-plot-reset" title="Restablecer">Reset</button>
+          <button id="btn-cursor-1" title="Cursor 1: click en la grafica para medir tiempo y amplitud">Cursor 1</button>
+          <button id="btn-cursor-2" title="Cursor 2: click en la grafica para medir tiempo y amplitud">Cursor 2</button>
+        </span>
+        <span class="plot-tools">
+          <label><input id="chk-show-raw" type="checkbox" checked> Cruda</label>
+          <label><input id="chk-show-filt" type="checkbox" checked> Filtrada <span id="wave-velocity" class="velocity-readout"></span></label>
+          <label><input id="chk-show-env-raw" type="checkbox"> Env cruda</label>
+          <label><input id="chk-show-env-filt" type="checkbox"> Env filtrada</label>
+          <label><input id="chk-dc-remove" type="checkbox"> Sin offset DC</label>
+          <label><input id="chk-spectrum" type="checkbox"> Espectro</label>
+        </span>
+      </div>
+      <div id="plots" class="plot-area"></div>
+      <div id="spectra" class="plot-area spectrum-area" hidden></div>
+    </section>
+
+    <aside class="control-sidebar">
+      <nav class="tab-bar" role="tablist" aria-label="Configuración">
+        <button id="tab-btn-capture" class="tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="tab-capture" data-tab-target="tab-capture">Captura</button>
+        <button id="tab-btn-slaves" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-slaves" data-tab-target="tab-slaves">Esclavos</button>
+        <button id="tab-btn-preserved" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-preserved" data-tab-target="tab-preserved">Preservados</button>
+        <button id="tab-btn-enlace" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-enlace" data-tab-target="tab-enlace">Enlace</button>
+        <button id="tab-btn-log" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-log" data-tab-target="tab-log">Log</button>
+      </nav>
+
+      <div class="tab-stack">
+        <section id="tab-capture" class="panel tab-page active" role="tabpanel" aria-labelledby="tab-btn-capture">
+          <h2>Captura</h2>
+          <div class="row">
+            <label>ARM n_esclavos <input id="arm-n" type="number" min="0" max="8" value="0"></label>
+            <button id="btn-arm">ARM</button>
+          </div>
+          <div class="row">
+            <label>N (decimación) <input id="capture-decim-n" type="number" min="1" max="100" step="1" value="1" title="Promedia N muestras (1=sin decimar). Fs efectiva = 2604/N. Se aplica a todos los nodos."></label>
+            <button id="btn-apply-decim">Aplicar N</button>
+            <span id="decim-fs-preview" class="status-text">2604 Hz</span>
+          </div>
+          <div class="row">
+            <label>Duración GEOs <input id="capture-secs" type="number" min="0.1" max="3600" step="0.01" value="3.0" title="Duración GEO; la señal completa se guarda en la SD del PSoC"> s</label>
+            <label>Duración HAMMER <input id="capture-secs-hammer" type="number" min="0" max="3600" step="0.1" value="" placeholder="= GEOs" title="HAMMER usa RAM y se limita automáticamente a 512 lotes"> s</label>
+            <button id="btn-max-ram" title="Fija GEO al máximo de RAM sin SD (416 lotes)">Máx RAM (416)</button>
+            <button id="btn-max-batches" title="Fija GEO al máximo de la SD del PSoC">Máx SD (60000)</button>
+            <button id="btn-start">START</button>
+            <button id="btn-preserve">Descontar</button>
+            <span id="capture-batches" class="status-text">--</span>
+          </div>
+          <div class="row">
+            <button id="btn-stop">STOP</button>
+          </div>
+          <div class="row">
+            <button id="btn-cal-all">Calibrar todos</button>
+          </div>
+          <div class="subhead capture-subhead">Exportar</div>
+          <div class="row">
+            <label>Nombre <input id="export-name" type="text" value="muestra"></label>
+            <button id="btn-export">Guardar CSV/ZIP</button>
+            <label title="Carpeta de raw/ donde el servidor guarda la captura">Carpeta
+              <select id="upload-campaign">
+                <option value="Canchiga">Canchiga</option>
+                <option value="Canchita">Canchita</option>
+                <option value="Canchita_2">Canchita_2</option>
+                <option value="laboratorio">laboratorio</option>
+              </select>
+            </label>
+            <button id="btn-folder-new" title="Crea la carpeta aquí y en el servidor">+ Carpeta</button>
+            <button id="btn-folder-sync" title="Sincroniza la lista de carpetas con el servidor">Sincronizar</button>
+            <button id="btn-upload-server" title="Manda el mismo ZIP al servidor por la red del cliente">Subir al server</button>
+          </div>
+          <div id="export-status" class="status-text">--</div>
+          <div class="subhead capture-subhead">Nodos</div>
+          <div class="node-list">
+            <div class="node-row" id="node-1" hidden>
+              <span class="name">Esclavo 1</span>
+              <span class="raw">--</span>
+              <span class="stats">--</span>
+              <span class="cfg">--</span>
+            </div>
+            <div class="node-row" id="node-2" hidden>
+              <span class="name">Esclavo 2</span>
+              <span class="raw">--</span>
+              <span class="stats">--</span>
+              <span class="cfg">--</span>
+            </div>
+            <div class="node-row" id="node-3" hidden>
+              <span class="name">Esclavo 3</span>
+              <span class="raw">--</span>
+              <span class="stats">--</span>
+              <span class="cfg">--</span>
+            </div>
+          </div>
+        </section>
+
+        <div id="tab-slaves" class="tab-page" role="tabpanel" aria-labelledby="tab-btn-slaves">
+          <div id="slave-panels" class="slave-panels"></div>
+        </div>
+
+        <section id="tab-preserved" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-preserved">
+          <h2>Preservados</h2>
+          <div class="row">
+            <button id="btn-preserved-all">Todos</button>
+            <button id="btn-preserved-none">Ninguno</button>
+            <button id="btn-preserved-clear">Vaciar</button>
+          </div>
+          <div id="preserve-status" class="status-text">0 preservados</div>
+          <div id="preserve-list" class="preserve-list"></div>
+        </section>
+
+        <section id="tab-enlace" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-enlace">
+          <h2>Enlace</h2>
+          <div class="status-text">
+            Red con internet del cliente. Con esto cargado, el maestro alterna
+            solo entre los esclavos y esta red; no hay nada que apretar acá.
+          </div>
+          <div class="row">
+            <label>Red <input id="enlace-ssid" type="text" list="enlace-redes" autocapitalize="off" autocomplete="off" spellcheck="false" title="Nombre de la red con internet (hotspot del celular o router)"></label>
+            <button id="btn-enlace-scan" title="Lista las redes 2.4 GHz que ve el maestro, con su canal">Buscar</button>
+            <datalist id="enlace-redes"></datalist>
+          </div>
+          <div class="row">
+            <label>Contraseña <input id="enlace-pass" type="password" autocomplete="off"></label>
+          </div>
+          <div class="row">
+            <label>Servidor <input id="enlace-server" type="text" autocapitalize="off" autocomplete="off" spellcheck="false" placeholder="http://100.x.y.z:8000/ingest" title="URL del servidor de datos. La usa el navegador para subir el ZIP; el maestro solo la guarda para que no haya que cargarla en cada cliente."></label>
+          </div>
+          <div class="row">
+            <button id="btn-enlace-save">Guardar</button>
+            <button id="btn-enlace-clear" title="Borra las copias guardadas en el maestro (no afecta los ZIP ya subidos ni lo que tenga el navegador)">Vaciar cola</button>
+          </div>
+          <div id="enlace-status" class="status-text">sin consultar</div>
+        </section>
+
+        <section id="tab-log" class="panel tab-page" role="tabpanel" aria-labelledby="tab-btn-log">
+          <h2>Log</h2>
+          <div id="log" class="log"></div>
+        </section>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Modal de autenticación — solo visible cuando el servidor lo requiere -->
+  <div id="auth-modal" class="auth-overlay" hidden>
+    <div class="auth-box">
+      <h2>Acceso protegido</h2>
+      <p>Ingresá la contraseña para conectarte al maestro.</p>
+      <input id="auth-password" type="password" placeholder="Contraseña" autocomplete="current-password">
+      <div class="auth-actions">
+        <button id="btn-auth-connect">Conectar</button>
+      </div>
+      <p id="auth-error" class="auth-error" hidden>Contraseña incorrecta. Intentá de nuevo.</p>
+    </div>
+  </div>
+
+  <script type="module" src="/js/app.js?v=field-study-31"></script>
+</body>
+</html>

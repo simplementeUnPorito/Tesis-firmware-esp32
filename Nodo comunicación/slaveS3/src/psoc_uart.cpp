@@ -1,0 +1,530 @@
+#include "psoc_uart.h"
+
+#if !defined(ESP8266)
+#include <driver/gpio.h>
+#endif
+
+#if PSOC_I2C_ENABLE
+#include <Wire.h>
+#endif
+
+/* Ring de recepción I2C. Estático porque Wire.onReceive() recibe una función
+ * suelta, sin contexto de instancia. Hay una sola PsocUART por firmware. */
+volatile uint8_t  PsocUART::_i2cRing[PSOC_I2C_RX_RING];
+volatile uint16_t PsocUART::_i2cHead = 0;
+volatile uint16_t PsocUART::_i2cTail = 0;
+volatile uint32_t PsocUART::_i2cOverruns = 0;
+
+#if PSOC_I2C_ENABLE
+void PsocUART::_onI2cReceive(int count)
+{
+    while (count-- > 0 && Wire.available() > 0) {
+        const uint8_t b = (uint8_t)Wire.read();
+        const uint16_t next = (uint16_t)((_i2cHead + 1u) % PSOC_I2C_RX_RING);
+        if (next == _i2cTail) {
+            /* Ring lleno: el consumidor se quedó atrás. Se descarta el byte
+             * nuevo (no el histórico) para no partir un frame ya empezado. */
+            _i2cOverruns++;
+            return;
+        }
+        _i2cRing[_i2cHead] = b;
+        _i2cHead = next;
+    }
+}
+#else
+void PsocUART::_onI2cReceive(int) {}
+#endif
+
+bool PsocUART::_rxAvailable()
+{
+#if PSOC_I2C_ENABLE
+    return _i2cHead != _i2cTail;
+#else
+    return (_ser != nullptr) && (_ser->available() > 0);
+#endif
+}
+
+bool PsocUART::_rxRead(uint8_t &b)
+{
+#if PSOC_I2C_ENABLE
+    if (_i2cHead == _i2cTail) { return false; }
+    b = _i2cRing[_i2cTail];
+    _i2cTail = (uint16_t)((_i2cTail + 1u) % PSOC_I2C_RX_RING);
+    return true;
+#else
+    if (_ser == nullptr || _ser->available() <= 0) { return false; }
+    b = (uint8_t)_ser->read();
+    return true;
+#endif
+}
+
+int32_t PsocUART::_sign24(uint8_t b0, uint8_t b1, uint8_t b2)
+{
+    uint32_t val = (uint32_t)b0 | ((uint32_t)b1 << 8) | ((uint32_t)b2 << 16);
+    return (val & 0x800000u) ? (int32_t)(val | 0xFF000000u) : (int32_t)val;
+}
+
+void PsocUART::begin(BatchCallback cb, HardwareSerial *serial)
+{
+    _cb = cb;
+    if (serial != nullptr) {
+        _ser = serial;
+    } else {
+#if defined(ESP8266)
+        _ser = &Serial1;   /* ESP8266: Serial1 (TX GPIO2). RX limitado. */
+#else
+        _ser = &Serial2;   /* ESP32: Serial2 */
+#endif
+    }
+#if defined(ESP8266)
+    _ser->begin(PSOC_UART_BAUD);
+#else
+    _ser->setRxBufferSize(PSOC_UART_RX_BUFFER_SIZE);
+    _ser->begin(PSOC_UART_BAUD, SERIAL_8N1, PSOC_UART_RX, PSOC_UART_TX);
+    /* El TX actual del PSoC esta como open-drain-low. Esto no reemplaza al
+     * pull-up externo a 3V3, pero ayuda a que la linea no quede flotando. */
+    gpio_pulldown_dis((gpio_num_t)PSOC_UART_RX);
+    gpio_pullup_en((gpio_num_t)PSOC_UART_RX);
+#endif
+
+#if PSOC_I2C_ENABLE
+    /* El ESP entra como ESCLAVO I2C: el PSoC es el maestro y escribe frames
+     * completos. Wire.begin(addr, sda, scl, freq) con freq=0 deja que la
+     * velocidad la imponga el maestro, que es lo correcto para un esclavo. */
+    _i2cHead = 0;
+    _i2cTail = 0;
+    Wire.onReceive(&PsocUART::_onI2cReceive);
+    /* El buffer se fija ANTES de begin(): el esclavo reserva sus colas dentro de
+     * begin() con el tamano vigente, asi que pedirlo despues no las agranda. */
+    Wire.setBufferSize(PSOC_I2C_RX_BUF);
+    /* La frecuencia NO puede ir en 0.
+     *
+     * Con 0, el core la reemplaza por 100 kHz (esp32-hal-i2c-slave.c: "if
+     * (!frequency) frequency = 100000") y configura el filtro de glitch y los
+     * umbrales de FIFO del esclavo para esa velocidad. Pero el maestro es el
+     * PSoC y corre a 1 MHz (I2C_DATA_RATE = 1000 kbps en I2C.h del TopDesign):
+     * un esclavo filtrado para 100 kHz descarta esos flancos y NUNCA dispara
+     * onReceive, aunque el bus este perfecto. Medido en la placa: 862 flancos
+     * en SCL en 3 s y 0 bytes recibidos.
+     *
+     * Tiene que coincidir con el maestro. */
+    Wire.begin((uint8_t)PSOC_I2C_ADDR, (int)PSOC_I2C_SDA, (int)PSOC_I2C_SCL,
+               (uint32_t)PSOC_I2C_FREQ_HZ);
+    /* Un frame de datos son 95 bytes: el buffer por defecto (32) los partiría
+     * en varias llamadas a onReceive. No es fatal (el ring reensambla), pero
+     * agrandarlo evita perder bytes en ráfaga. */
+    /* setBufferSize ya se llamo antes de begin(); repetirlo aca no tendria
+     * efecto sobre las colas del esclavo. */
+#endif
+
+    _idx = 0;
+}
+
+void PsocUART::onDiag(DiagCallback cb)
+{
+    _diagCb = cb;
+}
+
+void PsocUART::_noteRxByte(uint8_t b)
+{
+    _bytesRx++;
+    _lastByte = b;
+    _lastByteMs = millis();
+    _lastByteSeen = true;
+}
+
+void PsocUART::poll()
+{
+    if (_ser == nullptr) { return; }
+
+    uint8_t b;
+    while (_rxRead(b)) {
+        _noteRxByte(b);
+
+        if (_idx == 0) {
+            if (b != PSOC_FRAME_MARKER) {
+                _syncDrops++;
+                continue;
+            }
+            _markersRx++;
+        }
+        _buf[_idx++] = b;
+
+        /* Validar n=30 temprano para resincronizar rápido si hay basura. */
+        if (_idx == 2 && _buf[1] != SPI_BATCH_SAMPLES) {
+            /* Ping del PSoC (0xAB 0xC0): responder con pong (0xAB 0xC1 0x00 0xC1) */
+            if (_buf[1] == PSOC_CTRL_PING) {
+                _pingsRx++;
+                _lastOK = true;
+                const uint8_t pong[4] = {
+                    PSOC_FRAME_MARKER, PSOC_CTRL_PONG, 0x00u,
+                    (uint8_t)(PSOC_CTRL_PONG ^ 0x00u)
+                };
+                _ser->write(pong, sizeof(pong));
+            } else if (_buf[1] == PSOC_CTRL_CFG_ACK) {
+                continue;   /* frame corto: [AB][C2][cmd][val][crc] */
+            } else if (_buf[1] == PSOC_CTRL_FS_REPORT) {
+                continue;   /* frame corto: [AB][C3][fs_lo][fs_hi][crc] */
+            } else if (_buf[1] == PSOC_CTRL_DIAG_EVT) {
+                continue;   /* frame corto: [AB][C4][event][val][state][crc] */
+            } else if (_buf[1] == PSOC_CTRL_ST_RESULT) {
+                continue;   /* autotest: [AB][C5][id][st][v0 x4][v1 x4][crc] */
+            } else if (_buf[1] == 0xC6) {
+                continue;
+            } else {
+                _badLen++;
+            }
+            _idx = 0;
+            continue;
+        }
+        if (_idx >= PSOC_CTRL_ACK_BYTES && _buf[1] == PSOC_CTRL_CFG_ACK) {
+            _idx = 0;
+            _parseConfigAck();
+            continue;
+        }
+        if (_idx >= PSOC_CTRL_ACK_BYTES && _buf[1] == PSOC_CTRL_FS_REPORT) {
+            _idx = 0;
+            _parseFsReport();
+            continue;
+        }
+        if (_idx >= PSOC_CTRL_DIAG_BYTES && _buf[1] == PSOC_CTRL_DIAG_EVT) {
+            _idx = 0;
+            _parseDiagEvent();
+            continue;
+        }
+        if (_idx >= PSOC_ST_RESULT_BYTES && _buf[1] == PSOC_CTRL_ST_RESULT) {
+            _idx = 0;
+            _parseSelfTestResult();
+            continue;
+        }
+        if (_idx >= 11 && _buf[1] == 0xC6) {
+            _idx=0;_parseControlMetadata();continue;
+        }
+        if (_idx >= PSOC_FRAME_BYTES) {
+            _idx = 0;
+            _parseFrame();
+        }
+    }
+}
+
+void PsocUART::_parseControlMetadata()
+{
+    uint8_t crc=0;
+    for(unsigned i=2;i<10;++i)crc^=_buf[i];
+    /* Version 2 narrows the PSoC ADC-validity window and invalidates the old
+     * persisted profile, but keeps this 11-byte wire frame unchanged.  Accept
+     * both deployed schemas during the transition and reject future layouts
+     * explicitly instead of silently losing all controller telemetry. */
+    if(crc!=_buf[10] || _buf[2]<1 || _buf[2]>PSOC_CONTROL_METADATA_VERSION){++_badLen;return;}
+    uint16_t key=(uint16_t)_buf[4]|((uint16_t)_buf[5]<<8);
+    int32_t value=(int32_t)((uint32_t)_buf[6]|((uint32_t)_buf[7]<<8)|((uint32_t)_buf[8]<<16)|((uint32_t)_buf[9]<<24));
+    if(key>=512){++_badLen;return;}
+    bool capture=_buf[3]!=0;
+    if(capture && key==0x100)_controlCaptureValid=false;
+    (capture?_controlCapture:_controlLive)[key]=value;
+    if(!capture)_controlLiveSeen=true;
+    if(capture && key==0x1ff)_controlCaptureValid=true;
+    Serial.printf("#CTL %u %u %ld\n",capture?1:0,(unsigned)key,(long)value);
+    if(key==0x102)Serial.printf("[CAL] %s\n",value?"ESTOY_EN_BANDA":"SALI_DE_BANDA");
+}
+bool PsocUART::controlCommand(uint8_t opcode,uint8_t p1,uint8_t p2)
+{
+    if(opcode<0xD0||opcode>0xD7)return false;
+    uint8_t cmd,val;
+    while(takeConfigAck(cmd,val)){}
+    _sendCmd2(opcode,p1,p2);
+    uint32_t start=millis();
+    while(millis()-start<2000) {
+        poll();
+        if(takeConfigAck(cmd,val)&&cmd==opcode)return val==1;
+        delay(1);
+    }
+    return false;
+}
+bool PsocUART::controlSet(uint8_t parameter,int32_t value)
+{
+    if(!controlCommand(0xD0,parameter))return false;
+    for(unsigned i=0;i<4;++i)
+        if(!controlCommand((uint8_t)(0xD1+i),(uint8_t)((uint32_t)value>>(8*i))))return false;
+    return controlCommand(0xD5);
+}
+bool PsocUART::controlUsb(const char *line)
+{
+    if(strncmp(line,"ctl ",4))return false;
+    unsigned id;long value;bool ok=false;
+    unsigned par,pol;int c0,c1,c2,c3;
+    if(sscanf(line+4,"set %u %ld",&id,&value)==2 && id<256)ok=controlSet((uint8_t)id,(int32_t)value);
+    else if(sscanf(line+4,"get %u",&id)==1 && id<256)ok=controlCommand(0xD7,(uint8_t)id);
+    else if(sscanf(line+4,"channel %u",&id)==1 && id<5)
+        ok=controlSet(25,(int32_t)id)&&controlCommand(0xD6,1);
+    /* Tabla de puntos de trabajo. Probar los patrones mas especificos ANTES
+     * que "punto <par> <c0> <c1> <c2> <c3>", que si no se comeria "policy"/
+     * "dump"/"clear" como si fueran el primer %u. */
+    else if(sscanf(line+4,"punto policy %u",&pol)==1 && pol<=3)
+        ok=controlCommand(0xD6,CONTROL_PUNTO_POL,(uint8_t)pol);
+    else if(sscanf(line+4,"punto dump %u",&par)==1 && par<=80)
+        ok=controlCommand(0xD6,CONTROL_PUNTO_DUMP,(uint8_t)par);
+    else if(!strcmp(line+4,"punto clear"))
+        ok=controlCommand(0xD6,CONTROL_PUNTO_CLEAR,0xFF);
+    else if(sscanf(line+4,"punto clear %u",&par)==1 && par<=80)
+        ok=controlCommand(0xD6,CONTROL_PUNTO_CLEAR,(uint8_t)par);
+    else if(!strcmp(line+4,"puntos"))
+        ok=controlCommand(0xD6,CONTROL_PUNTO_DUMP,0xFF);
+    else if(sscanf(line+4,"punto %u %d %d %d %d",&par,&c0,&c1,&c2,&c3)==5 && par<=80
+            && c0>=-255&&c0<=255 && c1>=-255&&c1<=255 && c2>=-255&&c2<=255 && c3>=-255&&c3<=255) {
+        /* Palabra de 32 bits stageada en CP_PUNTO_ARG (ver psoc_uart.h):
+         * bits0-6 par, bit7 cual, bits8-17 primer codigo+512,
+         * bits18-27 segundo codigo+512, bit28 commit (solo en la 2da palabra). */
+        uint32_t w1=((uint32_t)par&0x7Fu)
+                   |(((uint32_t)(c0+512)&0x3FFu)<<8)
+                   |(((uint32_t)(c1+512)&0x3FFu)<<18);
+        uint32_t w2=((uint32_t)par&0x7Fu)|0x80u
+                   |(((uint32_t)(c2+512)&0x3FFu)<<8)
+                   |(((uint32_t)(c3+512)&0x3FFu)<<18)
+                   |(1u<<28);
+        ok=controlSet(CP_PUNTO_ARG,(int32_t)w1)&&controlCommand(0xD6,CONTROL_PUNTO_SET)
+           &&controlSet(CP_PUNTO_ARG,(int32_t)w2)&&controlCommand(0xD6,CONTROL_PUNTO_SET);
+    }
+    else {
+        const char *names[]={"apply","save","defaults","learn","pause","resume","report"};
+        for(unsigned i=0;i<7;++i)if(!strcmp(line+4,names[i]))ok=controlCommand(0xD6,(uint8_t)(i+1));
+    }
+    Serial.printf("#CTL_ACK %u %s\n",ok?1:0,line);
+    return true;
+}
+void PsocUART::_parseFrame()
+{
+    uint8_t crc = 0;
+    for (int i = 0; i < PSOC_FRAME_BYTES - 1; i++) { crc ^= _buf[i]; }
+    if (crc != _buf[PSOC_FRAME_BYTES - 1]) {
+        _lastOK = false;
+        _batchesBad++;
+        return;
+    }
+
+    PsocBatch batch;
+    batch.seq          = (uint16_t)(_buf[2] | (_buf[3] << 8));
+    batch.global_flags = 0;
+    batch.n_samples    = SPI_BATCH_SAMPLES;
+    batch.timestamp_us = (uint64_t)micros();
+
+    const uint8_t *p = &_buf[4];
+    for (int i = 0; i < SPI_BATCH_SAMPLES; i++, p += 3) {
+        PsocSample &s  = batch.samples[i];
+        int32_t raw    = _sign24(p[0], p[1], p[2]);
+        s.post_digital = raw;                         /* RAW 24-bit */
+        s.raw_input    = (int16_t)(raw & 0xFFFF);
+        s.post_analog  = 0;
+        s.gain_byte    = _confirmedPga;
+        s.sample_flags = 0;
+    }
+
+    _lastOK = true;
+    _batchesOK++;
+    if (_cb) { _cb(batch); }
+}
+
+void PsocUART::_parseConfigAck()
+{
+    const uint8_t cmd = _buf[2];
+    const uint8_t val = _buf[3];
+    const uint8_t crc = _buf[4];
+    if (crc != (uint8_t)(PSOC_CTRL_CFG_ACK ^ cmd ^ val)) {
+        _lastOK = false;
+        _badLen++;
+        return;
+    }
+
+    _lastOK = true;
+    _configAcksRx++;
+    _cfgAckCmd = cmd;
+    _cfgAckVal = val;
+    _cfgAckPending = true;
+
+    if (cmd == PSOC_CMD_PGA) {
+        _confirmedPga = val;
+    } else if (cmd == PSOC_CMD_PGAOUT) {
+        _confirmedPgaout = val;
+    } else if (cmd == PSOC_CMD_PGAVDAC) {
+        _confirmedPgavdac = val;
+    }
+}
+
+bool PsocUART::takeConfigAck(uint8_t &cmd, uint8_t &val)
+{
+    if (!_cfgAckPending) { return false; }
+    cmd = _cfgAckCmd;
+    val = _cfgAckVal;
+    _cfgAckPending = false;
+    return true;
+}
+
+void PsocUART::_sendCmd1(uint8_t cmd, uint8_t p)
+{
+    if (_ser == nullptr) { return; }
+    uint8_t f[4] = { PSOC_FRAME_MARKER, cmd, p, (uint8_t)(cmd ^ p) };
+    _ser->write(f, 4);
+}
+
+void PsocUART::_sendCmd2(uint8_t cmd, uint8_t p1, uint8_t p2)
+{
+    if (_ser == nullptr) { return; }
+    uint8_t f[5] = { PSOC_FRAME_MARKER, cmd, p1, p2, (uint8_t)(cmd ^ p1 ^ p2) };
+    _ser->write(f, 5);
+}
+
+void PsocUART::setN(uint16_t n)        { _sendCmd2(PSOC_CMD_SETN, (uint8_t)(n & 0xFF), (uint8_t)(n >> 8)); }
+void PsocUART::preStart()              { _sendCmd1(PSOC_CMD_PRESTART, 0); }
+void PsocUART::startNow()              { _sendCmd1(PSOC_CMD_START_NOW, 0); }
+void PsocUART::setStageDac(uint8_t stageWithSign, uint8_t magnitude)
+{
+    _sendCmd2(PSOC_CMD_VDAC, stageWithSign, magnitude);
+}
+void PsocUART::setPga(uint8_t code)    { _sendCmd1(PSOC_CMD_PGA, code); }
+void PsocUART::setPgaout(uint8_t code) { _sendCmd1(PSOC_CMD_PGAOUT, code); }
+void PsocUART::setPgavdac(uint8_t code){ _sendCmd1(PSOC_CMD_PGAVDAC, code); }
+void PsocUART::calibrate()             { _sendCmd1(PSOC_CMD_CALIBRATE, 1); }
+void PsocUART::acceptExternalCalibration()
+    { _sendCmd1(PSOC_CMD_ACCEPT_EXTERNAL_CAL, PSOC_ACCEPT_EXTERNAL_CAL_MAGIC); }
+void PsocUART::saveEeprom()            { _sendCmd1(PSOC_CMD_SAVE_EEPROM, 0); }
+void PsocUART::selectStream(uint8_t m) { _sendCmd1(PSOC_CMD_SELECT_STREAM, m); }
+void PsocUART::setAdcConfig(uint8_t c) { _sendCmd1(PSOC_CMD_ADC_CONFIG, c); }
+void PsocUART::setDecimation(uint8_t factor) { _sendCmd1(PSOC_CMD_SET_DECIMATION, factor); }
+void PsocUART::setViewChannel(uint8_t ch) { _sendCmd1(PSOC_CMD_VIEW_CHANNEL, ch); }
+void PsocUART::forcePi(uint8_t s) { _sendCmd1(PSOC_CMD_FORCE_PI, s); }
+void PsocUART::sdStatus(uint8_t reinit) { _sendCmd1(PSOC_CMD_SD_STATUS, reinit); }
+void PsocUART::sdTest()                { _sendCmd1(PSOC_CMD_SD_TEST, 0); }
+void PsocUART::sdCapture(uint8_t en)   { _sendCmd1(PSOC_CMD_SD_CAPTURE, en ? 1 : 0); }
+void PsocUART::sdReadBatch(uint16_t index) { _sendCmd2(PSOC_CMD_SD_READ_BATCH, (uint8_t)(index & 0xFFu), (uint8_t)(index >> 8)); }
+void PsocUART::adcSnapshot()           { _sendCmd1(PSOC_CMD_ADC_SNAPSHOT, 1); }
+void PsocUART::blinkLed()              { _sendCmd1(PSOC_CMD_BLINK_LED, 1); }
+void PsocUART::debugRamp(bool en)      { _sendCmd1(PSOC_CMD_DEBUG, en ? 1 : 0); }
+void PsocUART::requestStatus()         { _sendCmd1(PSOC_CMD_STATUS, 0); }
+void PsocUART::sendPong()              { _sendCmd1(PSOC_CTRL_PONG, 0); }
+
+void PsocUART::_parseFsReport()
+{
+    const uint8_t fs_lo = _buf[2];
+    const uint8_t fs_hi = _buf[3];
+    const uint8_t crc   = _buf[4];
+    if (crc != (uint8_t)(PSOC_CTRL_FS_REPORT ^ fs_lo ^ fs_hi)) {
+        _badLen++;
+        return;
+    }
+    const uint16_t fs = (uint16_t)fs_lo | ((uint16_t)fs_hi << 8);
+    if (fs > 0) { _sampleRate = fs; }
+}
+
+void PsocUART::onSelfTest(SelfTestCallback cb)
+{
+    _stCb = cb;
+}
+
+/* Trama de autotest: [AB][C5][id][status][v0 int32 LE][v1 int32 LE][XOR 2..11].
+ * El CRC cubre del byte 2 al 11 inclusive, igual que lo arma el PSoC. */
+void PsocUART::_parseSelfTestResult()
+{
+    uint8_t crc = 0;
+    for (int i = 2; i < PSOC_ST_RESULT_BYTES - 1; i++) { crc ^= _buf[i]; }
+    if (crc != _buf[PSOC_ST_RESULT_BYTES - 1]) {
+        _badLen++;
+        return;
+    }
+
+    PsocSelfTestResult r;
+    r.test_id = _buf[2];
+    r.status  = _buf[3];
+    r.v0 = (int32_t)((uint32_t)_buf[4]  | ((uint32_t)_buf[5]  << 8) |
+                     ((uint32_t)_buf[6]  << 16) | ((uint32_t)_buf[7]  << 24));
+    r.v1 = (int32_t)((uint32_t)_buf[8]  | ((uint32_t)_buf[9]  << 8) |
+                     ((uint32_t)_buf[10] << 16) | ((uint32_t)_buf[11] << 24));
+    r.timestamp_ms = millis();
+
+    _lastOK = true;
+    if (_stCb) { _stCb(r); }
+}
+
+void PsocUART::_parseDiagEvent()
+{
+    const uint8_t event = _buf[2];
+    const uint8_t value = _buf[3];
+    const uint8_t psocState = _buf[4];
+    const uint8_t crc = _buf[5];
+    if (crc != (uint8_t)(PSOC_CTRL_DIAG_EVT ^ event ^ value ^ psocState)) {
+        _lastOK = false;
+        _badLen++;
+        return;
+    }
+
+    _lastOK = true;
+    _diagEventsRx++;
+    if (_diagCb) {
+        PsocDiagEvent ev = { event, value, psocState, millis() };
+        _diagCb(ev);
+    }
+}
+
+bool PsocUART::probe(uint32_t timeoutMs)
+{
+    if (_ser == nullptr) return false;
+
+    const uint32_t startPings = _pingsRx;
+    const uint32_t startBatches = _batchesOK;
+    const uint32_t startDiag = _diagEventsRx;
+
+    while (_rxAvailable()) {
+        poll();   /* no descartar pings pendientes: poll() responde el pong */
+    }
+    if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {
+        return true;
+    }
+
+    /* Fase 1: probe activo no invasivo. En firmware PSoC nuevo, 0xA5 responde
+     * con un ping 0xC0 y poll() contesta el pong 0xC1. Esto cubre el caso en que
+     * el ESP reinicia mientras el PSoC ya estaba conectado e idle. */
+    uint32_t t0 = millis();
+    uint32_t lastTxMs = 0;
+    const uint32_t activeWindowMs = (timeoutMs > 90u) ? ((timeoutMs * 2u) / 3u) : timeoutMs;
+    while ((millis() - t0) < activeWindowMs) {
+        const uint32_t now = millis();
+        if (lastTxMs == 0u || (now - lastTxMs) >= 25u) {
+            sendPong();       /* Destraba PSoC viejo que sigue esperando PONG. */
+            requestStatus();
+            lastTxMs = now;
+        }
+        poll();
+        if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {
+            return true;
+        }
+        delay(1);
+    }
+
+    /* Fase 2: fallback legacy — activar rampa de debug para provocar respuesta
+     * en PSoC viejos que aún no respondan al 0xA5. */
+    debugRamp(true);
+    t0 = millis();
+    bool got = false;
+    const uint32_t fallbackMs = (timeoutMs > activeWindowMs)
+                              ? (timeoutMs - activeWindowMs)
+                              : timeoutMs;
+    while ((millis() - t0) < fallbackMs) {
+        poll();
+        if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {
+            got = true;
+            break;
+        }
+        delay(1);
+    }
+    debugRamp(false);
+    delay(20);
+    t0 = millis();
+    while ((millis() - t0) < 20u) {
+        poll();
+        if (_pingsRx != startPings || _batchesOK != startBatches || _diagEventsRx != startDiag) {
+            got = true;
+        }
+        delay(1);
+    }
+    _idx = 0;
+    return got;
+}
