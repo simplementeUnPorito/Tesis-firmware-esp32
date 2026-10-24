@@ -15,14 +15,21 @@
  *   STOPPED   → vuelve a WAIT_ARM al recibir CMD_STOP
  */
 
+#ifndef SLAVE_LAB_TOOLS_ENABLE
+  #define SLAVE_LAB_TOOLS_ENABLE 0
+#endif
+
 #include <Arduino.h>
-#if !defined(CONFIG_IDF_TARGET_ESP32S3)
-#error "slaveS3 requiere ESP32-S3; usar slave para ESP32 clasico"
+#if SLAVE_LAB_TOOLS_ENABLE
+  #include <SD.h>
+  #include <SPI.h>
 #endif
 #include <esp_wifi.h>
+#include <esp_timer.h>
 #include <driver/gpio.h>
 #include "psoc_uart.h"
 #include "espnow_transport.h"
+#include "live_capture.h"
 #include "sync_protocol.h"
 #include "debug_log.h"
 #include "sd_storage.h"
@@ -95,9 +102,6 @@
 #ifndef SLAVE_USB_CMD_ENABLE
   #define SLAVE_USB_CMD_ENABLE 1
 #endif
-#ifndef SLAVE_LAB_TOOLS_ENABLE
-  #define SLAVE_LAB_TOOLS_ENABLE 0
-#endif
 /* Lineas de protocolo para un parser de host (dumpusb/rftest/sdstress): sin
  * el prefijo "[t][S2] " de SLAVE_LOG_PRINTF, igual que LOGM con "#M,...". */
 #if DBG_ENABLE
@@ -144,7 +148,7 @@ static void scheduleBootGains()
     g_boot_gain_due_ms = millis() + SLAVE_BOOT_GAIN_DELAY_MS;
 }
 #ifndef WIFI_TX_POWER_QDBM
-  #define WIFI_TX_POWER_QDBM 78
+  #define WIFI_TX_POWER_QDBM 84   /* maximo del ESP32: 21 dBm */
 #endif
 
 /* MAC del ESP maestro. El valor real debe venir de platformio.ini. */
@@ -174,6 +178,38 @@ static uint8_t g_masterTxMac[6] = {
     MASTER_MAC0, MASTER_MAC1, MASTER_MAC2,
     MASTER_MAC3, MASTER_MAC4, MASTER_MAC5
 };
+/* BSSID del AP del maestro, del escaneo de canal. El ESP-NOW del maestro sale
+ * por su STA, que difiere del BSSID solo en el ultimo byte. Sin esto el esclavo
+ * aprendia como maestro cualquier trama ESP-NOW del aire (2026-10-23: MACs
+ * aleatorias de otro equipo; el ARM_ACK se iba a ellas y START se cancelaba). */
+static uint8_t g_masterApBssid[6] = {0};
+static bool    g_masterApKnown = false;
+static bool    g_beaconMarks = true;
+
+#if !defined(ESP8266)
+static void beaconPromiscCb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!g_beaconMarks || !g_masterApKnown || type != WIFI_PKT_MGMT || buf == nullptr) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    if (pkt->rx_ctrl.sig_len < 22u || frame[0] != 0x80u ||
+        memcmp(frame + 16, g_masterApBssid, 6) != 0) return;
+    const uint64_t now = (uint64_t)esp_timer_get_time();
+    const uint64_t airtime = (uint64_t)pkt->rx_ctrl.sig_len * 8ULL;
+    live::noteEvent(SAMPLE_FLAG_AP_BEACON, now - airtime, now);
+}
+
+static void applyBeaconMarks()
+{
+    wifi_promiscuous_filter_t filter = {};
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(beaconPromiscCb);
+    esp_wifi_set_promiscuous(g_beaconMarks);
+}
+#else
+static void applyBeaconMarks() {}
+#endif
 
 /* Pines GPIO hardware sync. platformio.ini es la fuente de verdad; estos
  * defaults solo evitan romper builds viejos que no definan las macros. */
@@ -218,6 +254,9 @@ static uint8_t  g_masterChannel = MASTER_CH_FALLBACK;
 
 enum SlaveState { WAIT_ARM, ARMED, HOT_WAIT, SAMPLING, STOPPED };
 static volatile SlaveState g_state       = WAIT_ARM;
+static bool                g_radio_silencio = false;
+static volatile bool       g_radio_silencio_pedido = false;
+static uint16_t            g_radio_silencio_ms = 0;
 static bool                g_psocConnected = false;  /* resultado de probe() en setup */
 /* GPIO configurado en platformio.ini -> PSoC P1[4] (esp_reset).
  * Sin pull-up externo: el ESP entrega 3V3 en reposo y 0V al pedir reset.
@@ -331,6 +370,50 @@ static uint32_t g_rftest_enviados   = 0;
 static uint32_t g_rftest_fallos     = 0;
 static uint32_t g_rftest_prox_ms    = 0;
 static bool     g_rftest_running    = false; /* para imprimir "#RFTEST fin" una sola vez */
+static bool     g_rftest_broadcast  = false;
+static const uint8_t RFTEST_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+/* Instantes (micros) de cada evento de radio durante la captura. El PSoC
+ * avisa por I2C en cada k*150 muestras (sdprobe modo 7, PSOC_EVT_LAB_PING) y
+ * esos avisos, tambien en micros, son el reloj de referencia: el host
+ * interpola cada evento entre dos avisos y obtiene su muestra exacta, sin la
+ * deriva del IMO del PSoC (+-1 %) ni la latencia de la captura a RAM. */
+#define LAB_POS_MAX 192
+struct LabPos {
+    volatile bool     enSampling;
+    volatile uint32_t base;
+    volatile uint16_t n;
+    uint32_t          pos[LAB_POS_MAX];
+};
+static uint32_t          g_ping_t[LAB_POS_MAX];
+static uint8_t           g_ping_v[LAB_POS_MAX];
+static volatile uint16_t g_ping_n = 0u;
+static bool              g_ping_en_sampling = false;
+static volatile bool     g_rftest_disparo = false;   /* rftest periodo 0: transmitir ya */
+static LabPos g_rftest_pos = {};
+static LabPos g_rfrx_pos   = {};
+
+static void labPosReset(LabPos &p) { p.enSampling = false; p.base = 0u; p.n = 0u; }
+
+/* Llamar seguido (loop/serviceLabWaitSlice) para fijar la base de lotes. */
+static void labPosTick(LabPos &p);
+/* Registra un evento ahora; tambien desde el callback de recepcion. */
+static void labPosMark(LabPos &p);
+static void labPosPrint(const char *tag, LabPos &p);
+
+/* rfrx: registra la llegada de las rafagas del maestro (tramas "RFB1"). */
+static uint32_t g_rfrx_hasta_ms  = 0;
+static bool     g_rfrx_running   = false;
+static uint32_t g_rfrx_recibidas = 0;
+
+/* Pulso para disparar el osciloscopio en cada transmision de rftest. */
+#define RF_TRIG_PIN 4
+
+#if defined(ESP8266)
+static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len);
+#else
+static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len);
+#endif
 
 /* ── sdstress (banco): escrituras a la SD del PSoC EN PARALELO a una captura
  * corta que si entra en RAM. NO toca la regla de g_psoc_sd_store_active: es
@@ -347,6 +430,35 @@ static uint32_t g_sdstress_fallos     = 0;
 static uint32_t g_sdstress_prox_ms    = 0;
 static bool     g_sdstress_running    = false;
 
+/* ── sdprobe (banco): prueba parametrizada de ruido SD del PSoC, en paralelo
+ * a una captura corta en RAM. El ack 0xAD se cuenta igual que sdstress. */
+static uint32_t g_sdprobe_hasta_ms   = 0;
+static uint32_t g_sdprobe_periodo_ms = 0;
+static uint32_t g_sdprobe_envios     = 0;
+static uint32_t g_sdprobe_fallos     = 0;
+static uint32_t g_sdprobe_prox_ms    = 0;
+static uint8_t  g_sdprobe_modo       = 0;
+static uint8_t  g_sdprobe_div        = 0;
+static uint8_t  g_sdprobe_slew       = 0;
+static bool     g_sdprobe_running    = false;
+
+#if SLAVE_LAB_TOOLS_ENABLE
+/* E14: la SD cuelga del ESP32 por un HSPI exclusivo y escribe mientras el
+ * PSoC captura solamente a RAM. */
+static SPIClass spiHspi(LIVE_SD_SPI_HOST);
+static uint32_t g_espsd_hasta_ms       = 0u;
+static uint32_t g_espsd_cada_lotes     = 0u;
+static uint32_t g_espsd_base           = 0u;
+static uint32_t g_espsd_proximo        = 0u;
+static uint32_t g_espsd_escrituras     = 0u;
+static uint32_t g_espsd_fallos         = 0u;
+static uint32_t g_espsd_sector         = 0u;
+static uint32_t g_espsd_pos[128]       = {};
+static bool     g_espsd_activo         = false;
+static bool     g_espsd_en_sampling    = false;
+static bool     g_espsd_tiempo_cumplido = false;
+#endif
+
 #ifndef STORE_PAGE_BATCHES
 #define STORE_PAGE_BATCHES 32u
 #endif
@@ -362,6 +474,21 @@ static uint32_t    *g_store_ts_us = nullptr;      /* timestamp relativo por batc
 static volatile uint16_t g_view_remaining    = 0; /* legado live deshabilitado */
 static volatile bool     g_view_store_active = false;
 static volatile bool     g_start_store_active = false;
+/* Modo de captura pedido (CAPMODE_*, ver sync_protocol.h). Lo fija el maestro
+ * en PRESTART o el banco con "capmode". El asincronico con RAM del PSoC es el
+ * camino clasico; todo lo demas pasa por live_capture. */
+static uint8_t  g_capmode = 0u;
+static bool     g_capmode_ramp = false;
+static bool     g_live_notified = false;
+static volatile uint8_t  g_psoc_live_ack = 0xFFu;
+static volatile uint32_t g_psoc_live_ack_seq = 0u;
+static int16_t  g_psoc_live_known = -1;
+static bool capmodeIsLive(uint8_t mode)
+{
+    return (mode & CAPMODE_REALTIME) != 0u ||
+           (mode & CAPMODE_STREAM_DUMP) != 0u ||
+           (mode & CAPMODE_STORAGE_MASK) != CAPMODE_STORAGE_PSOC;
+}
 static volatile uint8_t  g_psoc_last_setn_value = 0;
 static volatile uint32_t g_psoc_last_setn_ms = 0;
 static volatile uint32_t g_psoc_setn_seq = 0;
@@ -416,26 +543,19 @@ struct GpioScanSlot {
     volatile uint8_t level;
 };
 
-/* S3 N16R8: solo GPIO libres del cableado de PORT_S3.md. Fuera 0/3/45/46
- * (arranque), 19/20 (USB), 26-37 (flash/PSRAM octal) y 43/44 (consola). */
+/* Solo GPIO libres: fuera memoria, USB, consola, arranque y cableado. */
 static GpioScanSlot g_rx_scan[] = {
-    {1, 0, 0}, {2, 0, 0}, {4, 0, 0}, {13, 0, 0}, {14, 0, 0},
-    {21, 0, 0}, {42, 0, 0}, {47, 0, 0}, {48, 0, 0},
+    {1, 0, 0}, {2, 0, 0}, {4, 0, 0}, {47, 0, 0}, {48, 0, 0},
 };
 
-static void IRAM_ATTR onRxScan0()  { g_rx_scan[0].edges++;  g_rx_scan[0].level  = (uint8_t)digitalRead(g_rx_scan[0].pin); }
-static void IRAM_ATTR onRxScan1()  { g_rx_scan[1].edges++;  g_rx_scan[1].level  = (uint8_t)digitalRead(g_rx_scan[1].pin); }
-static void IRAM_ATTR onRxScan2()  { g_rx_scan[2].edges++;  g_rx_scan[2].level  = (uint8_t)digitalRead(g_rx_scan[2].pin); }
-static void IRAM_ATTR onRxScan3()  { g_rx_scan[3].edges++;  g_rx_scan[3].level  = (uint8_t)digitalRead(g_rx_scan[3].pin); }
-static void IRAM_ATTR onRxScan4()  { g_rx_scan[4].edges++;  g_rx_scan[4].level  = (uint8_t)digitalRead(g_rx_scan[4].pin); }
-static void IRAM_ATTR onRxScan5()  { g_rx_scan[5].edges++;  g_rx_scan[5].level  = (uint8_t)digitalRead(g_rx_scan[5].pin); }
-static void IRAM_ATTR onRxScan6()  { g_rx_scan[6].edges++;  g_rx_scan[6].level  = (uint8_t)digitalRead(g_rx_scan[6].pin); }
-static void IRAM_ATTR onRxScan7()  { g_rx_scan[7].edges++;  g_rx_scan[7].level  = (uint8_t)digitalRead(g_rx_scan[7].pin); }
-static void IRAM_ATTR onRxScan8()  { g_rx_scan[8].edges++;  g_rx_scan[8].level  = (uint8_t)digitalRead(g_rx_scan[8].pin); }
+static void IRAM_ATTR onRxScan0() { g_rx_scan[0].edges++; g_rx_scan[0].level = (uint8_t)digitalRead(g_rx_scan[0].pin); }
+static void IRAM_ATTR onRxScan1() { g_rx_scan[1].edges++; g_rx_scan[1].level = (uint8_t)digitalRead(g_rx_scan[1].pin); }
+static void IRAM_ATTR onRxScan2() { g_rx_scan[2].edges++; g_rx_scan[2].level = (uint8_t)digitalRead(g_rx_scan[2].pin); }
+static void IRAM_ATTR onRxScan3() { g_rx_scan[3].edges++; g_rx_scan[3].level = (uint8_t)digitalRead(g_rx_scan[3].pin); }
+static void IRAM_ATTR onRxScan4() { g_rx_scan[4].edges++; g_rx_scan[4].level = (uint8_t)digitalRead(g_rx_scan[4].pin); }
 
 static void (* const g_rx_scan_isr[])(void) = {
     onRxScan0, onRxScan1, onRxScan2, onRxScan3, onRxScan4,
-    onRxScan5, onRxScan6, onRxScan7, onRxScan8,
 };
 static_assert(sizeof(g_rx_scan_isr) / sizeof(g_rx_scan_isr[0]) ==
               sizeof(g_rx_scan) / sizeof(g_rx_scan[0]), "un ISR por pin");
@@ -483,32 +603,14 @@ static void beginPsocRxScan()
 
 static void logPsocRxScan()
 {
-    uint32_t edges[sizeof(g_rx_scan) / sizeof(g_rx_scan[0])];
-    uint8_t levels[sizeof(g_rx_scan) / sizeof(g_rx_scan[0])];
-
     noInterrupts();
     for (size_t i = 0; i < (sizeof(g_rx_scan) / sizeof(g_rx_scan[0])); i++) {
-        edges[i] = g_rx_scan[i].edges;
-        levels[i] = g_rx_scan[i].level;
+        SLAVE_LOG_PRINTF("[SLAVE] RX_SCAN p%u=%lu/%u\n",
+                         (unsigned)g_rx_scan[i].pin,
+                         (unsigned long)g_rx_scan[i].edges,
+                         (unsigned)g_rx_scan[i].level);
     }
     interrupts();
-
-    SLAVE_LOG_PRINTF(
-        "[SLAVE] RX_SCAN p4=%lu/%u p5=%lu/%u p12=%lu/%u p13=%lu/%u p14=%lu/%u "
-        "p18=%lu/%u p19=%lu/%u p21=%lu/%u p22=%lu/%u p25=%lu/%u p27=%lu/%u p32=%lu/%u p33=%lu/%u\n",
-        (unsigned long)edges[0], (unsigned)levels[0],
-        (unsigned long)edges[1], (unsigned)levels[1],
-        (unsigned long)edges[2], (unsigned)levels[2],
-        (unsigned long)edges[3], (unsigned)levels[3],
-        (unsigned long)edges[4], (unsigned)levels[4],
-        (unsigned long)edges[5], (unsigned)levels[5],
-        (unsigned long)edges[6], (unsigned)levels[6],
-        (unsigned long)edges[7], (unsigned)levels[7],
-        (unsigned long)edges[8], (unsigned)levels[8],
-        (unsigned long)edges[9], (unsigned)levels[9],
-        (unsigned long)edges[10], (unsigned)levels[10],
-        (unsigned long)edges[11], (unsigned)levels[11],
-        (unsigned long)edges[12], (unsigned)levels[12]);
 }
 #endif
 
@@ -536,6 +638,20 @@ static bool masterMacIsDefaultBroadcast()
     return !usableUnicastMac(MASTER_MAC_DEFAULT);
 }
 
+/* true si la trama puede venir del maestro: mismo equipo que el AP escaneado
+ * (STA y softAP del ESP32 difieren en pocas unidades). Sin escaneo, se acepta. */
+static bool macIsMaster(const uint8_t mac[6])
+{
+    if (!g_masterApKnown) return true;
+    uint64_t a = 0, b = 0;
+    for (int i = 0; i < 6; i++) {
+        a = (a << 8) | mac[i];
+        b = (b << 8) | g_masterApBssid[i];
+    }
+    const uint64_t d = (a > b) ? (a - b) : (b - a);
+    return d <= 3u;
+}
+
 static void learnMasterMac(const uint8_t mac[6])
 {
     if (!usableUnicastMac(mac) || sameMac(g_masterTxMac, mac)) return;
@@ -550,8 +666,15 @@ static void learnMasterMac(const uint8_t mac[6])
                      masterMacIsDefaultBroadcast() ? " (auto)" : "");
 }
 
+static void serviceRadioSilencio(bool desdeLoop);
+static void iniciarTimerSyncRadioSilencio();
+static void subirSyncConRadioSilencio();
+
 static esp_err_t sendToMaster(const uint8_t *data, size_t len)
 {
+    /* El ACK de fin de captura sale apenas se deja SAMPLING, antes de que el
+       loop vuelva a prender la radio callada por radiosil. */
+    serviceRadioSilencio(false);
     return espnowSend(g_masterTxMac, data, len);
 }
 
@@ -783,8 +906,12 @@ static void sendCfgAckS16(uint8_t hiBase, uint8_t loBase, uint8_t stage, int32_t
     sendCfgAck((uint8_t)(loBase + stage), (uint8_t)(raw & 0xFFu));
 }
 
+static void labPingRecord(uint8_t v);
 static void onPsocDiag(const PsocDiagEvent &event)
 {
+#if SLAVE_LAB_TOOLS_ENABLE
+    if (event.event == PSOC_EVT_LAB_PING) { labPingRecord(event.value); return; }
+#endif
     static uint8_t calStage = 0xFF;
     static uint8_t calDac = 0;
     static int16_t calMeas = 0;
@@ -811,7 +938,27 @@ static void onPsocDiag(const PsocDiagEvent &event)
         event.event != PSOC_EVT_CAPTURE_DONE &&
         event.event != PSOC_EVT_SD_SESSION &&
         event.event != PSOC_EVT_SD_ERROR &&
-        event.event != PSOC_EVT_ARMED_TIMEOUT) {
+        event.event != PSOC_EVT_ARMED_TIMEOUT &&
+        event.event != PSOC_EVT_LIVE_DONE &&
+        event.event != PSOC_EVT_LIVE_OVERRUN &&
+        event.event != PSOC_EVT_LIVE_TOTAL1 &&
+        event.event != PSOC_EVT_LIVE_TOTAL2) {
+        return;
+    }
+
+    if (event.event == PSOC_EVT_LIVE_TOTAL1 || event.event == PSOC_EVT_LIVE_TOTAL2) {
+        live::onPsocTotalByte(event.event == PSOC_EVT_LIVE_TOTAL1 ? 1u : 2u, event.value);
+        return;
+    }
+    if (event.event == PSOC_EVT_LIVE_OVERRUN) {
+        live::onPsocOverrun();
+        SLAVE_LOG_PRINTLN("[LIVE] PSoC: anillo lleno, la captura paro");
+        return;
+    }
+    if (event.event == PSOC_EVT_LIVE_DONE) {
+        live::onPsocDone(event.value);
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        if (g_state == SAMPLING) g_state = STOPPED;
         return;
     }
 
@@ -889,6 +1036,7 @@ static void onPsocDiag(const PsocDiagEvent &event)
 
     if (event.event == PSOC_EVT_BOOT) {
         g_psoc_hw_class = event.value;
+        g_psoc_live_known = -1;
         scheduleBootGains();
         SLAVE_LOG_PRINTF("[PSoC] boot hw=%u/%s pstate=%u/%s\n",
                          event.value, psocHwName(event.value),
@@ -1443,6 +1591,8 @@ static void onPsocDiag(const PsocDiagEvent &event)
 static void allocStore(uint16_t n_batches);
 static void handleReqBatch(const MsgReqBatch *msg);
 static void sendHotWaitAck();
+static void radioSilencioAlEntrar();
+static uint16_t effectivePsocSampleRateHz();
 
 /* ── Callbacks ESP-NOW ───────────────────────────────────────────────────── */
 
@@ -1528,6 +1678,15 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
             if (value == 0u && g_sdstress_running) {
                 g_sdstress_fallos++;
             }
+            break;
+        case PSOC_CMD_SD_PROBE:
+            if (value == 0u && g_sdprobe_running) {
+                g_sdprobe_fallos++;
+            }
+            break;
+        case PSOC_CMD_LIVE_MODE:
+            g_psoc_live_ack = value;
+            g_psoc_live_ack_seq++;
             break;
         default:
             break;
@@ -1671,7 +1830,9 @@ static bool sendAndConfirmPsocSetN(uint16_t n_batches)
 {
     const uint8_t expected = (n_batches > 255u) ? 255u : (uint8_t)n_batches;
 
-    for (int intento = 0; intento < 2; intento++) {
+    /* 2026-10-23: en modo vivo se perdieron los dos intentos seguidos y la
+     * captura se aborto; cuatro intentos (~2 s) cuestan menos que eso. */
+    for (int intento = 0; intento < 4; intento++) {
         const uint32_t startMs = millis();
         const uint32_t startSeq = g_psoc_setn_seq;
 
@@ -1690,9 +1851,9 @@ static bool sendAndConfirmPsocSetN(uint16_t n_batches)
             }
             delay(1);
         }
-        if (intento == 0) {
-            SLAVE_LOG_PRINTF("[SLAVE] SETN sin ack n=%u; reintento\n",
-                             (unsigned)n_batches);
+        if (intento < 3) {
+            SLAVE_LOG_PRINTF("[SLAVE] SETN sin ack n=%u; reintento %d\n",
+                             (unsigned)n_batches, intento + 1);
         }
     }
 
@@ -1707,11 +1868,43 @@ static bool sendAndConfirmPsocSetN(uint16_t n_batches)
     return false;
 }
 
+/* Deja el PSoC en el modo de captura de ESTA captura: 0 clasico, 1 en vivo,
+ * 2 en vivo con la rampa de banco. Se cachea y solo viaja si cambia; un boot
+ * del PSoC invalida la cache. */
+static bool syncPsocLiveMode(uint8_t mode)
+{
+    if (g_psoc_live_known == (int16_t)mode) return true;
+    for (int intento = 0; intento < 2; intento++) {
+        const uint32_t startMs = millis();
+        const uint32_t startSeq = g_psoc_live_ack_seq;
+        psoc.liveMode(mode);
+        while ((uint32_t)(millis() - startMs) < PSOC_SETN_ACK_TIMEOUT_MS) {
+            psoc.poll();
+            servicePsocConfigAck();
+            if (g_psoc_live_ack_seq != startSeq) {
+                if (g_psoc_live_ack == mode) {
+                    g_psoc_live_known = (int16_t)mode;
+                    return true;
+                }
+                break;
+            }
+            delay(1);
+        }
+    }
+    g_psoc_live_known = -1;
+    SLAVE_LOG_PRINTF("[SLAVE] PSoC LIVE_MODE %u sin confirmar (ack=%u)\n",
+                     (unsigned)mode, (unsigned)g_psoc_live_ack);
+    return false;
+}
+
 /* Deja la SD del PSoC como la necesita ESTA captura: prendida solo si no
  * entra en RAM. Funciona con cualquier firmware de PSoC (con o sin la regla
  * de psoc_arm), porque el PSoC usa la SD siempre que tenga el flag. */
 static bool syncPsocSdForCapture(bool want)
 {
+    /* El PSoC ya no tiene SD (se saco del TopDesign; la SD es del ESP): 0xBE
+     * contesta 0xEE. Apagada es el unico estado posible. */
+    if (!want) return true;
     if (!want && g_psoc_sd_known && !psocSdPresent()) return true;
     if (g_psoc_sd_known && g_psoc_sd_capture_enabled == want && !g_sd_sync_pending) return true;
 
@@ -1910,6 +2103,65 @@ static void serviceBootGains()
     g_boot_gain_step = 0u;
 }
 
+/* Fin de una captura en vivo: el asincronico clasico manda START_DONE; los
+ * caminos stream mandan STREAM_END con el total. */
+static void serviceLiveEnd()
+{
+    if (!live::active()) return;
+    if (live::wantsStop() && digitalRead(SYNC_TO_PSOC_PIN) == HIGH) {
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        SLAVE_LOG_PRINTLN("[LIVE] SD llena o con error: corto la captura");
+    }
+    /* Maestro desaparecido (reiniciado, sin enlace): sin ningun STREAM_ACK en
+     * 30 s con la captura ya cerrada, se abandona la sesion. Antes el esclavo
+     * quedaba esperando para siempre, sin HELLO, y no se podia volver a armar
+     * desde la web (2026-10-23). La SD conserva la captura. */
+    if ((live::config().realtime || live::config().streamDump) && live::psocDone() &&
+        live::msSinceMasterAck() > 30000u) {
+        SLAVE_LOG_PRINTF("[LIVE] maestro sin confirmar hace %lu ms: abandono la sesion\n",
+                         (unsigned long)live::msSinceMasterAck());
+        digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        live::close();
+        g_live_notified = false;
+        g_state = WAIT_ARM;
+        return;
+    }
+    /* STREAM_END se repite: si se pierde, el maestro no cierra nunca. */
+    static uint8_t endRetries = 0;
+    static uint32_t endMs = 0;
+    const bool streams = live::config().realtime || live::config().streamDump;
+    if (g_live_notified) {
+        if (streams && endRetries < 20u &&
+            (uint32_t)(millis() - endMs) >= 250u) {
+            endRetries++;
+            endMs = millis();
+            MsgStreamEnd e = { CMD_STREAM_END, NODE_ID, live::total(), live::endReason() };
+            sendToMaster((const uint8_t *)&e, sizeof(e));
+        }
+        return;
+    }
+    if (!live::finished()) return;
+    g_live_notified = true;
+    endRetries = 0;
+    endMs = millis();
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    if (g_state == SAMPLING) g_state = STOPPED;
+    const uint32_t total = live::total();
+    g_store_fill = (total > 0xFFFFu) ? 0xFFFFu : (uint16_t)total;
+    if (streams) {
+        MsgStreamEnd e = { CMD_STREAM_END, NODE_ID, total, live::endReason() };
+        sendToMaster((const uint8_t *)&e, sizeof(e));
+    }
+    /* En los caminos stream no: START_DONE dispara el volcado clasico. */
+    if (g_start_store_active && !streams) {
+        sendCompletionAckWithRetry(CMD_START);
+    }
+    g_start_store_active = false;
+    SLAVE_LOG_RAW("#LIVE_END total=%lu reason=%u\n", (unsigned long)total,
+                  (unsigned)live::endReason());
+    live::printStatus();
+}
+
 static void requestPrestartFromUsb(uint16_t n)
 {
     if (captureOrDumpBusy()) {
@@ -1936,7 +2188,7 @@ static void requestUsbStartFromHotWait()
     }
     uint32_t nowUs = (uint32_t)micros();
     int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
-    digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+    subirSyncConRadioSilencio();
     int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
     g_t_start_us = (uint64_t)nowUs;
     g_store_fill = 0;
@@ -1949,6 +2201,8 @@ static void requestUsbStartFromHotWait()
     g_start_store_active = (g_rec_n_batches > 0 && storeReadyForHotWait());
     g_start_fallback_sent = false;
     g_state = SAMPLING;
+    if (live::active()) live::start(g_t_start_us, effectivePsocSampleRateHz());
+    radioSilencioAlEntrar();
     SLAVE_LOG_PRINTF("[USB] sync start n=%u sync=%d->%d bytes=%lu\n",
                      (unsigned)g_rec_n_batches, syncBefore, syncAfter,
                      (unsigned long)g_sampling_start_psoc_bytes);
@@ -1981,6 +2235,7 @@ static void requestCaptureFromUsb(uint16_t n)
 
 static void requestStopFromUsb()
 {
+    if (live::active()) live::requestStop();
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
     g_debug_mode = false;
     debugEspSetRamp(false);
@@ -2244,11 +2499,78 @@ static uint32_t usbCaptureTimeoutMs(uint16_t n)
     return (timeoutMs < 3000u) ? 3000u : timeoutMs;
 }
 
+#if SLAVE_LAB_TOOLS_ENABLE
+static void serviceRfTest();
+static void serviceRfRx();
+static void serviceLabPing();
+static void serviceSdStress();
+static void serviceSdProbe();
+static void serviceEspSd();
+#endif
+
 static void serviceLabWaitSlice()
 {
     psoc.poll();
     servicePsocConfigAck();
+#if SLAVE_LAB_TOOLS_ENABLE
+    /* capwait/startwait bloquean loop(): sin esto los estresores paralelos
+     * (rftest/sdstress/sdprobe/espsd) no corrian DURANTE la captura sino antes y
+     * despues, y la captura salia limpia. Medido 2026-10-19: 0 marcas. */
+    serviceLabPing();
+    serviceRfTest();
+    serviceRfRx();
+    serviceSdStress();
+    serviceSdProbe();
+    serviceEspSd();
+#endif
+    serviceRadioSilencio(true);   /* radiosil: el apagado se difiere al loop */
     delay(1);
+}
+
+/* Banco: captura en vivo completa por USB, con el modo de "capmode". Con
+ * secs > 0 corta con STOP a los secs segundos (para N = 0, sin limite). Espera
+ * el fin (en tiempo real, que el maestro -o el simulado- confirme todo). */
+static void requestLiveCapFromUsb(uint32_t n, uint32_t secs)
+{
+    if (!capmodeIsLive(g_capmode)) {
+        SLAVE_LOG_RAW("#LIVECAP rechazado: capmode es el clasico\n");
+        return;
+    }
+    /* Lo que haria un ARM: soltar la captura anterior, que queda retenida
+     * esperando la descarga. */
+    live::close();
+    requestClearFromUsb();
+    requestCaptureFromUsb((uint16_t)(n > 0xFFFFu ? 0xFFFFu : n));
+    if (!live::active() || g_state != SAMPLING) {
+        SLAVE_LOG_RAW("#LIVECAP no arranco state=%d\n", (int)g_state);
+        live::printStatus();
+        return;
+    }
+    uint32_t fs = effectivePsocSampleRateHz();
+    if (fs == 0u) fs = PSOC_NATIVE_SAMPLE_RATE_HZ;
+    const uint32_t captureMs = (n > 0u)
+        ? (uint32_t)(((uint64_t)n * SPI_BATCH_SAMPLES * 1000u) / fs) : secs * 1000u;
+    const uint32_t limitMs = captureMs + secs * 1000u + 30000u;
+    const uint32_t t0 = millis();
+    uint32_t lastStatMs = t0;
+    bool stopped = false;
+    while ((uint32_t)(millis() - t0) < limitMs && !g_live_notified) {
+        serviceLabWaitSlice();
+        live::service();
+        serviceLiveEnd();
+        if (!stopped && secs > 0u && (uint32_t)(millis() - t0) >= secs * 1000u) {
+            stopped = true;
+            live::requestStop();
+            digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+        }
+        if ((uint32_t)(millis() - lastStatMs) >= 2000u) {
+            lastStatMs = millis();
+            live::printStatus();
+        }
+    }
+    SLAVE_LOG_RAW("#LIVECAP fin=%u ms=%lu\n", (unsigned)g_live_notified,
+                  (unsigned long)(millis() - t0));
+    if (!g_live_notified) live::printStatus();
 }
 
 static void waitForLabCaptureDone(const char *tag, uint16_t requestedBatches)
@@ -2495,21 +2817,104 @@ static void requestDumpUsbFromUsb(bool hasDesde, uint16_t desde,
  * casualidad). NO bloquea: arma el estado global y loop() -> serviceRfTest()
  * dispara una trama por periodo mientras millis() < g_rftest_hasta_ms. La
  * validacion de rango ya la hizo el parser en handleUsbCommand. */
-static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytesN)
+static void labPosTick(LabPos &p)
+{
+    if (!p.enSampling && g_state == SAMPLING) {
+        p.base = psoc.batchesOK();
+        p.enSampling = true;
+    }
+}
+
+static void labPosMark(LabPos &p)
+{
+    if (!p.enSampling || g_state != SAMPLING) return;
+    const uint16_t k = p.n;
+    if (k >= LAB_POS_MAX) return;
+    p.pos[k] = micros();
+    p.n = (uint16_t)(k + 1u);
+}
+
+static void labPosPrint(const char *tag, LabPos &p)
+{
+    SLAVE_LOG_RAW("#%s t %u", tag, (unsigned)p.n);
+    for (uint16_t i = 0; i < p.n; i++) SLAVE_LOG_RAW(" %lu", (unsigned long)p.pos[i]);
+    SLAVE_LOG_RAW("\n");
+    SLAVE_LOG_RAW("#PING t %u", (unsigned)g_ping_n);
+    for (uint16_t i = 0; i < g_ping_n; i++) {
+        SLAVE_LOG_RAW(" %u:%lu", (unsigned)g_ping_v[i], (unsigned long)g_ping_t[i]);
+    }
+    SLAVE_LOG_RAW("\n");
+}
+
+/* Reinicia el registro de pings al empezar cada captura. */
+static void serviceLabPing()
+{
+    if (g_state == SAMPLING) {
+        if (!g_ping_en_sampling) { g_ping_n = 0u; g_ping_en_sampling = true; }
+    } else {
+        g_ping_en_sampling = false;
+    }
+}
+
+static void labPingRecord(uint8_t v)
+{
+    const uint32_t t = micros();
+    const uint16_t k = g_ping_n;
+    if (k < LAB_POS_MAX) { g_ping_t[k] = t; g_ping_v[k] = v; g_ping_n = (uint16_t)(k + 1u); }
+    if (g_rftest_running && g_rftest_periodo_ms == 0u) g_rftest_disparo = true;
+}
+
+static void rftestFin(const char *evento)
+{
+    g_rftest_hasta_ms = 0u;
+    if (!g_rftest_running) return;
+    g_rftest_running = false;
+    labPosPrint("RFTEST", g_rftest_pos);
+    SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
+                  (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+    LOGM("USB_CMD", "cmd=rftest,event=%s,enviados=%lu,fallos=%lu", evento,
+         (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+}
+
+static bool ensureRfTestBroadcastPeer()
+{
+#if defined(ESP8266)
+    return espnowAddPeer(RFTEST_BROADCAST_MAC);
+#else
+    if (esp_now_is_peer_exist(RFTEST_BROADCAST_MAC)) return true;
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, RFTEST_BROADCAST_MAC, sizeof(peer.peer_addr));
+    peer.channel = espnowCurrentChannel();
+    peer.encrypt = false;
+    return esp_now_add_peer(&peer) == ESP_OK;
+#endif
+}
+
+static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytesN,
+                                 bool broadcast)
 {
     if (ms == 0u) {
-        g_rftest_hasta_ms = 0u;
-        g_rftest_running = false;
-        SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
-                      (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
-        LOGM("USB_CMD", "cmd=rftest,ok=1,cancel=1");
+        if (!g_rftest_running) {
+            SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
+                          (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
+        }
+        rftestFin("cancel");
+        return;
+    }
+    if (broadcast && !ensureRfTestBroadcastPeer()) {
+        SLAVE_LOG_PRINTF("[USB] rftest: no se pudo registrar peer broadcast\n");
         return;
     }
     g_rftest_periodo_ms = periodoMs;
     g_rftest_bytes      = (uint8_t)bytesN;
+    g_rftest_broadcast  = broadcast;
     g_rftest_enviados   = 0u;
     g_rftest_fallos     = 0u;
     g_rftest_prox_ms    = millis();
+    g_rftest_disparo    = false;
+    labPosReset(g_rftest_pos);
+    pinMode(RF_TRIG_PIN, OUTPUT);
+    digitalWrite(RF_TRIG_PIN, LOW);
     g_rftest_running    = true;
     g_rftest_hasta_ms   = millis() + ms;
     SLAVE_LOG_RAW("#RFTEST inicio ms=%lu periodo=%lu bytes=%lu\n",
@@ -2519,24 +2924,25 @@ static void requestRfTestFromUsb(uint32_t ms, uint32_t periodoMs, uint32_t bytes
 }
 
 /* loop(): una trama fija por periodo, sin bloquear. Payload de patron fijo,
- * el contenido no importa para medir ruido inducido por la radio. */
+ * el contenido no importa para medir ruido inducido por la radio. Cada envio
+ * queda registrado (lote de la captura) y levanta RF_TRIG_PIN ~200 us para
+ * disparar el osciloscopio. */
 static void serviceRfTest()
 {
     if (g_rftest_hasta_ms == 0u) return;
+    labPosTick(g_rftest_pos);
     const uint32_t now = millis();
     if (now >= g_rftest_hasta_ms) {
-        g_rftest_hasta_ms = 0u;
-        if (g_rftest_running) {
-            g_rftest_running = false;
-            SLAVE_LOG_RAW("#RFTEST fin enviados=%lu fallos=%lu\n",
-                          (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
-            LOGM("USB_CMD", "cmd=rftest,event=fin,enviados=%lu,fallos=%lu",
-                 (unsigned long)g_rftest_enviados, (unsigned long)g_rftest_fallos);
-        }
+        rftestFin("fin");
         return;
     }
-    if (now < g_rftest_prox_ms) return;
-    g_rftest_prox_ms = now + g_rftest_periodo_ms;
+    if (g_rftest_periodo_ms == 0u) {
+        if (!g_rftest_disparo) return;
+        g_rftest_disparo = false;
+    } else {
+        if (now < g_rftest_prox_ms) return;
+        g_rftest_prox_ms = now + g_rftest_periodo_ms;
+    }
 
     static uint8_t payload[240];
     static bool payloadReady = false;
@@ -2547,9 +2953,192 @@ static void serviceRfTest()
         payloadReady = true;
     }
 
-    const esp_err_t err = sendToMaster(payload, g_rftest_bytes);
+    labPosMark(g_rftest_pos);
+    digitalWrite(RF_TRIG_PIN, HIGH);
+    const esp_err_t err = g_rftest_broadcast
+        ? espnowSend(RFTEST_BROADCAST_MAC, payload, g_rftest_bytes)
+        : sendToMaster(payload, g_rftest_bytes);
+    delayMicroseconds(200);
+    digitalWrite(RF_TRIG_PIN, LOW);
     g_rftest_enviados++;
     if (err != ESP_OK) { g_rftest_fallos++; }
+}
+
+/* rfrx: mientras esta armado, cada trama "RFB1" del maestro (rafaga 0xC1)
+ * queda registrada por onDataRecv; al terminar se informa #RFRX pos. */
+static void rfrxFin()
+{
+    g_rfrx_hasta_ms = 0u;
+    if (!g_rfrx_running) return;
+    g_rfrx_running = false;
+    labPosPrint("RFRX", g_rfrx_pos);
+    SLAVE_LOG_RAW("#RFRX fin recibidas=%lu\n", (unsigned long)g_rfrx_recibidas);
+}
+
+static void requestRfRxFromUsb(uint32_t ms)
+{
+    if (ms == 0u) {
+        if (!g_rfrx_running) SLAVE_LOG_RAW("#RFRX fin recibidas=%lu\n", (unsigned long)g_rfrx_recibidas);
+        rfrxFin();
+        return;
+    }
+    labPosReset(g_rfrx_pos);
+    g_rfrx_recibidas = 0u;
+    g_rfrx_running = true;
+    g_rfrx_hasta_ms = millis() + ms;
+    SLAVE_LOG_RAW("#RFRX inicio ms=%lu\n", (unsigned long)ms);
+}
+
+static void serviceRfRx()
+{
+    if (g_rfrx_hasta_ms == 0u) return;
+    labPosTick(g_rfrx_pos);
+    if (millis() >= g_rfrx_hasta_ms) rfrxFin();
+}
+
+/* Llamado al principio de onDataRecv: true si era una trama de rafaga. */
+static bool rfrxOnFrame(const uint8_t *data, int len)
+{
+    if (len < 4 || data[0] != 'R' || data[1] != 'F' || data[2] != 'B' || data[3] != '1') return false;
+    if (g_rfrx_running) {
+        g_rfrx_recibidas++;
+        labPosMark(g_rfrx_pos);
+    }
+    return true;
+}
+
+/* txpower: potencia maxima de transmision en dBm (2..21). */
+static void requestTxPowerFromUsb(long dbm)
+{
+    if (dbm < 2 || dbm > 21) {
+        SLAVE_LOG_PRINTF("[USB] uso: txpower <dBm 2-21>\n");
+        return;
+    }
+    const esp_err_t err = esp_wifi_set_max_tx_power((int8_t)(dbm * 4));
+    int8_t real = 0;
+    esp_wifi_get_max_tx_power(&real);
+    SLAVE_LOG_RAW("#TXPOWER pedido=%ld dBm real=%d qdBm err=%d\n", dbm, (int)real, (int)err);
+}
+
+/* radio off|on: apaga y vuelve a prender WiFi + ESP-NOW sin reiniciar el ESP
+ * (reiniciarlo resetea el PSoC y obliga al lazo a volver a aprender). */
+static bool g_radio_on = true;
+static bool g_radio_apagada_por_silencio = false;
+static esp_timer_handle_t g_radio_silencio_sync_timer = nullptr;
+
+static void radioSilencioSyncTimerCb(void *)
+{
+    digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+}
+
+static void iniciarTimerSyncRadioSilencio()
+{
+    if (g_radio_silencio_sync_timer != nullptr) return;
+    const esp_timer_create_args_t args = {
+        .callback = &radioSilencioSyncTimerCb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "radiosil_sync",
+        .skip_unhandled_events = false,
+    };
+    if (esp_timer_create(&args, &g_radio_silencio_sync_timer) != ESP_OK) {
+        g_radio_silencio_sync_timer = nullptr;
+        SLAVE_LOG_RAW("#RADIOSIL timer FAIL\n");
+    }
+}
+
+static void subirSyncConRadioSilencio()
+{
+    if (!g_radio_silencio || g_radio_silencio_ms == 0u ||
+        (live::active() && live::config().realtime)) {
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+        return;
+    }
+    g_radio_silencio_pedido = true;
+    if (g_radio_silencio_sync_timer == nullptr) {
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+        return;
+    }
+    esp_timer_stop(g_radio_silencio_sync_timer);
+    if (esp_timer_start_once(g_radio_silencio_sync_timer,
+                             (uint64_t)g_radio_silencio_ms * 1000u) != ESP_OK) {
+        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+    }
+}
+
+static void radioApagar()
+{
+    if (g_radio_on) {
+        live::setRadioReady(false);
+#if !defined(ESP8266)
+        esp_wifi_set_promiscuous(false);
+#endif
+        esp_now_deinit();
+        esp_wifi_stop();
+        g_radio_on = false;
+    }
+}
+
+static void radioPrender()
+{
+    if (!g_radio_on) {
+        esp_wifi_start();
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+        esp_wifi_set_channel(g_masterChannel, WIFI_SECOND_CHAN_NONE);
+        const bool ok = transport.begin(g_masterTxMac);
+        esp_now_register_recv_cb(onDataRecv);
+        applyBeaconMarks();
+        g_radio_on = true;
+        live::setRadioReady(true);
+        if (!ok) SLAVE_LOG_RAW("#RADIO on: ESP-NOW FAIL\n");
+    }
+}
+
+static void radioSilencioAlEntrar()
+{
+    /* En tiempo real la radio tiene que quedar prendida. */
+    if (live::active() && live::config().realtime) return;
+    if (g_radio_silencio) g_radio_silencio_pedido = true;
+}
+
+static void serviceRadioSilencio(bool desdeLoop)
+{
+    if (desdeLoop && g_radio_silencio_pedido) {
+        if (g_radio_silencio && g_radio_on &&
+            (g_state == HOT_WAIT || g_state == SAMPLING)) {
+            radioApagar();
+            g_radio_apagada_por_silencio = true;
+        }
+        g_radio_silencio_pedido = false;
+    }
+    if (g_radio_silencio && g_radio_apagada_por_silencio &&
+        g_state != SAMPLING && g_state != HOT_WAIT) {
+        radioPrender();
+        g_radio_apagada_por_silencio = false;
+        SLAVE_LOG_RAW("#RADIOSIL vuelve\n");
+    }
+}
+
+static void requestRadioFromUsb(bool on)
+{
+    if (on) radioPrender();
+    else radioApagar();
+    g_radio_apagada_por_silencio = false;
+    SLAVE_LOG_RAW("#RADIO %s\n", g_radio_on ? "on" : "off");
+}
+
+static void requestRadioSilencioFromUsb(bool on, uint16_t ms = 0u)
+{
+    g_radio_silencio = on;
+    g_radio_silencio_ms = on ? ms : 0u;
+    if (!on) g_radio_silencio_pedido = false;
+    if (!on && g_radio_apagada_por_silencio) {
+        radioPrender();
+        g_radio_apagada_por_silencio = false;
+    }
+    SLAVE_LOG_RAW("#RADIOSIL %u %u\n", (unsigned)g_radio_silencio,
+                  (unsigned)g_radio_silencio_ms);
 }
 
 /* Banco: escrituras a la SD del PSoC EN PARALELO a una captura corta que SI
@@ -2605,6 +3194,738 @@ static void serviceSdStress()
     g_sdstress_prox_ms = now + g_sdstress_periodo_ms;
     psoc.sdTest();
     g_sdstress_escrituras++;
+}
+
+static void requestSdProbeFromUsb(uint32_t ms, uint32_t periodoMs,
+                                  uint8_t modo, uint8_t div, uint8_t slew)
+{
+    if (ms == 0u) {
+        g_sdprobe_hasta_ms = 0u;
+        g_sdprobe_running = false;
+        /* El PSoC arma la sonda en IDLE y la ejecuta en la captura: hay que
+         * desarmarla explicitamente (modo 6) o queda activa para la proxima. */
+        psoc.sdProbe(6u, 0u, 0u);
+        SLAVE_LOG_RAW("#SDPROBE fin envios=%lu fallos=%lu\n",
+                      (unsigned long)g_sdprobe_envios, (unsigned long)g_sdprobe_fallos);
+        LOGM("USB_CMD", "cmd=sdprobe,ok=1,cancel=1");
+        return;
+    }
+    /* Los modos 0-3 no tocan la tarjeta (solo CS/bus): corren aun sin SD. */
+    if (modo >= 4u && modo <= 5u && !psocSdPresent()) {
+        SLAVE_LOG_RAW("#SDPROBE sin sd\n");
+        LOGM("USB_CMD", "cmd=sdprobe,ok=0,reason=sin_sd");
+        return;
+    }
+    g_sdprobe_periodo_ms = periodoMs;
+    g_sdprobe_envios     = 0u;
+    g_sdprobe_fallos     = 0u;
+    g_sdprobe_prox_ms    = millis();
+    g_sdprobe_modo       = modo;
+    g_sdprobe_div        = div;
+    g_sdprobe_slew       = slew;
+    g_sdprobe_running    = true;
+    g_sdprobe_hasta_ms   = millis() + ms;
+    SLAVE_LOG_RAW("#SDPROBE inicio modo=%u periodo=%lu div=%u slew=%u\n",
+                  (unsigned)modo, (unsigned long)periodoMs,
+                  (unsigned)div, (unsigned)slew);
+    LOGM("USB_CMD", "cmd=sdprobe,ok=1,ms=%lu,periodo=%lu,modo=%u,div=%u,slew=%u",
+         (unsigned long)ms, (unsigned long)periodoMs, (unsigned)modo,
+         (unsigned)div, (unsigned)slew);
+}
+
+static void serviceSdProbe()
+{
+    if (g_sdprobe_hasta_ms == 0u) return;
+    const uint32_t now = millis();
+    if (now >= g_sdprobe_hasta_ms) {
+        g_sdprobe_hasta_ms = 0u;
+        if (g_sdprobe_running) {
+            g_sdprobe_running = false;
+            SLAVE_LOG_RAW("#SDPROBE fin envios=%lu fallos=%lu\n",
+                          (unsigned long)g_sdprobe_envios, (unsigned long)g_sdprobe_fallos);
+            LOGM("USB_CMD", "cmd=sdprobe,event=fin,envios=%lu,fallos=%lu",
+                 (unsigned long)g_sdprobe_envios, (unsigned long)g_sdprobe_fallos);
+        }
+        return;
+    }
+    if (now < g_sdprobe_prox_ms) return;
+    g_sdprobe_prox_ms = now + g_sdprobe_periodo_ms;
+
+    psoc.sdProbe(g_sdprobe_modo, g_sdprobe_div, g_sdprobe_slew);
+    g_sdprobe_envios++;
+}
+
+static void finishEspSd()
+{
+    SLAVE_LOG_RAW("#ESPSD pos %lu", (unsigned long)g_espsd_escrituras);
+    for (uint32_t i = 0u; i < g_espsd_escrituras; i++) {
+        SLAVE_LOG_RAW(" %lu", (unsigned long)g_espsd_pos[i]);
+    }
+    SLAVE_LOG_RAW("\n");
+    SLAVE_LOG_RAW("#ESPSD fin escrituras=%lu fallos=%lu\n",
+                  (unsigned long)g_espsd_escrituras,
+                  (unsigned long)g_espsd_fallos);
+    SD.end();
+    g_espsd_activo = false;
+    g_espsd_en_sampling = false;
+    g_espsd_tiempo_cumplido = false;
+}
+
+static void cancelEspSd()
+{
+    if (g_espsd_activo) {
+        SD.end();
+    }
+    g_espsd_activo = false;
+    g_espsd_en_sampling = false;
+    g_espsd_tiempo_cumplido = false;
+    g_espsd_hasta_ms = 0u;
+}
+
+/* sddiag: diagnóstico de bajo nivel de la SD del E14 (HSPI: SCK 14, MISO 32,
+ * MOSI 13, CS 25), sin la librería SD. Imprime el estado eléctrico de MISO con
+ * CS alto/bajo y cada respuesta del protocolo byte por byte. */
+/* SDDIAG_* vienen de board_pins_s3.h. */
+static uint8_t sdDiagXfer(uint8_t b) { return spiHspi.transfer(b); }
+
+static void sdDiagDump(const char *tag, uint8_t n)
+{
+    SLAVE_LOG_RAW("#SDDIAG %s:", tag);
+    for (uint8_t i = 0; i < n; i++) SLAVE_LOG_RAW(" %02X", sdDiagXfer(0xFF));
+    SLAVE_LOG_RAW("\n");
+}
+
+static uint8_t sdDiagCmd(uint8_t cmd, uint32_t arg, uint8_t crc)
+{
+    sdDiagXfer(0xFF);
+    sdDiagXfer(0x40 | cmd);
+    sdDiagXfer(arg >> 24); sdDiagXfer(arg >> 16); sdDiagXfer(arg >> 8); sdDiagXfer(arg);
+    sdDiagXfer(crc);
+    uint8_t r1 = 0xFF;
+    for (uint8_t i = 0; i < 16; i++) { r1 = sdDiagXfer(0xFF); if (!(r1 & 0x80)) break; }
+    return r1;
+}
+
+/* Nivel de MISO con pull-up y con pull-down internos: si sigue al pull, la
+ * línea flota (nadie la maneja); si no, alguien la maneja a ese nivel. */
+static void sdDiagMisoLevel(const char *tag)
+{
+    spiHspi.end();
+    pinMode(SDDIAG_MISO, INPUT_PULLUP);   delayMicroseconds(200);
+    const int up = digitalRead(SDDIAG_MISO);
+    pinMode(SDDIAG_MISO, INPUT_PULLDOWN); delayMicroseconds(200);
+    const int dn = digitalRead(SDDIAG_MISO);
+    pinMode(SDDIAG_MISO, INPUT);
+    SLAVE_LOG_RAW("#SDDIAG miso %s: pullup=%d pulldown=%d -> %s\n", tag, up, dn,
+                  (up && !dn) ? "FLOTA" : (up && dn) ? "MANEJADA ALTO" :
+                  (!up && !dn) ? "MANEJADA BAJO" : "RARO");
+    spiHspi.begin(SDDIAG_SCK, SDDIAG_MISO, SDDIAG_MOSI, -1);
+}
+
+static void sdDiagnostico()
+{
+    SD.end();
+    pinMode(SDDIAG_CS, OUTPUT);
+    digitalWrite(SDDIAG_CS, HIGH);
+    spiHspi.begin(SDDIAG_SCK, SDDIAG_MISO, SDDIAG_MOSI, -1);
+    sdDiagMisoLevel("CS_alto");
+    digitalWrite(SDDIAG_CS, LOW);
+    sdDiagMisoLevel("CS_bajo_sin_init");
+    digitalWrite(SDDIAG_CS, HIGH);
+
+    spiHspi.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+    for (uint8_t i = 0; i < 12; i++) sdDiagXfer(0xFF);   /* >=74 clocks, CS alto */
+    digitalWrite(SDDIAG_CS, LOW);
+    sdDiagDump("idle_CS_bajo", 8);
+
+    uint8_t r1 = 0xFF;
+    for (uint8_t i = 0; i < 10 && r1 != 0x01; i++) r1 = sdDiagCmd(0, 0, 0x95);
+    SLAVE_LOG_RAW("#SDDIAG CMD0 r1=%02X (esperado 01)\n", r1);
+    r1 = sdDiagCmd(8, 0x1AA, 0x87);
+    SLAVE_LOG_RAW("#SDDIAG CMD8 r1=%02X\n", r1);
+    sdDiagDump("CMD8_R7(esperado 00 00 01 AA)", 4);
+
+    uint16_t n = 0;
+    for (; n < 1000; n++) {
+        sdDiagCmd(55, 0, 0xFF);
+        r1 = sdDiagCmd(41, 0x40000000, 0xFF);
+        if (r1 == 0x00 || (r1 & 0x80)) break;
+        delay(1);
+    }
+    SLAVE_LOG_RAW("#SDDIAG ACMD41 r1=%02X intentos=%u\n", r1, n + 1);
+    sdDiagDump("tras_ACMD41", 8);
+
+    r1 = sdDiagCmd(58, 0, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG CMD58 r1=%02X\n", r1);
+    sdDiagDump("OCR(esperado C0 FF 80 00 o similar)", 4);
+
+    r1 = sdDiagCmd(9, 0, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG CMD9 r1=%02X\n", r1);
+    sdDiagDump("CMD9_bytes(esperado FF.. FE + 16 CSD)", 40);
+    sdDiagDump("idle_tras_CMD9", 8);
+
+    r1 = sdDiagCmd(10, 0, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG CMD10 r1=%02X\n", r1);
+    sdDiagDump("CMD10_bytes(CID)", 40);
+
+    r1 = sdDiagCmd(17, 0, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG CMD17 r1=%02X\n", r1);
+    sdDiagDump("CMD17_bytes(sector 0)", 40);
+
+    spiHspi.endTransaction();
+    sdDiagMisoLevel("CS_bajo_tras_init");
+    digitalWrite(SDDIAG_CS, HIGH);
+    sdDiagMisoLevel("CS_alto_final");
+    SLAVE_LOG_RAW("#SDDIAG fin\n");
+}
+
+/* sddiag2: tension ANALOGICA de MISO (GPIO32 = ADC1_CH4) segun CS y pulls,
+ * espera larga de busy, CMD13 y modos/velocidades alternativos. */
+static void sdDiagMv(const char *tag)
+{
+    spiHspi.end();
+    const int modos[3] = {INPUT, INPUT_PULLUP, INPUT_PULLDOWN};
+    const char *nom[3] = {"sin_pull", "pullup", "pulldown"};
+    SLAVE_LOG_RAW("#SDDIAG2 mv %s:", tag);
+    for (int m = 0; m < 3; m++) {
+        pinMode(SDDIAG_MISO, modos[m]); delay(2);
+        uint32_t acc = 0;
+        for (int k = 0; k < 16; k++) acc += analogReadMilliVolts(SDDIAG_MISO);
+        SLAVE_LOG_RAW(" %s=%lu", nom[m], (unsigned long)(acc / 16));
+    }
+    SLAVE_LOG_RAW("\n");
+    pinMode(SDDIAG_MISO, INPUT);
+    spiHspi.begin(SDDIAG_SCK, SDDIAG_MISO, SDDIAG_MOSI, -1);
+}
+
+static void sdDiagInit(uint32_t hz, uint8_t modo, const char *tag)
+{
+    digitalWrite(SDDIAG_CS, HIGH);
+    spiHspi.beginTransaction(SPISettings(hz, MSBFIRST, modo));
+    for (uint8_t i = 0; i < 12; i++) sdDiagXfer(0xFF);
+    digitalWrite(SDDIAG_CS, LOW);
+    uint8_t r0 = 0xFF;
+    for (uint8_t i = 0; i < 10 && r0 != 0x01; i++) r0 = sdDiagCmd(0, 0, 0x95);
+    const uint8_t r8 = sdDiagCmd(8, 0x1AA, 0x87);
+    uint8_t r7[4]; for (int i = 0; i < 4; i++) r7[i] = sdDiagXfer(0xFF);
+    /* 2000 bytes de reposo: cuantos no son 0x00 y cuantos son 0xFF */
+    uint16_t no0 = 0, ff = 0;
+    for (uint16_t i = 0; i < 2000; i++) { uint8_t b = sdDiagXfer(0xFF); if (b) no0++; if (b == 0xFF) ff++; }
+    const uint8_t r13 = sdDiagCmd(13, 0, 0xFF);
+    const uint8_t r13b = sdDiagXfer(0xFF);
+    SLAVE_LOG_RAW("#SDDIAG2 %s: CMD0=%02X CMD8=%02X R7=%02X%02X%02X%02X reposo2000: no_cero=%u ff=%u CMD13=%02X %02X\n",
+                  tag, r0, r8, r7[0], r7[1], r7[2], r7[3], no0, ff, r13, r13b);
+    spiHspi.endTransaction();
+    digitalWrite(SDDIAG_CS, HIGH);
+}
+
+/* sddiag3: el camino de sddiag2 (que anda) + ACMD41/CMD58/CMD9, midiendo el
+ * reposo despues de cada paso para ver en que paso MISO pasa a 00. */
+static void sdDiagReposo(const char *tag)
+{
+    uint16_t ff = 0, cero = 0;
+    for (uint16_t i = 0; i < 200; i++) { uint8_t b = sdDiagXfer(0xFF); if (b == 0xFF) ff++; if (!b) cero++; }
+    SLAVE_LOG_RAW("#SDDIAG3 reposo %s: ff=%u cero=%u de 200\n", tag, ff, cero);
+}
+
+static void sdDiagnostico3()
+{
+    SD.end();
+    pinMode(SDDIAG_CS, OUTPUT);
+    digitalWrite(SDDIAG_CS, HIGH);
+    spiHspi.begin(SDDIAG_SCK, SDDIAG_MISO, SDDIAG_MOSI, -1);
+    spiHspi.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+    for (uint8_t i = 0; i < 12; i++) sdDiagXfer(0xFF);
+    digitalWrite(SDDIAG_CS, LOW);
+    uint8_t r = 0xFF;
+    for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = sdDiagCmd(0, 0, 0x95);
+    SLAVE_LOG_RAW("#SDDIAG3 CMD0=%02X\n", r);
+    sdDiagReposo("tras_CMD0");
+    r = sdDiagCmd(8, 0x1AA, 0x87);
+    SLAVE_LOG_RAW("#SDDIAG3 CMD8=%02X\n", r); sdDiagDump("R7", 4);
+    sdDiagReposo("tras_CMD8");
+    r = sdDiagCmd(55, 0, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG3 CMD55=%02X\n", r);
+    sdDiagReposo("tras_CMD55");
+    uint16_t n = 0;
+    for (; n < 2000; n++) {
+        if (n) sdDiagCmd(55, 0, 0xFF);
+        r = sdDiagCmd(41, 0x40000000, 0xFF);
+        if (r == 0x00) break;
+        if (n < 3 || (n % 100) == 0) { SLAVE_LOG_RAW("#SDDIAG3 ACMD41[%u]=%02X\n", n, r); sdDiagReposo("tras_ACMD41"); }
+        delay(1);
+    }
+    SLAVE_LOG_RAW("#SDDIAG3 ACMD41 final=%02X intentos=%u\n", r, n + 1);
+    sdDiagReposo("tras_ACMD41_ok");
+    r = sdDiagCmd(58, 0, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG3 CMD58=%02X\n", r); sdDiagDump("OCR", 4);
+    sdDiagReposo("tras_CMD58");
+    r = sdDiagCmd(9, 0, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG3 CMD9=%02X\n", r); sdDiagDump("CMD9", 40);
+    spiHspi.endTransaction();
+    digitalWrite(SDDIAG_CS, HIGH);
+    SLAVE_LOG_RAW("#SDDIAG3 fin\n");
+}
+
+/* sddiag4: tras ACMD41 OK, quien sostiene MISO en bajo: con CS alto la
+ * tarjeta suelta DO (si sigue 00 es el modulo); espera larga de busy; CMD0. */
+static void sdDiagnostico4()
+{
+    SD.end();
+    pinMode(SDDIAG_CS, OUTPUT);
+    digitalWrite(SDDIAG_CS, HIGH);
+    spiHspi.begin(SDDIAG_SCK, SDDIAG_MISO, SDDIAG_MOSI, -1);
+    spiHspi.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+    for (uint8_t i = 0; i < 12; i++) sdDiagXfer(0xFF);
+    digitalWrite(SDDIAG_CS, LOW);
+    uint8_t r = 0xFF;
+    for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = sdDiagCmd(0, 0, 0x95);
+    sdDiagCmd(8, 0x1AA, 0x87); for (int i = 0; i < 4; i++) sdDiagXfer(0xFF);
+    uint16_t n = 0;
+    for (; n < 2000; n++) { sdDiagCmd(55, 0, 0xFF); r = sdDiagCmd(41, 0x40000000, 0xFF); if (r == 0x00) break; delay(1); }
+    SLAVE_LOG_RAW("#SDDIAG4 ACMD41=%02X intentos=%u\n", r, n + 1);
+    sdDiagReposo("CS_bajo");
+    digitalWrite(SDDIAG_CS, HIGH);
+    sdDiagReposo("CS_ALTO");
+    delay(100);
+    sdDiagReposo("CS_ALTO_100ms");
+    digitalWrite(SDDIAG_CS, LOW);
+    const uint32_t t0 = millis();
+    uint32_t bytes = 0; uint8_t b = 0;
+    while (millis() - t0 < 2000) { b = sdDiagXfer(0xFF); bytes++; if (b != 0x00) break; }
+    SLAVE_LOG_RAW("#SDDIAG4 espera busy: primer_no_cero=%02X tras %lu bytes, %lu ms\n",
+                  b, (unsigned long)bytes, (unsigned long)(millis() - t0));
+    r = sdDiagCmd(13, 0, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG4 CMD13=%02X %02X\n", r, sdDiagXfer(0xFF));
+    digitalWrite(SDDIAG_CS, HIGH);
+    for (uint8_t i = 0; i < 12; i++) sdDiagXfer(0xFF);
+    digitalWrite(SDDIAG_CS, LOW);
+    r = 0xFF;
+    for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = sdDiagCmd(0, 0, 0x95);
+    SLAVE_LOG_RAW("#SDDIAG4 CMD0_reset=%02X\n", r);
+    sdDiagReposo("tras_CMD0_reset");
+    spiHspi.endTransaction();
+    digitalWrite(SDDIAG_CS, HIGH);
+    SLAVE_LOG_RAW("#SDDIAG4 fin\n");
+}
+
+/* sddiag5: variantes de inicializacion; tras cada una, reposo con CS bajo. */
+static void sdDiagVariante(const char *tag, uint8_t tipo, uint32_t arg)
+{
+    digitalWrite(SDDIAG_CS, HIGH);
+    for (uint8_t i = 0; i < 12; i++) sdDiagXfer(0xFF);
+    digitalWrite(SDDIAG_CS, LOW);
+    uint8_t r = 0xFF;
+    for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = sdDiagCmd(0, 0, 0x95);
+    sdDiagCmd(8, 0x1AA, 0x87); for (int i = 0; i < 4; i++) sdDiagXfer(0xFF);
+    uint16_t n = 0;
+    for (; n < 1500; n++) {
+        if (tipo == 0) { sdDiagCmd(55, 0, 0xFF); r = sdDiagCmd(41, arg, 0xFF); }
+        else           { r = sdDiagCmd(1, arg, 0xFF); }
+        if (r == 0x00 || (r & 0x80)) break;
+        delay(1);
+    }
+    uint16_t ff = 0, cero = 0;
+    for (uint16_t i = 0; i < 200; i++) { uint8_t b = sdDiagXfer(0xFF); if (b == 0xFF) ff++; if (!b) cero++; }
+    SLAVE_LOG_RAW("#SDDIAG5 %s: r=%02X intentos=%u reposo ff=%u cero=%u\n", tag, r, n + 1, ff, cero);
+}
+
+static void sdDiagnostico5()
+{
+    SD.end();
+    pinMode(SDDIAG_CS, OUTPUT);
+    digitalWrite(SDDIAG_CS, HIGH);
+    spiHspi.begin(SDDIAG_SCK, SDDIAG_MISO, SDDIAG_MOSI, -1);
+    spiHspi.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+    sdDiagVariante("ACMD41_HCS1", 0, 0x40000000);
+    sdDiagVariante("ACMD41_HCS0", 0, 0x00000000);
+    sdDiagVariante("ACMD41_HCS1_ventana", 0, 0x40FF8000);
+    sdDiagVariante("ACMD41_XPC", 0, 0x50000000);
+    sdDiagVariante("CMD1", 1, 0x00000000);
+    spiHspi.endTransaction();
+    digitalWrite(SDDIAG_CS, HIGH);
+    SLAVE_LOG_RAW("#SDDIAG5 fin\n");
+}
+
+/* sddiag6: discrimina alimentacion vs tarjeta.
+ *  a) con la radio apagada (menos carga en el 5 V compartido);
+ *  b) ACMD41 espaciados con CS ALTO entre intentos (sin clocks: menos consumo)
+ *     y deteccion del primer byte de reposo que no es FF tras cada ACMD41. */
+static void sdDiag6Init(const char *tag, uint16_t pausaMs)
+{
+    digitalWrite(SDDIAG_CS, HIGH);
+    for (uint8_t i = 0; i < 12; i++) sdDiagXfer(0xFF);
+    digitalWrite(SDDIAG_CS, LOW);
+    uint8_t r = 0xFF;
+    for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = sdDiagCmd(0, 0, 0x95);
+    sdDiagCmd(8, 0x1AA, 0x87); for (int i = 0; i < 4; i++) sdDiagXfer(0xFF);
+    uint16_t n = 0; uint16_t ffAntes = 0;
+    for (; n < 400; n++) {
+        sdDiagCmd(55, 0, 0xFF);
+        r = sdDiagCmd(41, 0x40000000, 0xFF);
+        ffAntes = 0;
+        for (uint8_t i = 0; i < 32; i++) { if (sdDiagXfer(0xFF) == 0xFF) ffAntes++; }
+        if (r == 0x00 || ffAntes < 32) break;     /* lista, o la linea se cayo */
+        digitalWrite(SDDIAG_CS, HIGH); sdDiagXfer(0xFF);
+        delay(pausaMs);
+        digitalWrite(SDDIAG_CS, LOW);
+    }
+    uint16_t ff = 0;
+    for (uint16_t i = 0; i < 200; i++) if (sdDiagXfer(0xFF) == 0xFF) ff++;
+    const uint8_t r58 = sdDiagCmd(58, 0, 0xFF);
+    uint8_t ocr[4]; for (int i = 0; i < 4; i++) ocr[i] = sdDiagXfer(0xFF);
+    SLAVE_LOG_RAW("#SDDIAG6 %s: ACMD41 r=%02X en intento %u, ff_tras_r1=%u/32, reposo_ff=%u/200, CMD58=%02X OCR=%02X%02X%02X%02X\n",
+                  tag, r, n + 1, ffAntes, ff, r58, ocr[0], ocr[1], ocr[2], ocr[3]);
+    digitalWrite(SDDIAG_CS, HIGH);
+}
+
+static void sdDiagnostico6()
+{
+    SD.end();
+    pinMode(SDDIAG_CS, OUTPUT);
+    digitalWrite(SDDIAG_CS, HIGH);
+    spiHspi.begin(SDDIAG_SCK, SDDIAG_MISO, SDDIAG_MOSI, -1);
+    spiHspi.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+    sdDiag6Init("radio_ON_pausa1ms", 1);
+    sdDiag6Init("radio_ON_pausa50ms", 50);
+    spiHspi.endTransaction();
+    WiFi.mode(WIFI_OFF);
+    delay(300);
+    spiHspi.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+    sdDiag6Init("radio_OFF_pausa1ms", 1);
+    sdDiag6Init("radio_OFF_pausa50ms", 50);
+    spiHspi.endTransaction();
+    SLAVE_LOG_RAW("#SDDIAG6 fin (radio quedo APAGADA: reiniciar el ESP)\n");
+}
+
+/* sddiag7: SPI por bit-banging para leer MISO con el ADC entre bytes. El
+ * nivel ALTO de MISO es el VCC del buffer del modulo (= riel 3,3 V de la
+ * tarjeta): si el riel se hunde, se ve bajar antes de la caida a 0. */
+/* Pines SD definidos por la placa. */
+static uint8_t bbXfer(uint8_t out)
+{
+    uint8_t in = 0;
+    for (int8_t b = 7; b >= 0; b--) {
+        digitalWrite(SDDIAG_MOSI, (out >> b) & 1);
+        delayMicroseconds(4);
+        digitalWrite(SDDIAG_SCK, HIGH);
+        in = (uint8_t)((in << 1) | (digitalRead(SDDIAG_MISO) ? 1 : 0));
+        delayMicroseconds(4);
+        digitalWrite(SDDIAG_SCK, LOW);
+    }
+    return in;
+}
+
+static uint8_t bbCmd(uint8_t cmd, uint32_t arg, uint8_t crc)
+{
+    bbXfer(0xFF); bbXfer(0x40 | cmd);
+    bbXfer(arg >> 24); bbXfer(arg >> 16); bbXfer(arg >> 8); bbXfer(arg); bbXfer(crc);
+    uint8_t r = 0xFF;
+    for (uint8_t i = 0; i < 16; i++) { r = bbXfer(0xFF); if (!(r & 0x80)) break; }
+    return r;
+}
+
+/* n bytes de reposo; imprime byte y mV de MISO tras cada byte */
+static void bbSerie(const char *tag, uint8_t n)
+{
+    SLAVE_LOG_RAW("#SDDIAG7 %s:", tag);
+    for (uint8_t i = 0; i < n; i++) {
+        const uint8_t b = bbXfer(0xFF);
+        const uint32_t mv = analogReadMilliVolts(SDDIAG_MISO);
+        pinMode(SDDIAG_MISO, INPUT);   /* analogRead deja el pin analogico */
+        SLAVE_LOG_RAW(" %02X/%lu", b, (unsigned long)mv);
+    }
+    SLAVE_LOG_RAW("\n");
+}
+
+static void sdDiagnostico7()
+{
+    SD.end();
+    spiHspi.end();
+    pinMode(SDDIAG_CS, OUTPUT);   digitalWrite(SDDIAG_CS, HIGH);
+    pinMode(SDDIAG_SCK, OUTPUT);  digitalWrite(SDDIAG_SCK, LOW);
+    pinMode(SDDIAG_MOSI, OUTPUT); digitalWrite(SDDIAG_MOSI, HIGH);
+    pinMode(SDDIAG_MISO, INPUT);
+    for (uint8_t i = 0; i < 12; i++) bbXfer(0xFF);
+    digitalWrite(SDDIAG_CS, LOW);
+    uint8_t r = 0xFF;
+    for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = bbCmd(0, 0, 0x95);
+    SLAVE_LOG_RAW("#SDDIAG7 CMD0=%02X\n", r);
+    bbSerie("reposo_idle", 12);
+    r = bbCmd(8, 0x1AA, 0x87);
+    uint8_t r7[4]; for (int i = 0; i < 4; i++) r7[i] = bbXfer(0xFF);
+    SLAVE_LOG_RAW("#SDDIAG7 CMD8=%02X R7=%02X%02X%02X%02X\n", r, r7[0], r7[1], r7[2], r7[3]);
+    bbSerie("reposo_tras_CMD8", 12);
+    bbCmd(55, 0, 0xFF);
+    r = bbCmd(41, 0x40000000, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG7 ACMD41#1=%02X\n", r);
+    bbSerie("tras_ACMD41_a", 40);
+    bbSerie("tras_ACMD41_b", 40);
+    bbCmd(55, 0, 0xFF);
+    r = bbCmd(41, 0x40000000, 0xFF);
+    SLAVE_LOG_RAW("#SDDIAG7 ACMD41#2=%02X\n", r);
+    bbSerie("tras_ACMD41_2", 40);
+    digitalWrite(SDDIAG_CS, HIGH);
+    bbSerie("CS_alto", 12);
+    /* Ioff: 74LVC125A sin VCC deja la salida en alta Z -> MISO sigue al pull */
+    for (int k = 0; k < 3; k++) {
+        pinMode(SDDIAG_MISO, INPUT_PULLUP);   delay(2); const int up = digitalRead(SDDIAG_MISO);
+        pinMode(SDDIAG_MISO, INPUT_PULLDOWN); delay(2); const int dn = digitalRead(SDDIAG_MISO);
+        pinMode(SDDIAG_MISO, INPUT);
+        SLAVE_LOG_RAW("#SDDIAG7 trabado CS_alto t=%dms: pullup=%d pulldown=%d -> %s\n", k * 200, up, dn,
+                      (up && !dn) ? "ALTA_Z (riel caido / buffer sin VCC)" :
+                      (!up && !dn) ? "MANEJADA_BAJO (riel vivo)" : (up && dn) ? "MANEJADA_ALTO" : "RARO");
+        delay(200);
+    }
+    digitalWrite(SDDIAG_CS, LOW);
+    r = 0xFF;
+    for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = bbCmd(0, 0, 0x95);
+    SLAVE_LOG_RAW("#SDDIAG7 CMD0_tras_trabado=%02X\n", r);
+    bbSerie("tras_CMD0", 6);
+    digitalWrite(SDDIAG_CS, HIGH);
+    pinMode(SDDIAG_MISO, INPUT_PULLUP);   delay(2); const int up2 = digitalRead(SDDIAG_MISO);
+    pinMode(SDDIAG_MISO, INPUT_PULLDOWN); delay(2); const int dn2 = digitalRead(SDDIAG_MISO);
+    pinMode(SDDIAG_MISO, INPUT);
+    SLAVE_LOG_RAW("#SDDIAG7 sano CS_alto: pullup=%d pulldown=%d\n", up2, dn2);
+    SLAVE_LOG_RAW("#SDDIAG7 fin\n");
+    pinMode(SDDIAG_MISO, INPUT);
+}
+
+/* sddiag8: VDD real vs alimentacion parasita por las entradas. Se deja la
+ * tarjeta en idle SPI, se ponen CS/CLK/DI en 0 V (sin camino parasito) y se
+ * pregunta CMD13 SIN CMD0: si responde 01 conservo el estado (VDD bueno). */
+static void sdDiag8Ayuno(const char *tag, uint8_t csNivel, uint16_t ms)
+{
+    digitalWrite(SDDIAG_SCK, LOW);
+    digitalWrite(SDDIAG_MOSI, LOW);
+    digitalWrite(SDDIAG_CS, csNivel);
+    delay(ms);
+    digitalWrite(SDDIAG_MOSI, HIGH);
+    digitalWrite(SDDIAG_CS, LOW);
+    const uint8_t r = bbCmd(13, 0, 0xFF);
+    const uint8_t r2 = bbXfer(0xFF);
+    SLAVE_LOG_RAW("#SDDIAG8 %s: CMD13 sin CMD0 = %02X %02X -> %s\n", tag, r, r2,
+                  (r == 0x01) ? "conservo estado SPI (alimentada)" :
+                  (r == 0xFF) ? "sin respuesta (perdio estado)" : "otro");
+}
+
+static void sdDiagnostico8()
+{
+    SD.end();
+    spiHspi.end();
+    pinMode(SDDIAG_CS, OUTPUT);   digitalWrite(SDDIAG_CS, HIGH);
+    pinMode(SDDIAG_SCK, OUTPUT);  digitalWrite(SDDIAG_SCK, LOW);
+    pinMode(SDDIAG_MOSI, OUTPUT); digitalWrite(SDDIAG_MOSI, HIGH);
+    pinMode(SDDIAG_MISO, INPUT);
+    for (int rep = 0; rep < 2; rep++) {
+        digitalWrite(SDDIAG_CS, HIGH);
+        for (uint8_t i = 0; i < 12; i++) bbXfer(0xFF);
+        digitalWrite(SDDIAG_CS, LOW);
+        uint8_t r = 0xFF;
+        for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = bbCmd(0, 0, 0x95);
+        r = bbCmd(8, 0x1AA, 0x87); for (int i = 0; i < 4; i++) bbXfer(0xFF);
+        const uint8_t r13 = bbCmd(13, 0, 0xFF); bbXfer(0xFF);
+        SLAVE_LOG_RAW("#SDDIAG8 rep%d base: CMD8=%02X CMD13=%02X\n", rep, r, r13);
+        sdDiag8Ayuno(rep ? "ayuno_CS_ALTO_300ms" : "ayuno_TODO_0V_300ms", rep ? HIGH : LOW, 300);
+        sdDiag8Ayuno(rep ? "ayuno_CS_ALTO_2s" : "ayuno_TODO_0V_2s", rep ? HIGH : LOW, 2000);
+    }
+    /* trabado: tras ACMD41 y 2 s con todo en 0 V, ¿la linea vuelve sola? */
+    digitalWrite(SDDIAG_CS, HIGH);
+    for (uint8_t i = 0; i < 12; i++) bbXfer(0xFF);
+    digitalWrite(SDDIAG_CS, LOW);
+    uint8_t r = 0xFF;
+    for (uint8_t i = 0; i < 10 && r != 0x01; i++) r = bbCmd(0, 0, 0x95);
+    bbCmd(8, 0x1AA, 0x87); for (int i = 0; i < 4; i++) bbXfer(0xFF);
+    bbCmd(55, 0, 0xFF); r = bbCmd(41, 0x40000000, 0xFF);
+    uint8_t c = 0; for (int i = 0; i < 40; i++) if (bbXfer(0xFF) == 0) c++;
+    SLAVE_LOG_RAW("#SDDIAG8 trabada: ACMD41=%02X ceros=%u/40\n", r, c);
+    digitalWrite(SDDIAG_SCK, LOW); digitalWrite(SDDIAG_MOSI, LOW); digitalWrite(SDDIAG_CS, LOW);
+    delay(2000);
+    digitalWrite(SDDIAG_MOSI, HIGH);
+    c = 0; for (int i = 0; i < 40; i++) if (bbXfer(0xFF) == 0) c++;
+    SLAVE_LOG_RAW("#SDDIAG8 trabada tras 2s a 0V: ceros=%u/40\n", c);
+    digitalWrite(SDDIAG_CS, HIGH);
+    SLAVE_LOG_RAW("#SDDIAG8 fin\n");
+}
+
+/* sddiag9 (sin tarjeta): MISO analogico para cada combinacion de CS/SCK/MOSI
+ * y con/sin pull-up interno -> a que linea sigue MISO y cuanto la carga. */
+static uint32_t sdDiag9Mv(int modo)
+{
+    pinMode(SDDIAG_MISO, modo); delay(3);
+    uint32_t acc = 0;
+    for (int k = 0; k < 16; k++) acc += analogReadMilliVolts(SDDIAG_MISO);
+    pinMode(SDDIAG_MISO, INPUT);
+    return acc / 16;
+}
+
+static void sdDiagnostico9()
+{
+    SD.end();
+    spiHspi.end();
+    pinMode(SDDIAG_CS, OUTPUT); pinMode(SDDIAG_SCK, OUTPUT); pinMode(SDDIAG_MOSI, OUTPUT);
+    for (int m = 0; m < 8; m++) {
+        const int cs = (m >> 2) & 1, sck = (m >> 1) & 1, mosi = m & 1;
+        digitalWrite(SDDIAG_CS, cs); digitalWrite(SDDIAG_SCK, sck); digitalWrite(SDDIAG_MOSI, mosi);
+        delay(5);
+        const uint32_t a = sdDiag9Mv(INPUT), b = sdDiag9Mv(INPUT_PULLUP), c = sdDiag9Mv(INPUT_PULLDOWN);
+        SLAVE_LOG_RAW("#SDDIAG9 CS=%d SCK=%d MOSI=%d : miso_mV sin_pull=%lu pullup=%lu pulldown=%lu\n",
+                      cs, sck, mosi, (unsigned long)a, (unsigned long)b, (unsigned long)c);
+    }
+    digitalWrite(SDDIAG_CS, HIGH);
+    SLAVE_LOG_RAW("#SDDIAG9 fin\n");
+}
+
+static void sdDiagnostico2()
+{
+    SD.end();
+    pinMode(SDDIAG_CS, OUTPUT);
+    digitalWrite(SDDIAG_CS, HIGH);
+    spiHspi.begin(SDDIAG_SCK, SDDIAG_MISO, SDDIAG_MOSI, -1);
+    sdDiagMv("CS_alto");
+    digitalWrite(SDDIAG_CS, LOW);  delay(5);
+    sdDiagMv("CS_bajo");
+    digitalWrite(SDDIAG_CS, HIGH); delay(5);
+    sdDiagInit(250000, SPI_MODE0, "250k_modo0");
+    sdDiagInit(100000, SPI_MODE0, "100k_modo0");
+    sdDiagInit(250000, SPI_MODE3, "250k_modo3");
+    sdDiagInit(1000000, SPI_MODE0, "1M_modo0");
+    /* tras init: CS bajo sin clocks y CS alto */
+    digitalWrite(SDDIAG_CS, LOW);  delay(5);
+    sdDiagMv("CS_bajo_tras_init");
+    digitalWrite(SDDIAG_CS, HIGH); delay(5);
+    sdDiagMv("CS_alto_tras_init");
+    /* CS (GPIO25) realmente conmuta? leer el propio pin */
+    digitalWrite(SDDIAG_CS, LOW);  delay(1); const int csl = digitalRead(SDDIAG_CS);
+    digitalWrite(SDDIAG_CS, HIGH); delay(1); const int csh = digitalRead(SDDIAG_CS);
+    SLAVE_LOG_RAW("#SDDIAG2 CS lectura bajo=%d alto=%d\n#SDDIAG2 fin\n", csl, csh);
+}
+
+/* Banco: monta la SD del ESP (HSPI) y, si no tiene sistema de archivos, la
+ * formatea en FAT (BORRA la tarjeta). Para tarjetas nuevas o en exFAT, que
+ * SD.begin() no monta y dejan a espsd en "sin_sd". */
+static void requestEspSdFormatFromUsb()
+{
+    cancelEspSd();
+    spiHspi.begin(LIVE_SD_SCK, LIVE_SD_MISO, LIVE_SD_MOSI, LIVE_SD_CS);
+    SLAVE_LOG_RAW("#ESPSDFMT inicio (puede tardar minutos)\n");
+    const uint32_t t0 = millis();
+    const bool ok = SD.begin(LIVE_SD_CS, spiHspi, 4000000, "/sd", 5, true);
+    SLAVE_LOG_RAW("#ESPSDFMT ok=%d tipo=%u sectores=%lu MB=%llu ms=%lu\n",
+                  ok ? 1 : 0, (unsigned)SD.cardType(),
+                  (unsigned long)SD.numSectors(),
+                  (unsigned long long)(SD.cardSize() / (1024ull * 1024ull)),
+                  (unsigned long)(millis() - t0));
+    SD.end();
+}
+
+/* Banco: escribe /foo.txt en la SD del ESP, lo lee de vuelta y lista la raiz.
+ * Prueba visible de que la tarjeta monta y acepta escrituras con archivo. */
+static void requestEspSdFooFromUsb()
+{
+    cancelEspSd();
+    spiHspi.begin(LIVE_SD_SCK, LIVE_SD_MISO, LIVE_SD_MOSI, LIVE_SD_CS);
+    if (!SD.begin(LIVE_SD_CS, spiHspi, 4000000)) {
+        SLAVE_LOG_RAW("#ESPSDFOO sin_sd\n");
+        SD.end();
+        return;
+    }
+    File f = SD.open("/foo.txt", FILE_APPEND);
+    const size_t n = f ? f.printf("foo nodo=%u ms=%lu\n", (unsigned)NODE_ID,
+                                  (unsigned long)millis()) : 0u;
+    if (f) f.close();
+    SLAVE_LOG_RAW("#ESPSDFOO escritos=%u MB=%llu\n", (unsigned)n,
+                  (unsigned long long)(SD.cardSize() / (1024ull * 1024ull)));
+    f = SD.open("/foo.txt", FILE_READ);
+    if (f) {
+        SLAVE_LOG_RAW("#ESPSDFOO contenido (%u B):\n", (unsigned)f.size());
+        while (f.available()) {
+            const String linea = f.readStringUntil('\n');
+            SLAVE_LOG_RAW("#ESPSDFOO | %s\n", linea.c_str());
+        }
+        f.close();
+    }
+    File raiz = SD.open("/");
+    for (File e = raiz.openNextFile(); e; e = raiz.openNextFile()) {
+        SLAVE_LOG_RAW("#ESPSDFOO ls %s %u\n", e.name(), (unsigned)e.size());
+        e.close();
+    }
+    raiz.close();
+    SD.end();
+    SLAVE_LOG_RAW("#ESPSDFOO fin\n");
+}
+
+static void requestEspSdFromUsb(uint32_t ms, uint32_t cadaLotes)
+{
+    cancelEspSd();
+    if (ms == 0u) return;
+
+    spiHspi.begin(LIVE_SD_SCK, LIVE_SD_MISO, LIVE_SD_MOSI, LIVE_SD_CS);
+    if (!SD.begin(LIVE_SD_CS, spiHspi, 4000000) || SD.numSectors() < 2u) {
+        SLAVE_LOG_RAW("#ESPSD sin_sd\n");
+        SD.end();
+        return;
+    }
+
+    g_espsd_hasta_ms = millis() + ms;
+    g_espsd_cada_lotes = cadaLotes;
+    g_espsd_base = 0u;
+    g_espsd_proximo = cadaLotes;
+    g_espsd_escrituras = 0u;
+    g_espsd_fallos = 0u;
+    g_espsd_sector = (uint32_t)SD.numSectors() - 2u;
+    g_espsd_en_sampling = false;
+    g_espsd_tiempo_cumplido = false;
+    g_espsd_activo = true;
+}
+
+static void serviceEspSd()
+{
+    if (!g_espsd_activo) return;
+
+    const uint32_t now = millis();
+    if ((int32_t)(now - g_espsd_hasta_ms) >= 0) {
+        g_espsd_tiempo_cumplido = true;
+    }
+
+    if (g_state != SAMPLING) {
+        if (g_espsd_en_sampling) {
+            g_espsd_en_sampling = false;
+            if (g_espsd_escrituras > 0u) {
+                finishEspSd();
+                return;
+            }
+        }
+        if (g_espsd_tiempo_cumplido) {
+            finishEspSd();
+        }
+        return;
+    }
+
+    /* El reporte se difiere hasta salir de SAMPLING para no contaminar la
+     * captura con trafico USB. */
+    if (g_espsd_tiempo_cumplido) return;
+
+    if (!g_espsd_en_sampling) {
+        g_espsd_base = psoc.batchesOK();
+        g_espsd_proximo = g_espsd_cada_lotes;
+        g_espsd_en_sampling = true;
+        return;
+    }
+
+    if (g_espsd_escrituras >= 128u) return;
+    const uint32_t pos = psoc.batchesOK() - g_espsd_base;
+    if (pos < g_espsd_proximo) return;
+
+    static uint8_t sectorBuf[512];
+    memset(sectorBuf, (g_espsd_escrituras & 1u) ? 0xAA : 0x55,
+           sizeof(sectorBuf));
+    g_espsd_pos[g_espsd_escrituras] = pos;
+    if (!SD.writeRAW(sectorBuf, g_espsd_sector)) {
+        g_espsd_fallos++;
+    }
+    g_espsd_escrituras++;
+    g_espsd_proximo += g_espsd_cada_lotes;
 }
 #endif
 
@@ -2692,6 +4013,11 @@ static void requestStartNowFromUsb(uint16_t n)
     g_sampling_start_psoc_bytes = psoc.bytesRx();
     g_sampling_start_batches_ok = psoc.batchesOK();
     g_state = SAMPLING;
+    radioSilencioAlEntrar();
+    /* Camino USB (contexto de loop): apagar ya y, con radiosil on <ms>, dejar
+       que el transitorio del apagado se asiente antes de arrancar el PSoC. */
+    serviceRadioSilencio(true);
+    if (g_radio_silencio && g_radio_silencio_ms > 0u) delay(g_radio_silencio_ms);
     psoc.setN(g_rec_n_batches);
     psoc.startNow();
     SLAVE_LOG_PRINTF("[USB] startnow n=%u bytes=%lu store=%u\n",
@@ -2868,6 +4194,53 @@ static void handleUsbCommand(const char *cmd)
     } else if (usbParseU16Param(cmd, "startnow", value16) ||
                usbParseU16Param(cmd, "now", value16)) {
         requestStartNowFromUsb(value16);
+    } else if (!strncmp(cmd, "capmode", 7) && (cmd[7] == ' ' || cmd[7] == '\0')) {
+        unsigned st = 0, rt = 0, ramp = 0, streamDump = 0;
+        const int n = sscanf(cmd + 7, "%u %u %u %u", &st, &rt, &ramp, &streamDump);
+        if (n >= 1 && st <= CAPMODE_STORAGE_SD) {
+            g_capmode = (uint8_t)(st | (rt ? CAPMODE_REALTIME : 0u) |
+                                  (streamDump ? CAPMODE_STREAM_DUMP : 0u));
+            g_capmode_ramp = (ramp != 0u);
+        }
+        SLAVE_LOG_RAW("#CAPMODE storage=%u rt=%u ramp=%u streamdump=%u\n",
+                      (unsigned)(g_capmode & CAPMODE_STORAGE_MASK),
+                      (unsigned)((g_capmode & CAPMODE_REALTIME) != 0u),
+                      (unsigned)g_capmode_ramp,
+                      (unsigned)((g_capmode & CAPMODE_STREAM_DUMP) != 0u));
+    } else if (!strncmp(cmd, "sdhz", 4) && (cmd[4] == ' ' || cmd[4] == '\0')) {
+        unsigned long hz = 0;
+        if (sscanf(cmd + 4, "%lu", &hz) == 1 && hz >= 400000ul && hz <= 20000000ul) {
+            live::setSdHz((uint32_t)hz);
+        }
+        SLAVE_LOG_RAW("#SDHZ %lu\n", (unsigned long)live::sdHz());
+    } else if (!strncmp(cmd, "rtsim", 5) && (cmd[5] == ' ' || cmd[5] == '\0')) {
+        unsigned loss = 0;
+        if (strstr(cmd, "off")) {
+            live::simMaster(false, 0);
+        } else {
+            sscanf(cmd + 5, "%u", &loss);
+            live::simMaster(true, (uint8_t)(loss > 90u ? 90u : loss));
+        }
+        SLAVE_LOG_RAW("#RTSIM on=%u loss=%u\n", (unsigned)live::simEnabled(), loss);
+    } else if (usbCommandEquals(cmd, "livestat")) {
+        live::printStatus();
+    } else if (usbCommandEquals(cmd, "marcas")) {
+        live::printStatus();
+        SLAVE_LOG_RAW("#MARCAS beacon=%s\n", g_beaconMarks ? "on" : "off");
+    } else if (usbCommandEquals(cmd, "marcas beacon on")) {
+        g_beaconMarks = true;
+        applyBeaconMarks();
+        SLAVE_LOG_RAW("#MARCAS beacon=on\n");
+    } else if (usbCommandEquals(cmd, "marcas beacon off")) {
+        g_beaconMarks = false;
+        applyBeaconMarks();
+        SLAVE_LOG_RAW("#MARCAS beacon=off\n");
+    } else if (!strncmp(cmd, "livedump", 8) && (cmd[8] == ' ' || cmd[8] == '\0')) {
+        live::dumpUsb(strstr(cmd, "hex") != nullptr);
+    } else if (!strncmp(cmd, "livecap", 7) && (cmd[7] == ' ' || cmd[7] == '\0')) {
+        unsigned long n = 0, secs = 0;
+        sscanf(cmd + 7, "%lu %lu", &n, &secs);
+        requestLiveCapFromUsb((uint32_t)n, (uint32_t)secs);
     } else if (usbParseU16Param(cmd, "cap", value16) ||
                usbParseU16Param(cmd, "capture", value16) ||
                usbParseU16Param(cmd, "start", value16)) {
@@ -2894,6 +4267,20 @@ static void handleUsbCommand(const char *cmd)
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAOUT, value, "pgaout");
     } else if (usbParseGainParam(cmd, "pgavdac", value)) {
         (void)requestPsocGainFromUsb(PSOC_CMD_PGAVDAC, value, "pgavdac");
+    } else if (!strncmp(cmd, "view ", 5)) {
+        /* Banco: tap del AMux que digitaliza la captura (0xAC, solo IDLE).
+         * 0 PGA/SEo, 1 BP, 2 OPA_SUM, 3 SUMo, 4 LPo; 255 vuelve al de fabrica. */
+        int ch = -1;
+        servicePsocConfigAck();
+        if (sscanf(cmd + 5, "%d", &ch) == 1 &&
+            ((ch >= 0 && ch <= 4) || ch == 255) && !g_cfg_waiting &&
+            ensurePsocReadyForConfig()) {
+            psoc.setViewChannel((uint8_t)ch);
+            waitForPsocConfigAck(PSOC_CMD_VIEW_CHANNEL, (uint8_t)ch);
+            SLAVE_LOG_PRINTF("[USB] view %d -> PSoC CMD 0xAC\n", ch);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: view <0-4|255> (PSoC en IDLE, sin config pendiente)\n");
+        }
     } else if (!strncmp(cmd, "idac ", 5)) {
         int stage = -1;
         int code = 0;
@@ -2951,18 +4338,46 @@ static void handleUsbCommand(const char *cmd)
         } else {
             SLAVE_LOG_PRINTF("[USB] uso: dumpusb [desde] [hasta]\n");
         }
+    } else if (!strncmp(cmd, "rfrx", 4) && (cmd[4] == '\0' || cmd[4] == ' ')) {
+        long ms = -1;
+        if (sscanf(cmd + 4, "%ld", &ms) == 1 && ms >= 0 && ms <= 600000) requestRfRxFromUsb((uint32_t)ms);
+        else SLAVE_LOG_PRINTF("[USB] uso: rfrx <ms 0-600000>\n");
+    } else if (!strncmp(cmd, "txpower", 7) && (cmd[7] == '\0' || cmd[7] == ' ')) {
+        long dbm = -1;
+        sscanf(cmd + 7, "%ld", &dbm);
+        requestTxPowerFromUsb(dbm);
+    } else if (usbCommandEquals(cmd, "radio off")) {
+        requestRadioFromUsb(false);
+    } else if (usbCommandEquals(cmd, "radio on")) {
+        requestRadioFromUsb(true);
+    } else if (usbCommandEquals(cmd, "radiosil off")) {
+        requestRadioSilencioFromUsb(false);
+    } else if (!strncmp(cmd, "radiosil on", 11) &&
+               (cmd[11] == '\0' || cmd[11] == ' ')) {
+        long ms = 0;
+        char extra = '\0';
+        const int n = sscanf(cmd + 11, "%ld %c", &ms, &extra);
+        if (n <= 1 && ms >= 0 && ms <= 1000) {   /* n = -1: sin numero */
+            requestRadioSilencioFromUsb(true, (uint16_t)ms);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: radiosil on [ms 0-1000]\n");
+        }
     } else if (!strncmp(cmd, "rftest", 6) &&
                (cmd[6] == '\0' || cmd[6] == ' ')) {
         long ms = -1, periodo = -1, bytesN = -1;
-        const int n = sscanf(cmd + 6, "%ld %ld %ld", &ms, &periodo, &bytesN);
+        char modo = '\0', extra = '\0';
+        const int n = sscanf(cmd + 6, "%ld %ld %ld %c %c",
+                             &ms, &periodo, &bytesN, &modo, &extra);
         if (n >= 1 && ms == 0) {
-            requestRfTestFromUsb(0u, 0u, 0u);
-        } else if (n == 3 && ms > 0 && ms <= 600000 &&
-                   periodo >= 1 && periodo <= 10000 &&
+            requestRfTestFromUsb(0u, 0u, 0u, false);
+        } else if ((n == 3 || (n == 4 && (modo == 'b' || modo == 'B'))) &&
+                   ms > 0 && ms <= 600000 &&
+                   periodo >= 0 && periodo <= 10000 &&
                    bytesN >= 1 && bytesN <= 240) {
-            requestRfTestFromUsb((uint32_t)ms, (uint32_t)periodo, (uint32_t)bytesN);
+            requestRfTestFromUsb((uint32_t)ms, (uint32_t)periodo, (uint32_t)bytesN,
+                                 n == 4);
         } else {
-            SLAVE_LOG_PRINTF("[USB] uso: rftest <ms 0-600000> <periodo_ms 1-10000> <bytes 1-240>\n");
+            SLAVE_LOG_PRINTF("[USB] uso: rftest <ms 0-600000> <periodo_ms 0-10000 (0 = en cada ping del PSoC)> <bytes 1-240> [b]\n");
         }
     } else if (!strncmp(cmd, "sdstress", 8) &&
                (cmd[8] == '\0' || cmd[8] == ' ')) {
@@ -2976,10 +4391,60 @@ static void handleUsbCommand(const char *cmd)
         } else {
             SLAVE_LOG_PRINTF("[USB] uso: sdstress <ms 0-600000> <periodo_ms 5-10000>\n");
         }
+    } else if (usbCommandEquals(cmd, "sddiag")) {
+        sdDiagnostico();
+    } else if (usbCommandEquals(cmd, "sddiag2")) {
+        sdDiagnostico2();
+    } else if (usbCommandEquals(cmd, "sddiag3")) {
+        sdDiagnostico3();
+    } else if (usbCommandEquals(cmd, "sddiag4")) {
+        sdDiagnostico4();
+    } else if (usbCommandEquals(cmd, "sddiag5")) {
+        sdDiagnostico5();
+    } else if (usbCommandEquals(cmd, "sddiag6")) {
+        sdDiagnostico6();
+    } else if (usbCommandEquals(cmd, "sddiag7")) {
+        sdDiagnostico7();
+    } else if (usbCommandEquals(cmd, "sddiag8")) {
+        sdDiagnostico8();
+    } else if (usbCommandEquals(cmd, "sddiag9")) {
+        sdDiagnostico9();
+    } else if (usbCommandEquals(cmd, "espsdfmt")) {
+        requestEspSdFormatFromUsb();
+    } else if (usbCommandEquals(cmd, "espsdfoo")) {
+        requestEspSdFooFromUsb();
+    } else if (!strncmp(cmd, "espsd", 5) &&
+               (cmd[5] == '\0' || cmd[5] == ' ')) {
+        long ms = -1, cadaLotes = -1;
+        const int n = sscanf(cmd + 5, "%ld %ld", &ms, &cadaLotes);
+        if (n >= 1 && ms == 0) {
+            requestEspSdFromUsb(0u, 0u);
+        } else if (n == 2 && ms > 0 && ms <= 600000 &&
+                   cadaLotes >= 1 && cadaLotes <= 65535) {
+            requestEspSdFromUsb((uint32_t)ms, (uint32_t)cadaLotes);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: espsd <ms 0-600000> <cada_lotes 1-65535>\n");
+        }
+    } else if (!strncmp(cmd, "sdprobe", 7) &&
+               (cmd[7] == '\0' || cmd[7] == ' ')) {
+        long ms = -1, periodo = -1, modo = -1, div = 0, slew = 0;
+        const int n = sscanf(cmd + 7, "%ld %ld %ld %ld %ld",
+                             &ms, &periodo, &modo, &div, &slew);
+        if (n >= 1 && ms == 0) {
+            requestSdProbeFromUsb(0u, 0u, 0u, 0u, 0u);
+        } else if (n >= 3 && ms > 0 && ms <= 600000 &&
+                   periodo >= 5 && periodo <= 10000 &&
+                   ((modo >= 0 && modo <= 5) || modo == 7) && div >= 0 && div <= 255 &&
+                   slew >= 0 && slew <= 2) {
+            requestSdProbeFromUsb((uint32_t)ms, (uint32_t)periodo,
+                                  (uint8_t)modo, (uint8_t)div, (uint8_t)slew);
+        } else {
+            SLAVE_LOG_PRINTF("[USB] uso: sdprobe <ms 0-600000> <periodo_ms 5-10000> <modo 0-5> [div 0-255] [slew 0-2]\n");
+        }
 #endif
     } else if (usbCommandEquals(cmd, "?") || usbCommandEquals(cmd, "help")) {
 #if SLAVE_LAB_TOOLS_ENABLE
-        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, dumpusb [desde] [hasta], rftest ms periodo_ms bytes, sdstress ms periodo_ms, ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
+        SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, sdinfo, sdtest, sdcap N, diag, pins, quiet N MS, capwait N, startwait N, rawcap N, fircap N, sdread N, dumpusb [desde] [hasta], rftest ms periodo_ms bytes [b], sdstress ms periodo_ms, espsd ms cada_lotes, sdprobe ms periodo_ms modo [div] [slew], ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #else
         SLAVE_LOG_PRINTF("[USB] commands: resetlow, resethigh, resetstate, psocreset, probe, status, stream N, debugpsoc N, pre N, sync, startnow N, cap N, clear, stop, cal, adc, blink, pga N, pgaout N, pgavdac N, idac E C, range N, decim N, ctl punto P C0 C1 C2 C3, ctl puntos, ctl punto dump P, ctl punto clear, ctl punto clear P, ctl punto policy N\n");
 #endif
@@ -3055,6 +4520,7 @@ static SampleBytes *storeBatchPtr(uint16_t seq)
 
 static bool storeReadyForHotWait()
 {
+    if (live::active()) return g_psoc_arm_ready;
     if (g_rec_n_batches == 0) return true;
     if (!g_psoc_arm_ready) return false;
     if (g_psoc_sd_store_active) return true;
@@ -3063,6 +4529,7 @@ static bool storeReadyForHotWait()
 
 static bool storeAllocated()
 {
+    if (live::active()) return true;
     if (g_rec_n_batches == 0) return true;
     return g_psoc_sd_store_active || storeRamReady();
 }
@@ -3109,10 +4576,68 @@ static uint32_t expectedCaptureMs(uint16_t n_batches)
     return ms + PSOC_START_FALLBACK_EXTRA_MS;
 }
 
+/* Armado de una captura en vivo (todo lo que no es asincronico con la RAM
+ * del PSoC sola). La RAM clasica se libera para que el anillo la use. */
+static void enterHotWaitLive(uint16_t n_batches)
+{
+    allocStore(0);
+    digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    g_t_start_us     = 0;
+    g_store_fill     = 0;
+    g_view_remaining = 0;
+    g_view_store_active = false;
+    g_start_store_active = false;
+    g_debug_count    = 0;
+    g_debug_last_us  = (uint32_t)micros();
+    g_start_fallback_sent = false;
+    g_psoc_arm_ready = false;
+    g_live_notified  = false;
+
+    live::Config c;
+    c.storage  = (uint8_t)(g_capmode & CAPMODE_STORAGE_MASK);
+    c.realtime = (g_capmode & CAPMODE_REALTIME) != 0u;
+    c.streamDump = (g_capmode & CAPMODE_STREAM_DUMP) != 0u;
+    c.nBatches = n_batches;
+    c.ramp     = g_capmode_ramp;
+    const int32_t eff = live::prepare(c);
+    if (eff < 0) {
+        g_rec_n_batches = 0;
+        g_state = STOPPED;
+        sendHotWaitAck();
+        SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live aborted n=%u: sin almacenamiento\n",
+                         (unsigned)n_batches);
+        return;
+    }
+    /* 0xFFFF en el HOTWAIT_ACK = sin limite. */
+    g_rec_n_batches = (eff == 0) ? 0xFFFFu : (uint16_t)eff;
+    const bool psocReady = syncPsocSdForCapture(false) &&
+                           syncPsocLiveMode(g_capmode_ramp ? 2u : 1u) &&
+                           sendAndConfirmPsocSetN((uint16_t)eff);
+    if (!psocReady) {
+        live::close();
+        g_state = STOPPED;
+        sendHotWaitAck();
+        SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live aborted n=%ld: PSoC sin confirmar\n",
+                         (long)eff);
+        return;
+    }
+    psoc.preStart();
+    g_hotwait_enter_ms = millis();
+    g_hotwait_rearm_count = 0;
+    g_state = HOT_WAIT;
+    SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live mode=0x%02X n=%ld\n",
+                     (unsigned)g_capmode, (long)eff);
+}
+
 static void enterHotWait(uint16_t n_batches)
 {
     bool psocReady;
 
+    if (capmodeIsLive(g_capmode)) {
+        enterHotWaitLive(n_batches);
+        return;
+    }
+    live::close();
     n_batches = clampPsocCaptureBatches(n_batches);
     allocStore(n_batches);
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
@@ -3136,7 +4661,8 @@ static void enterHotWait(uint16_t n_batches)
     }
     n_batches = g_rec_n_batches;
     /* Armar el PSoC por UART: set N y pre-start (queda esperando flanco SYNC). */
-    psocReady = syncPsocSdForCapture(g_psoc_sd_store_active) &&
+    psocReady = syncPsocLiveMode(0u) &&
+                syncPsocSdForCapture(g_psoc_sd_store_active) &&
                 sendAndConfirmPsocSetN(n_batches);
     if (!psocReady) {
         allocStore(0);
@@ -3225,6 +4751,7 @@ static void debugEspSetRamp(bool enable)
             /* Modo streaming/test: A7 arranca la rampa inmediatamente. */
             g_t_start_us = (uint64_t)g_debug_last_us;
             g_state = SAMPLING;
+            radioSilencioAlEntrar();
         } else if (g_state == WAIT_ARM || g_state == STOPPED) {
             /* Store-and-forward: A7 solo selecciona debug; START/SYNC arranca. */
             g_state = ARMED;
@@ -3414,19 +4941,48 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 #endif
 {
     if (len < 1) return;
+    const int radioLen = len;
+#if SLAVE_LAB_TOOLS_ENABLE
+    if (rfrxOnFrame(data, len)) return;   /* rafaga de banco: no es protocolo */
+#endif
+    if (!geonetTagged(data, len)) {
+        static uint32_t s_untaggedLogMs = 0;
+        if (millis() - s_untaggedLogMs > 10000u) {
+            s_untaggedLogMs = millis();
+            SLAVE_LOG_PRINTF("[SLAVE] ESP-NOW sin marca de red ignorado %02X:%02X:%02X:%02X:%02X:%02X len=%d\n",
+                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (int)len);
+        }
+        return;
+    }
+    len -= GEONET_TAG_LEN;
+    if (!macIsMaster(mac)) {
+        static uint32_t s_foreignLogMs = 0;
+        if (millis() - s_foreignLogMs > 10000u) {
+            s_foreignLogMs = millis();
+            SLAVE_LOG_PRINTF("[SLAVE] ESP-NOW ajeno ignorado %02X:%02X:%02X:%02X:%02X:%02X cmd=0x%02X len=%d\n",
+                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                             data[0], (int)len);
+        }
+        return;
+    }
+    {
+        const uint64_t now = (uint64_t)esp_timer_get_time();
+        const uint64_t airtime = (uint64_t)(radioLen + 40) * 8ULL;
+        live::noteEvent(SAMPLE_FLAG_MASTER_RX, now - airtime, now);
+    }
     learnMasterMac(mac);
     g_lastMasterRxMs = millis();   /* para el seguimiento de canal (ver abajo) */
     uint8_t cmd = data[0];
-    /* La rampa ESP es una prueba de radio, no una captura analógica silenciosa.
-     * Permitir apagarla por el mismo comando que la encendió. El filtro original
-     * descartaba DEBUG=0 y dejaba al nodo transmitiendo hasta un STOP global. */
+    /* La rampa ESP es una prueba de radio: admitir DEBUG=0 para que
+     * s3_link_test.py pueda detenerla sin un STOP global. */
     const bool stopDebug = g_debug_mode &&
         ((cmd == CMD_DEBUG && len == (int)sizeof(MsgDebug) &&
           ((const MsgDebug *)data)->enable == 0) ||
          (cmd == CMD_DEBUG_NODE && len == (int)sizeof(MsgDebugNode) &&
           ((const MsgDebugNode *)data)->node_id == NODE_ID &&
           ((const MsgDebugNode *)data)->enable == 0));
-    if (g_state == SAMPLING && cmd != CMD_STOP && cmd != CMD_ARM && !stopDebug) {
+    if (g_state == SAMPLING && cmd != CMD_STOP && cmd != CMD_ARM &&
+        cmd != CMD_STREAM_ACK && !stopDebug) {
         /* En debug/test, VER puede interrumpir para evitar race condition */
         if (g_debug_mode && cmd == CMD_VIEW) {
             g_debug_mode = false;
@@ -3452,6 +5008,8 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_start_store_active = false;
         g_start_fallback_sent = false;
         allocStore(0);
+        live::close();
+        g_live_notified = false;
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_state = ARMED;
         scheduleAutoCalibration(0u);
@@ -3459,8 +5017,12 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         sendToMaster((const uint8_t *)&ack, sizeof(ack));
         SLAVE_LOG_PRINTLN("[SLAVE] ARMED");
     }
-    else if (cmd == CMD_PRESTART && len >= (int)sizeof(MsgPrestart) &&
-             g_state != SAMPLING) {
+    else if (cmd == CMD_PRESTART && len >= 3 && g_state != SAMPLING) {
+        /* Un maestro viejo manda 3 bytes: queda el modo que estaba (el banco
+         * puede fijarlo con "capmode"). */
+        if (len >= (int)sizeof(MsgPrestart)) {
+            g_capmode = ((const MsgPrestart *)data)->mode;
+        }
         if (!g_auto_cal_requested && g_auto_cal_due_ms != 0u) {
             serviceAutoCalibration();
         }
@@ -3539,7 +5101,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
             return;
         }
         int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
-        digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
+        subirSyncConRadioSilencio();
         int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
         /* No START_ACK here: once SYNC rises the PSoC is measuring, so RF stays
            silent until the store is full and CMD_START ok=2 can be sent. */
@@ -3553,6 +5115,8 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_start_store_active = (g_rec_n_batches > 0 && storeReadyForHotWait() && !g_view_store_active);
         g_start_fallback_sent = false;
         g_state = SAMPLING;
+        if (live::active()) live::start(g_t_start_us, effectivePsocSampleRateHz());
+        radioSilencioAlEntrar();
         SLAVE_LOG_PRINTF("[SLAVE] START_OK target=%u token=%u sync=%d->%d bytes=%lu fill=%u/%u view=%u start=%u\n",
                          (unsigned)targetNode, (unsigned)startToken,
                          syncBefore, syncAfter,
@@ -3565,7 +5129,14 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
              syncBefore, syncAfter, (unsigned)g_view_store_active,
              (unsigned)g_start_store_active);
     }
+    else if (cmd == CMD_STREAM_ACK && len >= (int)sizeof(MsgStreamAck)) {
+        const MsgStreamAck *a = (const MsgStreamAck *)data;
+        if (a->node_id == NODE_ID) live::onMasterAck(a->next_expected, a->sack);
+    }
     else if (cmd == CMD_STOP) {
+        /* En vivo el STOP no tira nada: el PSoC cierra con la bajada de SYNC
+         * y lo pendiente se sigue pasando hasta el aviso de fin. */
+        if (live::active()) live::requestStop();
         digitalWrite(SYNC_TO_PSOC_PIN, LOW);
         g_debug_mode = false;
         if (g_view_remaining > 0) {
@@ -3730,6 +5301,13 @@ static void handleReqBatch(const MsgReqBatch *msg)
     if (g_state == SAMPLING) {
         return;   /* No TX ESP-NOW mientras el ADC está capturando. */
     }
+    if (live::active()) {
+        if (!live::serveReq(seq)) {
+            MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
+            sendToMaster((const uint8_t *)&nack, sizeof(nack));
+        }
+        return;
+    }
     if ((g_view_store_active || g_start_store_active) && g_store_fill < g_rec_n_batches) {
         SLAVE_LOG_PRINTF("[SLAVE] REQ_BATCH ignored during capture seq=%u fill=%u/%u state=%d\n",
                          seq, g_store_fill, g_rec_n_batches, (int)g_state);
@@ -3821,6 +5399,11 @@ static void psocBatchToStored(const PsocBatch &batch, SampleBytes *dst)
 static void onBatch(const PsocBatch &batch)
 {
     g_psocConnected = true;
+
+    if (live::active()) {
+        live::onPsocBatch(batch);
+        return;
+    }
 
     if (g_psoc_sd_read_pending) {
         if (batch.seq != g_psoc_sd_read_seq) {
@@ -3946,7 +5529,11 @@ static uint8_t findMasterChannel(uint8_t fallback)
     for (int i = 0; i < n; i++) {
         if (WiFi.SSID(i) != MASTER_AP_SSID) continue;
         /* Puede haber más de un maestro al alcance: quedarse con el más fuerte. */
-        if (WiFi.RSSI(i) > best) { best = WiFi.RSSI(i); ch = WiFi.channel(i); }
+        if (WiFi.RSSI(i) > best) {
+            best = WiFi.RSSI(i);
+            ch = WiFi.channel(i);
+            memcpy(g_masterApBssid, WiFi.BSSID(i), 6);
+        }
     }
     WiFi.scanDelete();
     if (ch == 0) {
@@ -3954,8 +5541,11 @@ static uint8_t findMasterChannel(uint8_t fallback)
                          MASTER_AP_SSID, n, fallback);
         return fallback;
     }
-    SLAVE_LOG_PRINTF("[SLAVE] AP '%s' en canal %u (%d dBm)\n",
-                     MASTER_AP_SSID, ch, (int)best);
+    g_masterApKnown = true;
+    SLAVE_LOG_PRINTF("[SLAVE] AP '%s' en canal %u (%d dBm) BSSID %02X:%02X:%02X:%02X:%02X:%02X\n",
+                     MASTER_AP_SSID, ch, (int)best,
+                     g_masterApBssid[0], g_masterApBssid[1], g_masterApBssid[2],
+                     g_masterApBssid[3], g_masterApBssid[4], g_masterApBssid[5]);
     return ch;
 }
 
@@ -4056,6 +5646,7 @@ void setup()
         while (true) { delay(1000); }
     }
     esp_now_register_recv_cb(onDataRecv);
+    applyBeaconMarks();
 
     /* (El LED de identificación es el del PSoC; el ESP ya no maneja ningún LED.) */
 
@@ -4063,10 +5654,12 @@ void setup()
      * arranque llega por ESP-NOW y este flanco lo propaga al PSoC. */
     pinMode(SYNC_TO_PSOC_PIN, OUTPUT);
     digitalWrite(SYNC_TO_PSOC_PIN, LOW);
+    iniciarTimerSyncRadioSilencio();
 
     /* UART → PSoC */
     psoc.begin(onBatch);
     psoc.onDiag(onPsocDiag);
+    live::begin(&psoc, sendToMaster, NODE_ID);
     g_psoc_rx_last_level = (uint8_t)digitalRead(PSOC_UART_RX);
     attachInterrupt(digitalPinToInterrupt(PSOC_UART_RX), onPsocRxEdge, CHANGE);
 #if PSOC_RX_SCAN_ENABLE
@@ -4089,6 +5682,7 @@ void setup()
 void loop()
 {
     servicePsocResetRequest();
+    serviceRadioSilencio(true);
     if (g_state != SAMPLING) {
         debugEspHardwareService();
         /* Reengancharse al canal del maestro si dejo de hablar. No corre durante
@@ -4129,12 +5723,18 @@ void loop()
     serviceCompletionAckRetry();
     serviceLocalUi();
     serviceHotWaitWatchdog();
+    live::service();
+    serviceLiveEnd();
 #if SLAVE_LAB_TOOLS_ENABLE
-    /* rftest/sdstress (banco): no bloquean y tienen que poder correr EN
+    /* rftest/sdstress/sdprobe/espsd (banco): corren EN
      * PARALELO con una captura (g_state == SAMPLING incluido: este tramo del
      * loop no se salta en SAMPLING, ver arriba). */
+    serviceLabPing();
     serviceRfTest();
+    serviceRfRx();
     serviceSdStress();
+    serviceSdProbe();
+    serviceEspSd();
 #endif
 
     /* (El parpadeo de identificación lo hace ahora el PSoC con su Timer; el ESP
@@ -4154,7 +5754,7 @@ void loop()
 
     bool storeCaptureActive = g_view_store_active || g_start_store_active;
     if (g_state == SAMPLING && storeCaptureActive && g_rec_n_batches > 0 &&
-        g_store_fill == 0 && !g_start_fallback_sent) {
+        g_store_fill == 0 && !g_start_fallback_sent && !live::active()) {
         uint32_t elapsedMs = millis() - g_sampling_start_ms;
         uint32_t fallbackMs = expectedCaptureMs(g_rec_n_batches);
         uint32_t bytesNow = psoc.bytesRx();
@@ -4296,7 +5896,11 @@ void loop()
 #endif
             controlStatusForHello(),
             g_pga_code,
-            (g_psoc_hw_class == 0u) ? g_pgaout : (uint8_t)0xFFu
+            (g_psoc_hw_class == 0u) ? g_pgaout : (uint8_t)0xFFu,
+            live::ramCapacityBatches(),
+            live::sdCapacityBatches(),
+            (uint8_t)esp_reset_reason(),
+            (uint32_t)(millis() / 1000u)
         };
         esp_err_t err = sendToMaster((const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX

@@ -23,7 +23,7 @@ static const uint32_t SD_RECORD_BYTES =
  * uint16_t de n_batches con margen (65535), aunque la tarjeta sea enorme. */
 static const uint32_t SD_MAX_BATCHES_HARD_CAP = 60000u;
 
-static SPIClass g_sdSpi(FSPI);
+static SPIClass g_sdSpi(SD_SPI_HOST);
 static bool     g_sdPresent = false;
 static bool     g_sdEnabled = false;
 static File     g_sdFile;

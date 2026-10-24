@@ -1,7 +1,9 @@
 # slaveS3 — Nodo geófono/martillo ESP32-S3
 
-Port de `slave` desde `0aa1141`. Guía vigente de compilación, pines y
-pruebas: [PORT_S3.md](../PORT_S3.md). Usar el entorno **slaveS3** y pasar
+Port S3 sincronizado con el `slave` vigente el 2026-10-24. Incluye captura
+live, streaming con ACK/retransmisión, CAPMODE, marcas de ruido, trama PSoC
+`0x9E` y HELLO ampliado. Guía de compilación, pines y pruebas:
+[PORT_S3.md](../PORT_S3.md). Usar el entorno **slaveS3** y pasar
 el puerto real por CLI. Los pines y entornos del texto heredado siguiente
 son históricos; el mapa válido está en `platformio.ini` y en la guía S3.
 
@@ -10,6 +12,8 @@ El enlace de campo configurado recibe datos por **I2C esclavo**, dirección
 botones, captura, protocolos y herramientas del esclavo original.
 `NODE_ID=1` por defecto; cada esclavo de una red debe tener una identidad única.
 No requiere un PSoC para iniciar, responder por USB o usar la rampa ESP.
+Los cambios futuros se traen con `python ../tools/sync_s3.py`; el mapa S3 se
+reaplica desde `src/board_pins_s3.h`.
 
 ## Referencia funcional heredada
 

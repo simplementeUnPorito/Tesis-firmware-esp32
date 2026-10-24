@@ -1,13 +1,17 @@
 # masterS3 — Gateway ESP32-S3
 
-Port de `master` desde `0aa1141`. Guía vigente de compilación, pines y
-pruebas: [PORT_S3.md](../PORT_S3.md). Usar el entorno **masterS3** y pasar
+Port S3 sincronizado con el `master` vigente el 2026-10-24. Incluye streaming
+en tiempo real, ACK/retransmisión, CAPMODE, GEONET y la web actual (limpieza
+de ruido y firmas). Guía de compilación, pines y pruebas:
+[PORT_S3.md](../PORT_S3.md). Usar el entorno **masterS3** y pasar
 el puerto real por CLI; los ejemplos `esp32dev`/COM del texto heredado
 siguiente corresponden al ESP32 original.
 
 Conserva la interfaz web completa, LittleFS, USB a 921600 baud y ESP-NOW.
 La imagen de la web se carga por separado con `pio run -e masterS3 -t uploadfs
 --upload-port COMx`. La placa configurada es ESP32-S3 N16R8 con puente UART.
+Los cambios futuros se traen con `python ../tools/sync_s3.py` y un build de
+ambos proyectos S3.
 
 ## Referencia funcional heredada
 

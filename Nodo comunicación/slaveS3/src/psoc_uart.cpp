@@ -2,6 +2,7 @@
 
 #if !defined(ESP8266)
 #include <driver/gpio.h>
+#include <esp_timer.h>
 #endif
 
 #if PSOC_I2C_ENABLE
@@ -14,21 +15,47 @@ volatile uint8_t  PsocUART::_i2cRing[PSOC_I2C_RX_RING];
 volatile uint16_t PsocUART::_i2cHead = 0;
 volatile uint16_t PsocUART::_i2cTail = 0;
 volatile uint32_t PsocUART::_i2cOverruns = 0;
+volatile PsocUART::I2cRxStamp PsocUART::_i2cStamps[PsocUART::I2C_STAMP_RING];
+volatile uint8_t  PsocUART::_i2cStampHead = 0;
+volatile uint8_t  PsocUART::_i2cStampTail = 0;
+volatile uint32_t PsocUART::_i2cBytesEnqueued = 0;
+volatile uint32_t PsocUART::_i2cBytesConsumed = 0;
+volatile uint32_t PsocUART::_i2cStampOverruns = 0;
 
 #if PSOC_I2C_ENABLE
 void PsocUART::_onI2cReceive(int count)
 {
+    uint32_t added = 0u;
+    uint16_t headBytes = _i2cHead;
     while (count-- > 0 && Wire.available() > 0) {
         const uint8_t b = (uint8_t)Wire.read();
-        const uint16_t next = (uint16_t)((_i2cHead + 1u) % PSOC_I2C_RX_RING);
+        const uint16_t next = (uint16_t)((headBytes + 1u) % PSOC_I2C_RX_RING);
         if (next == _i2cTail) {
             /* Ring lleno: el consumidor se quedó atrás. Se descarta el byte
              * nuevo (no el histórico) para no partir un frame ya empezado. */
             _i2cOverruns++;
-            return;
+            continue;
         }
-        _i2cRing[_i2cHead] = b;
-        _i2cHead = next;
+        _i2cRing[headBytes] = b;
+        headBytes = next;
+        added++;
+    }
+    if (added != 0u) {
+        const uint8_t head = _i2cStampHead;
+        const uint8_t next = (uint8_t)((head + 1u) % I2C_STAMP_RING);
+        _i2cBytesEnqueued += added;
+        if (next == _i2cStampTail) {
+            _i2cStampTail = (uint8_t)((_i2cStampTail + 1u) % I2C_STAMP_RING);
+            _i2cStampOverruns++;
+        }
+#if defined(ESP8266)
+        _i2cStamps[head].us = (uint64_t)micros();
+#else
+        _i2cStamps[head].us = (uint64_t)esp_timer_get_time();
+#endif
+        _i2cStamps[head].endBytes = _i2cBytesEnqueued;
+        _i2cStampHead = next;
+        _i2cHead = headBytes;   /* publicar bytes despues de su marca temporal */
     }
 }
 #else
@@ -50,6 +77,14 @@ bool PsocUART::_rxRead(uint8_t &b)
     if (_i2cHead == _i2cTail) { return false; }
     b = _i2cRing[_i2cTail];
     _i2cTail = (uint16_t)((_i2cTail + 1u) % PSOC_I2C_RX_RING);
+    _i2cBytesConsumed++;
+    if (_i2cStampTail != _i2cStampHead) {
+        const uint8_t tail = _i2cStampTail;
+        _rxByteUs = _i2cStamps[tail].us;
+        if ((int32_t)(_i2cBytesConsumed - _i2cStamps[tail].endBytes) >= 0) {
+            _i2cStampTail = (uint8_t)((tail + 1u) % I2C_STAMP_RING);
+        }
+    }
     return true;
 #else
     if (_ser == nullptr || _ser->available() <= 0) { return false; }
@@ -93,6 +128,12 @@ void PsocUART::begin(BatchCallback cb, HardwareSerial *serial)
      * velocidad la imponga el maestro, que es lo correcto para un esclavo. */
     _i2cHead = 0;
     _i2cTail = 0;
+    _i2cStampHead = 0;
+    _i2cStampTail = 0;
+    _i2cBytesEnqueued = 0;
+    _i2cBytesConsumed = 0;
+    _i2cStampOverruns = 0;
+    _rxByteUs = 0;
     Wire.onReceive(&PsocUART::_onI2cReceive);
     /* El buffer se fija ANTES de begin(): el esclavo reserva sus colas dentro de
      * begin() con el tamano vigente, asi que pedirlo despues no las agranda. */
@@ -151,7 +192,8 @@ void PsocUART::poll()
         _buf[_idx++] = b;
 
         /* Validar n=30 temprano para resincronizar rápido si hay basura. */
-        if (_idx == 2 && _buf[1] != SPI_BATCH_SAMPLES) {
+        if (_idx == 2 && _buf[1] != SPI_BATCH_SAMPLES &&
+            _buf[1] != PSOC_LIVE_FRAME) {
             /* Ping del PSoC (0xAB 0xC0): responder con pong (0xAB 0xC1 0x00 0xC1) */
             if (_buf[1] == PSOC_CTRL_PING) {
                 _pingsRx++;
@@ -200,7 +242,9 @@ void PsocUART::poll()
         if (_idx >= 11 && _buf[1] == 0xC6) {
             _idx=0;_parseControlMetadata();continue;
         }
-        if (_idx >= PSOC_FRAME_BYTES) {
+        const uint16_t frameBytes = (_idx >= 2u && _buf[1] == PSOC_LIVE_FRAME)
+                                  ? PSOC_LIVE_FRAME_BYTES : PSOC_FRAME_BYTES;
+        if (_idx >= frameBytes) {
             _idx = 0;
             _parseFrame();
         }
@@ -294,9 +338,11 @@ bool PsocUART::controlUsb(const char *line)
 }
 void PsocUART::_parseFrame()
 {
+    const bool liveFrame = (_buf[1] == PSOC_LIVE_FRAME);
+    const uint16_t frameBytes = liveFrame ? PSOC_LIVE_FRAME_BYTES : PSOC_FRAME_BYTES;
     uint8_t crc = 0;
-    for (int i = 0; i < PSOC_FRAME_BYTES - 1; i++) { crc ^= _buf[i]; }
-    if (crc != _buf[PSOC_FRAME_BYTES - 1]) {
+    for (uint16_t i = 0; i < frameBytes - 1u; i++) { crc ^= _buf[i]; }
+    if (crc != _buf[frameBytes - 1u]) {
         _lastOK = false;
         _batchesBad++;
         return;
@@ -307,6 +353,16 @@ void PsocUART::_parseFrame()
     batch.global_flags = 0;
     batch.n_samples    = SPI_BATCH_SAMPLES;
     batch.timestamp_us = (uint64_t)micros();
+    batch.hasAnchor     = liveFrame;
+    batch.anchorStart   = liveFrame ? ((uint32_t)_buf[94] |
+                            ((uint32_t)_buf[95] << 8) |
+                            ((uint32_t)_buf[96] << 16) |
+                            ((uint32_t)_buf[97] << 24)) : 0u;
+    batch.prevEnd       = liveFrame ? ((uint32_t)_buf[98] |
+                            ((uint32_t)_buf[99] << 8) |
+                            ((uint32_t)_buf[100] << 16) |
+                            ((uint32_t)_buf[101] << 24)) : 0xFFFFFFFFu;
+    batch.rxUs          = liveFrame ? _rxByteUs : 0u;
 
     const uint8_t *p = &_buf[4];
     for (int i = 0; i < SPI_BATCH_SAMPLES; i++, p += 3) {

@@ -15,11 +15,13 @@
  *     cmd 0xA5: request status  param: ignorado
  *     cmd 0xA7: debug broadcast param: 0/1
  *     cmd 0xB0: scope multi-start param: n_batches, 0=cancelar
+ *     cmd 0xAF: modo de captura   param: CAPMODE_* (sync_protocol.h)
  *
  *   Comando "set N" 16 bits (5 bytes):
  *     [0xAB][cmd][n_lo][n_hi][cmd^n_lo^n_hi]
  *     cmd 0xA3: start sampling  N = n_lo|n_hi<<8 (lotes, 0=usar actual)
  *     cmd 0xAE: set record len  N = n_lo|n_hi<<8
+ *     cmd 0xC1: rafaga RF de banco, N = duracion en unidades de 10 ms (0 = parar)
  *
  *   Comando dirigido a esclavo (6 bytes; 7 para IDAC manual 0xAA):
  *     [0xAB][0xBD][node_id][sub_cmd][param][node_id^sub_cmd^param]
@@ -38,6 +40,7 @@
  *   [0x56][node_id][type][b2][b1][b0]
  *   node_id : 0x00 = maestro (martillo), 0x01-0x0N = esclavos
  *   type    : 0x00 dato, 0x01 heartbeat, 0x07 ACK, 0xFC START RTT/2 us,
+ *             0xFD STATUS/HELLO (b2=subtipo; 0x0C=RAM, 0x0D=SD, uint16 BE),
  *             0xFE ready (n_nodes)
  */
 
@@ -77,7 +80,9 @@ public:
                         uint16_t fs = 0, uint8_t hw_class = 0xFF,
                         uint8_t sd_present = 0xFF, uint8_t link_model = 0xFF,
                         uint8_t ctl_status = 0xFF, uint8_t pga_code = 0xFF,
-                        uint8_t pgaout_code = 0xFF);
+                        uint8_t pgaout_code = 0xFF, uint32_t ram_batches = 0,
+                        uint32_t sd_batches = 0, uint8_t reset_reason = 0xFF,
+                        uint32_t uptime_s = 0);
 
     /* Serial USB siempre disponible */
     bool connected() const { return true; }
@@ -87,7 +92,7 @@ public:
         uint8_t  param;    /* parámetro del comando estándar (= value & 0xFF) */
         uint8_t  node_id;  /* válido solo cuando cmd == 0xBD */
         uint8_t  sub_cmd;  /* válido solo cuando cmd == 0xBD */
-        uint16_t value;    /* valor 16 bits para 0xA3/0xAD/0xAE (set N) */
+        uint16_t value;    /* valor 16 bits para 0xA3/0xAD/0xAE/0xC1 (set N) */
         bool     valid;
         uint8_t  param2;       /* segundo parametro, solo 0xAA dirigido */
         bool     has_param2;
@@ -145,7 +150,7 @@ inline void MatlabTransport::loop()
         if (_rxIdx == 2) {
             uint8_t c = _rxBuf[1];
             if (c == MATLAB_CMD_DIRECTED)            _rxExpected = 6;
-            else if (c == 0xA3 || c == 0xAD || c == 0xAE) _rxExpected = 5; /* set N 16 bits */
+            else if (c == 0xA3 || c == 0xAD || c == 0xAE || c == 0xC1) _rxExpected = 5; /* set N 16 bits */
             else                                     _rxExpected = 4;
         }
         if (_rxIdx == 4 && _rxBuf[1] == MATLAB_CMD_DIRECTED &&
@@ -195,8 +200,8 @@ inline void MatlabTransport::sendAck(uint8_t nodeId, uint8_t cmd, uint8_t val)
 
 inline void MatlabTransport::sendSampleMark(uint8_t nodeId, uint8_t flags)
 {
-    /* type 0xFB: b2=flags (bit0 escritura SD, bit1 f_sync). Va justo antes de
-     * la muestra marcada; los clientes que no lo conocen lo ignoran. */
+    /* type 0xFB: b2=flags. bit0 SD I/O, bit1 SD sync, bit2 radio TX,
+     * bit3 I2C, bit4 beacon AP, bit5 RX maestro. Va antes de la muestra. */
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFB, flags, 0x00, 0x00 };
     _emit(pkt);
 }
@@ -223,7 +228,9 @@ inline void MatlabTransport::sendStatus(uint8_t espnow_ok, uint8_t ap_ch)
 inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, const uint8_t mac[6],
                                             uint16_t fs, uint8_t hw_class, uint8_t sd_present,
                                             uint8_t link_model, uint8_t ctl_status,
-                                            uint8_t pga_code, uint8_t pgaout_code)
+                                             uint8_t pga_code, uint8_t pgaout_code,
+                                             uint32_t ram_batches, uint32_t sd_batches,
+                                             uint8_t reset_reason, uint32_t uptime_s)
 {
     /* node_id=slave, type=0xFD, b2=0x01 (hello), b1=psoc_ok, b0=fs/100 (0=desconocido) */
     uint8_t fs_code = (fs >= 100u) ? (uint8_t)((fs + 50u) / 100u) : 0u;
@@ -270,6 +277,26 @@ inline void MatlabTransport::sendHelloNotif(uint8_t nodeId, uint8_t psoc_ok, con
     if (pgaout_code != 0xFFu) {
         uint8_t pgaoutPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0B, pgaout_code, 0x00 };
         _emit(pgaoutPkt);
+    }
+    /* b2=0x0C/0x0D: capacidades HELLO uint16 big-endian (saturadas a 65535),
+     * con el mismo layout que Fs exacta (0x05). SD=0 significa sin SD. */
+    const uint16_t ram16 = (ram_batches > 0xFFFFu) ? 0xFFFFu : (uint16_t)ram_batches;
+    const uint16_t sd16 = (sd_batches > 0xFFFFu) ? 0xFFFFu : (uint16_t)sd_batches;
+    uint8_t ramPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0C,
+                          (uint8_t)((ram16 >> 8) & 0xFFu), (uint8_t)(ram16 & 0xFFu) };
+    uint8_t sdCapPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0D,
+                            (uint8_t)((sd16 >> 8) & 0xFFu), (uint8_t)(sd16 & 0xFFu) };
+    _emit(ramPkt);
+    _emit(sdCapPkt);
+    if (reset_reason != 0xFFu) {
+        /* b2=0x0E: motivo del ultimo reinicio (esp_reset_reason, 9 = caida de
+         * tension); b2=0x0F: segundos encendido, uint16 BE saturado. */
+        const uint16_t up16 = (uptime_s > 0xFFFFu) ? 0xFFFFu : (uint16_t)uptime_s;
+        uint8_t rstPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0E, reset_reason, 0x00 };
+        uint8_t upPkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFD, 0x0F,
+                             (uint8_t)((up16 >> 8) & 0xFFu), (uint8_t)(up16 & 0xFFu) };
+        _emit(rstPkt);
+        _emit(upPkt);
     }
     if (mac != nullptr) {
         /* Enviar MAC en 3 paquetes: sub-tipo 0x02/0x03/0x04, 2 bytes por paquete */

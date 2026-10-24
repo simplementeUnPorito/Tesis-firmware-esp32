@@ -4,8 +4,8 @@
 // (packet_received / connection_changed / log_message signals) using
 // CustomEvents instead of Qt signals.
 
-import { decodePacket } from './protocol.js';
-import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-31';
+import { decodePacket } from './protocol.js?v=field-study-37';
+import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-37';
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
@@ -115,6 +115,18 @@ export class WsClient extends EventTarget {
       const closedFast = ageMs === 0 || ageMs < SHORT_CLOSE_MS;
       const reason = `${ev?.reason || ''}`.toLowerCase();
       const busy = ev?.code === WS_CLOSE_POLICY || reason.includes('busy') || reason.includes('ws_lock');
+      const replaced = this._replaced || reason.includes('replaced');
+      this._replaced = false;
+
+      if (replaced) {
+        // Otra pestana (o este mismo equipo tras un corte) tomo la conexion:
+        // no reintentar solo, para no robarsela de vuelta en bucle.
+        this._blocked = true;
+        this._openMs = null;
+        this._emitConnection(false);
+        this._log('WS: otra pestaña de este equipo tomó la conexión; tocá Reconectar para recuperarla');
+        return;
+      }
       const unauth = ev?.code === WS_CLOSE_UNAUTH || reason.includes('unauthorized') || reason.includes('auth');
 
       if (busy) {
@@ -166,7 +178,9 @@ export class WsClient extends EventTarget {
         this._log(`WS text: ${ev.data}`);
         try {
           const msg = JSON.parse(ev.data);
-          if (msg?.type === 'busy') {
+          if (msg?.type === 'replaced') {
+            this._replaced = true;
+          } else if (msg?.type === 'busy') {
             this._log('WS: maestro ocupado; reintentando');
             this._reconnectMs = Math.max(this._reconnectMs, BUSY_RETRY_MS);
             try { ws.close(); } catch (_) {}

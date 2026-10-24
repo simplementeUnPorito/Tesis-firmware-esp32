@@ -2,7 +2,7 @@
 // test/ver/latency, statistics. Mirrors gui/slave_tab.py at the view layer:
 // this module builds DOM and dispatches CustomEvents; app.js owns orchestration.
 
-import * as cfg from './config.js?v=field-study-31';
+import * as cfg from './config.js?v=field-study-37';
 
 // -- DOM helpers -------------------------------------------------------------
 
@@ -58,7 +58,8 @@ function fmtSignedPct(value) {
  * Events: 'pga-changed' {code}, 'pgaout-changed' {code}, 'adc-config-changed' {code},
  *         'vdac-manual-requested' {code},
  *         'fir-apply' {cmd}, 'fir-remove',
- *         'line-notch-changed' {enabled, nHarm},
+ *         'line-notch-changed' {enabled, nHarm}, 'noise-cleaning-changed' {kind, enabled},
+ *         'signatures-file-selected' {file},
  *         'dc-remove-toggled' {enabled}, 'test-requested', 'ver-requested',
  *         'send-all-requested', 'calibrate-requested', 'latency-requested',
  *         'offset-changed' {offset}, 'y-offset-changed' {offsetMv}
@@ -292,6 +293,37 @@ export class SlavePanel extends EventTarget {
       labeled('Sin ruido de linea', this._cbLineNotch),
       labeled('N', this._notchHarm),
     ));
+
+    this._noiseCleaningControls = {};
+    const cleaningRow = row();
+    for (const [kind, labelText] of [
+      ['i2c', 'Eliminar ruido I2C'],
+      ['sd', 'Eliminar ruido SD'],
+      ['radio', 'Eliminar ruido transmisión'],
+      ['beacon', 'Eliminar ruido beacon'],
+    ]) {
+      const checkbox = el('input');
+      checkbox.type = 'checkbox';
+      checkbox.addEventListener('change', () => this._dispatch('noise-cleaning-changed', {
+        kind,
+        enabled: checkbox.checked,
+      }));
+      this._noiseCleaningControls[kind] = checkbox;
+      cleaningRow.appendChild(labeled(labelText, checkbox));
+    }
+    firBox.appendChild(cleaningRow);
+
+    this._signatureFile = el('input');
+    this._signatureFile.type = 'file';
+    this._signatureFile.accept = '.json,application/json';
+    this._signatureFile.title = 'Cargar firmas_<placa>.json y usarlo en todos los nodos';
+    this._signatureFile.addEventListener('change', () => {
+      const file = this._signatureFile.files?.[0];
+      if (file) this._dispatch('signatures-file-selected', { file });
+      this._signatureFile.value = '';
+    });
+    this._signatureInfo = el('span', 'filter-status', 'Firmas: cargando...');
+    firBox.appendChild(row(labeled('Cargar firmas', this._signatureFile), this._signatureInfo));
     root.appendChild(firBox);
 
     this._btnTest = el('button', null, 'Test');
@@ -478,6 +510,15 @@ export class SlavePanel extends EventTarget {
     this._cbLineNotch.checked = !!enabled;
     const v = Number.isFinite(nHarm) ? nHarm : cfg.LINE_NOTCH_DEFAULT_HARM;
     this._notchHarm.value = String(Math.min(cfg.LINE_NOTCH_MAX_HARM, Math.max(1, Math.round(v))));
+  }
+
+  setNoiseCleaning(kind, enabled) {
+    const control = this._noiseCleaningControls?.[kind];
+    if (control) control.checked = !!enabled;
+  }
+
+  setSignaturesInfo(text) {
+    if (this._signatureInfo) this._signatureInfo.textContent = `Firmas: ${text}`;
   }
 
   setPga(code) {

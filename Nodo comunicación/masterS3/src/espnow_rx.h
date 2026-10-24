@@ -11,6 +11,15 @@
 #include "sync_protocol.h"
 #include "master_log.h"
 
+/* Unica salida ESP-NOW del maestro: agrega la marca de red (sync_protocol.h). */
+static inline esp_err_t geonetSend(const uint8_t *dst, const uint8_t *data, size_t len)
+{
+    uint8_t buf[ESPNOW_MAX_PAYLOAD];
+    const int n = geonetWrap(buf, data, (int)len);
+    if (n == 0) return ESP_ERR_INVALID_ARG;
+    return esp_now_send(dst, buf, (size_t)n);
+}
+
 #define MAX_NODES 9
 
 /* Un batch reensamblado */
@@ -32,6 +41,8 @@ typedef void (*CfgAckCallback)(const MsgCfgAck &msg);
 typedef void (*HelloCallback)(const MsgHello &msg, const uint8_t senderMac[6]);
 typedef void (*StartAckCallback)(const MsgStartAck &msg);
 typedef void (*HotWaitAckCallback)(const MsgHotWaitAck &msg);
+typedef void (*RtDataCallback)(const uint8_t *data, int len);
+typedef void (*RtEndCallback)(const MsgStreamEnd &msg);
 
 class EspNowRx {
 public:
@@ -48,8 +59,16 @@ public:
     /* Llamar desde el loop() o directamente del callback ESP-NOW */
     static void onRecv(const uint8_t *mac, const uint8_t *data, int len);
 
+    /* Tiempo real (rt_stream.h): tramas MsgData32 y STREAM_END. */
+    void setRtHandlers(RtDataCallback data, RtEndCallback end)
+    {
+        _rtDataCb = data;
+        _rtEndCb = end;
+    }
+
     uint32_t pktsRx()   const { return _pktsRx; }
     uint32_t crcFail()  const { return _crcFail; }
+    uint32_t foreignRx() const { return _foreignRx; }  /* tramas sin marca de red */
 
 private:
     BatchReadyCallback _cb = nullptr;
@@ -59,9 +78,12 @@ private:
     HelloCallback      _helloCb   = nullptr;
     StartAckCallback   _startAckCb = nullptr;
     HotWaitAckCallback _hotWaitAckCb = nullptr;
+    RtDataCallback     _rtDataCb = nullptr;
+    RtEndCallback      _rtEndCb = nullptr;
     ReassembledBatch   _bufs[MAX_NODES] = {};
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
+    volatile uint32_t  _foreignRx = 0;
 
     void _handleData(const MsgData *msg);
     void _handleStatus(const MsgStatus *msg);
@@ -109,10 +131,17 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
 inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
     if (!instance || len < 1) return;
+    /* Solo tramas de esta red (marca al final, sync_protocol.h). */
+    if (!geonetTagged(data, len)) { instance->_foreignRx++; return; }
+    len -= GEONET_TAG_LEN;
     uint8_t first = data[0];
 
     if (first == DATA_PKT_MARKER && (size_t)len >= sizeof(MsgData)) {
         instance->_handleData((const MsgData *)data);
+    } else if (first == DATA32_PKT_MARKER && (size_t)len >= sizeof(MsgData32)) {
+        if (instance->_rtDataCb) instance->_rtDataCb(data, len);
+    } else if (first == CMD_STREAM_END && (size_t)len >= sizeof(MsgStreamEnd)) {
+        if (instance->_rtEndCb) instance->_rtEndCb(*(const MsgStreamEnd *)data);
     } else if (first == CMD_ARM_ACK && (size_t)len >= sizeof(MsgArmAck)) {
         instance->_handleArmAck((const MsgArmAck *)data);
     } else if (first == CMD_STATUS && (size_t)len >= sizeof(MsgStatus)) {
@@ -126,6 +155,7 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         hello.ctl_status = SLAVE_CTL_UNKNOWN;
         hello.pga_code = 0xFFu;
         hello.pgaout_code = 0xFFu;
+        hello.reset_reason = 0xFFu;   /* esclavos viejos no lo mandan */
         const size_t copyLen = ((size_t)len < sizeof(MsgHello)) ? (size_t)len : sizeof(MsgHello);
         memcpy(&hello, data, copyLen);
         instance->_handleHello(&hello, mac);

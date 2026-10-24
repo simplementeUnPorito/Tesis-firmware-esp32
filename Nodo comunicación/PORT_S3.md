@@ -1,8 +1,11 @@
 # Port masterS3 / slaveS3
 
 Se conservaron `master` y `slave` y se añadieron dos proyectos de campo:
-`masterS3` y `slaveS3`, basados en `Tesis-firmware-esp32` commit `0aa1141`.
-Incluyen los fuentes, la web del maestro y las herramientas del original.
+`masterS3` y `slaveS3`. El port original partió del commit `0aa1141`; el
+2026-10-24 se regeneraron desde el firmware vigente. Incluyen captura live,
+streaming con ACK/retransmisión, CAPMODE, descarga rápida, marca GEONET,
+marcas de ruido, trama PSoC `0x9E`, HELLO ampliado y la web actual completa.
+Los fuentes y la web se mantienen con `python tools/sync_s3.py`.
 No se migraron Serial, Serial_HAMMER ni MasterFoo. Los artefactos históricos
 de pruebas siguen en los proyectos originales; no son evidencia del port.
 
@@ -25,6 +28,26 @@ La consola usa UART0 a través del CH343, igual
 que las dos placas identificadas. USB CDC nativo está desactivado.
 La partición `default.csv` ocupa los primeros 4 MiB; no usa toda la flash.
 LittleFS conserva offset `0x290000` y tamaño `0x160000` del original.
+
+## Delta S3 reproducible
+
+| Cambio S3 | Aplicación | Motivo |
+|---|---|---|
+| N16R8, 16 MiB DIO, `qio_opi`, PSRAM, USB CDC off | ambos | Hardware y consola CH343 |
+| AsyncTCP 3.5.0 / ESPAsyncWebServer 3.12.1 | maestro | API estable con Arduino-ESP32 2.0.17 |
+| `board_pins_s3.h` forzado sólo a fuentes propias | ambos | Mapa único y guarda de target |
+| GPIO7 sync; 8/9 I2C; 16/17/18 reset/UART | ambos | Evitar memoria, USB y consola |
+| OLED 12/11/10/5/6; botones 38–41 | esclavo | GPIO S3 libres con pull-up interno |
+| SD live FSPI 14/21/13/42 | esclavo | Sustituir 14/32/13/25 del WROOM |
+| `LIVE_MAX_PAGES=2048`, ring SD=512 | esclavo | Hasta 5,90 MiB de PSRAM para live |
+| RX_SCAN 1/2/4/47/48 | esclavo | Sólo GPIO no reservados |
+| VSPI/HSPI y diagnósticos SD parametrizados | esclavo | Host y GPIO válidos en S3 |
+| Firmas ESP-NOW/WebSocket sin parche | ambos | Compilan con las versiones fijadas |
+
+`tools/sync_s3.py` reemplaza `masterS3/src`, `masterS3/data` y
+`slaveS3/src` desde los proyectos WROOM, recrea los encabezados de placa y
+aplica sustituciones verificadas (falla si cambia el contexto esperado). No
+toca `platformio.ini`, README, artefactos ni herramientas de prueba S3.
 
 Desde cada proyecto, con PlatformIO instalado:
 
@@ -72,11 +95,16 @@ privado del firmware anterior. No se ejecutó borrado total ni cambios de eFuses
 | Botón OK | 36 | 40 |
 | Botón atrás | 39 | 41 |
 | Marcador opcional START | 15 | 15 |
+| SD live SCK | 14 | 14 |
+| SD live MISO | 32 | 21 |
+| SD live MOSI | 13 | 13 |
+| SD live CS | 25 | 42 |
 
 Botones a GND con pull-up interno habilitado. Compartir GND y respetar
 niveles de 3,3 V y los pull-ups del bus I2C. El pin RX del ESP no sustituye
-al I2C en la configuración de campo. La SD de campo continúa en el PSoC;
-el backend SD local opcional usa FSPI en S3 en lugar de VSPI.
+al I2C en la configuración de campo. La SD de campo continúa en el PSoC.
+El backend local de `live_capture` usa FSPI en 14/21/13/42; este cableado
+nuevo requiere verificación eléctrica en el montaje.
 
 En el maestro, el marcador `SYNC_OUT_PIN` pasa de GPIO25 a GPIO7;
 GPIO15 sigue como marcador START. El log opcional por Serial1 usa RX16/TX17.

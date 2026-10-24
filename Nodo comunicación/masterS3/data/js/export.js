@@ -1,8 +1,29 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-31';
+import * as cfg from './config.js?v=field-study-37';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-31';
+import { effectiveFs } from './data_store.js?v=field-study-37';
+
+const MARK_BITS = [
+  [0x01, 'SD_IO'],
+  [0x02, 'SD_SYNC'],
+  [0x04, 'RADIO_TX'],
+  [0x08, 'I2C'],
+  [0x10, 'AP_BEACON'],
+  [0x20, 'MASTER_RX'],
+];
+
+function noiseMarksCsv(marks) {
+  const lines = ['sample_index,flags,flags_hex,bit_names'];
+  for (const mark of Array.isArray(marks) ? marks : []) {
+    const sample = Number(mark?.[0]);
+    const flags = Number(mark?.[1]) & 0xFF;
+    if (!Number.isFinite(sample) || flags === 0) continue;
+    const names = MARK_BITS.filter(([bit]) => (flags & bit) !== 0).map(([, name]) => name).join('|');
+    lines.push(csvRow([Math.round(sample), flags, `0x${flags.toString(16).toUpperCase().padStart(2, '0')}`, names]));
+  }
+  return lines.join('\n') + '\n';
+}
 
 function compactTimestamp(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -218,7 +239,7 @@ function uniqueDir(base, used, index) {
 function slaveConnectedForExport(nd, index, nSlaves) {
   return index > 0
     && nd.visible
-    && (nd.fsKnown || !!nd.mac || nd.rawBuf.length > 0 || nd.filtBuf.length > 0);
+    && (nd.fsKnown || !!nd.mac || nd.captureRawLength > 0 || nd.captureFiltLength > 0);
 }
 
 function slaveTypeRank(alias) {
@@ -264,10 +285,15 @@ function nodeMetadata(nd, index, paths, connected) {
     filt_file: paths ? paths.filt : null,
     raw_csv_file: paths ? paths.rawCsv : null,
     filt_csv_file: paths ? paths.filtCsv : null,
-    raw_count: nd.rawBuf.length,
-    filt_count: nd.filtBuf.length,
+    noise_marks_file: paths ? paths.marksCsv : null,
+    raw_count: nd.captureRawLength,
+    filt_count: nd.captureFiltLength,
     batch_count: nd.batchCount,
     total_samples: nd.totalSamples,
+    capture_truncated: !!nd.captureTruncated,
+    dropped_samples: nd.droppedSamples || 0,
+    filter_scope: nd.filterScope || 'full',
+    filter_start_index: nd.filterStartIndex || 0,
     pga_code: nd.pgaCode,
     pga_gain: gainValue(nd.pgaCode),
     pgaout_code: nd.pgaoutCode,
@@ -290,7 +316,7 @@ function nodeMetadata(nd, index, paths, connected) {
     link_model: nd.linkModel,
     link_type: linkType,
     ctl_status: nd.ctlStatus,
-    sd_marks: nd.sdMarksFor(nd.rawBuf.length),
+    sd_marks: nd.sdMarksFor(nd.captureRawLength),
     hammer_offset_m: offsetM,
     offset_m_from_hammer: offsetM,
     position_m: offsetM,
@@ -301,6 +327,12 @@ function nodeMetadata(nd, index, paths, connected) {
     dc_remove: !!nd.dcRemove,
     notch_enabled: !!nd.notchEnabled,
     notch_harm: nd.notchHarm | 0,
+    clean_i2c: !!nd.cleanI2c,
+    clean_sd: !!nd.cleanSd,
+    clean_radio_tx: !!nd.cleanRadio,
+    clean_beacon: !!nd.cleanBeacon,
+    noise_signatures_placa: nd.noiseSignaturesPlaca || null,
+    noise_signatures_fecha: nd.noiseSignaturesFecha || null,
     invert_signal: !!nd.invertSignal,
     display_y_offset_v: nd.yOffsetV || 0,
     drift_hist: nd.driftHist.slice(),
@@ -338,10 +370,15 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     filt_file: paths ? paths.filt : null,
     raw_csv_file: paths ? paths.rawCsv : null,
     filt_csv_file: paths ? paths.filtCsv : null,
+    noise_marks_file: paths ? paths.marksCsv : null,
     raw_count: raw.length,
     filt_count: filt.length,
     batch_count: node?.batch_count ?? 0,
     total_samples: node?.total_samples ?? raw.length,
+    capture_truncated: !!node?.capture_truncated,
+    dropped_samples: node?.dropped_samples ?? 0,
+    filter_scope: node?.filter_scope || 'full',
+    filter_start_index: node?.filter_start_index ?? 0,
     pga_code: node?.pga_code ?? 0,
     pga_gain: node?.pga_gain ?? gainValue(node?.pga_code ?? 0),
     pgaout_code: node?.pgaout_code ?? 0,
@@ -353,8 +390,7 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     decimation_factor: decimationFactorForNode(node),
     sd_present: sdPresentForNode(node),
     sd_enabled: sdEnabledForNode(node),
-    // [indice en raw, flags]: bit0 escritura a SD, bit1 f_sync. La interferencia
-    // empieza en esa muestra; ver quitar_ruido_sd.py.
+    // [indice en raw, flags]: bits de interferencia conocida para esa muestra.
     sd_marks: Array.isArray(node?.sd_marks) ? node.sd_marks : [],
     vdac_byte: node?.vdac_byte ?? 128,
     cal_vdacs: calVdacsForNode(node),
@@ -376,6 +412,12 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     dc_removed_on_preserve: !!node?.dc_removed_on_preserve,
     notch_enabled: !!node?.notch_enabled,
     notch_harm: node?.notch_harm ?? 0,
+    clean_i2c: !!node?.clean_i2c,
+    clean_sd: !!node?.clean_sd,
+    clean_radio_tx: !!node?.clean_radio_tx,
+    clean_beacon: !!node?.clean_beacon,
+    noise_signatures_placa: node?.noise_signatures_placa || null,
+    noise_signatures_fecha: node?.noise_signatures_fecha || null,
     raw_dc_v: node?.raw_dc_v ?? null,
     filt_dc_v: node?.filt_dc_v ?? null,
     invert_signal: !!node?.invert_signal,
@@ -683,8 +725,8 @@ export function buildCaptureZip(dataStore, options = {}) {
     connectedByNode.set(i, connected);
     if (!connected) continue;
 
-    const raw = nd.rawBuf.toArray();
-    const filt = nd.filtBuf.toArray();
+    const raw = nd.captureRawArray();
+    const filt = nd.captureFiltArray();
     const pcbId = pcbIdForNode(i, nd.slaveId);
     const dirBase = dirBaseForNode(nd.alias || cfg.NODE_NAMES[i], pcbId, `slave${i}`);
     const dir = uniqueDir(dirBase, usedDirs, i);
@@ -694,6 +736,7 @@ export function buildCaptureZip(dataStore, options = {}) {
       filt: `${dir}/filt_f32le.bin`,
       rawCsv: `${dir}/raw.csv`,
       filtCsv: `${dir}/filt.csv`,
+      marksCsv: `${dir}/noise_marks.csv`,
     };
     pathsByNode.set(i, paths);
     files.push({ name: paths.raw, data: float32Bytes(raw) });
@@ -705,6 +748,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     // guessed/nominal constant - so the CSV time column matches reality.
     files.push({ name: paths.rawCsv, data: csvText(raw, nd.fs, 0) });
     files.push({ name: paths.filtCsv, data: csvText(filt, nd.fs, 0) });
+    files.push({ name: paths.marksCsv, data: noiseMarksCsv(nd.sdMarksFor(raw.length)) });
 
     visibleNodes.push(i);
     exportedNodes.push(i);
@@ -747,11 +791,13 @@ export function buildCaptureZip(dataStore, options = {}) {
           filt: `${dir}/filt_f32le.bin`,
           rawCsv: `${dir}/raw.csv`,
           filtCsv: `${dir}/filt.csv`,
+          marksCsv: `${dir}/noise_marks.csv`,
         };
         files.push({ name: paths.raw, data: float32Bytes(raw) });
         files.push({ name: paths.filt, data: float32Bytes(filt) });
         files.push({ name: paths.rawCsv, data: csvText(raw, node.fs || capture.fs || 0, captureOffset) });
         files.push({ name: paths.filtCsv, data: csvText(filt, node.fs || capture.fs || 0, captureOffset) });
+        files.push({ name: paths.marksCsv, data: noiseMarksCsv(node.sd_marks) });
       }
 
       capNodeMetas.push(captureNodeMetadata(node, index, paths, connected, captureOffset));
@@ -775,6 +821,7 @@ export function buildCaptureZip(dataStore, options = {}) {
       y_offset_mv: capture.y_offset_mv ?? 0,
       dc_removed_on_preserve: !!capture.dc_removed_on_preserve,
       notch_f0: capture.notch_f0 ?? cfg.LINE_NOTCH_F0,
+      truncated: !!capture.truncated || capNodeMetas.some((node) => node.capture_truncated),
       active_node_indices: Array.isArray(capture.active_node_indices)
         ? capture.active_node_indices.slice()
         : [],
@@ -806,7 +853,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-31',
+    web_app_version: 'field-study-37',
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,
@@ -831,6 +878,8 @@ export function buildCaptureZip(dataStore, options = {}) {
     exported_pcb_ids: exportedNodes.map((i) => pcbIdForNode(i, dataStore.nodes[i]?.slaveId)),
     capture_count: captureMetas.length || (exportedNodes.length ? 1 : 0),
     preserved_count: preservedCaptures.length,
+    truncated: nodes.some((node) => node.capture_truncated) ||
+      captureMetas.some((capture) => capture.truncated),
     combined_csv_file: combinedSignalsPath,
     capture_summary_csv_file: captureSummaryPath,
     node_summary_csv_file: nodeSummaryPath,

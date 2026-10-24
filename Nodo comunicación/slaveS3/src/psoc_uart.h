@@ -85,8 +85,10 @@
 #endif
 
 #define PSOC_FRAME_MARKER 0xAB
+#define PSOC_LIVE_FRAME  0x9E
 #define SPI_BATCH_SAMPLES 30                              /* muestras por lote */
 #define PSOC_FRAME_BYTES  (4 + SPI_BATCH_SAMPLES * 3 + 1) /* 95 */
+#define PSOC_LIVE_FRAME_BYTES (PSOC_FRAME_BYTES + 8)      /* 103 */
 #define PSOC_CTRL_ACK_BYTES 5
 #define PSOC_CTRL_DIAG_BYTES 6
 #define PSOC_CTRL_ST_RESULT  0xC5
@@ -161,9 +163,16 @@
 
 #define PSOC_CMD_VIEW_CHANNEL 0xAC
 #define PSOC_VIEW_CHANNEL_NONE 0xFF
+#define PSOC_CMD_SD_PROBE 0xAD    /* p1=modo, p2=div, p3=slew; Ack: 1 OK / 0 fallo */
 
 #define PSOC_CMD_SD_CAPTURE  0xBE    /* p=1 captura a SD (permite N>512), p=0 RAM-only. Ack 0/1, 0xEE=rechazo */
 #define PSOC_CMD_SD_READ_BATCH 0xBF  /* uint16 LE; éxito: frame normal seq=índice */
+/* Captura en vivo (ver psoc_hw.h del PSoC). LIVE_MODE: 0 clasico, 1 vivo,
+ * 2 vivo con rampa de banco. LIVE_ACK: [lote lo][lote hi][flags]. */
+#define PSOC_CMD_LIVE_MODE   0xAE
+#define PSOC_CMD_LIVE_ACK    0xAF
+#define PSOC_LIVE_ACK_REWIND 0x01
+#define PSOC_LIVE_ACK_ONE    0x02
 
 /* Control PSoC -> ESP */
 #define PSOC_CTRL_PING      0xC0
@@ -247,6 +256,11 @@
 #define PSOC_EVT_SD_DIAG_STAGE    0x4C  /* bits0-6 etapa init; bit7 timeout SPI */
 #define PSOC_EVT_SD_DIAG_R1       0x4D  /* ultima respuesta R1 (0xFF=sin respuesta) */
 #define PSOC_EVT_SD_DIAG_PINS     0x4E  /* low/high vistos en MISO, SCK, MOSI y CS */
+#define PSOC_EVT_LAB_PING         0x4F  /* sdprobe modo 7: aviso en cada k*150 muestras */
+#define PSOC_EVT_LIVE_DONE        0x50  /* captura en vivo cerrada; value = byte bajo del total */
+#define PSOC_EVT_LIVE_OVERRUN     0x51  /* el anillo del PSoC se lleno: no hubo donde guardar */
+#define PSOC_EVT_LIVE_TOTAL1      0x52  /* bits 8-15 del total, antes de LIVE_DONE */
+#define PSOC_EVT_LIVE_TOTAL2      0x53  /* bits 16-23 del total, antes de LIVE_DONE */
 
 struct PsocSample {
     int16_t  raw_input;
@@ -262,6 +276,10 @@ struct PsocBatch {
     uint8_t    n_samples;
     PsocSample samples[SPI_BATCH_SAMPLES];
     uint64_t   timestamp_us;
+    bool       hasAnchor;
+    uint32_t   anchorStart;
+    uint32_t   prevEnd;
+    uint64_t   rxUs;
 };
 
 /* Una medicion o reporte del autotest del PSoC. Los dos int32 significan
@@ -364,7 +382,27 @@ public:
     void forcePi(uint8_t seconds);
     void sdStatus(uint8_t reinit);   /* consulta/re-init de la SD del PSoC (0xBC) */
     void sdTest();                   /* self-test de bloque en la SD del PSoC (0xBD) */
+    void sdProbe(uint8_t modo, uint8_t div, uint8_t slew)
+    {
+        if (_ser == nullptr) { return; }
+        const uint8_t f[6] = {
+            PSOC_FRAME_MARKER, PSOC_CMD_SD_PROBE, modo, div, slew,
+            (uint8_t)(PSOC_CMD_SD_PROBE ^ modo ^ div ^ slew)
+        };
+        _ser->write(f, sizeof(f));
+    }
     void sdCapture(uint8_t enable);  /* modo captura a SD del PSoC (0xBE) */
+    void liveMode(uint8_t mode)      { _sendCmd1(PSOC_CMD_LIVE_MODE, mode); }
+    void liveAck(uint16_t batch, uint8_t flags)
+    {
+        if (_ser == nullptr) { return; }
+        const uint8_t lo = (uint8_t)(batch & 0xFFu), hi = (uint8_t)(batch >> 8);
+        const uint8_t f[6] = {
+            PSOC_FRAME_MARKER, PSOC_CMD_LIVE_ACK, lo, hi, flags,
+            (uint8_t)(PSOC_CMD_LIVE_ACK ^ lo ^ hi ^ flags)
+        };
+        _ser->write(f, sizeof(f));
+    }
     void sdReadBatch(uint16_t index);/* lectura bajo demanda desde GEOLAST.BIN (0xBF) */
     void adcSnapshot();
     void blinkLed();             /* pide al PSoC titilar su LED (identificación) */
@@ -403,7 +441,7 @@ private:
     BatchCallback   _cb        = nullptr;
     DiagCallback    _diagCb    = nullptr;
     SelfTestCallback _stCb     = nullptr;
-    uint8_t         _buf[PSOC_FRAME_BYTES];
+    uint8_t         _buf[PSOC_LIVE_FRAME_BYTES];
     uint16_t        _idx       = 0;
     bool            _lastOK    = false;
     uint32_t        _batchesOK = 0;
@@ -434,6 +472,18 @@ private:
     static volatile uint16_t _i2cHead;
     static volatile uint16_t _i2cTail;
     static volatile uint32_t _i2cOverruns;
+    struct I2cRxStamp {
+        uint64_t us;
+        uint32_t endBytes;
+    };
+    static constexpr uint8_t I2C_STAMP_RING = 16u;
+    static volatile I2cRxStamp _i2cStamps[I2C_STAMP_RING];
+    static volatile uint8_t  _i2cStampHead;
+    static volatile uint8_t  _i2cStampTail;
+    static volatile uint32_t _i2cBytesEnqueued;
+    static volatile uint32_t _i2cBytesConsumed;
+    static volatile uint32_t _i2cStampOverruns;
+    uint64_t _rxByteUs = 0;
     static void _onI2cReceive(int count);
 
     bool _rxAvailable();

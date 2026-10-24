@@ -7,6 +7,12 @@
  */
 
 #include <Arduino.h>
+#include "sync_protocol.h"
+
+namespace live {
+void noteRadioTxStart(size_t len);
+void noteRadioTxDone(uint64_t t1Us);
+}
 
 #if defined(ESP8266)
   #include <ESP8266WiFi.h>
@@ -44,11 +50,17 @@
 
   static inline esp_err_t espnowSend(const uint8_t *mac, const uint8_t *data, size_t len)
   {
-      return esp_now_send((uint8_t *)mac, (uint8_t *)data, (uint8_t)len);
+      uint8_t buf[ESPNOW_MAX_PAYLOAD];
+      const int n = geonetWrap(buf, data, (int)len);
+      if (n == 0) return 1;
+      const esp_err_t err = esp_now_send((uint8_t *)mac, buf, (uint8_t)n);
+      if (err == ESP_OK) live::noteRadioTxStart(len);
+      return err;
   }
 #else
   #include <WiFi.h>
   #include <esp_now.h>
+  #include <esp_timer.h>
 
   static inline uint8_t espnowCurrentChannel()
   {
@@ -74,8 +86,14 @@
       return esp_now_add_peer(&peer) == ESP_OK;
   }
 
+  /* Toda trama sale con la marca de red (sync_protocol.h). */
   static inline esp_err_t espnowSend(const uint8_t *mac, const uint8_t *data, size_t len)
   {
-      return esp_now_send(mac, data, len);
+      uint8_t buf[ESPNOW_MAX_PAYLOAD];
+      const int n = geonetWrap(buf, data, (int)len);
+      if (n == 0) return ESP_ERR_INVALID_ARG;
+      const esp_err_t err = esp_now_send(mac, buf, (size_t)n);
+      if (err == ESP_OK) live::noteRadioTxStart(len);
+      return err;
   }
 #endif

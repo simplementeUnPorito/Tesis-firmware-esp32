@@ -29,6 +29,8 @@
 #define CMD_BLINK_LED   0x70  /* master → esclavo unicast: titilar LED para identificación */
 #define CMD_SAVE_EEPROM 0x71  /* master → esclavo unicast: guardar config PSoC en EEPROM */
 #define CMD_SELECT_STREAM 0x72 /* master → esclavo unicast: 0=crudo, 1=FIR hardware */
+#define CMD_STREAM_ACK  0x73  /* master → esclavo: tiempo real, lotes ya entregados */
+#define CMD_STREAM_END  0x74  /* esclavo → master: tiempo real, la captura cerro */
 #define CMD_CAL_VDAC_STAGE_BASE       0x80 /* esclavo -> maestro ACK auxiliar: 0x80..0x83 stage VDAC code */
 #define CMD_CAL_TARGET_MV_HI_BASE     0x84 /* 0x84..0x87 signed int16 target mV high byte */
 #define CMD_CAL_TARGET_MV_LO_BASE     0x88 /* 0x88..0x8B signed int16 target mV low byte */
@@ -84,9 +86,14 @@ struct MsgDebug  { uint8_t cmd; uint8_t enable; };
 
 #define DATA_PKT_MARKER  0xBC
 
-/* SampleBytes.flags: marcas de interferencia conocida (ver PSoC sd_mark). */
-#define SAMPLE_FLAG_SD_WRITE 0x01u   /* el PSoC empezó una escritura a SD */
-#define SAMPLE_FLAG_SD_SYNC  0x02u   /* el PSoC hizo f_sync (FAT + directorio) */
+/* SampleBytes.flags: interferencias conocidas durante captura en vivo. */
+#define SAMPLE_FLAG_SD_IO      0x01u   /* acceso SPI a la SD del ESP esclavo */
+#define SAMPLE_FLAG_SD_WRITE   SAMPLE_FLAG_SD_IO
+#define SAMPLE_FLAG_SD_SYNC    0x02u   /* flush de la SD del ESP esclavo */
+#define SAMPLE_FLAG_RADIO_TX   0x04u   /* transmision ESP-NOW del esclavo */
+#define SAMPLE_FLAG_I2C        0x08u   /* trama I2C del PSoC al ESP */
+#define SAMPLE_FLAG_AP_BEACON  0x10u   /* beacon del AP GeoNetwork */
+#define SAMPLE_FLAG_MASTER_RX  0x20u   /* trama ESP-NOW recibida del maestro */
 #define SAMPLES_PER_PART 15
 
 struct SampleBytes {
@@ -106,6 +113,42 @@ struct MsgData {
     uint64_t    timestamp_us;
     SampleBytes samples[SAMPLES_PER_PART];
     uint8_t     crc;
+};
+
+/* Tiempo real: igual que MsgData pero con lote de 32 bits, porque una captura
+ * sin limite pasa los 65535 lotes (12,6 min a 2604 Hz). */
+#define DATA32_PKT_MARKER 0xBD
+struct MsgData32 {
+    uint8_t     marker;
+    uint8_t     node_id;
+    uint32_t    seq;
+    uint8_t     part;
+    uint8_t     n_samples;
+    uint64_t    timestamp_us;
+    SampleBytes samples[SAMPLES_PER_PART];
+    uint8_t     crc;
+};
+
+/* El maestro confirma estilo TCP: todo lo anterior a next_expected llego y se
+ * entrego a la web; el bit i de sack dice que llego next_expected + 1 + i. El
+ * esclavo libera lo confirmado y reenvia los huecos. */
+struct MsgStreamAck {
+    uint8_t  cmd;            /* CMD_STREAM_ACK */
+    uint8_t  node_id;
+    uint32_t next_expected;
+    uint32_t sack;
+};
+
+#define STREAM_END_COMPLETE  0u  /* llego al N pedido */
+#define STREAM_END_STOP      1u  /* STOP del usuario */
+#define STREAM_END_NO_MEMORY 2u  /* el esclavo se quedo sin donde guardar */
+#define STREAM_END_SD_FULL   3u
+#define STREAM_END_ERROR     4u
+struct MsgStreamEnd {
+    uint8_t  cmd;            /* CMD_STREAM_END */
+    uint8_t  node_id;
+    uint32_t total;          /* lotes de la captura; el ultimo es total-1 */
+    uint8_t  reason;         /* STREAM_END_* */
 };
 
 struct MsgStatus {
@@ -168,6 +211,11 @@ struct MsgHello {
     uint8_t  ctl_status;  /* SLAVE_CTL_*; aditivo, solo lo llena la placa I2C. */
     uint8_t  pga_code;    /* código de PGA confirmado por el PSoC (0xFF = sin dato) */
     uint8_t  pgaout_code; /* código de PGAout confirmado (0xFF = no existe / sin dato) */
+    uint32_t ram_batches; /* lotes que entran en RAM (PSoC + ESP) en una captura; aditivo */
+    uint32_t sd_batches;  /* lotes que entran en la SD del ESP; 0 = sin SD; aditivo */
+    uint8_t  reset_reason; /* esp_reset_reason() del ultimo arranque (9 = caida de
+                            * tension); aditivo: detecta esclavos que se reinician */
+    uint32_t uptime_s;     /* segundos desde el arranque; aditivo */
 };
 
 struct MsgSetRecLen {
@@ -185,9 +233,19 @@ struct MsgScopeStart {
     uint8_t cmd;        /* CMD_SCOPE_START */
 };
 
+/* Modo de captura: bits 0-1 almacenamiento, bit 2 tiempo real. Viaja al final
+ * de PRESTART; un PRESTART viejo de 3 bytes llega con modo 0 (el clasico). */
+#define CAPMODE_STORAGE_MASK   0x03u
+#define CAPMODE_STORAGE_PSOC   0u   /* solo RAM del PSoC */
+#define CAPMODE_STORAGE_SHARED 1u   /* RAM del PSoC + RAM del ESP */
+#define CAPMODE_STORAGE_SD     2u   /* RAM del PSoC + RAM del ESP + SD del ESP */
+#define CAPMODE_REALTIME       0x04u
+#define CAPMODE_STREAM_DUMP    0x08u /* asincronico: descarga por tiempo real al terminar */
+
 struct MsgPrestart {
     uint8_t  cmd;       /* CMD_PRESTART */
-    uint16_t n_batches;
+    uint16_t n_batches; /* 0 en tiempo real = sin limite */
+    uint8_t  mode;      /* CAPMODE_*; aditivo */
 };
 
 struct MsgHotWaitQuery {
@@ -220,3 +278,28 @@ struct MsgSelectStream {
 };
 
 #pragma pack(pop)
+
+/* Marca de red: toda trama ESP-NOW del sistema lleva al final estos 2 bytes
+ * (FNV-1a de "GeoNetwork", 0x1E5746E0). El que recibe descarta lo que no la
+ * tiene y la saca antes de procesar, asi los structs no cambian. Sin esto, el
+ * ESP-NOW de otro equipo al alcance se tomaba como maestro o como esclavo
+ * (2026-10-23: un "esclavo 4" fantasma y el ARM_ACK mandado a una MAC ajena). */
+#define GEONET_TAG0    0xE0u
+#define GEONET_TAG1    0x46u
+#define GEONET_TAG_LEN 2
+#define ESPNOW_MAX_PAYLOAD 250
+
+static inline bool geonetTagged(const uint8_t *d, int len)
+{
+    return len > GEONET_TAG_LEN && d[len - 2] == GEONET_TAG0 && d[len - 1] == GEONET_TAG1;
+}
+
+/* Copia la trama a buf con la marca; devuelve el largo o 0 si no entra. */
+static inline int geonetWrap(uint8_t *buf, const uint8_t *data, int len)
+{
+    if (len < 0 || len + GEONET_TAG_LEN > ESPNOW_MAX_PAYLOAD) return 0;
+    for (int i = 0; i < len; i++) buf[i] = data[i];
+    buf[len] = GEONET_TAG0;
+    buf[len + 1] = GEONET_TAG1;
+    return len + GEONET_TAG_LEN;
+}

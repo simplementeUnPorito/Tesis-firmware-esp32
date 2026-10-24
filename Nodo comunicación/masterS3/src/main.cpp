@@ -23,9 +23,6 @@
  */
 
 #include <Arduino.h>
-#if !defined(CONFIG_IDF_TARGET_ESP32S3)
-#error "masterS3 requiere ESP32-S3; usar master para ESP32 clasico"
-#endif
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
@@ -38,6 +35,7 @@
 #include "debug_log.h"
 #include "web_server.h"
 #include "link_mode.h"
+#include "rt_stream.h"
 #include "../../scope_measurement.h"
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
@@ -85,8 +83,10 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
 #ifndef HOTWAIT_QUERY_TIMEOUT_MS
   #define HOTWAIT_QUERY_TIMEOUT_MS 120
 #endif
+/* El esclavo reintenta el SETN al PSoC hasta 4 veces de 500 ms: el maestro
+ * tiene que esperar mas que eso antes de saltear el nodo (2026-10-23). */
 #ifndef HOTWAIT_QUERY_RETRIES
-  #define HOTWAIT_QUERY_RETRIES 3
+  #define HOTWAIT_QUERY_RETRIES 20
 #endif
 #ifndef HOTWAIT_SETTLE_MS
   #define HOTWAIT_SETTLE_MS 50
@@ -130,7 +130,7 @@ static const uint8_t ESPNOW_BROADCAST[6] = {
   #define AP_KEEP_BEACON_DURING_CAPTURE 0
 #endif
 #ifndef WIFI_TX_POWER_QDBM
-  #define WIFI_TX_POWER_QDBM 78
+  #define WIFI_TX_POWER_QDBM 84   /* maximo del ESP32 (el chip la limita a 78) */
 #endif
 
 /* MACs de los esclavos — actualizar con las MACs reales */
@@ -143,7 +143,9 @@ static const uint8_t SLAVE_MACS[NUM_SLAVES][6] = {
 /* ── Pin GPIO de scope ────────────────────────────────────────────────────────
  * SYNC_OUT_PIN es SOLO marcador de osciloscopio: NO está cableado a los esclavos
  * (el START real viaja por ESP-NOW). Se compila a nada si DEBUG_HARDWARE=0. */
-#define SYNC_OUT_PIN 7
+#ifndef SYNC_OUT_PIN
+#define SYNC_OUT_PIN 25
+#endif
 #define LED_PIN      2    /* GPIO2 = LED azul integrado ESP32-DevKitC V4 */
 
 #if DEBUG_HARDWARE
@@ -187,6 +189,71 @@ static bool              g_hotWaitQueryInFlight = false;
 static bool              g_hotWaitSettling = false;
 static uint32_t          g_hotWaitQueryMs = 0;
 static uint32_t          g_hotWaitSettleDueMs = 0;
+
+/* Rafaga RF de banco (cmd USB 0xC1): trafico ESP-NOW sintetico no bloqueante. */
+static bool              g_rfBurstArmed = false;
+static uint32_t          g_rfBurstStartMs = 0;
+static uint32_t          g_rfBurstDurationMs = 0;
+static uint32_t          g_rfBurstNextTxMs = 0;
+static uint32_t          g_rfBurstCounter = 0;
+static uint32_t          g_rfBurstSent = 0;
+
+static void stopRfBurst()
+{
+    if (!g_rfBurstArmed) return;
+    g_rfBurstArmed = false;
+    MASTER_LOG_PRINTF("[MASTER] RFBURST fin enviadas=%lu\n",
+                      (unsigned long)g_rfBurstSent);
+}
+
+static void armRfBurst(uint16_t duration10Ms)
+{
+    if (duration10Ms == 0) {
+        stopRfBurst();
+        return;
+    }
+
+    uint32_t now = millis();
+    g_rfBurstArmed = true;
+    g_rfBurstStartMs = now;
+    g_rfBurstDurationMs = (uint32_t)duration10Ms * 10u;
+    g_rfBurstNextTxMs = now;
+    g_rfBurstCounter = 0;
+    g_rfBurstSent = 0;
+    MASTER_LOG_PRINTF("[MASTER] RFBURST inicio N=%u duracion_ms=%lu\n",
+                      duration10Ms, (unsigned long)g_rfBurstDurationMs);
+}
+
+static void serviceRfBurst()
+{
+    if (!g_rfBurstArmed) return;
+
+    uint32_t now = millis();
+    if ((uint32_t)(now - g_rfBurstStartMs) >= g_rfBurstDurationMs) {
+        stopRfBurst();
+        return;
+    }
+    if (!g_espnowReady || (int32_t)(now - g_rfBurstNextTxMs) < 0) return;
+
+    uint8_t payload[240];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(0x5A ^ i);
+    }
+    payload[0] = 'R';
+    payload[1] = 'F';
+    payload[2] = 'B';
+    payload[3] = '1';
+    payload[4] = (uint8_t)(g_rfBurstCounter & 0xFFu);
+    payload[5] = (uint8_t)((g_rfBurstCounter >> 8) & 0xFFu);
+    payload[6] = (uint8_t)((g_rfBurstCounter >> 16) & 0xFFu);
+    payload[7] = (uint8_t)((g_rfBurstCounter >> 24) & 0xFFu);
+
+    if (geonetSend(ESPNOW_BROADCAST, payload, sizeof(payload)) == ESP_OK) {
+        g_rfBurstSent++;
+    }
+    g_rfBurstCounter++;
+    g_rfBurstNextTxMs = now + 58u;
+}
 
 struct StartProbePending {
     bool active;
@@ -251,6 +318,15 @@ static bool     g_viewDump = false;            /* dump de un solo nodo tras VIEW
 
 /* ── Objetos ─────────────────────────────────────────────────────────────── */
 static EspNowRx       espnowRx;
+/* Captura en tiempo real (rt_stream.h) y modo pedido por la web/USB (0xAF). */
+static RtStream       g_rt;
+static uint32_t       g_rtStopReqMs = 0;   /* STOP pedido en modo stream; 0 = no */
+static uint8_t        g_capMode = 0u;
+static bool capModeRealtime() { return (g_capMode & CAPMODE_REALTIME) != 0u; }
+static bool capModeStreams()
+{
+    return capModeRealtime() || (g_capMode & CAPMODE_STREAM_DUMP) != 0u;
+}
 static MatlabTransport matlab;
 
 struct CachedHello {
@@ -263,6 +339,10 @@ struct CachedHello {
     uint8_t ctl_status = SLAVE_CTL_UNKNOWN;
     uint8_t pga_code = 0xFF;
     uint8_t pgaout_code = 0xFF;
+    uint32_t ram_batches = 0;
+    uint32_t sd_batches = 0;
+    uint8_t reset_reason = 0xFFu;
+    uint32_t uptime_s = 0;
     uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
 };
 static CachedHello g_cachedHello[NUM_SLAVES + 1];
@@ -427,7 +507,9 @@ static void sendCachedStateToWeb()
         if (h.valid) {
             matlab.sendHelloNotif(node, h.psoc_ok, h.mac, h.sample_rate,
                                   h.hw_class, h.sd_present, h.link_model,
-                                  h.ctl_status, h.pga_code, h.pgaout_code);
+                                   h.ctl_status, h.pga_code, h.pgaout_code,
+                                   h.ram_batches, h.sd_batches,
+                                   h.reset_reason, h.uptime_s);
         }
     }
     MASTER_LOG_PRINTLN("[WEB] cached READY/HELLO replay sent");
@@ -570,7 +652,7 @@ static void onCfgAck(const MsgCfgAck &msg)
             suppressForward = true;   /* retry tardío: ya estamos en DUMPING/ARMED */
         }
         if (msg.node_id > 0 && msg.node_id <= NUM_SLAVES &&
-            msg.ok == 2 && g_state == RUNNING) {
+            msg.ok == 2 && g_state == RUNNING && !capModeStreams()) {
             uint32_t bit = (1UL << msg.node_id);
             if (g_armAckMask & bit) {
                 suppressForward = (g_captureDoneMask & bit) != 0;
@@ -654,12 +736,18 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
         h.ctl_status = msg.ctl_status;
         h.pga_code = msg.pga_code;
         h.pgaout_code = msg.pgaout_code;
+        h.ram_batches = msg.ram_batches;
+        h.sd_batches = msg.sd_batches;
+        h.reset_reason = msg.reset_reason;
+        h.uptime_s = msg.uptime_s;
         memcpy(h.mac, senderMac, 6);
         if (isUsableUnicastMac(h.mac)) addPeerIfNeeded(h.mac);
     }
     matlab.sendHelloNotif(msg.node_id, msg.psoc_ok, senderMac, msg.sample_rate,
                           msg.hw_class, msg.sd_present, msg.link_model,
-                          msg.ctl_status, msg.pga_code, msg.pgaout_code);
+                          msg.ctl_status, msg.pga_code, msg.pgaout_code,
+                          msg.ram_batches, msg.sd_batches,
+                          msg.reset_reason, msg.uptime_s);
 }
 
 static void onStartAck(const MsgStartAck &msg)
@@ -711,7 +799,10 @@ static void onHotWaitAck(const MsgHotWaitAck &msg)
                       (unsigned)g_hotWaitAckMask);
     /* NACK espontáneo del watchdog HOT_WAIT del esclavo con captura en curso:
      * ese nodo ya no va a capturar nada, abortar limpio. */
-    if (!msg.ok && g_state == RUNNING) {
+    /* Un "todavia no listo" (state HOT_WAIT=2 o SAMPLING=3 en el esclavo)
+     * puede llegar tarde, ya en RUNNING: no es un aborto. El aborto real
+     * viene con el esclavo fuera de captura. */
+    if (!msg.ok && g_state == RUNNING && msg.state != 2u && msg.state != 3u) {
         abortCaptureToArmed(msg.node_id, "hotwait_abort");
     }
 }
@@ -720,17 +811,24 @@ static void requestBatch(uint8_t nodeId, uint16_t seq)
 {
     const uint8_t *dst = espnowDstForSlave(nodeId);
     MsgReqBatch msg = { CMD_REQ_BATCH, nodeId, seq };
-    if (g_espnowReady) { esp_now_send(dst, (uint8_t *)&msg, sizeof(msg)); }
+    if (g_espnowReady) { geonetSend(dst, (uint8_t *)&msg, sizeof(msg)); }
     MASTER_LOG_PRINTF("[MASTER] REQ_BATCH node=%d seq=%d\n", nodeId, seq);
 }
 
 static uint16_t effectiveSampleRateHz()
 {
+    uint16_t minFs = 0;
     for (uint8_t i = 1; i <= NUM_SLAVES; i++) {
-        if (g_cachedHello[i].valid && g_cachedHello[i].sample_rate > 0)
-            return g_cachedHello[i].sample_rate;
+        if ((g_armAckMask & (1UL << i)) == 0u) continue;
+        if (g_cachedHello[i].valid && g_cachedHello[i].sample_rate > 0 &&
+            (minFs == 0u || g_cachedHello[i].sample_rate < minFs)) {
+            minFs = g_cachedHello[i].sample_rate;
+        }
     }
-    return ADC_SAMPLE_RATE_HZ;
+    if (minFs != 0u) return minFs;
+    const uint8_t decim = (g_wantDecim >= 1u) ? g_wantDecim : 1u;
+    const uint16_t fallback = (uint16_t)(ADC_SAMPLE_RATE_HZ / decim);
+    return (fallback != 0u) ? fallback : 1u;
 }
 
 static uint32_t captureDurationMs(uint16_t nBatches)
@@ -884,7 +982,7 @@ static void sendStartProbe(uint8_t nodeId)
     g_startCmdTxUs   = (uint32_t)micros();
     rememberStartProbe(nodeId, g_startCmdToken, g_startCmdTxUs);
     esp_err_t err = g_espnowReady
-                  ? esp_now_send(dst, (uint8_t *)&msg, sizeof(msg))
+                  ? geonetSend(dst, (uint8_t *)&msg, sizeof(msg))
                   : ESP_FAIL;
     matlab.sendAck(nodeId, 0xAF, err == ESP_OK ? 1 : 0);
     MASTER_LOG_PRINTF("[MASTER] START_PROBE node=%d token=%u err=%d\n",
@@ -971,7 +1069,7 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
     esp_err_t err;
     if (sub_cmd == 0xA7) {
         MsgDebugNode msg = { CMD_DEBUG_NODE, node_id, param };
-        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        err = geonetSend(dst, (uint8_t *)&msg, sizeof(msg));
     } else if (sub_cmd == 0xB2) {
         /* "Ver": captura única de N lotes. El esclavo guarda en RAM (sin RF durante
          * el muestreo) y luego el maestro hace dump vía REQ_BATCH. */
@@ -989,23 +1087,23 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
         g_dumpWaitingForWeb = false;
         dumpDeliveryGuardReset();
         MsgView msg = { CMD_VIEW, node_id, n };
-        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        err = geonetSend(dst, (uint8_t *)&msg, sizeof(msg));
         g_captureDumpDueMs = 0;      /* el dump arranca solo con VIEW_DONE del esclavo */
         g_captureDoneMask = 0;
         LOGM("VIEW", "node=%d,n=%u,store=1,wait_done=1", node_id, msg.n);
     } else if (sub_cmd == 0xB3) {
         MsgDebugPsoc msg = { CMD_DEBUG_PSOC, node_id, param };
-        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        err = geonetSend(dst, (uint8_t *)&msg, sizeof(msg));
         LOGM("DBGPSOC", "node=%d,en=%d", node_id, param);
     } else if (sub_cmd == CMD_BLINK_LED) {
         /* LED blink: no pasa por PSoC, mensaje propio */
         MsgBlinkLed msg = { CMD_BLINK_LED, node_id };
-        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        err = geonetSend(dst, (uint8_t *)&msg, sizeof(msg));
         LOGM("BLINK_LED", "node=%d", node_id);
     } else {
         /* SaveEEPROM (0xB6) y SelectStream (0xB7) van por MsgSetConfig igual que calibrate */
         MsgSetConfig msg = { CMD_SET_CONFIG, node_id, sub_cmd, param, param2 };
-        err = esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        err = geonetSend(dst, (uint8_t *)&msg, sizeof(msg));
     }
     if (err != ESP_OK) {
         matlab.sendAck(node_id, sub_cmd, 0);
@@ -1078,7 +1176,7 @@ static void broadcastRecordLength(uint16_t nBatches)
 {
     MsgSetRecLen msg = { CMD_SET_RECLEN, nBatches };
     if (g_espnowReady) {
-        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+        geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] SET_RECLEN=%u\n", nBatches);
 
@@ -1089,7 +1187,7 @@ static void broadcastRecordLength(uint16_t nBatches)
         uint16_t n = nBatchesForNode(node);
         if (n == nBatches) continue;
         MsgSetRecLen m = { CMD_SET_RECLEN, n };
-        esp_now_send(espnowDstForSlave(node), (uint8_t *)&m, sizeof(m));
+        geonetSend(espnowDstForSlave(node), (uint8_t *)&m, sizeof(m));
         MASTER_LOG_PRINTF("[MASTER] SET_RECLEN node=%u n=%u (hammer)\n", node, n);
     }
 }
@@ -1127,9 +1225,9 @@ static void abortDump(const char *reason)
 
 static void broadcastPrestart(uint16_t nBatches)
 {
-    MsgPrestart msg = { CMD_PRESTART, nBatches };
+    MsgPrestart msg = { CMD_PRESTART, nBatches, g_capMode };
     if (g_espnowReady) {
-        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+        geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] PRESTART sent n=%u\n", nBatches);
 
@@ -1139,8 +1237,8 @@ static void broadcastPrestart(uint16_t nBatches)
     for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
         uint16_t n = nBatchesForNode(node);
         if (n == nBatches) continue;
-        MsgPrestart m = { CMD_PRESTART, n };
-        esp_now_send(espnowDstForSlave(node), (uint8_t *)&m, sizeof(m));
+        MsgPrestart m = { CMD_PRESTART, n, g_capMode };
+        geonetSend(espnowDstForSlave(node), (uint8_t *)&m, sizeof(m));
         MASTER_LOG_PRINTF("[MASTER] PRESTART node=%u n=%u (hammer)\n", node, n);
     }
 }
@@ -1150,7 +1248,7 @@ static void sendHotWaitQuery(uint8_t nodeId)
     const uint8_t *dst = espnowDstForSlave(nodeId);
     MsgHotWaitQuery msg = { CMD_HOTWAIT_QUERY, nodeId };
     if (g_espnowReady) {
-        esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+        geonetSend(dst, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] HOTWAIT_QUERY node=%d retry=%d\n",
                       nodeId, g_hotWaitRetries);
@@ -1164,7 +1262,7 @@ static void broadcastArm()
     }
     MsgArm msg = { CMD_ARM };
     if (g_espnowReady) {
-        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+        geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTLN("[MASTER] ARM enviado");
 }
@@ -1180,7 +1278,7 @@ static void broadcastStart()
     MsgStart msg = { CMD_START, g_t_start_us, 0 };
     if (g_espnowReady) {
         g_startCmdTxUs = (uint32_t)micros();
-        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+        geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] START t0=%llu\n", g_t_start_us);
 }
@@ -1190,7 +1288,7 @@ static void broadcastScopeStart()
     debugEspHardwareStartPulse();
     MsgScopeStart msg = { CMD_SCOPE_START };
     if (g_espnowReady) {
-        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+        geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTLN("[MASTER] SCOPE_START");
 }
@@ -1199,7 +1297,7 @@ static void broadcastDebug(uint8_t enable)
 {
     MsgDebug msg = { CMD_DEBUG, enable ? (uint8_t)1 : (uint8_t)0 };
     if (g_espnowReady) {
-        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+        geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTF("[MASTER] DEBUG broadcast=%u\n", (unsigned)enable);
 }
@@ -1209,7 +1307,7 @@ static void broadcastStop()
     syncOutWrite(LOW);
     MsgStop msg = { CMD_STOP };
     if (g_espnowReady) {
-        esp_now_send(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
+        geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
     MASTER_LOG_PRINTLN("[MASTER] STOP enviado");
 }
@@ -1321,7 +1419,7 @@ static void finishPrestartAction()
             MsgStart msg = { CMD_START, g_t_start_us, g_viewNode };
             if (g_espnowReady) {
                 g_startCmdTxUs = (uint32_t)micros();
-                esp_now_send(dst, (uint8_t *)&msg, sizeof(msg));
+                geonetSend(dst, (uint8_t *)&msg, sizeof(msg));
             }
         }
         scheduleCaptureDumpTimeout(g_rec_n_batches, "view");
@@ -1334,7 +1432,7 @@ static void finishPrestartAction()
         /* No modificar g_armedCount: intentar dump desde todos los slaves ARM'd.
            Los que no grabaron responderán NACK y se saltean via retry. */
         g_armedCount = countArmAcks(g_armAckMask);
-        if (g_rec_n_batches == 0 || g_armedCount == 0 || g_armAckMask == 0) {
+        if ((g_rec_n_batches == 0 && !capModeRealtime()) || g_armedCount == 0 || g_armAckMask == 0) {
             MASTER_LOG_PRINTF("[MASTER] START rejected after PRESTART n=%u armed=%u mask=0x%08lX\n",
                               g_rec_n_batches, g_armedCount,
                               (unsigned long)g_armAckMask);
@@ -1345,8 +1443,17 @@ static void finishPrestartAction()
         }
         g_captureDoneMask = 0;
         matlab.sendReady(g_armedCount);
+        if (capModeStreams()) {
+            /* Antes del START: los primeros lotes llegan enseguida. */
+            g_rtStopReqMs = 0;
+            if (!g_rt.start(g_armAckMask)) {
+                MASTER_LOG_PRINTLN("[MASTER] RT sin RAM: captura cancelada");
+                abortCaptureToArmed(0, "rt_no_ram");
+                return;
+            }
+        }
         broadcastStart();
-        scheduleStoreDump(g_rec_n_batches);
+        if (!capModeStreams()) scheduleStoreDump(g_rec_n_batches);
         g_state = RUNNING;
         matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
         MASTER_LOG_PRINTF("[MASTER] HOT_WAIT done (ready=%u/armed=%u) -> RUNNING\n",
@@ -1401,10 +1508,7 @@ static void onBatchReady(const ReassembledBatch &batch)
                     | ((int32_t)s.digi1 << 8)
                     | ((int32_t)s.digi2 << 16);
         if (val & 0x800000) val |= (int32_t)0xFF000000;
-        if (s.flags & (SAMPLE_FLAG_SD_WRITE | SAMPLE_FLAG_SD_SYNC)) {
-            matlab.sendSampleMark(batch.node_id,
-                                  s.flags & (SAMPLE_FLAG_SD_WRITE | SAMPLE_FLAG_SD_SYNC));
-        }
+        if (s.flags != 0u) matlab.sendSampleMark(batch.node_id, s.flags);
         matlab.sendSample(batch.node_id, val);
         samplePulse();
     }
@@ -1440,6 +1544,56 @@ static void onBatchReady(const ReassembledBatch &batch)
         }
     }
 }
+
+/* ── Tiempo real ─────────────────────────────────────────────────────────── */
+
+/* Mismo envio que onBatchReady: 30 muestras de 24 bits por lote. */
+static void rtEmit(uint8_t node, const SampleBytes *s, uint32_t seq)
+{
+    (void)seq;
+    for (int i = 0; i < SAMPLES_PER_PART * 2; i++) {
+        int32_t val = (int32_t)s[i].digi0 | ((int32_t)s[i].digi1 << 8) |
+                      ((int32_t)s[i].digi2 << 16);
+        if (val & 0x800000) val |= (int32_t)0xFF000000;
+        if (s[i].flags != 0u) matlab.sendSampleMark(node, s[i].flags);
+        matlab.sendSample(node, val);
+    }
+}
+
+/* Contrapresion solo si hay un navegador recibiendo: uno conectado pero
+ * callado no puede frenar la entrega por USB (lo que no le llega lo
+ * recupera de la copia .geoq, como en el volcado). */
+static bool rtReady()
+{
+    /* Contrapresion de la web, pero con limite: una pestana en segundo plano
+     * (Chrome la frena) o un socket medio muerto que el maestro cree vivo
+     * congelaban el tiempo real para siempre (2026-10-23). Pasados 10 s sin
+     * poder entregar se sigue igual; la copia .geoq del maestro guarda todo. */
+    static uint32_t s_blockedSinceMs = 0;
+    static bool s_warned = false;
+    if (!webRelayHasActiveClient() || webRelayReadyForDumpRequest(false)) {
+        s_blockedSinceMs = 0;
+        s_warned = false;
+        return true;
+    }
+    const uint32_t now = millis();
+    if (s_blockedSinceMs == 0) s_blockedSinceMs = now | 1u;
+    if ((now - s_blockedSinceMs) < 10000u) return false;
+    if (!s_warned) {
+        s_warned = true;
+        MASTER_LOG_PRINTLN("[MASTER] RT: la web no consume hace 10 s; entrego sin esperarla");
+    }
+    return true;
+}
+
+static void rtAck(uint8_t node, uint32_t next, uint32_t sack)
+{
+    MsgStreamAck a = { CMD_STREAM_ACK, node, next, sack };
+    if (g_espnowReady) geonetSend(espnowDstForSlave(node), (uint8_t *)&a, sizeof(a));
+}
+
+static void rtOnData(const uint8_t *data, int len) { g_rt.onFrame(data, len); }
+static void rtOnEnd(const MsgStreamEnd &e) { g_rt.onEnd(e); }
 
 /* ── Procesar comandos de MATLAB ─────────────────────────────────────────── */
 
@@ -1485,7 +1639,9 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
             uint16_t requestedBatches = clampRecordBatches(rxCmd.value);
             g_armedCount = countArmAcks(g_armAckMask);
             bool stateOk = (g_state == IDLE || g_state == ARMED || g_state == ARMING);
-            if (!stateOk || requestedBatches == 0 || g_armedCount == 0 || g_armAckMask == 0) {
+            /* N = 0 en tiempo real es "sin limite": termina con STOP. */
+            const bool nOk = requestedBatches != 0 || capModeRealtime();
+            if (!stateOk || !nOk || g_armedCount == 0 || g_armAckMask == 0) {
                 MASTER_LOG_PRINTF("[MASTER] START rejected state=%d n=%u armed=%u mask=0x%08lX\n",
                                   (int)g_state, requestedBatches, g_armedCount,
                                   (unsigned long)g_armAckMask);
@@ -1516,6 +1672,14 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
         }
 
         case 0xA4:   /* STOP */
+            if (capModeStreams()) {
+                /* Camino stream: los esclavos cortan y siguen pasando lo
+                 * pendiente; se cierra con sus STREAM_END, sin volcado. */
+                broadcastStop();
+                if (g_rt.active()) g_rtStopReqMs = millis() | 1u;
+                matlab.sendAck(0xFF, cmd, 0);
+                break;
+            }
             g_viewNode = 0;
             g_viewBatchesRemaining = 0;
             g_captureDumpDueMs = 0;
@@ -1526,6 +1690,15 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
             broadcastStop();
             g_state = STOPPING;
             matlab.sendAck(0xFF, cmd, 0);
+            break;
+
+        case 0xAF:   /* modo de captura: CAPMODE_* */
+            if (g_state == IDLE || g_state == ARMED || g_state == ARMING) {
+                g_capMode = param & (CAPMODE_STORAGE_MASK | CAPMODE_REALTIME |
+                                     CAPMODE_STREAM_DUMP);
+            }
+            matlab.sendAck(0xFF, cmd, g_capMode);
+            MASTER_LOG_PRINTF("[MASTER] capmode=0x%02X\n", g_capMode);
             break;
 
         case 0xA5:   /* STATUS */
@@ -1602,6 +1775,11 @@ static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = 
             MASTER_LOG_PRINTF("[MASTER] SET_RECLEN_HAMMER=%u\n", g_rec_n_batches_hammer);
             break;
         }
+
+        case 0xC1:   /* RFBURST: N unidades de 10 ms; 0 = parar */
+            armRfBurst(rxCmd.value);
+            matlab.sendAck(0xFF, 0xC1, (uint8_t)(rxCmd.value & 0xFFu));
+            break;
 
         case 0xC0: {  /* ENLACE: param=1 subir ahora, param=0 auto on/off por value */
             if (param == 0) {
@@ -1801,6 +1979,8 @@ void setup()
     }
 
     /* ESP-NOW (convive con AP mode) */
+    g_rt.begin(rtEmit, rtReady, rtAck);
+    espnowRx.setRtHandlers(rtOnData, rtOnEnd);
     if (!espnowRx.begin(onBatchReady, onArmAck, onSlaveStatus, onCfgAck,
                         onHello, onStartAck, onHotWaitAck)) {
         MASTER_LOG_PRINTLN("[MASTER] ESP-NOW FAIL - USB test continues");
@@ -1832,6 +2012,7 @@ void setup()
 void loop()
 {
     debugEspHardwareService();
+    serviceRfBurst();
 
     /* Fase ENLACE: ESP-NOW esta abajo (no hay esclavos que atender) pero la SPA
      * y los endpoints /enlace/* siguen vivos sobre la red del cliente — es toda
@@ -1879,7 +2060,10 @@ void loop()
     linkRssiLoop();
     /* Mantiene la STA asociada a la red del cliente sin bajar el AP ni ESP-NOW:
      * el maestro habita las dos redes. Ver linkStaService() para la letra chica
-     * del canal compartido. */
+     * del canal compartido. Con captura en marcha no se reintenta. */
+    g_linkStaHold = g_rt.active() || g_state == ARMING || g_state == PRESTART ||
+                    g_state == RUNNING || g_state == STOPPING || g_state == DUMPING ||
+                    g_state == SCOPE_MULTI;
     linkStaService();
 
     if (g_webReplayCachedState) {
@@ -2030,6 +2214,40 @@ void loop()
             MASTER_LOG_PRINTLN("[MASTER] SCOPE_MULTI completo -> ARMED");
         } else if ((int32_t)(millis() - g_scopeStartNextMs) >= 0) {
             beginPrestart(PRESTART_ACTION_SCOPE_MULTI);
+        }
+    }
+
+    /* Tiempo real: entrega en orden y cierre por STREAM_END. */
+    if (g_rt.active()) {
+        g_rt.service();
+        /* Vigia: un esclavo que se resetea o pierde el enlace nunca manda su
+         * STREAM_END. La descarga rapida puede callar durante toda la captura:
+         * usar la duracion a la menor Fs efectiva armada, con 20 % de margen. */
+        const uint32_t quiet = g_rt.msSinceProgress();
+        const uint32_t captureMs = captureDurationMs(g_rec_n_batches);
+        const uint32_t limitMs = capModeRealtime() ? 15000u
+                               : ((captureMs * 12u + 9u) / 10u) + 20000u;
+        if ((g_rtStopReqMs != 0u && quiet > 5000u) || quiet > limitMs) {
+            MASTER_LOG_PRINTF("[MASTER] RT sin progreso %lu ms (stop=%u) -> ARMED\n",
+                              (unsigned long)quiet, (unsigned)(g_rtStopReqMs != 0u));
+            g_rt.printStats(Serial);
+            g_rt.stop();
+            g_rtStopReqMs = 0;
+            syncOutWrite(LOW);
+            g_state = ARMED;
+            matlab.sendReady(g_armedCount);
+            matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+        }
+    }
+    if (g_rt.active()) {
+        if (g_rt.allDone()) {
+            g_rtStopReqMs = 0;
+            g_rt.stop();
+            syncOutWrite(LOW);
+            g_state = ARMED;
+            matlab.sendReady(g_armedCount);
+            matlab.sendHeartbeat(0x00, 0, 0, (uint8_t)g_state);
+            MASTER_LOG_PRINTLN("[MASTER] RT completo -> ARMED");
         }
     }
 
