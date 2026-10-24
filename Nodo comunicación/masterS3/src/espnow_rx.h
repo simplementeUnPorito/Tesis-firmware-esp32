@@ -60,6 +60,7 @@ public:
 
     /* Llamar desde el loop() o directamente del callback ESP-NOW */
     static void onRecv(const uint8_t *mac, const uint8_t *data, int len);
+    static void onSent(const uint8_t *mac, esp_now_send_status_t status);
 
     /* Tiempo real (rt_stream.h): tramas MsgData32 y STREAM_END. */
     void setOtaHandler(OtaStatusCallback cb) { _otaCb = cb; }
@@ -130,8 +131,18 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
         return false;
     }
     esp_now_register_recv_cb(onRecv);
+    esp_now_register_send_cb(onSent);
     MASTER_LOG_PRINTLN("[ESPNOW-RX] ready");
     return true;
+}
+
+/* Unicast confirmados (ACK de MAC del destino) y fallidos: diagnostico. */
+inline volatile uint32_t &espnowTxAckOk()   { static volatile uint32_t n = 0; return n; }
+inline volatile uint32_t &espnowTxAckFail() { static volatile uint32_t n = 0; return n; }
+inline void EspNowRx::onSent(const uint8_t *, esp_now_send_status_t status)
+{
+    if (status == ESP_NOW_SEND_SUCCESS) espnowTxAckOk()++;
+    else espnowTxAckFail()++;
 }
 
 inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
@@ -177,8 +188,22 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         r.ev_status = 0xFFu;
         memcpy(&r, data, ((size_t)len < sizeof(r)) ? (size_t)len : sizeof(r));
         if (instance->_ftmCb) instance->_ftmCb(r);
-    } else if (first == CMD_HOTWAIT_ACK && (size_t)len >= sizeof(MsgHotWaitAck)) {
-        instance->_handleHotWaitAck((const MsgHotWaitAck *)data);
+    } else if (first == CMD_SLAVE_LOG && len >= 3) {
+        const MsgSlaveLog *l = (const MsgSlaveLog *)data;
+        int n = l->len;
+        if (n > len - 3) n = len - 3;
+        /* Partido en lineas: cada una con el nodo adelante. */
+        int start = 0;
+        for (int i = 0; i <= n; i++) {
+            if (i == n || l->text[i] == '\n') {
+                if (i > start) MASTER_LOG_PRINTF("[S%u>] %.*s\n", (unsigned)l->node_id, i - start, &l->text[start]);
+                start = i + 1;
+            }
+        }
+    } else if (first == CMD_HOTWAIT_ACK && (size_t)len >= offsetof(MsgHotWaitAck, reason)) {
+        MsgHotWaitAck a = {};   /* esclavos viejos no mandan el motivo */
+        memcpy(&a, data, ((size_t)len < sizeof(a)) ? (size_t)len : sizeof(a));
+        instance->_handleHotWaitAck(&a);
     }
 }
 
@@ -259,7 +284,7 @@ inline void EspNowRx::_handleStartAck(const MsgStartAck *msg)
 
 inline void EspNowRx::_handleHotWaitAck(const MsgHotWaitAck *msg)
 {
-    MASTER_LOG_PRINTF("[ESPNOW-RX] HOTWAIT_ACK node=%d ok=%d state=%d n=%u\n",
-                      msg->node_id, msg->ok, msg->state, msg->n_batches);
+    MASTER_LOG_PRINTF("[ESPNOW-RX] HOTWAIT_ACK node=%d ok=%d state=%d n=%u motivo=%u\n",
+                      msg->node_id, msg->ok, msg->state, msg->n_batches, msg->reason);
     if (_hotWaitAckCb) { _hotWaitAckCb(*msg); }
 }

@@ -260,7 +260,13 @@ struct MsgHotWaitAck {
     uint8_t  ok;        /* 1=HOT_WAIT listo, 0=no listo */
     uint8_t  state;
     uint16_t n_batches;
+    uint8_t  reason;    /* HOTWAIT_WHY_*: por que no quedo listo; aditivo */
 };
+#define HOTWAIT_WHY_NONE       0u
+#define HOTWAIT_WHY_LIVE_STORE 1u   /* en vivo sin almacenamiento */
+#define HOTWAIT_WHY_LIVE_PSOC  2u   /* en vivo, el PSoC no confirmo */
+#define HOTWAIT_WHY_NO_RAM     3u   /* sin RAM en el ESP para N lotes */
+#define HOTWAIT_WHY_SETN       4u   /* el PSoC no confirmo SETN */
 
 struct MsgBlinkLed {
     uint8_t cmd;      /* CMD_BLINK_LED */
@@ -454,5 +460,17 @@ struct MsgFtmReport {
     uint8_t  channel;
     int16_t  init_err;     /* esp_err_t de la ultima esp_wifi_ftm_initiate_session; aditivo */
     uint8_t  ev_status;    /* wifi_ftm_status_t crudo del ultimo reporte; aditivo */
+};
+#pragma pack(pop)
+
+/* Log del esclavo replicado al maestro (remote_log.h), texto sin terminar en 0. */
+#define CMD_SLAVE_LOG   0x7E   /* esclavo -> maestro */
+#define SLAVE_LOG_MAX   200
+#pragma pack(push, 1)
+struct MsgSlaveLog {
+    uint8_t cmd;          /* CMD_SLAVE_LOG */
+    uint8_t node_id;
+    uint8_t len;
+    char    text[SLAVE_LOG_MAX];
 };
 #pragma pack(pop)

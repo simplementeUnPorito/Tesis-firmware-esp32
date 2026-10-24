@@ -20,6 +20,12 @@ typedef void (*EspNowSentHook)(bool ok);
 inline EspNowSentHook &espnowSentHook() { static EspNowSentHook h = nullptr; return h; }
 #define ESPNOW_LOG_PRINTF(...)  MASTER_LOG_PRINTF(__VA_ARGS__)
 
+/* Tramas de lote en vuelo (salieron y todavia no llego su aviso de envio). Las
+ * dos mitades de un lote se mandaban pegadas y el S3 perdia la segunda en
+ * rafagas (descarga a ~3 lotes/s por reintentos): ahora cada una espera a la
+ * anterior, con tope de 6 ms. */
+inline volatile uint8_t &espnowBatchInflight() { static volatile uint8_t n = 0; return n; }
+
 class EspNowTransport {
 public:
     /* masterMac: dirección MAC del ESP maestro (6 bytes) */
@@ -76,6 +82,7 @@ inline void EspNowTransport::onSendCb(const uint8_t *, esp_now_send_status_t sta
 #else
     live::noteRadioTxDone((uint64_t)esp_timer_get_time());
 #endif
+    if (espnowBatchInflight() > 0) espnowBatchInflight()--;
     if (espnowSentHook()) espnowSentHook()(status == ESP_NOW_SEND_SUCCESS);
 }
 
@@ -156,8 +163,17 @@ inline void EspNowTransport::_buildAndSendRaw(const SampleBytes *samples15, uint
     msg.timestamp_us= timestamp_us;
     memcpy(msg.samples, samples15, sizeof(SampleBytes) * SAMPLES_PER_PART);
     msg.crc = _calcCrc((const uint8_t *)&msg, sizeof(msg) - 1);
+#if !defined(ESP8266)
+    const int64_t t0 = esp_timer_get_time();
+    while (espnowBatchInflight() > 0 && (esp_timer_get_time() - t0) < 6000) { delayMicroseconds(50); }
+#endif
     esp_err_t err = espnowSend(_masterMac, (const uint8_t *)&msg, sizeof(msg));
-    if (err == ESP_OK) { _sentOK++; } else { _sentFail++; }
+    if (err == ESP_OK) {
+        _sentOK++;
+        espnowBatchInflight() = 1;
+    } else {
+        _sentFail++;
+    }
 }
 
 inline void EspNowTransport::sendStoredBatch(const SampleBytes *samples30, uint16_t seq,

@@ -405,10 +405,12 @@ static void addPeerIfNeeded(const uint8_t mac[6])
     memcpy(peer.peer_addr, mac, 6);
     peer.channel = 0;
     peer.encrypt = false;
-    /* Salir por el AP: el origen es entonces el BSSID que los esclavos ya
-     * filtran. En el S3 la MAC de la STA no es BSSID-1 (difiere en el bit de
-     * administrada localmente) y los esclavos descartaban todo. */
-    peer.ifidx = WIFI_IF_AP;
+    /* Por la STA (por defecto). Por el AP el S3 retenia las unicast a
+     * esclavos no asociados hasta la baliza siguiente: la descarga perdia
+     * un pedido de cada dos (2026-10-24). Los esclavos aceptan la MAC de la
+     * STA del S3 aunque difiera del BSSID en el bit de administrada
+     * localmente (macIsMaster). */
+    peer.ifidx = WIFI_IF_STA;
     esp_now_add_peer(&peer);
 }
 
@@ -788,8 +790,14 @@ static void onStartAck(const MsgStartAck &msg)
                       msg.node_id, msg.status, (unsigned)rttUs, (unsigned)tofUs);
     /* Un esclavo rechazó el START real (no estaba en HOT_WAIT listo): abortar
      * ya, en vez de esperar el timeout de rescate y dumpear lotes vacíos. */
-    if (msg.status == 0 && g_state == RUNNING) {
+    /* Solo cuenta si ese nodo estaba listo en HOT_WAIT: uno salteado (sin
+     * PSoC, sin memoria) siempre rechaza y no tiene que tirar a los demas. */
+    if (msg.status == 0 && g_state == RUNNING &&
+        (g_hotWaitAckMask & (1UL << msg.node_id)) != 0u) {
         abortCaptureToArmed(msg.node_id, "start_refused");
+    } else if (msg.status == 0) {
+        MASTER_LOG_PRINTF("[MASTER] START rechazado por S%d (no estaba listo): sigue sin el\n",
+                          msg.node_id);
     }
 }
 
@@ -810,17 +818,48 @@ static void onHotWaitAck(const MsgHotWaitAck &msg)
     /* Un "todavia no listo" (state HOT_WAIT=2 o SAMPLING=3 en el esclavo)
      * puede llegar tarde, ya en RUNNING: no es un aborto. El aborto real
      * viene con el esclavo fuera de captura. */
-    if (!msg.ok && g_state == RUNNING && msg.state != 2u && msg.state != 3u) {
+    /* Y solo si el nodo participa: uno salteado en HOT_WAIT manda NACK
+     * tardios que tiraban la captura de los demas. */
+    if (!msg.ok && g_state == RUNNING && msg.state != 2u && msg.state != 3u &&
+        (g_armAckMask & (1UL << msg.node_id)) != 0u) {
         abortCaptureToArmed(msg.node_id, "hotwait_abort");
     }
 }
+
+/* Pedido de lote que no pudo salir porque la cola de TX del WiFi estaba llena
+ * (ESP_ERR_ESPNOW_NO_MEM: el WebSocket hacia la web la ocupa durante la
+ * descarga). Se reintenta desde loop() a los 2 ms en vez de esperar el
+ * timeout de 300 ms: en el S3 fallaba uno de cada dos pedidos. */
+static volatile bool     g_reqResendPending = false;
+static uint8_t           g_reqResendNode = 0;
+static uint16_t          g_reqResendSeq = 0;
+static uint32_t          g_reqResendDueMs = 0;
+static uint8_t           g_reqResendTries = 0;
 
 static void requestBatch(uint8_t nodeId, uint16_t seq)
 {
     const uint8_t *dst = espnowDstForSlave(nodeId);
     MsgReqBatch msg = { CMD_REQ_BATCH, nodeId, seq };
-    if (g_espnowReady) { geonetSend(dst, (uint8_t *)&msg, sizeof(msg)); }
-    MASTER_LOG_PRINTF("[MASTER] REQ_BATCH node=%d seq=%d\n", nodeId, seq);
+    esp_err_t err = ESP_FAIL;
+    if (g_espnowReady) { err = geonetSend(dst, (uint8_t *)&msg, sizeof(msg)); }
+    if (err == ESP_ERR_ESPNOW_NO_MEM) {
+        const bool same = g_reqResendPending && g_reqResendNode == nodeId && g_reqResendSeq == seq;
+        g_reqResendTries = same ? (uint8_t)(g_reqResendTries + 1u) : 1u;
+        if (g_reqResendTries <= 50u) {
+            g_reqResendNode = nodeId;
+            g_reqResendSeq = seq;
+            g_reqResendDueMs = millis() + 2u;
+            g_reqResendPending = true;
+        } else {
+            g_reqResendPending = false;   /* queda el timeout normal */
+        }
+        return;
+    }
+    if (g_reqResendPending && g_reqResendNode == nodeId && g_reqResendSeq == seq) {
+        g_reqResendPending = false;
+    }
+    MASTER_LOG_PRINTF("[MASTER] REQ_BATCH node=%d seq=%d err=%d txack=%lu/%lu\n", nodeId, seq, (int)err,
+                      (unsigned long)espnowTxAckOk(), (unsigned long)espnowTxAckFail());
 }
 
 static uint16_t effectiveSampleRateHz()
@@ -1493,6 +1532,14 @@ static void finishPrestartAction()
     } else {
         /* No modificar g_armedCount: intentar dump desde todos los slaves ARM'd.
            Los que no grabaron responderán NACK y se saltean via retry. */
+        /* Los nodos que no llegaron a HOT_WAIT no graban: fuera de la captura,
+         * si no el fin (todos los armados completos) y el tiempo real los
+         * esperan hasta el timeout. */
+        if ((g_armAckMask & g_hotWaitAckMask) != 0u && (g_armAckMask & ~g_hotWaitAckMask) != 0u) {
+            MASTER_LOG_PRINTF("[MASTER] fuera de la captura (sin HOT_WAIT): mask=0x%08lX\n",
+                              (unsigned long)(g_armAckMask & ~g_hotWaitAckMask));
+            g_armAckMask &= g_hotWaitAckMask;
+        }
         g_armedCount = countArmAcks(g_armAckMask);
         if ((g_rec_n_batches == 0 && !capModeRealtime()) || g_armedCount == 0 || g_armAckMask == 0) {
             MASTER_LOG_PRINTF("[MASTER] START rejected after PRESTART n=%u armed=%u mask=0x%08lX\n",
@@ -2190,6 +2237,14 @@ void setup()
 
 void loop()
 {
+    if (g_reqResendPending && (int32_t)(millis() - g_reqResendDueMs) >= 0) {
+        if (g_state == DUMPING && g_reqResendNode == g_dumpSlaveIdx &&
+            g_reqResendSeq == g_dumpBatchSeq) {
+            requestBatch(g_reqResendNode, g_reqResendSeq);
+        } else {
+            g_reqResendPending = false;
+        }
+    }
     debugEspHardwareService();
     serviceFtmReports();
     otam::service();

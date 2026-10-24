@@ -20,6 +20,10 @@
  */
 
 #include <Arduino.h>
+#include "remote_log.h"
+#if REMOTE_LOG_ENABLE && !defined(DBG_STREAM)
+  #define DBG_STREAM remoteLogTee()   /* tee: Serial + envio al maestro */
+#endif
 
 #ifndef DBG_ENABLE
   #ifdef SLAVE_LOGS_ENABLE

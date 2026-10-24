@@ -528,7 +528,14 @@ bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt)
             m.timestamp_us = tsFor(seq);
             memcpy(m.samples, s + part * SAMPLES_PER_PART, sizeof(m.samples));
             m.crc = xorCrc((const uint8_t *)&m, sizeof(m) - 1);
+            /* La segunda mitad espera el aviso de envio de la primera: pegadas,
+             * el S3 perdia una de cada dos respuestas a REQ_BATCH. */
+            const int64_t t0 = esp_timer_get_time();
+            while (espnowBatchInflight() > 0 && (esp_timer_get_time() - t0) < 6000) {
+                delayMicroseconds(50);
+            }
             err = sendRaw((const uint8_t *)&m, sizeof(m));
+            if (err == ESP_OK) espnowBatchInflight() = 1;
         }
         if (err != ESP_OK) { g_txFail++; g_lastTxErr = err; return false; }
     }

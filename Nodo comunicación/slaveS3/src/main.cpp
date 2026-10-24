@@ -36,6 +36,18 @@
 #include "sim_psoc.h"
 #endif
 
+/* Pedido de lote del maestro, atendido en loop() (ver onDataRecv). */
+static volatile MsgReqBatch g_reqBatchPending = {};
+static volatile bool        g_reqBatchPendingFlag = false;
+#if !defined(ESP8266)
+static portMUX_TYPE         g_reqBatchMux = portMUX_INITIALIZER_UNLOCKED;
+#define REQ_LOCK()   portENTER_CRITICAL(&g_reqBatchMux)
+#define REQ_UNLOCK() portEXIT_CRITICAL(&g_reqBatchMux)
+#else
+#define REQ_LOCK()   noInterrupts()
+#define REQ_UNLOCK() interrupts()
+#endif
+
 /* FIR del PSoC en transito (ver serviceFirUpload). */
 static uint8_t  g_firBuf[FIR_HW_TAPS * 3];
 static uint32_t g_firGot[(FIR_HW_TAPS + 31) / 32];
@@ -1624,6 +1636,7 @@ static void onPsocDiag(const PsocDiagEvent &event)
 static void allocStore(uint16_t n_batches);
 static void handleReqBatch(const MsgReqBatch *msg);
 static void sendHotWaitAck();
+static uint8_t g_hotwait_why = HOTWAIT_WHY_NONE;   /* motivo del ultimo NACK de HOT_WAIT */
 static void radioSilencioAlEntrar();
 static uint16_t effectivePsocSampleRateHz();
 
@@ -4688,6 +4701,7 @@ static void enterHotWaitLive(uint16_t n_batches)
     if (eff < 0) {
         g_rec_n_batches = 0;
         g_state = STOPPED;
+        g_hotwait_why = HOTWAIT_WHY_LIVE_STORE;
         sendHotWaitAck();
         SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live aborted n=%u: sin almacenamiento\n",
                          (unsigned)n_batches);
@@ -4701,6 +4715,7 @@ static void enterHotWaitLive(uint16_t n_batches)
     if (!psocReady) {
         live::close();
         g_state = STOPPED;
+        g_hotwait_why = HOTWAIT_WHY_LIVE_PSOC;
         sendHotWaitAck();
         SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live aborted n=%ld: PSoC sin confirmar\n",
                          (long)eff);
@@ -4739,6 +4754,7 @@ static void enterHotWait(uint16_t n_batches)
      * un reset. allocStore puede haber recortado N a la RAM disponible. */
     if (n_batches > 0 && !g_psoc_sd_store_active && !storeRamReady()) {
         g_state = STOPPED;
+        g_hotwait_why = HOTWAIT_WHY_NO_RAM;
         sendHotWaitAck();
         SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT aborted n=%u: sin RAM en el ESP\n",
                          (unsigned)n_batches);
@@ -4752,6 +4768,7 @@ static void enterHotWait(uint16_t n_batches)
     if (!psocReady) {
         allocStore(0);
         g_state = STOPPED;
+        g_hotwait_why = HOTWAIT_WHY_SETN;
         sendHotWaitAck();   /* NACK explícito: el maestro no debe esperar READY */
         SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT aborted n=%u: PSoC SETN no confirmado\n",
                          (unsigned)n_batches);
@@ -4773,7 +4790,8 @@ static void sendHotWaitAck()
 {
     uint8_t ok = (g_state == HOT_WAIT && storeReadyForHotWait()) ? 1 : 0;
     MsgHotWaitAck ack = {
-        CMD_HOTWAIT_ACK, NODE_ID, ok, (uint8_t)g_state, g_rec_n_batches
+        CMD_HOTWAIT_ACK, NODE_ID, ok, (uint8_t)g_state, g_rec_n_batches,
+        ok ? (uint8_t)HOTWAIT_WHY_NONE : g_hotwait_why
     };
     sendToMaster((const uint8_t *)&ack, sizeof(ack));
     SLAVE_LOG_PRINTF("[SLAVE] HOTWAIT_ACK ok=%u state=%u n=%u\n",
@@ -5331,7 +5349,13 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         sendToMaster((const uint8_t *)&ack, sizeof(ack));
     }
     else if (cmd == CMD_REQ_BATCH && len >= (int)sizeof(MsgReqBatch)) {
-        handleReqBatch((const MsgReqBatch *)data);
+        /* Se atiende en loop(): mandar las dos tramas desde la tarea WiFi la
+         * dejaba ocupada cuando llegaba el pedido siguiente, y en el S3 se
+         * perdia uno de cada dos (descarga a ~3 lotes/s por reintentos). */
+        REQ_LOCK();
+        memcpy((void *)&g_reqBatchPending, data, sizeof(MsgReqBatch));
+        g_reqBatchPendingFlag = true;
+        REQ_UNLOCK();
     }
     else if (cmd == CMD_BLINK_LED && len >= (int)sizeof(MsgBlinkLed)) {
         const MsgBlinkLed *msg = (const MsgBlinkLed *)data;
@@ -5416,6 +5440,9 @@ static void handleReqBatch(const MsgReqBatch *msg)
 {
     if (msg->node_id != NODE_ID) return;
     uint16_t seq = msg->batch_seq;
+#if SIM_SIN_HW
+    SLAVE_LOG_PRINTF("[REQ] seq=%u state=%d live=%d\n", seq, (int)g_state, (int)live::active());
+#endif
     if (g_state == SAMPLING) {
         return;   /* No TX ESP-NOW mientras el ADC está capturando. */
     }
@@ -5848,8 +5875,34 @@ static void serviceFtm()
     }
 }
 
+/* Log replicado al maestro (remote_log.h): una trama cada 50 ms como mucho. */
+static void serviceRemoteLog()
+{
+#if REMOTE_LOG_ENABLE
+    static uint32_t lastMs = 0;
+    if (!g_radio_on || millis() - lastMs < 50u) return;
+    MsgSlaveLog m;
+    const size_t n = remoteLogTee().take(m.text, SLAVE_LOG_MAX);
+    if (n == 0) return;
+    lastMs = millis();
+    m.cmd = CMD_SLAVE_LOG;
+    m.node_id = NODE_ID;
+    m.len = (uint8_t)n;
+    sendToMaster((const uint8_t *)&m, 3u + n);
+#endif
+}
+
 void loop()
 {
+    serviceRemoteLog();
+    if (g_reqBatchPendingFlag) {
+        MsgReqBatch req;
+        REQ_LOCK();
+        memcpy(&req, (const void *)&g_reqBatchPending, sizeof(req));
+        g_reqBatchPendingFlag = false;
+        REQ_UNLOCK();
+        handleReqBatch(&req);
+    }
     serviceFirUpload();
     ota::service();   /* una descarga OTA bloquea y termina reiniciando */
     servicePsocResetRequest();
