@@ -139,7 +139,14 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
 #else
     esp_now_register_recv_cb(onRecv);
 #endif
+#if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    /* IDF 5.5: el aviso de envio recibe wifi_tx_info_t. */
+    esp_now_register_send_cb([](const wifi_tx_info_t *info, esp_now_send_status_t st) {
+        onSent(info ? info->des_addr : nullptr, st);
+    });
+#else
     esp_now_register_send_cb(onSent);
+#endif
     MASTER_LOG_PRINTLN("[ESPNOW-RX] ready");
     return true;
 }

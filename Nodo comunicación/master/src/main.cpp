@@ -42,7 +42,11 @@
 
 /* ── Configuración ────────────────────────────────────────────────────────── */
 static const char *AP_SSID = "GeoNetwork";
+#ifndef MASTER_AP_PASS_OVERRIDE
 static const char *AP_PASS = "geophone2026";
+#else
+static const char *AP_PASS = MASTER_AP_PASS_OVERRIDE;   /* banco: "" = AP abierto */
+#endif
 static DNSServer dnsServer;
 static const uint8_t ESPNOW_BROADCAST[6] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
@@ -887,6 +891,9 @@ static uint32_t captureDurationMs(uint16_t nBatches)
  * el ESP32 clasico no existe y no se toca nada. */
 static void apEnableFtmResponder()
 {
+#if defined(FTM_RESPONDER_DISABLE) && FTM_RESPONDER_DISABLE
+    return;   /* banco: sin responder FTM */
+#endif
 #if defined(CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT) && CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT
     wifi_config_t ap_cfg = {};
     if (esp_wifi_get_config(WIFI_IF_AP, &ap_cfg) != ESP_OK) return;
@@ -925,6 +932,9 @@ static void serviceFtmReports()
         if (!g_ftmNew[n]) continue;
         g_ftmNew[n] = false;
         const MsgFtmReport m = g_ftmLast[n];
+        MASTER_LOG_PRINTF("[FTM] S%u st=%u ev=%u cfg=%u win=%u rtt=%lu ps ses=%u\n", (unsigned)n,
+                          (unsigned)m.status, (unsigned)m.ev_status, (unsigned)m.cfg_idx,
+                          (unsigned)m.window, (unsigned long)m.rtt_med_ps, (unsigned)m.sessions);
         char js[384];
         snprintf(js, sizeof(js),
                  "{\"type\":\"ftm\",\"node\":%u,\"status\":%u,\"sync_mode\":%u,"

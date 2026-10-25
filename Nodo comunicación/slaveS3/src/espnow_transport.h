@@ -95,7 +95,14 @@ inline bool EspNowTransport::begin(const uint8_t *masterMac)
         return false;
     }
     espnowSetRole();
+#if !defined(ESP8266) && defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    /* IDF 5.5: el aviso de envio recibe wifi_tx_info_t. */
+    esp_now_register_send_cb([](const wifi_tx_info_t *info, esp_now_send_status_t st) {
+        onSendCb(info ? info->des_addr : nullptr, st);
+    });
+#else
     esp_now_register_send_cb(onSendCb);
+#endif
 
     if (!setMasterMac(masterMac)) {
         ESPNOW_LOG_PRINTLN("[ESPNOW] add_peer failed");

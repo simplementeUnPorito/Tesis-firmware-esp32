@@ -5115,6 +5115,18 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         return;
     }
     len -= GEONET_TAG_LEN;
+    /* Lo que solo manda un esclavo no puede venir del maestro: sin esto, un
+     * esclavo que arranco sin ver el AP (acepta cualquier origen) tomaba a otro
+     * esclavo como maestro, le mandaba su HELLO a el y, como se oian entre si,
+     * ninguno reescaneaba: la red quedaba muda (2026-10-25). */
+    switch (data[0]) {
+        case CMD_ARM_ACK: case CMD_START_ACK: case CMD_CFG_ACK: case CMD_STATUS:
+        case CMD_HELLO: case CMD_HOTWAIT_ACK: case CMD_STREAM_END: case CMD_OTA_STATUS:
+        case CMD_FTM_REPORT: case CMD_SLAVE_LOG:
+        case DATA_PKT_MARKER: case DATA32_PKT_MARKER: case DATAZ_PKT_MARKER:
+            return;
+        default: break;
+    }
     if (!macIsMaster(mac)) {
         static uint32_t s_foreignLogMs = 0;
         if (millis() - s_foreignLogMs > 10000u) {
@@ -5759,7 +5771,10 @@ static void masterChannelService()
      * caido en el canal de respaldo (maestro apagado, o todavia en el canal 1
      * antes de asociarse al hotspot): sin rescanear, el esclavo quedaba sordo
      * para siempre. Se cuenta el silencio desde el boot. */
-    if ((millis() - g_lastMasterRxMs) < MASTER_SILENCE_MS) return;
+    /* Sin el AP del maestro identificado (arranco con el maestro apagado) se
+     * reescanea seguido hasta encontrarlo. */
+    const uint32_t silencio = g_masterApKnown ? MASTER_SILENCE_MS : 10000u;
+    if ((millis() - g_lastMasterRxMs) < silencio) return;
     /* Las balizas del AP del maestro tambien cuentan: un maestro en reposo no
      * manda ESP-NOW, y el reescaneo (segundos sordo) se comia el ARM/PRESTART
      * de la captura siguiente (2026-10-24). */

@@ -75,22 +75,25 @@ static void onFtmReport(void *, esp_event_base_t, int32_t, void *data)
 {
     const wifi_event_ftm_report_t *ev = (const wifi_event_ftm_report_t *)data;
     if (ev == nullptr) return;
-    portENTER_CRITICAL(&s_mux);
     const uint8_t n = (ev->ftm_report_num_entries < MAX_ENTRIES) ? ev->ftm_report_num_entries
                                                                   : (uint8_t)MAX_ENTRIES;
+    /* Las tramas se copian FUERA de la seccion critica: esp_wifi_ftm_get_report
+     * bloquea y adentro de portENTER_CRITICAL disparaba el watchdog de
+     * interrupciones (bucle de reinicio con IDF 5.5, 2026-10-24). */
+    static wifi_ftm_report_entry_t tmp[MAX_ENTRIES];
+    uint8_t got = 0;
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
     /* IDF 5: las tramas se piden con esp_wifi_ftm_get_report (use_get_report_api). */
-    bool got = false;
-    if (ev->status == FTM_STATUS_SUCCESS && n > 0) {
-        got = (esp_wifi_ftm_get_report(s_raw, n) == ESP_OK);
-    }
-    s_rawCount = got ? n : 0;
+    if (ev->status == FTM_STATUS_SUCCESS && n > 0 && esp_wifi_ftm_get_report(tmp, n) == ESP_OK) got = n;
 #else
     if (ev->ftm_report_data != nullptr && n > 0) {
-        memcpy(s_raw, ev->ftm_report_data, (size_t)n * sizeof(wifi_ftm_report_entry_t));
+        memcpy(tmp, ev->ftm_report_data, (size_t)n * sizeof(wifi_ftm_report_entry_t));
+        got = n;
     }
-    s_rawCount = (ev->ftm_report_data != nullptr) ? n : 0;
 #endif
+    portENTER_CRITICAL(&s_mux);
+    memcpy(s_raw, tmp, (size_t)got * sizeof(wifi_ftm_report_entry_t));
+    s_rawCount = got;
     s_rawStatus = (uint8_t)ev->status;
     s_rawDistCm = ev->dist_est;
     s_rawReady = true;
