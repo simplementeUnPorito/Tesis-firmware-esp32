@@ -2,20 +2,20 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-45';
-import { WsClient } from './ws_client.js?v=field-study-45';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-45';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-45';
-import { PlotArea } from './plot.js?v=field-study-45';
-import { SpectrumArea } from './spectrum.js?v=field-study-45';
-import { SlavePanel } from './slave_panel.js?v=field-study-45';
-import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-45';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-45';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-45';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-45';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-45';
-import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-45';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-45';
+import * as cfg from './config.js?v=field-study-47';
+import { WsClient } from './ws_client.js?v=field-study-47';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-47';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-47';
+import { PlotArea } from './plot.js?v=field-study-47';
+import { SpectrumArea } from './spectrum.js?v=field-study-47';
+import { SlavePanel } from './slave_panel.js?v=field-study-47';
+import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-47';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-47';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-47';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-47';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-47';
+import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-47';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-47';
 
 const $ = (id) => document.getElementById(id);
 
@@ -4036,5 +4036,5 @@ ws.addEventListener('sync-start', (ev) => {
   onSyncStart(ev.detail);
   appendLog(ev.detail.method === 'ftm_scheduled'
     ? `START programado por FTM (+${Math.round((ev.detail.lead_us || 0) / 1000)} ms)`
-    : 'START por broadcast (sin modelo FTM en todos los nodos)');
+    : 'START por broadcast; los esclavos S3 anclan el flanco a la recepcion de la radio');
 });

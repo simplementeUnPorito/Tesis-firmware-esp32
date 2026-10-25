@@ -116,7 +116,9 @@ export function initEnlaceTab(log) {
   async function saveConfig() {
     const ssid = $('enlace-ssid').value.trim();
     const url = $('enlace-server').value.trim();
-    if (!ssid) { show('falta el nombre de la red'); return; }
+    // La SPA sube su ZIP directo desde el navegador: la URL del servidor sirve
+    // sola, sin red para el maestro (SSID vacio = el maestro no intenta la STA).
+    if (!ssid && !url) { show('falta el nombre de la red o la URL del servidor'); return; }
     const body = new URLSearchParams();
     body.append('ssid', ssid);
     // El campo de clave no se rellena al cargar (el maestro no la devuelve), asi
@@ -135,7 +137,7 @@ export function initEnlaceTab(log) {
       if (!r.ok) { show(`el maestro respondió HTTP ${r.status} al guardar`); return; }
       cachedServerUrl = url;
       render(parseStatus(txt), txt);
-      log && log(`Enlace: guardado (red "${ssid}"${url ? ', servidor ' + url : ''})`);
+      log && log(`Enlace: guardado (${ssid ? `red "${ssid}"` : 'sin red para el maestro'}${url ? ', servidor ' + url : ''})`);
     } catch (e) {
       show('no se pudo guardar: ' + e);
     }
