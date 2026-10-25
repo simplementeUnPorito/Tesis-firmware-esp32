@@ -945,12 +945,22 @@ static volatile bool g_ftmNew[NUM_SLAVES + 1];
 
 static uint32_t g_ftmLastMs[NUM_SLAVES + 1];
 
+/* NO_RESPONSE seguidos por nodo: el responder tiene 3 plazas (una por MAC
+ * iniciadora) y si se pierde la limpieza de una sesion bajo carga, esa MAC
+ * queda sin respuesta para siempre. Solo lo limpia bajar el SoftAP. */
+static volatile uint8_t g_ftmNoResp[NUM_SLAVES + 1];
+
 static void onFtmReport(const MsgFtmReport &m)
 {
     if (m.node_id == 0 || m.node_id > NUM_SLAVES) return;
     g_ftmLast[m.node_id] = m;
     g_ftmLastMs[m.node_id] = millis();
     g_ftmNew[m.node_id] = true;
+    if (m.ev_status == 3u /* FTM_STATUS_NO_RESPONSE */) {
+        if (g_ftmNoResp[m.node_id] < 255u) g_ftmNoResp[m.node_id]++;
+    } else if (m.ev_status == 0u) {
+        g_ftmNoResp[m.node_id] = 0;
+    }
 }
 
 /* ── Sincronia por FTM (solo S3 / IDF 5) ─────────────────────────────────────
@@ -966,6 +976,34 @@ static void onFtmReport(const MsgFtmReport &m)
 #endif
 static uint32_t g_runId = 0;
 static constexpr uint32_t FTM_START_LEAD_US = 400000u;
+
+/* Si algun nodo quedo sin respuesta FTM (3 NO_RESPONSE seguidos), reiniciar el
+ * WiFi entre capturas: wifi_softap_stop() vacia las plazas del responder. El
+ * telefono se reasocia; nunca durante una captura. */
+static void serviceFtmResponderWatchdog()
+{
+#if MASTER_FTM_SYNC
+    static uint32_t lastFixMs = 0;
+    if (g_state != IDLE && g_state != ARMED) return;
+    if (lastFixMs != 0u && millis() - lastFixMs < 60000u) return;
+    uint8_t stuck = 0;
+    for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
+        if (g_ftmNoResp[n] >= 3u && millis() - g_ftmLastMs[n] < 30000u) { stuck = n; break; }
+    }
+    if (!stuck) return;
+    lastFixMs = millis();
+    const esp_err_t e1 = esp_wifi_stop();
+#if ESPNOW_RAW_TX
+    esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
+#endif
+    const esp_err_t e2 = esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+    for (uint8_t n = 1; n <= NUM_SLAVES; n++) g_ftmNoResp[n] = 0;
+    MASTER_LOG_PRINTF("[FTM] responder sin respuesta para S%u: WiFi reiniciado stop=%d start=%d\n",
+                      (unsigned)stuck, (int)e1, (int)e2);
+#endif
+}
 
 static void serviceTimeBeacon()
 {
@@ -990,7 +1028,8 @@ static bool ftmStartPosible(uint32_t mask)
     if (mask == 0u) return false;
     for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
         if (!(mask & (1UL << n))) continue;
-        if (!g_ftmLast[n].model_ok || millis() - g_ftmLastMs[n] > 4000u) return false;
+        /* Con turnos (ftm_slave.cpp) cada nodo informa cada ~8 s. */
+        if (!g_ftmLast[n].model_ok || millis() - g_ftmLastMs[n] > 20000u) return false;
     }
     return true;
 #else
@@ -2525,6 +2564,7 @@ void loop()
 {
     serviceAckResend();
     serviceTimeBeacon();
+    serviceFtmResponderWatchdog();
     serviceTxStallDiag();
     if (g_reqResendPending && (int32_t)(millis() - g_reqResendDueMs) >= 0) {
         if (g_state == DUMPING && g_reqResendNode == g_dumpSlaveIdx &&

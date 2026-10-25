@@ -187,6 +187,15 @@ static uint32_t s_sessionStartMs = 0;
 static uint32_t s_lastSessionMs = 0;
 static uint32_t s_lastValidMs = 0;
 static uint32_t s_periodMs = 1000u;
+/* Turnos: el responder del maestro tiene 3 plazas y una sesion cuya limpieza
+ * se pierde bajo carga deja la plaza ocupada para siempre (NO_RESPONSE
+ * permanente, 2026-10-25; ver lab/s3/INFORME_BANCO_S3.md). Con la hora del
+ * maestro que da la baliza, cada esclavo mide solo en su ventana: nunca hay
+ * dos sesiones a la vez. */
+static constexpr uint32_t TURN_MS = 1000u;
+static constexpr uint32_t TURN_SLOTS = 8u;
+static uint8_t  s_turnSlot = 0xFF;      /* 0xFF = sin turnos (periodo libre) */
+static uint32_t s_lastTurn = 0xFFFFFFFFu;
 static uint16_t s_sessions = 0;
 static uint16_t s_framesTotal = 0;
 static uint16_t s_framesValid = 0;
@@ -247,6 +256,7 @@ void begin()
 }
 
 void setPeriodMs(uint32_t ms) { s_periodMs = ms; }
+void setTurn(uint8_t nodeId) { s_turnSlot = (uint8_t)(nodeId % TURN_SLOTS); }
 
 #if FTM_CLOCK_MODEL
 void noteMasterBeacon(uint32_t masterMacUs, uint32_t localRxMacUs)
@@ -256,7 +266,9 @@ void noteMasterBeacon(uint32_t masterMacUs, uint32_t localRxMacUs)
     s_coarseOk = true;
 }
 
-bool modelOk() { return s_mOk && (uint32_t)(millis() - s_mLastMs) < 5000u; }
+/* Con turnos cada nodo mide cada TURN_SLOTS*TURN_MS = 8 s: la recta se
+ * extrapola hasta 20 s (deriva de ppm, error de us). */
+bool modelOk() { return s_mOk && (uint32_t)(millis() - s_mLastMs) < 20000u; }
 uint32_t modelAgeMs() { return s_mLastMs ? (uint32_t)(millis() - s_mLastMs) : 0xFFFFFFFFu; }
 
 /* theta (ps, modulo W32) en un instante del reloj MAC local. */
@@ -372,6 +384,17 @@ void service(bool allowed, const uint8_t responder[6], uint8_t channel)
         return;
     }
     if (!allowed || s_periodMs == 0u || channel == 0u) return;
+#if FTM_CLOCK_MODEL
+    if (s_turnSlot != 0xFFu && s_coarseOk) {
+        /* Hora del maestro (ms de exactitud, de la baliza) -> ventana. */
+        const uint32_t masterMs = (esp_wifi_internal_get_mac_clock_time() - s_coarseThetaUs) / 1000u;
+        const uint32_t turn = masterMs / TURN_MS;
+        if (turn % TURN_SLOTS != s_turnSlot || turn == s_lastTurn) return;
+        /* Solo en los primeros 300 ms de la ventana: la sesion termina adentro. */
+        if (masterMs % TURN_MS > 300u) return;
+        s_lastTurn = turn;
+    } else
+#endif
     if (s_lastSessionMs != 0u && now - s_lastSessionMs < s_periodMs) return;
     wifi_ftm_initiator_cfg_t cfg = {};
     memcpy(cfg.resp_mac, responder, 6);

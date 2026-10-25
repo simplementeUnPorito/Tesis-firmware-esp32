@@ -6139,6 +6139,7 @@ void setup()
     live::begin(&psoc, sendToMaster, NODE_ID);
     ota::begin(sendToMaster, NODE_ID, MASTER_AP_SSID, MASTER_AP_PASS);
     ftm::begin();
+    ftm::setTurn(NODE_ID);
     g_psoc_rx_last_level = (uint8_t)digitalRead(PSOC_UART_RX);
     attachInterrupt(digitalPinToInterrupt(PSOC_UART_RX), onPsocRxEdge, CHANGE);
 #if PSOC_RX_SCAN_ENABLE

@@ -31,6 +31,9 @@ bool takeReport(MsgFtmReport &out, uint8_t nodeId, uint8_t syncMode);
 void printStatus(bool raw);
 /* Periodo entre sesiones (ms, 0 = apagado). */
 void setPeriodMs(uint32_t ms);
+/* Turno fijo por nodo: con la baliza del maestro, una sesion por ventana de
+ * 1 s cada 8 ventanas, para no superponer sesiones entre esclavos. */
+void setTurn(uint8_t nodeId);
 
 /* ── Modelo de reloj (solo S3 / IDF 5) ─────────────────────────────────────
  * theta = reloj MAC local - reloj MAC del maestro (us, modulo 2^32), ajustado

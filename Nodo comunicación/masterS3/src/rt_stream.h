@@ -23,8 +23,11 @@
 #define RT_WINDOW     64u
 #define RT_MAX_NODES  9u
 #define RT_QUEUE      96u
-#define RT_ACK_EVERY  8u
-#define RT_ACK_MS     50u
+/* Cada STREAM_ACK es una trama ESP-NOW y cada una puede trabar el TX del
+ * maestro en IDF 5.5 (esp-idf #19269): la mitad de ACK que antes. El RTO del
+ * esclavo (live_capture.cpp) tiene que quedar por encima de RT_ACK_MS. */
+#define RT_ACK_EVERY  16u
+#define RT_ACK_MS     120u
 
 class RtStream {
 public:
