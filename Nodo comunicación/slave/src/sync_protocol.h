@@ -59,15 +59,6 @@
 #define SLAVE_CTL_STATE_MASK   0x0Eu
 #define SLAVE_CTL_PROFILE_BIT  0x10u
 
-/* sub_cmd bajo CMD_SET_CONFIG que NO se reenvía al PSoC — vive 100% en el
- * ESP32 del esclavo (handleSetConfig() lo resuelve local, nunca llega a
- * psoc_uart). 0=deshabilitar SD, 1=habilitar (solo si sd_present=1, ver
- * MsgHello). NOTA: el valor numérico 0xC0 coincide con PSOC_CTRL_PING de
- * psoc_uart.h, pero son espacios de bytes distintos sin colisión real: ese
- * es un byte de protocolo UART crudo hacia el PSoC, este es un sub_cmd de
- * radio ESP-NOW que nunca se copia a la UART. */
-#define SLAVE_CMD_SET_SD_ENABLE 0xC0u
-
 #pragma pack(push, 1)
 
 struct MsgArm {

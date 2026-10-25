@@ -245,10 +245,6 @@ static_assert(sizeof(g_rx_scan_isr) / sizeof(g_rx_scan_isr[0]) ==
     replace_all(main, "SD.begin(25, spiHspi, 4000000)",
                 "SD.begin(LIVE_SD_CS, spiHspi, 4000000)", 2)
 
-    replace_once(src / "sd_storage.cpp", "static SPIClass g_sdSpi(VSPI);",
-                 "static SPIClass g_sdSpi(SD_SPI_HOST);")
-
-
 def main() -> None:
     sync_tree(ROOT / "master" / "src", ROOT / "masterS3" / "src")
     sync_tree(ROOT / "master" / "data", ROOT / "masterS3" / "data")

@@ -892,20 +892,11 @@ static uint32_t captureDurationMs(uint16_t nBatches)
  * el ESP32 clasico no existe y no se toca nada. */
 static void apEnableFtmResponder()
 {
-#if defined(FTM_RESPONDER_DISABLE) && FTM_RESPONDER_DISABLE
-    return;   /* banco: sin responder FTM */
-#endif
 #if defined(CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT) && CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT
     wifi_config_t ap_cfg = {};
     if (esp_wifi_get_config(WIFI_IF_AP, &ap_cfg) != ESP_OK) return;
     if (ap_cfg.ap.ftm_responder) return;
-#if defined(FTM_RESPONDER_FLAG_OFF) && FTM_RESPONDER_FLAG_OFF
-    /* Biseccion del TX trabado: mismo camino (HT20 + reinicio del WiFi) sin
-     * prender el responder. */
-    ap_cfg.ap.ftm_responder = false;
-#else
     ap_cfg.ap.ftm_responder = true;
-#endif
     const esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
     /* El responder se inicializa al arrancar el WiFi: con el AP ya levantado
      * el flag quedaba guardado pero sin efecto y los esclavos recibian
@@ -917,12 +908,6 @@ static void apEnableFtmResponder()
     /* ESP-NOW por TX raw (espnow_rx.h): 1 Mbps como ESP-NOW por defecto. Se
      * fija con el WiFi parado, justo antes del arranque de abajo. */
     const bool rawRatePending = true;
-#endif
-#if defined(AP_PROTOCOL_BG) && AP_PROTOCOL_BG
-    /* Experimento del TX trabado (IDF 5.5): AP sin HT, sin AMPDU con el
-     * telefono. ESP-NOW va a tasa legacy y no cambia. */
-    const esp_err_t ep = esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
-    MASTER_LOG_PRINTF("[MASTER] AP solo 11b/g err=%d\n", (int)ep);
 #endif
     const esp_err_t e1 = esp_wifi_stop();
 #if ESPNOW_RAW_TX
@@ -1007,7 +992,7 @@ static void serviceFtmResponderWatchdog()
 
 static void serviceTimeBeacon()
 {
-#if MASTER_FTM_SYNC && !(defined(TIME_BEACON_DISABLE) && TIME_BEACON_DISABLE)
+#if MASTER_FTM_SYNC
     static uint32_t lastMs = 0;
     if (!g_espnowReady || millis() - lastMs < 500u) return;
     lastMs = millis();
@@ -1020,10 +1005,6 @@ static void serviceTimeBeacon()
 /* true si todos los esclavos de la captura informaron modelo valido hace poco. */
 static bool ftmStartPosible(uint32_t mask)
 {
-#if defined(FTM_START_DISABLE) && FTM_START_DISABLE
-    (void)mask;
-    return false;   /* banco: START por broadcast aunque haya modelo */
-#endif
 #if MASTER_FTM_SYNC
     if (mask == 0u) return false;
     for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
@@ -1976,33 +1957,9 @@ static void rtOnData(const uint8_t *data, int len)
 }
 static void rtOnEnd(const MsgStreamEnd &e) { g_rt.onEnd(e); }
 
-/* TX de WiFi trabado (IDF 5.5, 2026-10-25): en tiempo real el maestro deja de
- * transmitir todo -AP, WebSocket, respuestas FTM y ESP-NOW (esp_now_send da
- * NO_MEM sin fin y no vuelve ningun aviso de envio)- mientras la recepcion
- * sigue. Es esp-idf #19269 (Arduino 3.3.12 / IDF 5.5.5): ESP-NOW inserta en la
- * cola de TX sin g_wifi_global_lock y, si choca con una trama del SoftAP, la
- * cola queda inalcanzable. Pasa en 9 de 11 corridas de 14 min con 3 nodos en
- * tiempo real; con IDF 4.4, en ninguna. esp_wifi_stop/start no lo destraba:
- * hace falta deinit + init. En tiempo real no se pierde nada (los esclavos
- * retienen lo no confirmado y la web pide los huecos con FILL). */
-static void radioTearDownCapture();
-static void radioBringUpCapture();
-
-static void wifiFullReinit()
-{
-    const uint32_t t0 = millis();
-    /* mDNS antes que nada: WiFi.mode(WIFI_OFF) destruye las netif y MDNS.end()
-     * despues las tocaba liberadas (LoadStoreError, 2026-10-25). */
-    MDNS.end();
-    radioTearDownCapture();
-    WiFi.mode(WIFI_OFF);              /* esp_wifi_stop + esp_wifi_deinit */
-    delay(20);
-    radioBringUpCapture();
-    if (MDNS.begin(LINK_MDNS_NAME)) MDNS.addService("http", "tcp", 80);
-    MASTER_LOG_PRINTF("[TXSTALL] WiFi re-inicializado en %lu ms espnow=%d\n",
-                      (unsigned long)(millis() - t0), (int)g_espnowReady);
-}
-
+/* Diagnostico del bloqueo de TX observado con esp_now_send en IDF 5.5. El
+ * camino vigente usa esp_wifi_80211_tx, pero se conserva el detector para
+ * dejar evidencia si la radio vuelve a quedar sin avisos de envio. */
 static void serviceTxStallDiag()
 {
 #if DBG_ENABLE && ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -2029,15 +1986,8 @@ static void serviceTxStallDiag()
         dumped = false;
         return;
     }
-    static uint32_t lastFixMs = 0;
-    if (dumped) {
-        /* Sigue trabado: otro intento cada 20 s. */
-        if (millis() - lastFixMs < 20000u) return;
-    } else if (millis() - sinceMs < 5000u) {
-        return;
-    }
+    if (dumped || millis() - sinceMs < 5000u) return;
     dumped = true;
-    lastFixMs = millis();
     wifi_sta_list_t sta = {};
     esp_wifi_ap_get_sta_list(&sta);
     MASTER_LOG_PRINTF("[TXSTALL] sin avisos de envio hace %lu ms; avisos=%lu sta=%d heap_int=%u mayor_int=%u dma=%u\n",
@@ -2061,13 +2011,6 @@ static void serviceTxStallDiag()
                           sta.sta[i].mac[0], sta.sta[i].mac[1], sta.sta[i].mac[2],
                           sta.sta[i].mac[3], sta.sta[i].mac[4], sta.sta[i].mac[5], sta.sta[i].rssi);
     Serial.flush();
-    esp_wifi_statis_dump(WIFI_STATIS_ALL);
-    static uint32_t recoveries = 0;
-    recoveries++;
-    wifiFullReinit();
-    for (uint8_t n = 1; n <= NUM_SLAVES; n++) g_ackPendingOn[n] = false;
-    lastCount = espnowTxAckOk() + espnowTxAckFail();
-    MASTER_LOG_PRINTF("[TXSTALL] recuperacion %lu\n", (unsigned long)recoveries);
 #endif
 }
 

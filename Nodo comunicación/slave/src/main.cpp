@@ -56,7 +56,6 @@ static volatile uint8_t g_firAction = 0;
 static volatile uint16_t g_firSum = 0;
 #include "sync_protocol.h"
 #include "debug_log.h"
-#include "sd_storage.h"
 #include "local_ui.h"
 #include "../../scope_measurement.h"
 
@@ -919,7 +918,7 @@ static const char *psocStateName(uint8_t state)
 static uint8_t g_psoc_hw_class = 0xFFu;
 
 /* Estado de la SD del PSoC (2026-07-11): la SD vive en el PSoC (SPI Master de
- * TopDesign), NO en el ESP32 — sd_storage.* queda obsoleto/stub. El PSoC
+ * TopDesign), no en este camino del ESP32. El PSoC
  * reporta PSOC_EVT_SD_STATUS en boot y ante PSOC_CMD_SD_STATUS; con firmware
  * PSoC viejo (sin 0xBC) no llega nunca → sd_present=0. */
 static uint8_t g_psoc_sd_status = 0u;   /* +bit4 FAT montado, bit5 sesión COMPLETE */
@@ -3189,9 +3188,6 @@ static bool programarSyncFtm(uint32_t startMasterUs)
     return true;
 }
 
-static volatile int64_t g_bcast_sync_local = 0;
-static volatile bool    g_bcast_sync_new = false;
-
 #if defined(ESP32) && ESP_ARDUINO_VERSION_MAJOR >= 3
 #ifndef START_RX_DELAY_US
 #define START_RX_DELAY_US 20000   /* > SCHED_EARLY_US */
@@ -3241,13 +3237,6 @@ static bool programarSyncRx()
 /* Informe del SYNC programado (desde loop): a que hora del maestro se subio. */
 static void serviceSchedSyncReport()
 {
-    if (g_bcast_sync_new) {
-        g_bcast_sync_new = false;
-        uint32_t m = 0;
-        const bool ok = ftm::localEspToMasterMac(g_bcast_sync_local, m);
-        SLAVE_LOG_PRINTF("[SYNCBC] broadcast real_maestro=%lu conv=%d modelo=%d\n",
-                         (unsigned long)m, (int)ok, (int)ftm::modelOk());
-    }
     if (!g_sched_fired) return;
     g_sched_fired = false;
     uint32_t realMaster = 0;
@@ -5201,10 +5190,6 @@ static void handleSetConfig(const MsgSetConfig *cfg)
                 waitAck = true;
             }
             break;
-        case SLAVE_CMD_SET_SD_ENABLE:       /* 0xC0: OBSOLETO (era SD-en-ESP32). La SD vive en el
-                                             * PSoC; usar 0xBE. Se rechaza siempre. */
-            ok = 0;
-            break;                          /* waitAck queda false: ack inmediato abajo */
         default:
             ok = 0;
             break;
@@ -5542,10 +5527,6 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 #endif
         if (!programado) {
             subirSyncConRadioSilencio();
-            /* Para medir la dispersion del START por broadcast entre nodos:
-             * a que hora del maestro subio SYNC, segun el modelo FTM. */
-            g_bcast_sync_local = esp_timer_get_time();
-            g_bcast_sync_new = true;
         }
         int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
         /* No START_ACK here: once SYNC rises the PSoC is measuring, so RF stays
@@ -6084,8 +6065,8 @@ void setup()
     SLAVE_LOG_PRINTF("[PSoC] reset pin GPIO%d OUTPUT, nivel=%d esperado=1\n",
                      PSOC_RESET_REQUEST_PIN,
                      digitalRead(PSOC_RESET_REQUEST_PIN));
-    /* SD-en-ESP32 purgada (2026-07-11): la SD vive en el PSoC. sd_storage.*
-     * queda como stub sin inicializar; sd_present sale de PSOC_EVT_SD_STATUS. */
+    /* La SD de las capturas asincronicas vive en el PSoC; sd_present sale de
+     * PSOC_EVT_SD_STATUS. */
     /* Heap: el store usa paginas de STORE_PAGE_BATCHES lotes, asi el limite
      * RAM-only lo da la suma de heap util y el buffer PSoC, no un bloque gigante. */
     SLAVE_LOG_PRINTF("[SLAVE %d] heap free=%u maxAlloc=%u (~%u lotes contiguos antiguos)\n",
@@ -6466,7 +6447,7 @@ void loop()
         MsgHello h = {
             CMD_HELLO, NODE_ID, (uint8_t)g_psocConnected,
             effectivePsocSampleRateHz(), g_psoc_hw_class,
-            psocSdPresent(),  /* SD del PSoC, no del ESP32 (sd_storage obsoleto) */
+            psocSdPresent(),  /* SD del PSoC */
 #if PSOC_I2C_ENABLE
             SLAVE_LINK_I2C,
 #else

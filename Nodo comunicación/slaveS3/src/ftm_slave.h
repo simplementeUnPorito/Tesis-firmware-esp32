@@ -9,8 +9,8 @@
  *   - theta = ((T2-T1) + (T3-T4)) / 2, el desfasaje entre los relojes MAC. Su
  *     pendiente contra el reloj local es la deriva (ppb) y su dispersion la
  *     calidad de sincronia, ambas independientes del origen de cada reloj.
- * El origen de T1/T4 respecto del esp_timer del maestro todavia no esta medido
- * en IDF 4.4, asi que el START no se programa con este modelo: solo se informa.
+ * En S3 / IDF 5 el modelo permite programar START contra el reloj del maestro.
+ * En IDF 4.4 no hay FTM y se usa el respaldo de recepcion inmediata.
  *
  * Solo los S3 traen FTM; en el ESP32 clasico todo compila y status() da
  * FTM_ST_UNSUPPORTED.
@@ -46,8 +46,7 @@ uint32_t modelAgeMs();
  * local. false si el modelo no es valido o el instante no esta entre 50 ms y
  * 5 s en el futuro. */
 bool masterMacToLocalEsp(uint32_t masterMacUs, int64_t &deadlineEsp, uint32_t &uncertNs);
-/* Instante local (esp_timer) expresado en el reloj MAC del maestro (para
- * verificar a que hora del maestro se subio SYNC). */
+/* Instante local (esp_timer) expresado en el reloj MAC del maestro. */
 bool localEspToMasterMac(int64_t esp, uint32_t &masterMacUs);
 
 }  // namespace ftm

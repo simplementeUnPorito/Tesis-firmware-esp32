@@ -546,6 +546,7 @@ void printStatus(bool raw)
 void begin() {}
 void service(bool, const uint8_t *, uint8_t) {}
 void setPeriodMs(uint32_t) {}
+void setTurn(uint8_t) {}
 static bool s_reported = false;
 bool takeReport(MsgFtmReport &out, uint8_t nodeId, uint8_t syncMode)
 {
