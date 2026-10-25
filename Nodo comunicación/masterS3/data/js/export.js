@@ -1,9 +1,9 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-44';
+import * as cfg from './config.js?v=field-study-45';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-44';
-import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-44';
+import { effectiveFs } from './data_store.js?v=field-study-45';
+import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-45';
 
 const MARK_BITS = [
   [0x01, 'SD_IO'],
@@ -861,7 +861,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-44',
+    web_app_version: 'field-study-45',
     noise_signatures_file: noiseSignaturesPath,
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {

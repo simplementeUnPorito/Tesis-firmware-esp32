@@ -132,8 +132,10 @@ export function syncCaptureMetadata() {
       note: 'START programado: cada esclavo sube SYNC en el instante indicado del reloj MAC del maestro, convertido con su modelo FTM.' };
   }
   return { ...rest, start_method: 'broadcast_start',
-    note: start ? 'START por broadcast ESP-NOW: algun esclavo no tenia modelo FTM valido.'
-      : 'START por broadcast ESP-NOW (el maestro no informo el metodo).' };
+    slave_sync_anchor: 'radio_rx_timestamp_plus_20ms',
+    note: 'START por broadcast ESP-NOW. Los esclavos S3 (IDF 5) suben SYNC en el instante de ' +
+      'recepcion de la radio + 20 ms (dispersion medida entre 3 nodos: 5 us mediana, 10 us max); ' +
+      'los esclavos clasicos lo suben al procesar el paquete (152 us mediana, 374 us max).' };
 }
 
 export function syncNodeMetadata(node) {
