@@ -216,9 +216,12 @@ void runOffer()
     const uint8_t err = download();
     leaveAp();
     if (err != OTA_ERR_NONE) {
-        setState(OTA_ST_FAILED, err);
+        /* Reinicio limpio: tras desasociarse del AP en medio de una descarga la
+         * radio podia quedar fuera del canal de ESP-NOW y el nodo mudo (nodo 4,
+         * 2026-10-25). El firmware anterior sigue intacto. */
+        for (int i = 0; i < 3; i++) { setState(OTA_ST_FAILED, err); delay(200); }
         g_inProgress = false;
-        return;
+        ESP.restart();
     }
     saveSession(g_session);
     setState(OTA_ST_REBOOTING);

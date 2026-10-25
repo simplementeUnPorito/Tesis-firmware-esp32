@@ -456,6 +456,9 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len);
 #if defined(ESP32)
 #include <esp_arduino_version.h>
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
+#include <esp_private/wifi.h>   /* reloj MAC para la baliza de tiempo FTM */
+#endif
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
 /* IDF 5: el callback de ESP-NOW recibe esp_now_recv_info_t. */
 static void onDataRecvV3(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
@@ -3097,6 +3100,75 @@ static void radioSilencioSyncTimerCb(void *)
     digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
 }
 
+/* SYNC programado por FTM: el esp_timer despierta unos ms antes y se espera
+ * activamente hasta el microsegundo del plazo. */
+static esp_timer_handle_t g_sched_sync_timer = nullptr;
+static volatile int64_t   g_sched_deadline = 0;
+static volatile int64_t   g_sched_actual = 0;
+static volatile bool      g_sched_fired = false;
+static uint32_t           g_sched_master_us = 0;
+static uint32_t           g_sched_uncert_ns = 0;
+static constexpr int64_t  SCHED_EARLY_US = 10000;   /* con 3 ms el timer igual llegaba ~20 us tarde */
+
+static portMUX_TYPE g_sched_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void schedSyncTimerCb(void *)
+{
+    const int64_t dl = g_sched_deadline;
+    /* Hasta 300 us antes, espera normal; el tramo final sin interrupciones (una
+     * del WiFi en el ultimo tramo atrasaba el flanco 15-30 us). */
+    while (esp_timer_get_time() < dl - 300) { }
+    portENTER_CRITICAL(&g_sched_mux);
+    while (esp_timer_get_time() < dl) { }
+    gpio_set_level((gpio_num_t)SYNC_TO_PSOC_PIN, 1);
+    const int64_t real = esp_timer_get_time();
+    portEXIT_CRITICAL(&g_sched_mux);
+    g_sched_actual = real;
+    g_sched_fired = true;
+}
+
+static bool programarSyncFtm(uint32_t startMasterUs)
+{
+    int64_t deadline = 0;
+    uint32_t unc = 0;
+    if (!ftm::masterMacToLocalEsp(startMasterUs, deadline, unc)) return false;
+    if (g_sched_sync_timer == nullptr) {
+        const esp_timer_create_args_t args = {
+            .callback = &schedSyncTimerCb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ftm_sync",
+            .skip_unhandled_events = false,
+        };
+        if (esp_timer_create(&args, &g_sched_sync_timer) != ESP_OK) {
+            g_sched_sync_timer = nullptr;
+            return false;
+        }
+    }
+    esp_timer_stop(g_sched_sync_timer);
+    g_sched_deadline = deadline;
+    g_sched_fired = false;
+    g_sched_master_us = startMasterUs;
+    g_sched_uncert_ns = unc;
+    const int64_t wait = deadline - SCHED_EARLY_US - esp_timer_get_time();
+    if (esp_timer_start_once(g_sched_sync_timer, (uint64_t)(wait > 0 ? wait : 1)) != ESP_OK) return false;
+    return true;
+}
+
+/* Informe del SYNC programado (desde loop): a que hora del maestro se subio. */
+static void serviceSchedSyncReport()
+{
+    if (!g_sched_fired) return;
+    g_sched_fired = false;
+    uint32_t realMaster = 0;
+    const bool okConv = ftm::localEspToMasterMac(g_sched_actual, realMaster);
+    SLAVE_LOG_PRINTF("[SYNCFTM] objetivo_maestro=%lu real_maestro=%lu err_us=%ld tarde_local_us=%lld incert_ns=%lu conv=%d\n",
+                     (unsigned long)g_sched_master_us, (unsigned long)realMaster,
+                     (long)(int32_t)(realMaster - g_sched_master_us),
+                     (long long)(g_sched_actual - g_sched_deadline),
+                     (unsigned long)g_sched_uncert_ns, (int)okConv);
+}
+
 static void iniciarTimerSyncRadioSilencio()
 {
     if (g_radio_silencio_sync_timer != nullptr) return;
@@ -5229,7 +5301,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
                              (int)g_state, (unsigned)storeReadyForHotWait());
         }
     }
-    else if (cmd == CMD_START && len >= (int)sizeof(MsgStart)) {
+    else if (cmd == CMD_START && len >= (int)offsetof(MsgStart, sched)) {
         const MsgStart *msg = (const MsgStart *)data;
         uint8_t targetNode = msg->target_node & 0x7Fu;
         bool probeOnly = (msg->target_node & 0x80u) != 0;
@@ -5257,7 +5329,17 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
             return;
         }
         int syncBefore = digitalRead(SYNC_TO_PSOC_PIN);
-        subirSyncConRadioSilencio();
+        /* START programado por FTM: el flanco sale en el instante del maestro,
+         * no al llegar el paquete. Sin modelo valido, como siempre. */
+        const bool sched = len >= (int)sizeof(MsgStart) && msg->sched == 1u;
+        bool programado = false;
+        if (sched) {
+            programado = programarSyncFtm(msg->start_mac_us);
+            SLAVE_LOG_PRINTF("[SYNCFTM] START programado=%d objetivo_maestro=%lu modelo=%d\n",
+                             (int)programado, (unsigned long)msg->start_mac_us, (int)ftm::modelOk());
+            if (programado && radioSilActiva()) g_radio_silencio_pedido = true;
+        }
+        if (!programado) subirSyncConRadioSilencio();
         int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
         /* No START_ACK here: once SYNC rises the PSoC is measuring, so RF stays
            silent until the store is full and CMD_START ok=2 can be sent. */
@@ -5284,6 +5366,12 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
              (unsigned)g_rec_n_batches, (int)storeReadyForHotWait(),
              syncBefore, syncAfter, (unsigned)g_view_store_active,
              (unsigned)g_start_store_active);
+    }
+    else if (cmd == CMD_TIME_BEACON && len >= (int)sizeof(MsgTimeBeacon)) {
+#if defined(ESP32) && ESP_ARDUINO_VERSION_MAJOR >= 3
+        ftm::noteMasterBeacon(((const MsgTimeBeacon *)data)->master_mac_us,
+                              esp_wifi_internal_get_mac_clock_time());
+#endif
     }
     else if (cmd == CMD_STREAM_ACK && len >= (int)sizeof(MsgStreamAck)) {
         const MsgStreamAck *a = (const MsgStreamAck *)data;
@@ -5950,6 +6038,7 @@ static void serviceRemoteLog()
 void loop()
 {
     serviceRemoteLog();
+    serviceSchedSyncReport();
     if (g_reqBatchPendingFlag) {
         MsgReqBatch req;
         REQ_LOCK();

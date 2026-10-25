@@ -14,6 +14,10 @@
 #include <esp_event.h>
 #include <esp_timer.h>
 #include <esp_arduino_version.h>
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#include <esp_private/wifi.h>
+#define FTM_CLOCK_MODEL 1
+#endif
 #else
 #define FTM_AVAILABLE 0
 #endif
@@ -26,6 +30,138 @@ static constexpr int      WINDOW        = 128;   /* tramas validas que se conser
 static constexpr int      MAX_ENTRIES   = 64;    /* tramas por sesion */
 static constexpr uint32_t SESSION_TIMEOUT_MS = 4000u;
 static constexpr int64_t  RTT_MAX_PS    = 2000000;  /* 300 m de ida y vuelta */
+
+#ifndef FTM_CLOCK_MODEL
+#define FTM_CLOCK_MODEL 0
+#endif
+
+/* ── Modelo de reloj ──────────────────────────────────────────────────────
+ * T2/T3 = reloj MAC local en ps (modulo 2^32 us); T1/T4 = reloj MAC del
+ * maestro en ps recortado a 48 bits. Con la estimacion gruesa de la baliza se
+ * reconstruye T1/T4 completo y sale theta exacto por trama. */
+static constexpr int64_t W32_PS = 4294967296LL * 1000000LL;   /* 2^32 us en ps */
+static constexpr int64_t W48_PS = 281474976710656LL;          /* 2^48 ps */
+static constexpr int     MODEL_N = 16;                        /* sesiones en la recta */
+static bool     s_coarseOk = false;
+static uint32_t s_coarseThetaUs = 0;   /* local_mac - master_mac de la baliza */
+struct SessionTheta {
+    uint32_t localMacUs;   /* reloj MAC local de la sesion */
+    int64_t  thetaPs;      /* modulo W32_PS */
+    uint32_t ms;           /* millis() al procesarla */
+};
+static SessionTheta s_ses[MODEL_N];
+static int      s_sesHead = 0, s_sesCount = 0;
+static double   s_mSlope = 0;      /* ps de theta por us local (= deriva) */
+static int64_t  s_mThetaRef = 0;   /* theta en el instante de referencia (ps) */
+static uint32_t s_mRefLocal = 0;   /* reloj MAC local de referencia (us) */
+static double   s_mResidNs = 0;
+static bool     s_mOk = false;
+static uint32_t s_mLastMs = 0;
+
+static int64_t wrapW32(int64_t v)
+{
+    v %= W32_PS;
+    if (v < 0) v += W32_PS;
+    if (v >= W32_PS / 2) v -= W32_PS;
+    return v;
+}
+
+static int64_t modW32(int64_t v)
+{
+    v %= W32_PS;
+    return v < 0 ? v + W32_PS : v;
+}
+
+/* Valor completo (modulo W32) de un tiempo del maestro recortado a 48 bits,
+ * el mas cercano a la estimacion. */
+static int64_t unwrapMaster(int64_t raw48, int64_t estPs)
+{
+    int64_t k = (estPs - raw48) / W48_PS;
+    int64_t best = raw48 + k * W48_PS;
+    for (int64_t c = best - W48_PS; c <= best + W48_PS; c += W48_PS) {
+        if (llabs(wrapW32(c - estPs)) < llabs(wrapW32(best - estPs))) best = c;
+    }
+    return modW32(best);
+}
+
+static int cmpI64m(const void *a, const void *b)
+{
+    const int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void refitModel()
+{
+    s_mOk = false;
+    if (s_sesCount < 4) return;
+    const int last = (s_sesHead + MODEL_N - 1) % MODEL_N;
+    const SessionTheta &r = s_ses[last];
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    int n = 0;
+    for (int i = 0; i < s_sesCount; i++) {
+        const SessionTheta &e = s_ses[i];
+        if ((uint32_t)(r.ms - e.ms) > 30000u) continue;   /* solo sesiones recientes */
+        const double x = (double)(int32_t)(e.localMacUs - r.localMacUs);
+        const double y = (double)wrapW32(e.thetaPs - r.thetaPs);
+        sx += x; sy += y; sxx += x * x; sxy += x * y; n++;
+    }
+    if (n < 4) return;
+    const double den = sxx - sx * sx / n;
+    const double slope = den > 0 ? (sxy - sx * sy / n) / den : 0.0;
+    const double icpt = (sy - slope * sx) / n;
+    double ss = 0;
+    for (int i = 0; i < s_sesCount; i++) {
+        const SessionTheta &e = s_ses[i];
+        if ((uint32_t)(r.ms - e.ms) > 30000u) continue;
+        const double x = (double)(int32_t)(e.localMacUs - r.localMacUs);
+        const double y = (double)wrapW32(e.thetaPs - r.thetaPs);
+        const double d = y - (icpt + slope * x);
+        ss += d * d;
+    }
+    s_mSlope = slope;
+    s_mRefLocal = r.localMacUs;
+    s_mThetaRef = modW32(r.thetaPs + (int64_t)llround(icpt));
+    s_mResidNs = sqrt(ss / n) / 1000.0;
+    s_mLastMs = r.ms;
+    /* Deriva fisica < 100 ppm (= 1e6 ps/s = 1 ps/us * 100) y dispersion chica. */
+    s_mOk = fabs(slope) < 100.0 && s_mResidNs < 500.0;
+}
+
+/* theta de una sesion: mediana por trama, con T1/T4 desenrollados. */
+static void addSessionTheta(const wifi_ftm_report_entry_t *e, uint8_t n)
+{
+    if (!s_coarseOk || n == 0) return;
+    static int64_t th[64];
+    int k = 0;
+    uint32_t midLocal = 0;
+    for (uint8_t i = 0; i < n && k < 64; i++) {
+        const int64_t t1r = (int64_t)(e[i].t1 % (uint64_t)W48_PS);
+        const int64_t t4r = (int64_t)(e[i].t4 % (uint64_t)W48_PS);
+        const int64_t t2 = modW32((int64_t)(e[i].t2 % (uint64_t)W32_PS));
+        const int64_t t3 = modW32((int64_t)(e[i].t3 % (uint64_t)W32_PS));
+        if (e[i].t1 == 0 || e[i].t2 == 0) continue;
+        const int64_t estT1 = modW32(t2 - (int64_t)s_coarseThetaUs * 1000000LL);
+        const int64_t t1 = unwrapMaster(t1r, estT1);
+        const int64_t t4 = unwrapMaster(t4r, modW32(estT1 + (t3 - t2)));
+        const int64_t rtt = wrapW32(t4 - t1) - wrapW32(t3 - t2);
+        if (rtt <= 0 || rtt > RTT_MAX_PS) continue;
+        /* theta = local - maestro = ((t2 - t1) + (t3 - t4)) / 2 */
+        th[k++] = wrapW32((wrapW32(t2 - t1) + wrapW32(t3 - t4)) / 2);
+        midLocal = (uint32_t)(t2 / 1000000LL);
+    }
+    if (k < 4) return;
+    /* La mediana se toma alrededor de la estimacion gruesa (sin saltos de modulo). */
+    const int64_t c = (int64_t)s_coarseThetaUs * 1000000LL;
+    for (int i = 0; i < k; i++) th[i] = wrapW32(th[i] - c);
+    qsort(th, k, sizeof(int64_t), cmpI64m);
+    SessionTheta &s = s_ses[s_sesHead];
+    s.localMacUs = midLocal;
+    s.thetaPs = modW32(c + th[k / 2]);
+    s.ms = millis();
+    s_sesHead = (s_sesHead + 1) % MODEL_N;
+    if (s_sesCount < MODEL_N) s_sesCount++;
+    refitModel();
+}
 
 struct Entry {
     int64_t local_us;   /* esp_timer al procesar la sesion */
@@ -112,6 +248,59 @@ void begin()
 
 void setPeriodMs(uint32_t ms) { s_periodMs = ms; }
 
+#if FTM_CLOCK_MODEL
+void noteMasterBeacon(uint32_t masterMacUs, uint32_t localRxMacUs)
+{
+    /* La latencia de ESP-NOW solo suma; alcanza con ms de exactitud. */
+    s_coarseThetaUs = localRxMacUs - masterMacUs;
+    s_coarseOk = true;
+}
+
+bool modelOk() { return s_mOk && (uint32_t)(millis() - s_mLastMs) < 5000u; }
+uint32_t modelAgeMs() { return s_mLastMs ? (uint32_t)(millis() - s_mLastMs) : 0xFFFFFFFFu; }
+
+/* theta (ps, modulo W32) en un instante del reloj MAC local. */
+static int64_t thetaAtLocal(uint32_t localUs)
+{
+    const double dx = (double)(int32_t)(localUs - s_mRefLocal);
+    return modW32(s_mThetaRef + (int64_t)llround(s_mSlope * dx));
+}
+
+bool masterMacToLocalEsp(uint32_t masterMacUs, int64_t &deadlineEsp, uint32_t &uncertNs)
+{
+    if (!modelOk()) return false;
+    /* local = maestro + theta(local): dos pasadas alcanzan (theta varia ppm). */
+    int64_t localPs = modW32((int64_t)masterMacUs * 1000000LL + thetaAtLocal(masterMacUs + (uint32_t)(s_mThetaRef / 1000000LL)));
+    localPs = modW32((int64_t)masterMacUs * 1000000LL + thetaAtLocal((uint32_t)(localPs / 1000000LL)));
+    /* Reloj MAC y esp_timer salen del mismo cristal: delta directo. */
+    const uint32_t macNow = esp_wifi_internal_get_mac_clock_time();
+    const int64_t espNow = esp_timer_get_time();
+    const int64_t nowPs = (int64_t)macNow * 1000000LL;
+    const int64_t deltaPs = wrapW32(localPs - nowPs);
+    if (deltaPs < 50000000000LL || deltaPs > 5000000000000LL) return false;   /* 50 ms .. 5 s */
+    deadlineEsp = espNow + (deltaPs + 500000) / 1000000LL;
+    uncertNs = (uint32_t)(s_mResidNs + 1000.0);   /* + 1 us por la cuantizacion del esp_timer */
+    return true;
+}
+
+bool localEspToMasterMac(int64_t esp, uint32_t &masterMacUs)
+{
+    if (s_sesCount == 0) return false;
+    const uint32_t macNow = esp_wifi_internal_get_mac_clock_time();
+    const int64_t espNow = esp_timer_get_time();
+    const uint32_t localMac = macNow + (uint32_t)(esp - espNow);
+    const int64_t masterPs = modW32((int64_t)localMac * 1000000LL - thetaAtLocal(localMac));
+    masterMacUs = (uint32_t)(masterPs / 1000000LL);
+    return true;
+}
+#else
+void noteMasterBeacon(uint32_t, uint32_t) {}
+bool modelOk() { return false; }
+uint32_t modelAgeMs() { return 0xFFFFFFFFu; }
+bool masterMacToLocalEsp(uint32_t, int64_t &, uint32_t &) { return false; }
+bool localEspToMasterMac(int64_t, uint32_t &) { return false; }
+#endif
+
 static void absorb()
 {
     wifi_ftm_report_entry_t raw[MAX_ENTRIES];
@@ -142,6 +331,9 @@ static void absorb()
     s_status = FTM_ST_OK;
     s_cfgLocked = true;
     s_sessions++;
+#if FTM_CLOCK_MODEL
+    addSessionTheta(raw, n);
+#endif
     s_distEstCm = dist;
     const int64_t now = esp_timer_get_time();
     for (uint8_t i = 0; i < n; i++) {
@@ -298,6 +490,8 @@ bool takeReport(MsgFtmReport &out, uint8_t nodeId, uint8_t syncMode)
     out.init_err = s_initErr;
     out.ev_status = s_evStatus;
     out.cfg_idx = s_cfgIdx;
+    out.model_ok = modelOk() ? 1u : 0u;
+    out.model_age_ms = (int32_t)modelAgeMs();
     return true;
 }
 
@@ -343,6 +537,11 @@ bool takeReport(MsgFtmReport &out, uint8_t nodeId, uint8_t syncMode)
     return true;
 }
 void printStatus(bool) { SLAVE_LOG_RAW("#FTM sin soporte en esta placa\n"); }
+void noteMasterBeacon(uint32_t, uint32_t) {}
+bool modelOk() { return false; }
+uint32_t modelAgeMs() { return 0xFFFFFFFFu; }
+bool masterMacToLocalEsp(uint32_t, int64_t &, uint32_t &) { return false; }
+bool localEspToMasterMac(int64_t, uint32_t &) { return false; }
 
 #endif
 

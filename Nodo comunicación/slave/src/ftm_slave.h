@@ -32,4 +32,19 @@ void printStatus(bool raw);
 /* Periodo entre sesiones (ms, 0 = apagado). */
 void setPeriodMs(uint32_t ms);
 
+/* ── Modelo de reloj (solo S3 / IDF 5) ─────────────────────────────────────
+ * theta = reloj MAC local - reloj MAC del maestro (us, modulo 2^32), ajustado
+ * por recta sobre las ultimas sesiones FTM. La baliza del maestro solo resuelve
+ * la epoca de T1/T4 (48 bits de ps). */
+void noteMasterBeacon(uint32_t masterMacUs, uint32_t localRxMacUs);
+bool modelOk();
+uint32_t modelAgeMs();
+/* Convierte un instante del reloj MAC del maestro en un plazo del esp_timer
+ * local. false si el modelo no es valido o el instante no esta entre 50 ms y
+ * 5 s en el futuro. */
+bool masterMacToLocalEsp(uint32_t masterMacUs, int64_t &deadlineEsp, uint32_t &uncertNs);
+/* Instante local (esp_timer) expresado en el reloj MAC del maestro (para
+ * verificar a que hora del maestro se subio SYNC). */
+bool localEspToMasterMac(int64_t esp, uint32_t &masterMacUs);
+
 }  // namespace ftm

@@ -73,7 +73,9 @@
 
 struct MsgArm    { uint8_t cmd; };
 struct MsgArmAck { uint8_t cmd; uint8_t node_id; uint8_t status; };
-struct MsgStart  { uint8_t cmd; uint64_t t_start_us; uint8_t target_node; };
+struct MsgStart  { uint8_t cmd; uint64_t t_start_us; uint8_t target_node;
+                   /* Aditivo: START programado por FTM (ver la copia del esclavo). */
+                   uint8_t sched; uint32_t start_mac_us; };
 struct MsgStartAck {
     uint8_t  cmd;
     uint8_t  node_id;
@@ -464,6 +466,8 @@ struct MsgFtmReport {
     int16_t  init_err;     /* esp_err_t de la ultima esp_wifi_ftm_initiate_session; aditivo */
     uint8_t  ev_status;    /* wifi_ftm_status_t crudo del ultimo reporte; aditivo */
     uint8_t  cfg_idx;      /* configuracion FTM en uso (ftm_slave.cpp); aditivo */
+    uint8_t  model_ok;     /* modelo de reloj valido para programar el START; aditivo */
+    int32_t  model_age_ms; /* edad de la ultima sesion usada en el modelo; aditivo */
 };
 #pragma pack(pop)
 
@@ -476,5 +480,17 @@ struct MsgSlaveLog {
     uint8_t node_id;
     uint8_t len;
     char    text[SLAVE_LOG_MAX];
+};
+#pragma pack(pop)
+
+/* Baliza de tiempo del maestro (solo S3 / IDF 5): su reloj MAC en us. El
+ * esclavo la usa para resolver la epoca de T1/T4 del FTM (vienen recortados a
+ * 48 bits de ps). No hace falta precision: un error de ms alcanza. */
+#define CMD_TIME_BEACON 0x7D   /* maestro -> broadcast, 2 Hz */
+#pragma pack(push, 1)
+struct MsgTimeBeacon {
+    uint8_t  cmd;          /* CMD_TIME_BEACON */
+    uint32_t run_id;       /* cambia en cada arranque del maestro */
+    uint32_t master_mac_us;
 };
 #pragma pack(pop)

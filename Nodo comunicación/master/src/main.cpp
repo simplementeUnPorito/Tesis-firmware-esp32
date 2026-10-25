@@ -920,11 +920,56 @@ static void apEnableFtmResponder()
 static MsgFtmReport  g_ftmLast[NUM_SLAVES + 1];
 static volatile bool g_ftmNew[NUM_SLAVES + 1];
 
+static uint32_t g_ftmLastMs[NUM_SLAVES + 1];
+
 static void onFtmReport(const MsgFtmReport &m)
 {
     if (m.node_id == 0 || m.node_id > NUM_SLAVES) return;
     g_ftmLast[m.node_id] = m;
+    g_ftmLastMs[m.node_id] = millis();
     g_ftmNew[m.node_id] = true;
+}
+
+/* ── Sincronia por FTM (solo S3 / IDF 5) ─────────────────────────────────────
+ * Baliza de tiempo: el reloj MAC del maestro, para que el esclavo resuelva la
+ * epoca de T1/T4. START programado: si TODOS los esclavos de la captura tienen
+ * modelo de reloj valido, el START lleva un instante futuro del reloj MAC del
+ * maestro y cada esclavo sube SYNC en ese instante. */
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#include <esp_private/wifi.h>
+#define MASTER_FTM_SYNC 1
+#else
+#define MASTER_FTM_SYNC 0
+#endif
+static uint32_t g_runId = 0;
+static constexpr uint32_t FTM_START_LEAD_US = 400000u;
+
+static void serviceTimeBeacon()
+{
+#if MASTER_FTM_SYNC
+    static uint32_t lastMs = 0;
+    if (!g_espnowReady || millis() - lastMs < 500u) return;
+    lastMs = millis();
+    if (g_runId == 0) g_runId = esp_random() | 1u;
+    MsgTimeBeacon b = { CMD_TIME_BEACON, g_runId, esp_wifi_internal_get_mac_clock_time() };
+    geonetSend(ESPNOW_BROADCAST, (uint8_t *)&b, sizeof(b));
+#endif
+}
+
+/* true si todos los esclavos de la captura informaron modelo valido hace poco. */
+static bool ftmStartPosible(uint32_t mask)
+{
+#if MASTER_FTM_SYNC
+    if (mask == 0u) return false;
+    for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
+        if (!(mask & (1UL << n))) continue;
+        if (!g_ftmLast[n].model_ok || millis() - g_ftmLastMs[n] > 4000u) return false;
+    }
+    return true;
+#else
+    (void)mask;
+    return false;
+#endif
 }
 
 static void serviceFtmReports()
@@ -933,22 +978,24 @@ static void serviceFtmReports()
         if (!g_ftmNew[n]) continue;
         g_ftmNew[n] = false;
         const MsgFtmReport m = g_ftmLast[n];
-        MASTER_LOG_PRINTF("[FTM] S%u st=%u ev=%u cfg=%u win=%u rtt=%lu ps ses=%u\n", (unsigned)n,
+        MASTER_LOG_PRINTF("[FTM] S%u st=%u ev=%u cfg=%u win=%u rtt=%lu ps ses=%u modelo=%u edad=%ld\n", (unsigned)n,
                           (unsigned)m.status, (unsigned)m.ev_status, (unsigned)m.cfg_idx,
-                          (unsigned)m.window, (unsigned long)m.rtt_med_ps, (unsigned)m.sessions);
+                          (unsigned)m.window, (unsigned long)m.rtt_med_ps, (unsigned)m.sessions,
+                          (unsigned)m.model_ok, (long)m.model_age_ms);
         char js[384];
         snprintf(js, sizeof(js),
                  "{\"type\":\"ftm\",\"node\":%u,\"status\":%u,\"sync_mode\":%u,"
                  "\"sessions\":%u,\"frames_total\":%u,\"frames_valid\":%u,\"window\":%u,"
                  "\"rtt_med_ps\":%lu,\"rtt_mad_ps\":%lu,\"rtt_p95_ps\":%lu,\"rssi_med\":%d,"
                  "\"dist_sdk_cm\":%lu,\"skew_ppb\":%ld,\"resid_ns\":%lu,\"age_ms\":%lu,"
-                 "\"channel\":%u,\"init_err\":%d,\"ev_status\":%u,\"cfg_idx\":%u}",
+                 "\"channel\":%u,\"init_err\":%d,\"ev_status\":%u,\"cfg_idx\":%u,\"model_ok\":%u}",
                  (unsigned)n, (unsigned)m.status, (unsigned)m.sync_mode,
                  (unsigned)m.sessions, (unsigned)m.frames_total, (unsigned)m.frames_valid,
                  (unsigned)m.window, (unsigned long)m.rtt_med_ps, (unsigned long)m.rtt_mad_ps,
                  (unsigned long)m.rtt_p95_ps, (int)m.rssi_med, (unsigned long)m.dist_est_cm,
                  (long)m.skew_ppb, (unsigned long)m.resid_ns, (unsigned long)m.age_ms,
-                 (unsigned)m.channel, (int)m.init_err, (unsigned)m.ev_status, (unsigned)m.cfg_idx);
+                 (unsigned)m.channel, (int)m.init_err, (unsigned)m.ev_status, (unsigned)m.cfg_idx,
+                 (unsigned)m.model_ok);
         webRelayText(js);
     }
 }
@@ -1395,12 +1442,26 @@ static void broadcastStart()
     /* GPIO primero — flanco hardware llega a los PSoC antes que el ESP-NOW */
     syncOutWrite(HIGH);
     debugEspHardwareStartPulse();
-    MsgStart msg = { CMD_START, g_t_start_us, 0 };
+    MsgStart msg = { CMD_START, g_t_start_us, 0, 0, 0 };
+#if MASTER_FTM_SYNC
+    if (ftmStartPosible(g_armAckMask)) {
+        msg.sched = 1;
+        msg.start_mac_us = esp_wifi_internal_get_mac_clock_time() + FTM_START_LEAD_US;
+    }
+#endif
     if (g_espnowReady) {
         g_startCmdTxUs = (uint32_t)micros();
         geonetSend(ESPNOW_BROADCAST, (uint8_t *)&msg, sizeof(msg));
     }
-    MASTER_LOG_PRINTF("[MASTER] START t0=%llu\n", g_t_start_us);
+    {
+        char js[160];
+        snprintf(js, sizeof(js), "{\"type\":\"sync_start\",\"method\":\"%s\",\"start_mac_us\":%lu,\"lead_us\":%lu}",
+                 msg.sched ? "ftm_scheduled" : "broadcast_start", (unsigned long)msg.start_mac_us,
+                 (unsigned long)(msg.sched ? FTM_START_LEAD_US : 0u));
+        webRelayText(js);
+    }
+    MASTER_LOG_PRINTF("[MASTER] START t0=%llu ftm=%u mac=%lu\n", g_t_start_us, (unsigned)msg.sched,
+                      (unsigned long)msg.start_mac_us);
 }
 
 static void broadcastScopeStart()
@@ -2336,6 +2397,7 @@ void setup()
 void loop()
 {
     serviceAckResend();
+    serviceTimeBeacon();
     if (g_reqResendPending && (int32_t)(millis() - g_reqResendDueMs) >= 0) {
         if (g_state == DUMPING && g_reqResendNode == g_dumpSlaveIdx &&
             g_reqResendSeq == g_dumpBatchSeq) {
