@@ -1912,6 +1912,61 @@ static void rtOnData(const uint8_t *data, int len)
 }
 static void rtOnEnd(const MsgStreamEnd &e) { g_rt.onEnd(e); }
 
+/* TX de WiFi trabado (IDF 5.5, 2026-10-25): en tiempo real el maestro deja de
+ * transmitir todo -AP, WebSocket, respuestas FTM y ESP-NOW (esp_now_send da
+ * NO_MEM sin fin y no vuelve ningun aviso de envio)- mientras la recepcion
+ * sigue. Si hay envios ESP-NOW pendientes y el contador de avisos no se mueve
+ * en 5 s, se vuelcan las estadisticas internas del WiFi una vez por episodio. */
+static void serviceTxStallDiag()
+{
+#if DBG_ENABLE && ESP_ARDUINO_VERSION_MAJOR >= 3
+    static uint32_t lastCount = 0, sinceMs = 0;
+    static bool dumped = false;
+    static bool logSet = false;
+    if (!logSet) {
+        logSet = true;
+        esp_log_level_set("wifi", ESP_LOG_WARN);   /* Arduino silencia el blob */
+    }
+    const uint32_t count = espnowTxAckOk() + espnowTxAckFail();
+    bool pending = false;
+    for (uint8_t n = 1; n <= NUM_SLAVES; n++) pending |= g_ackPendingOn[n];
+    if (count != lastCount || !pending) {
+        if (dumped && count != lastCount)
+            MASTER_LOG_PRINTF("[TXSTALL] el TX volvio solo tras %lu ms\n", (unsigned long)(millis() - sinceMs));
+        lastCount = count;
+        sinceMs = millis();
+        dumped = false;
+        return;
+    }
+    if (dumped || millis() - sinceMs < 5000u) return;
+    dumped = true;
+    wifi_sta_list_t sta = {};
+    esp_wifi_ap_get_sta_list(&sta);
+    MASTER_LOG_PRINTF("[TXSTALL] sin avisos de envio hace %lu ms; avisos=%lu sta=%d heap_int=%u mayor_int=%u dma=%u\n",
+                      (unsigned long)(millis() - sinceMs), (unsigned long)count, sta.num,
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    for (int i = 0; i < sta.num; i++)
+        MASTER_LOG_PRINTF("[TXSTALL] sta %02X:%02X:%02X:%02X:%02X:%02X rssi=%d\n",
+                          sta.sta[i].mac[0], sta.sta[i].mac[1], sta.sta[i].mac[2],
+                          sta.sta[i].mac[3], sta.sta[i].mac[4], sta.sta[i].mac[5], sta.sta[i].rssi);
+    Serial.flush();
+    esp_wifi_statis_dump(WIFI_STATIS_ALL);
+    /* Recuperacion: reiniciar el WiFi. En tiempo real no se pierde nada (los
+     * esclavos retienen lo no confirmado y la web pide los huecos con FILL);
+     * el telefono se reasocia solo. */
+    static uint32_t recoveries = 0;
+    const esp_err_t e1 = esp_wifi_stop();
+    const esp_err_t e2 = esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+    recoveries++;
+    MASTER_LOG_PRINTF("[TXSTALL] WiFi reiniciado stop=%d start=%d (vez %lu)\n", (int)e1, (int)e2,
+                      (unsigned long)recoveries);
+#endif
+}
+
 /* ── Procesar comandos de MATLAB ─────────────────────────────────────────── */
 
 static void handleMatlabCmd(const MatlabTransport::RxCmd &rxCmd, bool fromWeb = false)
@@ -2400,6 +2455,7 @@ void loop()
 {
     serviceAckResend();
     serviceTimeBeacon();
+    serviceTxStallDiag();
     if (g_reqResendPending && (int32_t)(millis() - g_reqResendDueMs) >= 0) {
         if (g_state == DUMPING && g_reqResendNode == g_dumpSlaveIdx &&
             g_reqResendSeq == g_dumpBatchSeq) {
