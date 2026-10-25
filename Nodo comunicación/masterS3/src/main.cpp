@@ -895,7 +895,15 @@ static void apEnableFtmResponder()
     if (ap_cfg.ap.ftm_responder) return;
     ap_cfg.ap.ftm_responder = true;
     const esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    MASTER_LOG_PRINTF("[MASTER] FTM responder err=%d\n", (int)err);
+    /* El responder se inicializa al arrancar el WiFi: con el AP ya levantado
+     * el flag quedaba guardado pero sin efecto y los esclavos recibian
+     * FTM_STATUS_CONF_REJECTED en toda sesion. Se reinicia el WiFi (antes de
+     * ESP-NOW y del DNS, que se levantan despues). */
+    const esp_err_t e1 = esp_wifi_stop();
+    const esp_err_t e2 = esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+    MASTER_LOG_PRINTF("[MASTER] FTM responder err=%d restart=%d/%d\n", (int)err, (int)e1, (int)e2);
 #endif
 }
 
