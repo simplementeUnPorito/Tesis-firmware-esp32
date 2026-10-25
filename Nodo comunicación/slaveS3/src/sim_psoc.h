@@ -10,7 +10,7 @@ struct SampleBytes;
 
 /* Modelo de muestras:
  *   post_analog = indice global de muestra, modulo 24 bits.
- *   post_digital = 200000*sin(12 Hz) + 200000*sin(37 Hz) + ruido LCG.
+ *   post_digital = 2000*sin(12 Hz) + 1000*sin(37 Hz) + ruido LCG (+-256).
  *   raw_input = los 16 bits bajos, con signo, de post_digital.
  *
  * Los frames wire siguen llevando un unico int24, exactamente como el PSoC.

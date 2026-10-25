@@ -59,7 +59,7 @@ void onMasterAck(uint32_t nextExpected, uint32_t sack);
 void requestStop();
 /* Asincronico: el maestro pide el lote seq. false = todavia no esta o no
  * existe (el que llama manda NACK). */
-bool serveReq(uint32_t seq);
+bool serveReq(uint32_t seq, bool compressed);
 void service();
 
 bool psocDone();

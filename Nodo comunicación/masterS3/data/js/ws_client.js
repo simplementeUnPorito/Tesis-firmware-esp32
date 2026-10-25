@@ -4,8 +4,11 @@
 // (packet_received / connection_changed / log_message signals) using
 // CustomEvents instead of Qt signals.
 
-import { decodePacket } from './protocol.js?v=field-study-41';
-import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-41';
+import { decodePacket } from './protocol.js?v=field-study-42';
+import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-42';
+import { decodeGeoZ } from './geo_codec.js?v=field-study-42';
+
+const ZBATCH_HEADER = 0x57;
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
@@ -97,6 +100,7 @@ export class WsClient extends EventTarget {
       if (this.authToken) {
         ws.send(JSON.stringify({ cmd: 'AUTH', token: this.authToken }));
       }
+      ws.send(JSON.stringify({ cmd: 'ZWEB', on: 1 }));
       this._emitConnection(true);
       if (this._stableTimer) clearTimeout(this._stableTimer);
       this._stableTimer = setTimeout(() => {
@@ -192,6 +196,8 @@ export class WsClient extends EventTarget {
             if (!msg.ok) {
               this._log('WS: contraseña incorrecta');
               this.dispatchEvent(new CustomEvent('auth-required', { detail: { reason: 'wrong_password' } }));
+            } else {
+              ws.send(JSON.stringify({ cmd: 'ZWEB', on: 1 }));
             }
           } else if (msg?.type === 'fill_miss') {
             this.dispatchEvent(new CustomEvent('fill-miss', { detail: msg }));
@@ -217,14 +223,34 @@ export class WsClient extends EventTarget {
     }, this._reconnectMs);
   }
 
-  /** A WS binary frame may carry one or several back-to-back 6-byte packets. */
+  /** Un frame puede mezclar paquetes 0x56 y lotes comprimidos 0x57. */
   _handleBinary(bytes) {
     let i = 0;
-    while (i + PKT_LEN <= bytes.length) {
-      if (bytes[i] !== PKT_HEADER) { i++; continue; }
-      const pkt = decodePacket(bytes.subarray(i, i + PKT_LEN));
-      if (pkt) this._emitPacket(pkt);
-      i += PKT_LEN;
+    while (i < bytes.length) {
+      if (bytes[i] === PKT_HEADER) {
+        if (i + PKT_LEN > bytes.length) break;
+        const pkt = decodePacket(bytes.subarray(i, i + PKT_LEN));
+        if (pkt) this._emitPacket(pkt);
+        i += PKT_LEN;
+        continue;
+      }
+      if (bytes[i] === ZBATCH_HEADER) {
+        if (i + 6 > bytes.length) break;
+        const len = bytes[i + 5];
+        if (i + 6 + len > bytes.length) break;
+        try {
+          const decoded = decodeGeoZ(bytes.subarray(i + 6, i + 6 + len));
+          const seq = bytes[i + 2] | (bytes[i + 3] << 8) | (bytes[i + 4] << 16);
+          this.dispatchEvent(new CustomEvent('zbatch', {
+            detail: { node: bytes[i + 1], seq, values: decoded.values, flags: decoded.flags },
+          }));
+        } catch (err) {
+          this._log(`WS: lote Z invalido (${err?.message || err})`);
+        }
+        i += 6 + len;
+        continue;
+      }
+      i++;
     }
   }
 

@@ -121,9 +121,12 @@ int32_t signalAt(uint32_t sample)
 {
     const float t = (float)sample / (float)(g_fs ? g_fs : NATIVE_FS);
     uint32_t rnd = sample * 1664525u + 1013904223u;
-    const int32_t noise = ((int32_t)((rnd >> 24u) & 0xFFu) - 128) * 8;
-    const float wave = 200000.0f * sinf(SIM_TWO_PI * 12.0f * t) +
-                       200000.0f * sinf(SIM_TWO_PI * 37.0f * t);
+    /* Amplitud de geofono quieto: los artefactos (3000-8000 cuentas) dominan
+     * la alta frecuencia como en campo. Con 200000 la senal tapaba las firmas
+     * y la limpieza no se podia evaluar. */
+    const int32_t noise = ((int32_t)((rnd >> 24u) & 0xFFu) - 128) * 2;
+    const float wave = 2000.0f * sinf(SIM_TWO_PI * 12.0f * t) +
+                       1000.0f * sinf(SIM_TWO_PI * 37.0f * t);
     int32_t value = (int32_t)lroundf(wave) + noise;
     if (value > 0x7FFFFF) value = 0x7FFFFF;
     if (value < -0x800000) value = -0x800000;

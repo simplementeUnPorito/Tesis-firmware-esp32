@@ -162,6 +162,7 @@ volatile uint32_t g_sdReadSeq = 0;
 volatile uint32_t g_sdReadCount = 0;
 bool g_sdReadForRt = false;
 bool g_sdReadPendingSend = false;
+bool g_sdReadCompressed = false;
 SampleBytes g_sdReadBuf[SD_READ_BATCHES * SPI_BATCH_SAMPLES];
 TaskHandle_t g_sdTask = nullptr;
 SemaphoreHandle_t g_sdMutex = nullptr;
@@ -484,10 +485,14 @@ static void batchValues(const SampleBytes *s, int32_t *x, uint8_t *flags)
     }
 }
 
-bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt)
+bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt, bool compressed = false)
 {
 #if LIVE_COMPRESS
-    if (rt) {
+    const bool useCompressed = rt || compressed;
+#else
+    const bool useCompressed = compressed;
+#endif
+    if (useCompressed) {
         /* Una sola trama comprimida por lote (geo_codec.h). */
         MsgDataZ m;
         int32_t x[SPI_BATCH_SAMPLES];
@@ -504,7 +509,6 @@ bool sendBatch(uint32_t seq, const SampleBytes *s, bool rt)
         g_txBytes += MSG_DATAZ_HEADER + m.len;
         return true;
     }
-#endif
     for (uint8_t part = 0; part < 2; part++) {
         esp_err_t err;
         if (rt) {
@@ -1163,19 +1167,22 @@ void onMasterAck(uint32_t nextExpected, uint32_t sack)
 
 void requestStop() { g_stopReq = true; }
 
-bool serveReq(uint32_t seq)
+bool serveReq(uint32_t seq, bool compressed)
 {
     if (!g_active) return false;
     if (g_psocDone && seq >= g_total) return false;
     if (g_cfg.storage == CAPMODE_STORAGE_SHARED && seq > g_dumpAck) g_dumpAck = seq;
     if (seq < g_recv && seq >= tailNow()) {
-        return sendBatch(seq, slotPtr(seq), false);
+        return sendBatch(seq, slotPtr(seq), false, compressed);
     }
     if (g_cfg.storage == CAPMODE_STORAGE_SD && seq < g_sdw) {
         /* La tarea lee bloques de 32 lotes: el pedido siguiente casi siempre
          * ya esta en el buffer. Antes se mandaba uno y se tiraba el resto, y
          * la descarga clasica desde SD iba a 4 lotes/s (2026-10-23). */
-        if (!g_sdReadForRt && sdReadContains(seq)) return sendBatch(seq, sdReadPtr(seq), false);
+        if (!g_sdReadForRt && sdReadContains(seq)) {
+            return sendBatch(seq, sdReadPtr(seq), false, compressed);
+        }
+        g_sdReadCompressed = compressed;
         requestSdRead(seq, false, true);
         return true;   /* sale en service() cuando la tarea lo lea */
     }
@@ -1187,7 +1194,7 @@ void service()
     if (!g_active) return;
     servicePsocFlow();
     if (!streaming() && g_sdReadState == 2u && !g_sdReadForRt && g_sdReadPendingSend) {
-        sendBatch(g_sdReadSeq, sdReadPtr(g_sdReadSeq), false);
+        sendBatch(g_sdReadSeq, sdReadPtr(g_sdReadSeq), false, g_sdReadCompressed);
         g_sdReadPendingSend = false;   /* el bloque queda para los pedidos siguientes */
     } else if (!streaming() && g_sdReadState == 3u && !g_sdReadForRt) {
         g_sdReadPendingSend = false;

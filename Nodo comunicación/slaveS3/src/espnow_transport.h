@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include "psoc_uart.h"
 #include "sync_protocol.h"
+#include "geo_codec.h"
 #include "espnow_compat.h"
 #include "debug_log.h"
 
@@ -37,7 +38,8 @@ public:
 
     /* Envía un batch desde el buffer de store-and-forward (30 SampleBytes ya convertidos). */
     void sendStoredBatch(const SampleBytes *samples30, uint16_t seq,
-                         uint64_t timestamp_us, uint8_t nodeId);
+                         uint64_t timestamp_us, uint8_t nodeId,
+                         bool compressed = false);
 
 
     uint32_t sentOK()   const { return _sentOK; }
@@ -177,8 +179,31 @@ inline void EspNowTransport::_buildAndSendRaw(const SampleBytes *samples15, uint
 }
 
 inline void EspNowTransport::sendStoredBatch(const SampleBytes *samples30, uint16_t seq,
-                                              uint64_t timestamp_us, uint8_t nodeId)
+                                              uint64_t timestamp_us, uint8_t nodeId,
+                                              bool compressed)
 {
+    if (compressed) {
+        MsgDataZ msg = {};
+        int32_t values[GEOZ_SAMPLES];
+        uint8_t flags[GEOZ_SAMPLES];
+        for (int i = 0; i < GEOZ_SAMPLES; i++) {
+            const SampleBytes &s = samples30[i];
+            const uint32_t v = (uint32_t)s.digi0 | ((uint32_t)s.digi1 << 8) |
+                               ((uint32_t)s.digi2 << 16);
+            values[i] = geoz_sext24(v);
+            flags[i] = s.flags;
+        }
+        msg.marker = DATAZ_PKT_MARKER;
+        msg.node_id = nodeId;
+        msg.seq = seq;
+        msg.len = (uint8_t)geoz_encode(values, flags, msg.data);
+        if (msg.len == 0u) { _sentFail++; return; }
+        msg.crc = dataZCrc(&msg);
+        const esp_err_t err = espnowSend(_masterMac, (const uint8_t *)&msg,
+                                         MSG_DATAZ_HEADER + msg.len);
+        if (err == ESP_OK) { _sentOK++; } else { _sentFail++; }
+        return;
+    }
     _buildAndSendRaw(samples30,                    0, seq, timestamp_us, nodeId);
     _buildAndSendRaw(samples30 + SAMPLES_PER_PART, 1, seq, timestamp_us, nodeId);
 }

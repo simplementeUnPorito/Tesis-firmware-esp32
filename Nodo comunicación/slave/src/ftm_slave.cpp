@@ -57,6 +57,12 @@ static uint8_t  s_status = FTM_ST_IDLE;
 static uint32_t s_distEstCm = 0;
 static uint8_t  s_channel = 0;
 static int16_t  s_initErr = 0;
+/* Configuraciones a probar si el responder rechaza (FTM_STATUS_CONF_REJECTED):
+ * {tramas, periodo de rafaga en 100 ms}. Se queda con la primera aceptada. */
+static const uint8_t  CFG_FRAMES[] = {16, 32, 0, 64, 24};
+static const uint16_t CFG_PERIOD[] = { 2,  2, 0,  0,  0};
+static uint8_t  s_cfgIdx = 0;
+static bool     s_cfgLocked = false;
 static uint8_t  s_evStatus = 0xFF;
 static bool     s_newReport = false;
 static wifi_ftm_report_entry_t s_last[MAX_ENTRIES];
@@ -108,10 +114,14 @@ static void absorb()
     if (st != FTM_STATUS_SUCCESS) {
         s_status = (st == FTM_STATUS_UNSUPPORTED) ? FTM_ST_UNSUPPORTED_PEER
                  : (st == FTM_STATUS_NO_RESPONSE) ? FTM_ST_NO_RESPONSE : FTM_ST_FAIL;
+        if (st == FTM_STATUS_CONF_REJECTED && !s_cfgLocked) {
+            s_cfgIdx = (uint8_t)((s_cfgIdx + 1u) % sizeof(CFG_FRAMES));
+        }
         s_newReport = true;
         return;
     }
     s_status = FTM_ST_OK;
+    s_cfgLocked = true;
     s_sessions++;
     s_distEstCm = dist;
     const int64_t now = esp_timer_get_time();
@@ -154,8 +164,8 @@ void service(bool allowed, const uint8_t responder[6], uint8_t channel)
     wifi_ftm_initiator_cfg_t cfg = {};
     memcpy(cfg.resp_mac, responder, 6);
     cfg.channel = channel;
-    cfg.frm_count = 16;
-    cfg.burst_period = 2;   /* 200 ms */
+    cfg.frm_count = CFG_FRAMES[s_cfgIdx];
+    cfg.burst_period = CFG_PERIOD[s_cfgIdx];
     s_lastSessionMs = now;
     s_channel = channel;
     const esp_err_t err = esp_wifi_ftm_initiate_session(&cfg);
@@ -259,6 +269,7 @@ bool takeReport(MsgFtmReport &out, uint8_t nodeId, uint8_t syncMode)
     out.channel = s_channel;
     out.init_err = s_initErr;
     out.ev_status = s_evStatus;
+    out.cfg_idx = s_cfgIdx;
     return true;
 }
 

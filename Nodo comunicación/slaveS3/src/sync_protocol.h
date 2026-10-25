@@ -24,7 +24,7 @@
 #define CMD_STATUS     0x30
 #define CMD_HELLO      0x40   /* beacon diagnóstico: esclavo → maestro */
 #define CMD_SET_RECLEN 0x50   /* master → todos: cuántos batches grabar (respuesta: CMD_CFG_ACK sub=0x50) */
-#define CMD_REQ_BATCH  0x51   /* master → esclavo: pedir batch específico (respuesta: 2× MsgData) */
+#define CMD_REQ_BATCH  0x51   /* master → esclavo: pedir batch específico */
 #define CMD_SCOPE_START 0x60  /* master → esclavos: pulso START falso, sin muestreo ni ACK */
 #define CMD_PRESTART    0x61  /* master → todos: entrar en HOT_WAIT con n_batches listo */
 #define CMD_HOTWAIT_QUERY 0x62 /* master → esclavo: consultar si está en HOT_WAIT */
@@ -245,7 +245,10 @@ struct MsgReqBatch {
     uint8_t  cmd;       /* CMD_REQ_BATCH */
     uint8_t  node_id;
     uint16_t batch_seq;
+    uint8_t  flags;     /* bit0: responder con un MsgDataZ; aditivo */
 };
+#define REQ_BATCH_COMPRESSED 0x01u
+#define MSG_REQ_BATCH_LEGACY_BYTES 4u
 
 struct MsgScopeStart {
     uint8_t cmd;        /* CMD_SCOPE_START */
@@ -478,6 +481,7 @@ struct MsgFtmReport {
     uint8_t  channel;
     int16_t  init_err;     /* esp_err_t de la ultima esp_wifi_ftm_initiate_session; aditivo */
     uint8_t  ev_status;    /* wifi_ftm_status_t crudo del ultimo reporte; aditivo */
+    uint8_t  cfg_idx;      /* configuracion FTM en uso (ftm_slave.cpp); aditivo */
 };
 #pragma pack(pop)
 

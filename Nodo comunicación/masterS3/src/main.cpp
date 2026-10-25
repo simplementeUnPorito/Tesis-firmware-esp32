@@ -839,7 +839,7 @@ static uint8_t           g_reqResendTries = 0;
 static void requestBatch(uint8_t nodeId, uint16_t seq)
 {
     const uint8_t *dst = espnowDstForSlave(nodeId);
-    MsgReqBatch msg = { CMD_REQ_BATCH, nodeId, seq };
+    MsgReqBatch msg = { CMD_REQ_BATCH, nodeId, seq, REQ_BATCH_COMPRESSED };
     esp_err_t err = ESP_FAIL;
     if (g_espnowReady) { err = geonetSend(dst, (uint8_t *)&msg, sizeof(msg)); }
     if (err == ESP_ERR_ESPNOW_NO_MEM) {
@@ -923,13 +923,13 @@ static void serviceFtmReports()
                  "\"sessions\":%u,\"frames_total\":%u,\"frames_valid\":%u,\"window\":%u,"
                  "\"rtt_med_ps\":%lu,\"rtt_mad_ps\":%lu,\"rtt_p95_ps\":%lu,\"rssi_med\":%d,"
                  "\"dist_sdk_cm\":%lu,\"skew_ppb\":%ld,\"resid_ns\":%lu,\"age_ms\":%lu,"
-                 "\"channel\":%u,\"init_err\":%d,\"ev_status\":%u}",
+                 "\"channel\":%u,\"init_err\":%d,\"ev_status\":%u,\"cfg_idx\":%u}",
                  (unsigned)n, (unsigned)m.status, (unsigned)m.sync_mode,
                  (unsigned)m.sessions, (unsigned)m.frames_total, (unsigned)m.frames_valid,
                  (unsigned)m.window, (unsigned long)m.rtt_med_ps, (unsigned long)m.rtt_mad_ps,
                  (unsigned long)m.rtt_p95_ps, (int)m.rssi_med, (unsigned long)m.dist_est_cm,
                  (long)m.skew_ppb, (unsigned long)m.resid_ns, (unsigned long)m.age_ms,
-                 (unsigned)m.channel, (int)m.init_err, (unsigned)m.ev_status);
+                 (unsigned)m.channel, (int)m.init_err, (unsigned)m.ev_status, (unsigned)m.cfg_idx);
         webRelayText(js);
     }
 }
@@ -1611,7 +1611,9 @@ static void onBatchReady(const ReassembledBatch &batch)
         return;
     }
 
-    /* Reenviar las 30 muestras (post_digital) al MATLAB */
+    const bool zweb = webRelayZEnabled();
+    matlab.setBatchRelayEnabled(!zweb);
+    /* Reenviar las 30 muestras (post_digital) al MATLAB. */
     for (int i = 0; i < SAMPLES_PER_PART * 2; i++) {
         const SampleBytes &s = batch.samples[i];
         int32_t val = (int32_t)s.digi0
@@ -1621,6 +1623,19 @@ static void onBatchReady(const ReassembledBatch &batch)
         if (s.flags != 0u) matlab.sendSampleMark(batch.node_id, s.flags);
         matlab.sendSample(batch.node_id, val);
         samplePulse();
+    }
+    matlab.setBatchRelayEnabled(true);
+    if (zweb) {
+        int32_t values[GEOZ_SAMPLES];
+        uint8_t flags[GEOZ_SAMPLES], payload[GEOZ_MAX_BYTES];
+        for (int i = 0; i < GEOZ_SAMPLES; i++) {
+            const SampleBytes &s = batch.samples[i];
+            values[i] = geoz_sext24((uint32_t)s.digi0 | ((uint32_t)s.digi1 << 8) |
+                                    ((uint32_t)s.digi2 << 16));
+            flags[i] = s.flags;
+        }
+        const size_t len = geoz_encode(values, flags, payload);
+        if (len > 0u) webRelayZ(batch.node_id, batch.seq, payload, (uint8_t)len);
     }
 
     /* Durante dump: marcar batch como recibido si es el que esperábamos */
@@ -1661,6 +1676,8 @@ static void onBatchReady(const ReassembledBatch &batch)
 /* Un lote con su numero; tambien lo usa el relleno de huecos (FILL). */
 static void emitNumberedBatch(uint8_t node, const SampleBytes *s, uint32_t seq)
 {
+    const bool zweb = webRelayZEnabled();
+    matlab.setBatchRelayEnabled(!zweb);
     matlab.sendBatchHeader(node, seq);
     for (int i = 0; i < SAMPLES_PER_PART * 2; i++) {
         int32_t val = (int32_t)s[i].digi0 | ((int32_t)s[i].digi1 << 8) |
@@ -1668,6 +1685,18 @@ static void emitNumberedBatch(uint8_t node, const SampleBytes *s, uint32_t seq)
         if (val & 0x800000) val |= (int32_t)0xFF000000;
         if (s[i].flags != 0u) matlab.sendSampleMark(node, s[i].flags);
         matlab.sendSample(node, val);
+    }
+    matlab.setBatchRelayEnabled(true);
+    if (zweb) {
+        int32_t values[GEOZ_SAMPLES];
+        uint8_t flags[GEOZ_SAMPLES], payload[GEOZ_MAX_BYTES];
+        for (int i = 0; i < GEOZ_SAMPLES; i++) {
+            values[i] = geoz_sext24((uint32_t)s[i].digi0 | ((uint32_t)s[i].digi1 << 8) |
+                                    ((uint32_t)s[i].digi2 << 16));
+            flags[i] = s[i].flags;
+        }
+        const size_t len = geoz_encode(values, flags, payload);
+        if (len > 0u) webRelayZ(node, seq, payload, (uint8_t)len);
     }
 }
 
@@ -1769,7 +1798,35 @@ static void serviceAckResend()
     }
 }
 
-static void rtOnData(const uint8_t *data, int len) { g_rt.onFrame(data, len); }
+static void rtOnData(const uint8_t *data, int len)
+{
+    if (g_state == DUMPING && len >= MSG_DATAZ_HEADER && data[0] == DATAZ_PKT_MARKER) {
+        const MsgDataZ *z = (const MsgDataZ *)data;
+        if (z->node_id != g_dumpSlaveIdx || z->seq != g_dumpBatchSeq ||
+            z->len == 0u || z->len > MSG_DATAZ_MAX ||
+            len != MSG_DATAZ_HEADER + z->len || z->crc != dataZCrc(z)) {
+            return;
+        }
+        int32_t values[GEOZ_SAMPLES];
+        uint8_t flags[GEOZ_SAMPLES];
+        if (!geoz_decode(z->data, z->len, values, flags)) return;
+        ReassembledBatch batch = {};
+        batch.node_id = z->node_id;
+        batch.seq = (uint16_t)z->seq;
+        batch.active = true;
+        batch.part_rx[0] = batch.part_rx[1] = true;
+        for (int i = 0; i < GEOZ_SAMPLES; i++) {
+            const uint32_t v = (uint32_t)values[i] & 0xFFFFFFu;
+            batch.samples[i].digi0 = (uint8_t)v;
+            batch.samples[i].digi1 = (uint8_t)(v >> 8);
+            batch.samples[i].digi2 = (uint8_t)(v >> 16);
+            batch.samples[i].flags = flags[i];
+        }
+        onBatchReady(batch);
+        return;
+    }
+    g_rt.onFrame(data, len);
+}
 static void rtOnEnd(const MsgStreamEnd &e) { g_rt.onEnd(e); }
 
 /* ── Procesar comandos de MATLAB ─────────────────────────────────────────── */

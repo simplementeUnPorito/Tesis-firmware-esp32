@@ -2,11 +2,13 @@
 /*
  * web_relay.h — Puente WebSocket <-> protocolo binario existente.
  *
- * Telemetría (maestro -> navegador): cada paquete de 6 bytes que
+ * Telemetría (maestro -> navegador): paquetes de 6 bytes que
  * MatlabTransport ya emite hacia MATLAB (vía _emit, ver matlab_transport.h)
  * se espeja por WS como mensaje binario, con el mismo framing
  * [0x56][node][type][b2][b1][b0] — protocol.js lo decodifica igual que
- * protocol.py, así que no hace falta un protocolo nuevo.
+ * protocol.py. Una web que envía {"cmd":"ZWEB","on":1} recibe los lotes como
+ * [0x57][node][seq LE24][len][geo_codec payload]; ambos registros pueden ir
+ * concatenados dentro del mismo mensaje WebSocket.
  *
  * Comandos (navegador -> maestro): mensajes de texto JSON planos
  *   {"cmd":"A1","param":1}                      comando estándar   (4 bytes)
@@ -22,6 +24,7 @@
 
 #include <ESPAsyncWebServer.h>
 #include "matlab_transport.h"
+#include "geo_codec.h"
 #include "master_log.h"
 
 static AsyncWebSocket ws("/ws");
@@ -46,6 +49,7 @@ static bool     g_wsAuthOk     = false;   /* true: cliente autenticado */
 static uint32_t g_wsAuthDeadMs = 0;       /* deadline de auth (0 = inactivo) */
 static uint32_t g_wsOwnerId    = 0;       /* cliente aceptado actual */
 static uint32_t g_wsAliveMs    = 0;       /* ultima actividad del dueño */
+static bool     g_wsZWeb       = false;   /* dueño opto por lotes comprimidos */
 
 static constexpr size_t WEB_RELAY_PKT_LEN = 6;
 /* 1200 paquetes = 7,2 KB por mensaje: varios segmentos TCP, asi Windows
@@ -108,6 +112,11 @@ inline bool webRelayOwnerRecentlyAlive()
     if (g_wsOwnerId == 0) return false;
     if (g_wsAliveMs == 0) return true;
     return (uint32_t)(millis() - g_wsAliveMs) <= WEB_RELAY_ALIVE_MS;
+}
+
+inline bool webRelayZEnabled()
+{
+    return g_wsOwnerId != 0 && g_wsZWeb && webRelayHasConnectedClient();
 }
 
 /* Cerrar el cliente WS activo a propósito (p. ej. justo antes de
@@ -230,6 +239,14 @@ static void webRelayDecodeCmd(const String &json)
             g_webFillHook((uint8_t)node, (uint32_t)seq,
                           (uint16_t)(count > 256 ? 256 : count));
         }
+        return;
+    }
+    if (cmdStr == "ZWEB") {
+        long on = 0;
+        webRelayJsonInt(json, "on", on);
+        g_wsZWeb = on != 0;
+        MASTER_LOG_PRINTF("[WEB] lotes Z %s para #%u\n", g_wsZWeb ? "ON" : "OFF",
+                          (unsigned)g_wsOwnerId);
         return;
     }
     uint8_t cmd = webRelayHexByte(cmdStr);
@@ -384,36 +401,42 @@ inline bool webRelayReadyForDumpRequest(bool requireClient = false)
     return true;
 }
 
-static void webRelayPacket(const uint8_t pkt[6])
+static bool webRelayQueueBinary(const uint8_t *data, size_t len)
 {
+    if (!data || len == 0u || len > WEB_RELAY_TX_BYTES) return false;
     if (!webRelayHasConnectedClient()) {
         webRelayTxLock();
         g_webRelayTxLen = 0;
         g_webRelayTxFirstMs = 0;
         webRelayTxUnlock();
-        return;
+        return false;
     }
 
     bool flushFirst = false;
     webRelayTxLock();
-    flushFirst = (g_webRelayTxLen + WEB_RELAY_PKT_LEN > WEB_RELAY_TX_BYTES);
+    flushFirst = (g_webRelayTxLen + len > WEB_RELAY_TX_BYTES);
     webRelayTxUnlock();
     if (flushFirst) webRelayFlush();
 
     bool queued = false;
     webRelayTxLock();
-    if (g_webRelayTxLen + WEB_RELAY_PKT_LEN <= WEB_RELAY_TX_BYTES) {
+    if (g_webRelayTxLen + len <= WEB_RELAY_TX_BYTES) {
         if (g_webRelayTxLen == 0) g_webRelayTxFirstMs = millis();
-        memcpy(&g_webRelayTxBuf[g_webRelayTxLen], pkt, WEB_RELAY_PKT_LEN);
-        g_webRelayTxLen += WEB_RELAY_PKT_LEN;
+        memcpy(&g_webRelayTxBuf[g_webRelayTxLen], data, len);
+        g_webRelayTxLen += len;
         queued = true;
     }
     webRelayTxUnlock();
 
     if (!queued) {
-        ws.binaryAll(const_cast<uint8_t *>(pkt), WEB_RELAY_PKT_LEN);
-        return;
+        ws.binaryAll(const_cast<uint8_t *>(data), len);
     }
+    return true;
+}
+
+static void webRelayPacket(const uint8_t pkt[6])
+{
+    if (!webRelayQueueBinary(pkt, WEB_RELAY_PKT_LEN)) return;
 
     /* Los de control (ACK, READY, estado...) salen ya; los del flujo de datos
      * (muestra 0x00, cabecera de lote 0xFA, marca 0xFB, fin 0xF9) se agrupan.
@@ -421,6 +444,21 @@ static void webRelayPacket(const uint8_t pkt[6])
      * promedio y la web no pasaba de ~32 lotes/s (2026-10-24). */
     const uint8_t t = pkt[2];
     if (t != 0x00 && t != 0xFA && t != 0xFB && t != 0xF9) webRelayFlush();
+}
+
+/* Lote web comprimido: seq usa little-endian de 24 bits. */
+inline void webRelayZ(uint8_t node, uint32_t seq, const uint8_t *payload, uint8_t len)
+{
+    uint8_t record[6u + GEOZ_MAX_BYTES];
+    if (!webRelayZEnabled() || !payload || len == 0u || len > GEOZ_MAX_BYTES) return;
+    record[0] = 0x57u;
+    record[1] = node;
+    record[2] = (uint8_t)(seq & 0xFFu);
+    record[3] = (uint8_t)((seq >> 8) & 0xFFu);
+    record[4] = (uint8_t)((seq >> 16) & 0xFFu);
+    record[5] = len;
+    memcpy(record + 6u, payload, len);
+    webRelayQueueBinary(record, 6u + len);
 }
 
 /* ── Eventos WebSocket ─────────────────────────────────────────────────────  */
@@ -504,6 +542,7 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
                                   client->id(), client->remoteIP().toString().c_str());
                 g_wsOwnerId = client->id();
                 g_wsAliveMs = millis();
+                g_wsZWeb = false;
                 if (WS_AUTH_ENABLED) {
                     g_wsAuthOk     = false;
                     g_wsAuthDeadMs = millis() + 5000u;
@@ -521,6 +560,7 @@ static void webRelayOnEvent(AsyncWebSocket *server, AsyncWebSocketClient *client
             if (client->id() == g_wsOwnerId) {
                 g_wsOwnerId    = 0;
                 g_wsAliveMs    = 0;
+                g_wsZWeb       = false;
                 g_wsAuthOk     = !WS_AUTH_ENABLED;   /* reset para próximo cliente */
                 g_wsAuthDeadMs = 0;
             }

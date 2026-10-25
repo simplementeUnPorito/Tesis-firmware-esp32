@@ -211,6 +211,11 @@ static bool    g_masterApKnown = false;
 static bool    g_beaconMarks = true;
 
 #if !defined(ESP8266)
+/* Ultima baliza del AP del maestro: mientras se oiga, el maestro sigue en el
+ * canal y no hace falta reescanear aunque no mande ESP-NOW (ver
+ * masterChannelService). */
+static volatile uint32_t g_lastMasterBeaconMs = 0;
+
 static void beaconPromiscCb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
     if (!g_beaconMarks || !g_masterApKnown || type != WIFI_PKT_MGMT || buf == nullptr) return;
@@ -218,6 +223,7 @@ static void beaconPromiscCb(void *buf, wifi_promiscuous_pkt_type_t type)
     const uint8_t *frame = pkt->payload;
     if (pkt->rx_ctrl.sig_len < 22u || frame[0] != 0x80u ||
         memcmp(frame + 16, g_masterApBssid, 6) != 0) return;
+    g_lastMasterBeaconMs = millis();
     const uint64_t now = (uint64_t)esp_timer_get_time();
     const uint64_t airtime = (uint64_t)pkt->rx_ctrl.sig_len * 8ULL;
     live::noteEvent(SAMPLE_FLAG_AP_BEACON, now - airtime, now);
@@ -387,6 +393,7 @@ static bool         g_psoc_sd_capture_error = false;
 static bool         g_psoc_sd_read_pending = false;
 static bool         g_psoc_sd_read_usb = false;    /* banco: sdread N imprime por USB en vez de ESP-NOW */
 static uint16_t     g_psoc_sd_read_seq = 0;
+static bool         g_psoc_sd_read_compressed = false;
 static uint32_t     g_psoc_sd_read_started_ms = 0;
 #define PSOC_SD_READ_TIMEOUT_MS 450u  /* H3 auditoría 2026-07-11: ~3.6% de lecturas 0xBF
                                         * superan 250 ms (pico periódico); 450 ms absorbe casi
@@ -5348,12 +5355,15 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
                           (uint8_t)((msg->n_batches == 0 || storeAllocated()) ? 1 : 0) };
         sendToMaster((const uint8_t *)&ack, sizeof(ack));
     }
-    else if (cmd == CMD_REQ_BATCH && len >= (int)sizeof(MsgReqBatch)) {
+    else if (cmd == CMD_REQ_BATCH && len >= (int)MSG_REQ_BATCH_LEGACY_BYTES) {
         /* Se atiende en loop(): mandar las dos tramas desde la tarea WiFi la
          * dejaba ocupada cuando llegaba el pedido siguiente, y en el S3 se
          * perdia uno de cada dos (descarga a ~3 lotes/s por reintentos). */
         REQ_LOCK();
-        memcpy((void *)&g_reqBatchPending, data, sizeof(MsgReqBatch));
+        MsgReqBatch req = {};
+        const size_t copyLen = ((size_t)len < sizeof(req)) ? (size_t)len : sizeof(req);
+        memcpy(&req, data, copyLen);
+        memcpy((void *)&g_reqBatchPending, &req, sizeof(req));
         g_reqBatchPendingFlag = true;
         REQ_UNLOCK();
     }
@@ -5440,6 +5450,7 @@ static void handleReqBatch(const MsgReqBatch *msg)
 {
     if (msg->node_id != NODE_ID) return;
     uint16_t seq = msg->batch_seq;
+    const bool compressed = (msg->flags & REQ_BATCH_COMPRESSED) != 0u;
 #if SIM_SIN_HW
     SLAVE_LOG_PRINTF("[REQ] seq=%u state=%d live=%d\n", seq, (int)g_state, (int)live::active());
 #endif
@@ -5447,7 +5458,7 @@ static void handleReqBatch(const MsgReqBatch *msg)
         return;   /* No TX ESP-NOW mientras el ADC está capturando. */
     }
     if (live::active()) {
-        if (!live::serveReq(seq)) {
+        if (!live::serveReq(seq, compressed)) {
             MsgCfgAck nack = { CMD_CFG_ACK, NODE_ID, CMD_REQ_BATCH, 0 };
             sendToMaster((const uint8_t *)&nack, sizeof(nack));
         }
@@ -5476,6 +5487,7 @@ static void handleReqBatch(const MsgReqBatch *msg)
         }
         g_psoc_sd_read_pending = true;
         g_psoc_sd_read_seq = seq;
+        g_psoc_sd_read_compressed = compressed;
         g_psoc_sd_read_started_ms = millis();
         psoc.sdReadBatch(seq);
         return;
@@ -5488,7 +5500,7 @@ static void handleReqBatch(const MsgReqBatch *msg)
         return;
     }
     uint64_t ts = g_t_start_us + (uint64_t)g_store_ts_us[seq];
-    transport.sendStoredBatch(s, seq, ts, NODE_ID);
+    transport.sendStoredBatch(s, seq, ts, NODE_ID, compressed);
 }
 
 static void servicePsocSdReadTimeout()
@@ -5601,7 +5613,7 @@ static void onBatch(const PsocBatch &batch)
         }
         const uint64_t ts = g_t_start_us +
             ((uint64_t)seq * SPI_BATCH_SAMPLES * 1000000ULL) / fs;
-        transport.sendStoredBatch(stored, seq, ts, NODE_ID);
+        transport.sendStoredBatch(stored, seq, ts, NODE_ID, g_psoc_sd_read_compressed);
         return;
     }
 
@@ -5706,6 +5718,10 @@ static void masterChannelService()
      * antes de asociarse al hotspot): sin rescanear, el esclavo quedaba sordo
      * para siempre. Se cuenta el silencio desde el boot. */
     if ((millis() - g_lastMasterRxMs) < MASTER_SILENCE_MS) return;
+    /* Las balizas del AP del maestro tambien cuentan: un maestro en reposo no
+     * manda ESP-NOW, y el reescaneo (segundos sordo) se comia el ARM/PRESTART
+     * de la captura siguiente (2026-10-24). */
+    if (g_lastMasterBeaconMs != 0u && (millis() - g_lastMasterBeaconMs) < 5000u) return;
 
     uint8_t ch = findMasterChannel(g_masterChannel);
     if (ch != g_masterChannel) {

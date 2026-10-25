@@ -65,6 +65,8 @@ public:
     void loop();
     /* Registrar (o quitar con nullptr) un espejo de los paquetes salientes */
     void setPacketRelay(MatlabPacketRelay relay) { _relay = relay; }
+    /* El USB no cambia; solo silencia el espejo de datos de lote al usar ZWEB. */
+    void setBatchRelayEnabled(bool enabled) { _batchRelayEnabled = enabled; }
 
     void sendSample(uint8_t nodeId, int32_t value24);
     void sendHeartbeat(uint8_t nodeId, uint8_t pga, uint8_t vdac, uint8_t mode);
@@ -119,13 +121,14 @@ private:
     uint8_t _rxIdx      = 0;
     uint8_t _rxExpected = 4;
     MatlabPacketRelay _relay = nullptr;
+    bool _batchRelayEnabled = true;
 
-    void _write6(uint8_t nodeId, uint8_t type, int32_t val24);
+    void _write6(uint8_t nodeId, uint8_t type, int32_t val24, bool relay = true);
     /* Único punto de salida — escribe por USB y, si hay un relay registrado,
      * espeja el mismo paquete (p.ej. hacia los clientes WS de la web UI). */
-    void _emit(const uint8_t pkt[6]) {
+    void _emit(const uint8_t pkt[6], bool relay = true) {
         Serial.write(pkt, 6);
-        if (_relay) _relay(pkt);
+        if (relay && _relay) _relay(pkt);
     }
     void _parseRx();
     void _pushCmd(const RxCmd &c) {
@@ -169,7 +172,7 @@ inline void MatlabTransport::loop()
     }
 }
 
-inline void MatlabTransport::_write6(uint8_t nodeId, uint8_t type, int32_t val24)
+inline void MatlabTransport::_write6(uint8_t nodeId, uint8_t type, int32_t val24, bool relay)
 {
     uint8_t pkt[6] = {
         MATLAB_PKT_HEADER,
@@ -179,12 +182,12 @@ inline void MatlabTransport::_write6(uint8_t nodeId, uint8_t type, int32_t val24
         (uint8_t)((val24 >>  8) & 0xFF),
         (uint8_t)( val24        & 0xFF)
     };
-    _emit(pkt);
+    _emit(pkt, relay);
 }
 
 inline void MatlabTransport::sendSample(uint8_t nodeId, int32_t value24)
 {
-    _write6(nodeId, 0x00, value24);
+    _write6(nodeId, 0x00, value24, _batchRelayEnabled);
 }
 
 inline void MatlabTransport::sendHeartbeat(uint8_t nodeId, uint8_t pga,
@@ -207,14 +210,14 @@ inline void MatlabTransport::sendSampleMark(uint8_t nodeId, uint8_t flags)
     /* type 0xFB: b2=flags. bit0 SD I/O, bit1 SD sync, bit2 radio TX,
      * bit3 I2C, bit4 beacon AP, bit5 RX maestro. Va antes de la muestra. */
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFB, flags, 0x00, 0x00 };
-    _emit(pkt);
+    _emit(pkt, _batchRelayEnabled);
 }
 
 inline void MatlabTransport::sendBatchHeader(uint8_t nodeId, uint32_t seq)
 {
     uint8_t pkt[6] = { MATLAB_PKT_HEADER, nodeId, 0xFA, (uint8_t)((seq >> 16) & 0xFFu),
                        (uint8_t)((seq >> 8) & 0xFFu), (uint8_t)(seq & 0xFFu) };
-    _emit(pkt);
+    _emit(pkt, _batchRelayEnabled);
 }
 
 inline void MatlabTransport::sendBatchEnd(uint8_t nodeId, uint32_t total)

@@ -2,20 +2,20 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-41';
-import { WsClient } from './ws_client.js?v=field-study-41';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-41';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-41';
-import { PlotArea } from './plot.js?v=field-study-41';
-import { SpectrumArea } from './spectrum.js?v=field-study-41';
-import { SlavePanel } from './slave_panel.js?v=field-study-41';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-41';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-41';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-41';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-41';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-41';
-import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart } from './sync_panel.js?v=field-study-41';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-41';
+import * as cfg from './config.js?v=field-study-42';
+import { WsClient } from './ws_client.js?v=field-study-42';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-42';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-42';
+import { PlotArea } from './plot.js?v=field-study-42';
+import { SpectrumArea } from './spectrum.js?v=field-study-42';
+import { SlavePanel } from './slave_panel.js?v=field-study-42';
+import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-42';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-42';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-42';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-42';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-42';
+import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart } from './sync_panel.js?v=field-study-42';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-42';
 
 const $ = (id) => document.getElementById(id);
 
@@ -1922,6 +1922,17 @@ function handleData(nd, pkt) {
   }
 }
 
+function handleDecodedBatch(node, seq, values, flags) {
+  if (node < 0 || node >= cfg.MAX_NODES || values.length !== cfg.SAMPLES_PER_BATCH ||
+      flags.length !== cfg.SAMPLES_PER_BATCH) return;
+  const nd = data.nodes[node];
+  onBatchHeader(nd, seq);
+  for (let i = 0; i < cfg.SAMPLES_PER_BATCH; i++) {
+    if (flags[i]) nd.pendingMarkFlags |= flags[i];
+    handleData(nd, { value24: values[i] });
+  }
+}
+
 function fillRingBuffer(ring, arr) {
   ring.clear();
   const start = Math.max(0, arr.length - ring.capacity);
@@ -3539,6 +3550,11 @@ ws.addEventListener('link-rssi', (ev) => {
     const panel = panelFor(slave.node);
     if (panel) panel.setRssi(Number.isFinite(slave.rssi) ? slave.rssi : null);
   }
+});
+
+ws.addEventListener('zbatch', (ev) => {
+  const batch = ev.detail;
+  handleDecodedBatch(batch.node, batch.seq, batch.values, batch.flags);
 });
 
 ws.addEventListener('packet', (ev) => {
