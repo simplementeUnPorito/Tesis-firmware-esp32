@@ -460,8 +460,18 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len);
 #endif
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
 /* IDF 5: el callback de ESP-NOW recibe esp_now_recv_info_t. */
+/* Instante de recepcion de la ultima trama (radio) y, en el mismo momento,
+ * los dos relojes locales: sirve para anclar el START broadcast. */
+static volatile uint32_t g_rx_ts = 0;
+static volatile uint32_t g_rx_mac = 0;
+static volatile int64_t  g_rx_esp = 0;
 static void onDataRecvV3(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
+    if (info && info->rx_ctrl) {
+        g_rx_ts = info->rx_ctrl->timestamp;
+        g_rx_mac = esp_wifi_internal_get_mac_clock_time();
+        g_rx_esp = esp_timer_get_time();
+    }
     onDataRecv(info->src_addr, data, len);
 }
 #define ESPNOW_RECV_CB onDataRecvV3
@@ -3155,13 +3165,78 @@ static bool programarSyncFtm(uint32_t startMasterUs)
     return true;
 }
 
+static volatile int64_t g_bcast_sync_local = 0;
+static volatile bool    g_bcast_sync_new = false;
+
+#if defined(ESP32) && ESP_ARDUINO_VERSION_MAJOR >= 3
+#ifndef START_RX_DELAY_US
+#define START_RX_DELAY_US 20000   /* > SCHED_EARLY_US */
+#endif
+static uint8_t  g_sched_kind = 0;      /* 0 = FTM, 1 = recepcion del broadcast */
+static uint32_t g_sched_rx_age = 0;
+static char     g_sched_rx_dom = '-';
+
+/* Plazo local = recepcion del START + START_RX_DELAY_US. El timestamp de
+ * rx_ctrl esta en el reloj MAC o en el esp_timer (32 bits, us): se usa el que
+ * de una edad razonable. */
+static bool programarSyncRx()
+{
+    const uint32_t ageMac = g_rx_mac - g_rx_ts;
+    const uint32_t ageEsp = (uint32_t)g_rx_esp - g_rx_ts;
+    uint32_t age;
+    if (ageMac < 20000u) { age = ageMac; g_sched_rx_dom = 'M'; }
+    else if (ageEsp < 20000u) { age = ageEsp; g_sched_rx_dom = 'E'; }
+    else return false;
+    const int64_t deadline = g_rx_esp - (int64_t)age + START_RX_DELAY_US;
+    if (deadline - esp_timer_get_time() < (int64_t)SCHED_EARLY_US + 500) return false;
+    if (g_sched_sync_timer == nullptr) {
+        const esp_timer_create_args_t args = {
+            .callback = &schedSyncTimerCb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ftm_sync",
+            .skip_unhandled_events = false,
+        };
+        if (esp_timer_create(&args, &g_sched_sync_timer) != ESP_OK) {
+            g_sched_sync_timer = nullptr;
+            return false;
+        }
+    }
+    esp_timer_stop(g_sched_sync_timer);
+    g_sched_kind = 1;
+    g_sched_rx_age = age;
+    g_sched_deadline = deadline;
+    g_sched_fired = false;
+    g_sched_master_us = 0;
+    g_sched_uncert_ns = 0;
+    const int64_t wait = deadline - SCHED_EARLY_US - esp_timer_get_time();
+    return esp_timer_start_once(g_sched_sync_timer, (uint64_t)(wait > 0 ? wait : 1)) == ESP_OK;
+}
+#endif
+
 /* Informe del SYNC programado (desde loop): a que hora del maestro se subio. */
 static void serviceSchedSyncReport()
 {
+    if (g_bcast_sync_new) {
+        g_bcast_sync_new = false;
+        uint32_t m = 0;
+        const bool ok = ftm::localEspToMasterMac(g_bcast_sync_local, m);
+        SLAVE_LOG_PRINTF("[SYNCBC] broadcast real_maestro=%lu conv=%d modelo=%d\n",
+                         (unsigned long)m, (int)ok, (int)ftm::modelOk());
+    }
     if (!g_sched_fired) return;
     g_sched_fired = false;
     uint32_t realMaster = 0;
     const bool okConv = ftm::localEspToMasterMac(g_sched_actual, realMaster);
+#if defined(ESP32) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    if (g_sched_kind == 1) {
+        g_sched_kind = 0;
+        SLAVE_LOG_PRINTF("[SYNCRX] real_maestro=%lu conv=%d edad_rx_us=%lu reloj=%c tarde_local_us=%lld\n",
+                         (unsigned long)realMaster, (int)okConv, (unsigned long)g_sched_rx_age,
+                         g_sched_rx_dom, (long long)(g_sched_actual - g_sched_deadline));
+        return;
+    }
+#endif
     SLAVE_LOG_PRINTF("[SYNCFTM] objetivo_maestro=%lu real_maestro=%lu err_us=%ld tarde_local_us=%lld incert_ns=%lu conv=%d\n",
                      (unsigned long)g_sched_master_us, (unsigned long)realMaster,
                      (long)(int32_t)(realMaster - g_sched_master_us),
@@ -5440,7 +5515,20 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
                              (int)programado, (unsigned long)msg->start_mac_us, (int)ftm::modelOk());
             if (programado && radioSilActiva()) g_radio_silencio_pedido = true;
         }
-        if (!programado) subirSyncConRadioSilencio();
+#if defined(ESP32) && ESP_ARDUINO_VERSION_MAJOR >= 3
+        /* Sin plan FTM: anclar al instante de recepcion del broadcast. */
+        if (!programado) {
+            programado = programarSyncRx();
+            if (programado && radioSilActiva()) g_radio_silencio_pedido = true;
+        }
+#endif
+        if (!programado) {
+            subirSyncConRadioSilencio();
+            /* Para medir la dispersion del START por broadcast entre nodos:
+             * a que hora del maestro subio SYNC, segun el modelo FTM. */
+            g_bcast_sync_local = esp_timer_get_time();
+            g_bcast_sync_new = true;
+        }
         int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
         /* No START_ACK here: once SYNC rises the PSoC is measuring, so RF stays
            silent until the store is full and CMD_START ok=2 can be sent. */

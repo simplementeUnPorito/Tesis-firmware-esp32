@@ -8,6 +8,7 @@
 
 #include <Arduino.h>
 #include <esp_now.h>
+#include <lwip/tcpip.h>
 #include <esp_arduino_version.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -20,7 +21,18 @@ static inline esp_err_t geonetSend(const uint8_t *dst, const uint8_t *data, size
     uint8_t buf[ESPNOW_MAX_PAYLOAD];
     const int n = geonetWrap(buf, data, (int)len);
     if (n == 0) return ESP_ERR_INVALID_ARG;
+#if defined(ESPNOW_LOCK_TCPIP) && ESPNOW_LOCK_TCPIP
+    /* esp-idf #19269: ESP-NOW encola en la TX del WiFi sin el lock global y
+     * choca con las tramas del SoftAP que salen de lwIP. Con el core de lwIP
+     * tomado no sale ninguna mientras ESP-NOW encola. No llamar desde el hilo
+     * de tcpip (el mutex no es recursivo). */
+    LOCK_TCPIP_CORE();
+    const esp_err_t err = esp_now_send(dst, buf, (size_t)n);
+    UNLOCK_TCPIP_CORE();
+    return err;
+#else
     return esp_now_send(dst, buf, (size_t)n);
+#endif
 }
 
 #define MAX_NODES 9
