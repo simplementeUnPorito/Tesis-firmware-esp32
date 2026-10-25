@@ -69,6 +69,12 @@ body {
   color: var(--fg);
   font-size: 16px;
   min-height: 100vh;
+  overflow-x: hidden;
+}
+
+main, section, aside, nav, fieldset, .panel, .row, .tab-stack, .tab-page {
+  min-width: 0;
+  max-width: 100%;
 }
 
 h1 { font-size: 1.3rem; margin: 0 0 0.5rem; }
@@ -188,9 +194,38 @@ button, select, input {
   color: var(--input-fg);
   border: 1px solid var(--input-border);
   border-radius: 6px;
+  max-width: 100%;
 }
 
 button:active { background: var(--input-active); }
+
+.capture-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  padding: 0.45rem;
+  background: var(--panel-bg);
+  border-top: 1px solid var(--panel-border);
+}
+
+.capture-actions button {
+  flex: 1 1 8rem;
+  min-height: 3rem;
+  font-weight: 700;
+}
+
+#btn-start { border-color: var(--ok); }
+#btn-stop { border-color: var(--bad); }
+
+table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+th, td { white-space: nowrap; }
 
 .node-list {
   display: flex;
@@ -502,10 +537,33 @@ input[type="number"].small-number {
   }
 }
 
-@media (max-width: 520px) {
+@media (max-width: 600px) {
   body {
     padding: 0.5rem;
   }
+
+  header { margin-bottom: 0.5rem; }
+
+  .status-bar {
+    gap: 0.45rem 0.65rem;
+  }
+
+  .app-layout { gap: 0.5rem; }
+
+  .control-sidebar {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .tab-bar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    padding: 0.25rem 0;
+    background: var(--bg);
+  }
+
+  .panel { padding: 0.65rem; }
 
   .node-row {
     grid-template-columns: 1fr 1fr;
@@ -533,12 +591,35 @@ input[type="number"].small-number {
   }
 
   button, select, input {
-    min-height: 2.75rem;
+    min-height: 2.5rem;
   }
 
-  .row {
+  .tab-page .row {
+    flex-direction: column;
+    align-items: stretch;
     gap: 0.4rem;
   }
+
+  .tab-page .row > button,
+  .tab-page .row > select,
+  .tab-page .row > input,
+  .tab-page .row > label {
+    width: 100%;
+  }
+
+  .tab-page .row > label {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.25rem;
+  }
+
+  .tab-page .row > label:has(input[type="checkbox"]) {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  input[type="file"] { font-size: 0.85rem; }
 
   .plot-tools button, .plot-tools label {
     flex: 1 1 auto;
@@ -549,8 +630,26 @@ input[type="number"].small-number {
   }
 
   input[type="number"] {
-    width: auto;
+    width: 100%;
     min-width: 4rem;
+  }
+
+  .capture-actions {
+    flex-direction: row !important;
+    margin-inline: -0.65rem;
+    padding-inline: 0.65rem;
+  }
+
+  .capture-actions button { width: auto !important; }
+
+  .plot-panel { padding-inline: 0.5rem; }
+
+  .plot-wrap {
+    height: clamp(15rem, 48vh, 22rem);
+  }
+
+  .log {
+    height: min(28rem, 65vh);
   }
 }
 

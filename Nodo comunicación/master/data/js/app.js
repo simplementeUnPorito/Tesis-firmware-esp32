@@ -2,20 +2,20 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-42';
-import { WsClient } from './ws_client.js?v=field-study-42';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-42';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-42';
-import { PlotArea } from './plot.js?v=field-study-42';
-import { SpectrumArea } from './spectrum.js?v=field-study-42';
-import { SlavePanel } from './slave_panel.js?v=field-study-42';
-import { compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-42';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-42';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-42';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-42';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-42';
-import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart } from './sync_panel.js?v=field-study-42';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-42';
+import * as cfg from './config.js?v=field-study-44';
+import { WsClient } from './ws_client.js?v=field-study-44';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-44';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-44';
+import { PlotArea } from './plot.js?v=field-study-44';
+import { SpectrumArea } from './spectrum.js?v=field-study-44';
+import { SlavePanel } from './slave_panel.js?v=field-study-44';
+import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-44';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-44';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-44';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-44';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-44';
+import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-44';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-44';
 
 const $ = (id) => document.getElementById(id);
 
@@ -1731,6 +1731,7 @@ function appendPlaceholders(nd, count) {
   for (let i = 0; i < count; i++) {
     const evicted = nd.pushRaw(NaN);
     if (Number.isFinite(evicted)) nd.rawSum -= evicted;
+    if (nd.liveFir) nd.filtBuf.push(nd.liveFir.push(0));
     nd.totalSamples++;
     if (nd.fullCaptureEnabled) unlimitedSamplesStored++;
     if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
@@ -1909,17 +1910,34 @@ function handleData(nd, pkt) {
   nd.totalSamples++;
   if (nd.totalSamples % cfg.SAMPLES_PER_BATCH === 0) nd.batchCount++;
 
-  // Filtrar al cerrar: captura normal completa; captura grande, solo su cola.
+  // En vivo: FIR causal sobre la vista (sin notch ni limpieza de marcas).
+  // Al cerrar se refiltra todo con filtFilt: captura normal completa; captura
+  // grande, solo su cola.
+  if (!nd.captureActive || !nd.filtB) {
+    if (nd.filtBuf.length) nd.filtBuf.clear();
+    nd.liveFir = null;
+  }
   nd.captureActive = true;
   nd.filterDirty = true;
   nd.filterReady = false;
-  if (nd.filtBuf.length) nd.filtBuf.clear();
   if (nd.fullFiltStore?.length) nd.fullFiltStore.clear();
+  if (nd.filtB) liveFilterSample(nd, rawVal);
   if (nd.fullCaptureEnabled && unlimitedSamplesStored >= UNLIMITED_STOP_SAMPLES && !unlimitedStopSent) {
     unlimitedStopSent = true;
     sendStd(cfg.CMD_STOP, 0);
     appendLog('Presupuesto de memoria al 95 %: STOP enviado; drenando muestras pendientes');
   }
+}
+
+function liveFilterSample(nd, rawVal) {
+  if (!nd.liveFir || nd.liveFir.b !== nd.filtB || nd.filtBuf.length < nd.rawBuf.length - 1) {
+    // Filtro nuevo, cambiado o vista borrada a mitad de captura: alinear con el crudo.
+    nd.liveFir = new CausalFir(nd.filtB);
+    nd.filtBuf.clear();
+    for (let i = 1; i < nd.rawBuf.length; i++) nd.filtBuf.push(0);
+  }
+  const mean = nd.rawBuf.length ? nd.rawSum / nd.rawBuf.length : rawVal;
+  nd.filtBuf.push(nd.liveFir.push(rawVal - mean));
 }
 
 function handleDecodedBatch(node, seq, values, flags) {
@@ -2657,6 +2675,7 @@ function buildExportZip() {
     nSlaves: visibleSlaveCount(),
     nBatches,
     displaySecs,
+    noiseSignatures,
     preservedCaptures: preservedCaptures.slice(),
     liveCapture: captureHasSamples(liveCapture) ? liveCapture : null,
   });
@@ -3389,8 +3408,8 @@ function renderTick() {
   const removeDc = displayDcRemoveEnabled();
   const rawBufsOrig = data.nodes.map((nd) => (nd.rawBuf.length ? nd.rawBuf.toArray() : null));
   const filtBufs = data.nodes.map((nd) => (nd.filtBuf.length ? nd.filtBuf.toArray() : null));
-  // filtFilt is zero-phase — no group-delay trim needed.
-  const filtTrims = data.nodes.map(() => 0);
+  // filtFilt es de fase cero; el FIR causal en vivo va atrasado su retardo de grupo.
+  const filtTrims = data.nodes.map((nd) => (nd.captureActive && nd.liveFir ? nd.liveFir.delay : 0));
   updateWaveVelocityLabel(fs);
   const overlays = selectedPreservedCaptures().map(preparePreservedOverlay);
 
@@ -4013,3 +4032,9 @@ mountOtaPanel(document.getElementById('tab-slaves'), appendLog);
 // Sincronización FTM y distancia, también en Esclavos.
 const syncPanel = mountSyncPanel(document.getElementById('tab-slaves'), appendLog);
 ws.addEventListener('ftm', (ev) => syncPanel?.onReport(ev.detail));
+ws.addEventListener('sync-start', (ev) => {
+  onSyncStart(ev.detail);
+  appendLog(ev.detail.method === 'ftm_scheduled'
+    ? `START programado por FTM (+${Math.round((ev.detail.lead_us || 0) / 1000)} ms)`
+    : 'START por broadcast (sin modelo FTM en todos los nodos)');
+});

@@ -111,11 +111,29 @@ export function syncSnapshotForStart(mode) {
     sync_schema: 'geophone_sync_v1', started_at: new Date().toISOString(), nodes };
 }
 
+/* El maestro informa como salio el START: programado por el modelo FTM de
+ * cada esclavo (todos con modelo valido) o broadcast como antes. */
+export function onSyncStart(msg) {
+  if (!snapshot) syncSnapshotForStart(loadSyncMode());
+  snapshot.start = {
+    method: msg.method === 'ftm_scheduled' ? 'ftm_scheduled' : 'broadcast_start',
+    start_master_mac_us: Number.isFinite(msg.start_mac_us) ? msg.start_mac_us : null,
+    lead_us: Number.isFinite(msg.lead_us) ? msg.lead_us : null,
+    received_at: new Date().toISOString(),
+  };
+}
+
 export function syncCaptureMetadata() {
   if (!snapshot) return null;
-  const { nodes, ...rest } = snapshot;
+  const { nodes, start, ...rest } = snapshot;
+  if (start?.method === 'ftm_scheduled') {
+    return { ...rest, start_method: 'ftm_scheduled',
+      start_master_mac_us: start.start_master_mac_us, start_lead_us: start.lead_us,
+      note: 'START programado: cada esclavo sube SYNC en el instante indicado del reloj MAC del maestro, convertido con su modelo FTM.' };
+  }
   return { ...rest, start_method: 'broadcast_start',
-    note: 'START por broadcast ESP-NOW; el modelo FTM se informa pero todavia no programa el flanco.' };
+    note: start ? 'START por broadcast ESP-NOW: algun esclavo no tenia modelo FTM valido.'
+      : 'START por broadcast ESP-NOW (el maestro no informo el metodo).' };
 }
 
 export function syncNodeMetadata(node) {

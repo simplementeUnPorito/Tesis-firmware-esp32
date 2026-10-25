@@ -2,9 +2,9 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-study-42">
+  <link rel="stylesheet" href="/css/style.css?v=field-study-44">
 </head>
 <body>
   <header>
@@ -95,11 +95,11 @@
             <label class="capture-duration-control">Duración HAMMER <input id="capture-secs-hammer" type="number" min="0" max="3600" step="0.1" value="" placeholder="= GEOs"> s</label>
             <button class="capture-duration-control" id="btn-max-ram" title="Fija GEO al máximo de RAM">Máx RAM</button>
             <button class="capture-duration-control" id="btn-max-batches" title="Fija GEO al máximo de SD">Máx SD</button>
-            <button id="btn-start">START</button>
             <button id="btn-preserve">Descontar</button>
             <span id="capture-batches" class="status-text">--</span>
           </div>
-          <div class="row">
+          <div class="row capture-actions" aria-label="Acciones principales de captura">
+            <button id="btn-start">START</button>
             <button id="btn-stop">STOP</button>
           </div>
           <div class="row">
@@ -207,6 +207,6 @@
     </div>
   </div>
 
-  <script type="module" src="/js/app.js?v=field-study-42"></script>
+  <script type="module" src="/js/app.js?v=field-study-44"></script>
 </body>
 </html>

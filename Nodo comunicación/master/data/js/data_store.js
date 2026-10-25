@@ -3,7 +3,7 @@
 // use fixed-capacity rings for live plotting and optional chunked stores for
 // the complete unlimited capture.
 
-import * as cfg from './config.js?v=field-study-42';
+import * as cfg from './config.js?v=field-study-44';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -333,6 +333,7 @@ export class NodeData {
     if (this.fullFiltStore) this.fullFiltStore.clear();
     this.rawSum = 0;
     this.filtZi = null;
+    this.liveFir = null;
     this.batchCount = 0;
     this.totalSamples = 0;
     this.sdMarks = [];

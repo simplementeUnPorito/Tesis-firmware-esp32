@@ -188,6 +188,32 @@ function reverseCopy(input) {
 }
 
 /**
+ * FIR causal muestra a muestra para la vista en vivo. Como los FIR compilados
+ * son de fase lineal, la salida va atrasada `delay` muestras respecto de la
+ * entrada; la vista lo compensa. Al cerrar la captura se reemplaza por filtFilt.
+ */
+export class CausalFir {
+  constructor(b) {
+    this.b = b;
+    this.coeff = ArrayBuffer.isView(b) ? b : new Float64Array(b);
+    this.state = new Float64Array(Math.max(0, this.coeff.length - 1));
+    this.delay = Math.max(0, (this.coeff.length - 1) >> 1);
+  }
+
+  push(xn) {
+    const c = this.coeff;
+    const s = this.state;
+    if (c.length === 0) return 0;
+    if (c.length === 1) return c[0] * xn;
+    const yn = c[0] * xn + s[0];
+    const last = s.length - 1;
+    for (let i = 0; i < last; i++) s[i] = c[i + 1] * xn + s[i + 1];
+    s[last] = c[c.length - 1] * xn;
+    return yn;
+  }
+}
+
+/**
  * Zero-phase FIR filtering, equivalent in spirit to scipy.signal.filtfilt(b, 1, x).
  * Uses odd reflection padding so edge transients fall mostly outside the returned
  * capture. This is for full-buffer display/export, not real-time hardware FIR.

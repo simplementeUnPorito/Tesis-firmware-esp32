@@ -1,9 +1,9 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-42';
+import * as cfg from './config.js?v=field-study-44';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-42';
-import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-42';
+import { effectiveFs } from './data_store.js?v=field-study-44';
+import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-44';
 
 const MARK_BITS = [
   [0x01, 'SD_IO'],
@@ -706,6 +706,18 @@ export function buildCaptureZip(dataStore, options = {}) {
   const stamp = compactTimestamp(now);
   const nSlaves = options.nSlaves ?? (cfg.MAX_NODES - 1);
   const files = [];
+  const noiseSignatures = options.noiseSignatures &&
+    typeof options.noiseSignatures === 'object' &&
+    options.noiseSignatures.types && typeof options.noiseSignatures.types === 'object'
+    ? options.noiseSignatures
+    : null;
+  const noiseSignaturesPath = noiseSignatures ? 'noise_signatures.json' : null;
+  if (noiseSignaturesPath) {
+    files.push({
+      name: noiseSignaturesPath,
+      data: JSON.stringify(noiseSignatures, null, 2) + '\n',
+    });
+  }
   const nodes = [];
   const visibleNodes = [];
   const exportedNodes = [];
@@ -849,7 +861,8 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-42',
+    web_app_version: 'field-study-44',
+    noise_signatures_file: noiseSignaturesPath,
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
       hammer_origin_m: 0,
@@ -886,6 +899,7 @@ export function buildCaptureZip(dataStore, options = {}) {
       'metadata.json',
       'maestro/metadata.json',
       'maestro/config.json',
+      ...(noiseSignaturesPath ? [noiseSignaturesPath] : []),
       nodeSummaryPath,
       ...(captureSummaryPath ? [captureSummaryPath] : []),
       ...(captureNodeSummaryPath ? [captureNodeSummaryPath] : []),
@@ -916,6 +930,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     node_summary_csv_file: metadata.node_summary_csv_file,
     capture_node_summary_csv_file: metadata.capture_node_summary_csv_file,
     metadata_files: metadata.metadata_files,
+    noise_signatures_file: metadata.noise_signatures_file,
     id_semantics: metadata.id_semantics,
     captures: captureMetas,
     slaves: nodes.filter((node) => node.index > 0),
