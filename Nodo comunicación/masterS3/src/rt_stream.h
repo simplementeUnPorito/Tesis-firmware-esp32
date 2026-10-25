@@ -164,6 +164,7 @@ public:
     }
 
     bool nodeOn(uint8_t node) const { return node < RT_MAX_NODES && _nodes[node].on; }
+    bool nodeEnded(uint8_t node) const { return node < RT_MAX_NODES && _nodes[node].ended; }
 
     uint32_t delivered(uint8_t node) const
     {

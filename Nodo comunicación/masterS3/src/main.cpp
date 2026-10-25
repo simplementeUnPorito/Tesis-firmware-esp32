@@ -2632,6 +2632,21 @@ void loop()
     /* Tiempo real: entrega en orden y cierre por STREAM_END. */
     if (g_rt.active()) {
         g_rt.service();
+        /* El STOP sale por broadcast (sin ACK): si un nodo no lo oyo seguia
+         * transmitiendo para siempre (2026-10-25). Mientras haya nodos sin
+         * STREAM_END se les reenvia por unicast cada 300 ms. */
+        if (g_rtStopReqMs != 0u) {
+            static uint32_t lastStopResendMs = 0;
+            if (millis() - lastStopResendMs >= 300u) {
+                lastStopResendMs = millis();
+                MsgStop st = { CMD_STOP };
+                for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
+                    if (g_rt.nodeOn(n) && !g_rt.nodeEnded(n) && g_espnowReady) {
+                        geonetSend(espnowDstForSlave(n), (uint8_t *)&st, sizeof(st));
+                    }
+                }
+            }
+        }
 #if DBG_ENABLE
         {   /* Diagnostico del tiempo real, una linea por segundo. */
             static uint32_t lastDiagMs = 0;
