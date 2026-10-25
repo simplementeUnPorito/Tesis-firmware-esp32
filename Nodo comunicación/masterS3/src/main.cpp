@@ -915,6 +915,11 @@ static void apEnableFtmResponder()
      * ESP-NOW y del DNS, que se levantan despues). */
     /* FTM sensible al ancho: AP en HT20, igual que el iniciador. */
     esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+#if ESPNOW_RAW_TX
+    /* ESP-NOW por TX raw (espnow_rx.h): 1 Mbps como ESP-NOW por defecto. Se
+     * fija con el WiFi parado, justo antes del arranque de abajo. */
+    const bool rawRatePending = true;
+#endif
 #if defined(AP_PROTOCOL_BG) && AP_PROTOCOL_BG
     /* Experimento del TX trabado (IDF 5.5): AP sin HT, sin AMPDU con el
      * telefono. ESP-NOW va a tasa legacy y no cambia. */
@@ -922,10 +927,16 @@ static void apEnableFtmResponder()
     MASTER_LOG_PRINTF("[MASTER] AP solo 11b/g err=%d\n", (int)ep);
 #endif
     const esp_err_t e1 = esp_wifi_stop();
+#if ESPNOW_RAW_TX
+    const esp_err_t er = rawRatePending ? esp_wifi_config_80211_tx_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L) : ESP_OK;
+#endif
     const esp_err_t e2 = esp_wifi_start();
     esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
     MASTER_LOG_PRINTF("[MASTER] FTM responder err=%d restart=%d/%d\n", (int)err, (int)e1, (int)e2);
+#if ESPNOW_RAW_TX
+    MASTER_LOG_PRINTF("[MASTER] ESP-NOW por TX raw, tasa 1M err=%d\n", (int)er);
+#endif
 #endif
 }
 

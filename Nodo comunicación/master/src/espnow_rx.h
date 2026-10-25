@@ -15,12 +15,71 @@
 #include "sync_protocol.h"
 #include "master_log.h"
 
+/* ── ESP-NOW por TX raw (IDF 5, esp-idf #19269) ──────────────────────────────
+ * esp_now_send encola en la TX del WiFi (s_tx_cacheq) SIN g_wifi_global_lock y,
+ * si choca con el consumidor (ppTask) mientras sale trafico del SoftAP, la cola
+ * queda inalcanzable: el maestro deja de transmitir todo (9 de 11 corridas de
+ * tiempo real). esp_wifi_80211_tx usa la misma cola pero inserta con el lock
+ * tomado (verificado desensamblando libnet80211.a de IDF 5.5.5, 2026-10-25). Se
+ * arma la misma action frame que esp_now_send (formato sacado del binario: un
+ * IE, payload <= 250, version 2) y los esclavos la reciben igual por su
+ * callback de ESP-NOW. Solo sirve para peers sin cifrar, que es lo que usamos.
+ * La tasa se fija en 1 Mbps (la de ESP-NOW por defecto) al levantar el WiFi. */
+#if !defined(ESPNOW_RAW_TX)
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#define ESPNOW_RAW_TX 1
+#else
+#define ESPNOW_RAW_TX 0
+#endif
+#endif
+#if ESPNOW_RAW_TX
+#include <esp_wifi.h>
+#include <esp_random.h>
+static constexpr size_t ESPNOW_RAW_HDR = 39;
+
+static inline esp_err_t espnowRawSend(const uint8_t *dst, const uint8_t *body, size_t n)
+{
+    if (n == 0 || n > 250) return ESP_ERR_INVALID_ARG;
+    static uint8_t staMac[6];
+    static bool haveMac = false;
+    if (!haveMac) {
+        if (esp_wifi_get_mac(WIFI_IF_STA, staMac) != ESP_OK) return ESP_FAIL;
+        haveMac = true;
+    }
+    uint8_t f[ESPNOW_RAW_HDR + 250];
+    f[0] = 0xD0; f[1] = 0x00;                 /* management / action */
+    f[2] = 0x00; f[3] = 0x00;                 /* duration */
+    memcpy(f + 4, dst, 6);                    /* addr1: destino */
+    memcpy(f + 10, staMac, 6);                /* addr2: MAC de la STA (peers por WIFI_IF_STA) */
+    memset(f + 16, 0xFF, 6);                  /* addr3: broadcast */
+    f[22] = 0x00; f[23] = 0x00;               /* secuencia: la pone el driver */
+    f[24] = 0x7F;                             /* category: vendor specific */
+    f[25] = 0x18; f[26] = 0xFE; f[27] = 0x34; /* OUI de Espressif */
+    const uint32_t rnd = esp_random();
+    memcpy(f + 28, &rnd, 4);
+    f[32] = 0xDD;                             /* IE vendor specific */
+    f[33] = (uint8_t)(n + 5);
+    f[34] = 0x18; f[35] = 0xFE; f[36] = 0x34;
+    f[37] = 0x04;                             /* tipo ESP-NOW */
+    f[38] = 0x02;                             /* version 2, ultimo IE */
+    memcpy(f + ESPNOW_RAW_HDR, body, n);
+    const esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, f, (int)(ESPNOW_RAW_HDR + n), true);
+    /* Sin buffer: el mismo codigo que esp_now_send, asi siguen andando los
+     * reintentos que ya existen (STREAM_ACK, REQ_BATCH). */
+    if (e == ESP_ERR_NO_MEM) return ESP_ERR_ESPNOW_NO_MEM;   /* el binario devuelve 0x101 */
+    return e;
+}
+#endif
+
 /* Unica salida ESP-NOW del maestro: agrega la marca de red (sync_protocol.h). */
 static inline esp_err_t geonetSend(const uint8_t *dst, const uint8_t *data, size_t len)
 {
     uint8_t buf[ESPNOW_MAX_PAYLOAD];
     const int n = geonetWrap(buf, data, (int)len);
     if (n == 0) return ESP_ERR_INVALID_ARG;
+#if ESPNOW_RAW_TX
+    return espnowRawSend(dst, buf, (size_t)n);
+#endif
 #if defined(ESPNOW_LOCK_TCPIP) && ESPNOW_LOCK_TCPIP
     /* esp-idf #19269: ESP-NOW encola en la TX del WiFi sin el lock global y
      * choca con las tramas del SoftAP que salen de lwIP. Con el core de lwIP
@@ -160,6 +219,14 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
     });
 #else
     esp_now_register_recv_cb(onRecv);
+#endif
+#if ESPNOW_RAW_TX
+    /* Los envios salen por esp_wifi_80211_tx: su aviso alimenta los mismos
+     * contadores que el de ESP-NOW. */
+    esp_wifi_register_80211_tx_cb([](const esp_80211_tx_info_t *info) {
+        onSent(info ? info->des_addr : nullptr,
+               (info && info->tx_status == WIFI_SEND_SUCCESS) ? ESP_NOW_SEND_SUCCESS : ESP_NOW_SEND_FAIL);
+    });
 #endif
 #if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
     /* IDF 5.5: el aviso de envio recibe wifi_tx_info_t. */
