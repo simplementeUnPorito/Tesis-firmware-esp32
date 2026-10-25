@@ -13,6 +13,7 @@
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_timer.h>
+#include <esp_arduino_version.h>
 #else
 #define FTM_AVAILABLE 0
 #endif
@@ -62,6 +63,8 @@ static int16_t  s_initErr = 0;
 static const uint8_t  CFG_FRAMES[] = {16, 32, 0, 64, 24};
 static const uint16_t CFG_PERIOD[] = { 2,  2, 0,  0,  0};
 static uint8_t  s_cfgIdx = 0;
+/* El modo promiscuo (marcas de baliza) se apaga mientras dura la sesion. */
+static bool     s_promiscWas = false;
 static bool     s_cfgLocked = false;
 static uint8_t  s_evStatus = 0xFF;
 static bool     s_newReport = false;
@@ -75,21 +78,33 @@ static void onFtmReport(void *, esp_event_base_t, int32_t, void *data)
     portENTER_CRITICAL(&s_mux);
     const uint8_t n = (ev->ftm_report_num_entries < MAX_ENTRIES) ? ev->ftm_report_num_entries
                                                                   : (uint8_t)MAX_ENTRIES;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    /* IDF 5: las tramas se piden con esp_wifi_ftm_get_report (use_get_report_api). */
+    bool got = false;
+    if (ev->status == FTM_STATUS_SUCCESS && n > 0) {
+        got = (esp_wifi_ftm_get_report(s_raw, n) == ESP_OK);
+    }
+    s_rawCount = got ? n : 0;
+#else
     if (ev->ftm_report_data != nullptr && n > 0) {
         memcpy(s_raw, ev->ftm_report_data, (size_t)n * sizeof(wifi_ftm_report_entry_t));
     }
     s_rawCount = (ev->ftm_report_data != nullptr) ? n : 0;
+#endif
     s_rawStatus = (uint8_t)ev->status;
     s_rawDistCm = ev->dist_est;
     s_rawReady = true;
     portEXIT_CRITICAL(&s_mux);
+#if ESP_ARDUINO_VERSION_MAJOR < 3
     /* Contrato de IDF 4.4: el reporte lo libera quien lo recibe. */
     if (ev->ftm_report_data != nullptr) free(ev->ftm_report_data);
+#endif
 }
 
 void begin()
 {
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_FTM_REPORT, &onFtmReport, nullptr);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);   /* mismo ancho que el AP */
 }
 
 void setPeriodMs(uint32_t ms) { s_periodMs = ms; }
@@ -108,6 +123,7 @@ static void absorb()
     portEXIT_CRITICAL(&s_mux);
 
     s_busy = false;
+    if (s_promiscWas) esp_wifi_set_promiscuous(true);
     memcpy(s_last, raw, (size_t)n * sizeof(wifi_ftm_report_entry_t));
     s_lastCount = n;
     s_evStatus = st;
@@ -154,6 +170,7 @@ void service(bool allowed, const uint8_t responder[6], uint8_t channel)
         if (now - s_sessionStartMs > SESSION_TIMEOUT_MS) {
             esp_wifi_ftm_end_session();
             s_busy = false;
+            if (s_promiscWas) esp_wifi_set_promiscuous(true);
             s_status = FTM_ST_NO_RESPONSE;
             s_newReport = true;
         }
@@ -166,10 +183,18 @@ void service(bool allowed, const uint8_t responder[6], uint8_t channel)
     cfg.channel = channel;
     cfg.frm_count = CFG_FRAMES[s_cfgIdx];
     cfg.burst_period = CFG_PERIOD[s_cfgIdx];
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    cfg.use_get_report_api = true;
+#endif
     s_lastSessionMs = now;
     s_channel = channel;
+    bool prom = false;
+    esp_wifi_get_promiscuous(&prom);
+    s_promiscWas = prom;
+    if (prom) esp_wifi_set_promiscuous(false);
     const esp_err_t err = esp_wifi_ftm_initiate_session(&cfg);
     s_initErr = (int16_t)err;
+    if (err != ESP_OK && prom) esp_wifi_set_promiscuous(true);
     if (err == ESP_OK) {
         s_busy = true;
         s_sessionStartMs = now;

@@ -10,6 +10,13 @@
 #include <Preferences.h>
 #include <esp_ota_ops.h>
 #include <mbedtls/sha256.h>
+#include <esp_arduino_version.h>
+/* mbedtls 3 (IDF 5) quito el sufijo _ret. */
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#define mbedtls_sha256_starts_ret mbedtls_sha256_starts
+#define mbedtls_sha256_update_ret mbedtls_sha256_update
+#define mbedtls_sha256_finish_ret mbedtls_sha256_finish
+#endif
 
 /* Marca que el maestro busca en el .bin antes de ofrecerlo: evita mandarle a
  * un esclavo la imagen del maestro u otra cosa. */

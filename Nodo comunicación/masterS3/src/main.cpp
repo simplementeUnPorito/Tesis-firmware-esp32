@@ -899,6 +899,8 @@ static void apEnableFtmResponder()
      * el flag quedaba guardado pero sin efecto y los esclavos recibian
      * FTM_STATUS_CONF_REJECTED en toda sesion. Se reinicia el WiFi (antes de
      * ESP-NOW y del DNS, que se levantan despues). */
+    /* FTM sensible al ancho: AP en HT20, igual que el iniciador. */
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
     const esp_err_t e1 = esp_wifi_stop();
     const esp_err_t e2 = esp_wifi_start();
     esp_wifi_set_ps(WIFI_PS_NONE);

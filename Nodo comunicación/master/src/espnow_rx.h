@@ -8,6 +8,7 @@
 
 #include <Arduino.h>
 #include <esp_now.h>
+#include <esp_arduino_version.h>
 #include "sync_protocol.h"
 #include "master_log.h"
 
@@ -130,7 +131,14 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
         MASTER_LOG_PRINTLN("[ESPNOW-RX] init failed");
         return false;
     }
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    /* IDF 5: el callback recibe esp_now_recv_info_t. */
+    esp_now_register_recv_cb([](const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+        onRecv(info->src_addr, data, len);
+    });
+#else
     esp_now_register_recv_cb(onRecv);
+#endif
     esp_now_register_send_cb(onSent);
     MASTER_LOG_PRINTLN("[ESPNOW-RX] ready");
     return true;

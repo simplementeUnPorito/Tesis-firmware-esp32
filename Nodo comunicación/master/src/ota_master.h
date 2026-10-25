@@ -16,6 +16,13 @@
 #include <LittleFS.h>
 #include <ESPAsyncWebServer.h>
 #include <mbedtls/sha256.h>
+#include <esp_arduino_version.h>
+/* mbedtls 3 (IDF 5) quito el sufijo _ret. */
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#define mbedtls_sha256_starts_ret mbedtls_sha256_starts
+#define mbedtls_sha256_update_ret mbedtls_sha256_update
+#define mbedtls_sha256_finish_ret mbedtls_sha256_finish
+#endif
 #include "sync_protocol.h"
 
 #ifndef OTA_MAX_NODES

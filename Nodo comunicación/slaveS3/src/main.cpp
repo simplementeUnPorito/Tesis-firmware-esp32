@@ -453,6 +453,19 @@ static uint32_t g_rfrx_recibidas = 0;
 static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len);
 #else
 static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len);
+#if defined(ESP32)
+#include <esp_arduino_version.h>
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+/* IDF 5: el callback de ESP-NOW recibe esp_now_recv_info_t. */
+static void onDataRecvV3(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+    onDataRecv(info->src_addr, data, len);
+}
+#define ESPNOW_RECV_CB onDataRecvV3
+#else
+#define ESPNOW_RECV_CB onDataRecv
+#endif
+#endif
 #endif
 
 /* ── sdstress (banco): escrituras a la SD del PSoC EN PARALELO a una captura
@@ -3157,7 +3170,7 @@ static void radioPrender()
         esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
         esp_wifi_set_channel(g_masterChannel, WIFI_SECOND_CHAN_NONE);
         const bool ok = transport.begin(g_masterTxMac);
-        esp_now_register_recv_cb(onDataRecv);
+        esp_now_register_recv_cb(ESPNOW_RECV_CB);
         applyBeaconMarks();
         g_radio_on = true;
         live::setRadioReady(true);
@@ -5817,7 +5830,7 @@ void setup()
         SLAVE_LOG_PRINTLN("[SLAVE] ESP-NOW FAIL - halt");
         while (true) { delay(1000); }
     }
-    esp_now_register_recv_cb(onDataRecv);
+    esp_now_register_recv_cb(ESPNOW_RECV_CB);
     applyBeaconMarks();
 
     /* (El LED de identificación es el del PSoC; el ESP ya no maneja ningún LED.) */
