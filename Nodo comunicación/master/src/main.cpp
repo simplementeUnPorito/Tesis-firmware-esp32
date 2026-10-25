@@ -28,6 +28,7 @@
 #include <ESPmDNS.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_heap_caps.h>
 #include "sync_protocol.h"
 #include "espnow_rx.h"
 #include "ota_master.h"
@@ -1840,7 +1841,8 @@ static void rtOnData(const uint8_t *data, int len)
             batch.samples[i].digi2 = (uint8_t)(v >> 16);
             batch.samples[i].flags = flags[i];
         }
-        onBatchReady(batch);
+        /* No tocar LittleFS ni WebSocket desde la tarea WiFi. */
+        espnowRx.enqueueBatch(batch);
         return;
     }
     g_rt.onFrame(data, len);
@@ -2344,6 +2346,18 @@ void loop()
     }
     debugEspHardwareService();
     serviceFtmReports();
+    espnowRx.service();
+#if DBG_ENABLE
+    {   /* Vigilar fragmentacion interna sin cargar el firmware de campo. */
+        static uint32_t heapDiagMs = 0;
+        if (millis() - heapDiagMs >= 5000u) {
+            heapDiagMs = millis();
+            MASTER_LOG_PRINTF("[HEAP] libre=%u mayor=%u\n",
+                              (unsigned)ESP.getFreeHeap(),
+                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        }
+    }
+#endif
     otam::service();
     serviceRfBurst();
 

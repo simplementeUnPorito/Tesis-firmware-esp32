@@ -9,6 +9,8 @@
 #include <Arduino.h>
 #include <esp_now.h>
 #include <esp_arduino_version.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include "sync_protocol.h"
 #include "master_log.h"
 
@@ -66,6 +68,8 @@ public:
     /* Tiempo real (rt_stream.h): tramas MsgData32 y STREAM_END. */
     void setOtaHandler(OtaStatusCallback cb) { _otaCb = cb; }
     void setFtmHandler(FtmReportCallback cb) { _ftmCb = cb; }
+    bool enqueueBatch(const ReassembledBatch &batch);
+    void service();
     void setRtHandlers(RtDataCallback data, RtEndCallback end)
     {
         _rtDataCb = data;
@@ -89,6 +93,7 @@ private:
     OtaStatusCallback  _otaCb = nullptr;
     FtmReportCallback  _ftmCb = nullptr;
     ReassembledBatch   _bufs[MAX_NODES] = {};
+    QueueHandle_t       _batchQueue = nullptr;
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
     volatile uint32_t  _foreignRx = 0;
@@ -127,6 +132,11 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
     _startAckCb = startAckCb;
     _hotWaitAckCb = hotWaitAckCb;
     instance = this;
+    if (!_batchQueue) _batchQueue = xQueueCreate(4, sizeof(ReassembledBatch));
+    if (!_batchQueue) {
+        MASTER_LOG_PRINTLN("[ESPNOW-RX] cola de lotes sin memoria");
+        return false;
+    }
     if (esp_now_init() != ESP_OK) {
         MASTER_LOG_PRINTLN("[ESPNOW-RX] init failed");
         return false;
@@ -149,6 +159,20 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
 #endif
     MASTER_LOG_PRINTLN("[ESPNOW-RX] ready");
     return true;
+}
+
+inline bool EspNowRx::enqueueBatch(const ReassembledBatch &batch)
+{
+    return _batchQueue && xQueueSend(_batchQueue, &batch, 0) == pdTRUE;
+}
+
+inline void EspNowRx::service()
+{
+    if (!_batchQueue || !_cb) return;
+    ReassembledBatch batch;
+    for (uint8_t i = 0; i < 4 && xQueueReceive(_batchQueue, &batch, 0) == pdTRUE; i++) {
+        _cb(batch);
+    }
 }
 
 /* Unicast confirmados (ACK de MAC del destino) y fallidos: diagnostico. */
@@ -253,7 +277,8 @@ inline void EspNowRx::_handleData(const MsgData *msg)
     }
 
     if (buf.complete() && _cb) {
-        _cb(buf);
+        /* El callback WiFi solo copia. LittleFS y WebSocket corren en loop(). */
+        enqueueBatch(buf);
         buf = {};   /* limpiar para siguiente batch */
     }
 }
