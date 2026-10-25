@@ -4742,9 +4742,20 @@ static void enterHotWaitLive(uint16_t n_batches)
     }
     /* 0xFFFF en el HOTWAIT_ACK = sin limite. */
     g_rec_n_batches = (eff == 0) ? 0xFFFFu : (uint16_t)eff;
-    const bool psocReady = syncPsocSdForCapture(false) &&
-                           syncPsocLiveMode(g_capmode_ramp ? 2u : 1u) &&
-                           sendAndConfirmPsocSetN((uint16_t)eff);
+    /* Un intento mas antes de abortar: un ack perdido (o el PSoC todavia con
+     * el SETN anterior, p. ej. tras SET_RECLEN de la web) dejaba al nodo fuera
+     * de la captura. Se registra que paso fallo. */
+    bool psocReady = false;
+    for (int intento = 0; intento < 2 && !psocReady; intento++) {
+        const bool sdOk = syncPsocSdForCapture(false);
+        const bool liveOk = sdOk && syncPsocLiveMode(g_capmode_ramp ? 2u : 1u);
+        const bool setnOk = liveOk && sendAndConfirmPsocSetN((uint16_t)eff);
+        psocReady = setnOk;
+        if (!psocReady) {
+            SLAVE_LOG_PRINTF("[SLAVE] HOT_WAIT live intento %d: sd=%d live=%d setn=%d\n",
+                             intento + 1, (int)sdOk, (int)liveOk, (int)setnOk);
+        }
+    }
     if (!psocReady) {
         live::close();
         g_state = STOPPED;
