@@ -75,10 +75,20 @@ SLAVE_BOARD = r'''#pragma once
 '''
 
 
+# Propios del port S3: el build de pioarduino (IDF 5) los necesita en src/.
+KEEP_IN_TARGET = ("idf_component.yml",)
+
+
 def sync_tree(source: Path, target: Path) -> None:
+    kept = {}
     if target.exists():
+        for name in KEEP_IN_TARGET:
+            if (target / name).exists():
+                kept[name] = (target / name).read_bytes()
         shutil.rmtree(target)
     shutil.copytree(source, target)
+    for name, data in kept.items():
+        (target / name).write_bytes(data)
 
 
 def replace_once(path: Path, old: str, new: str) -> None:
