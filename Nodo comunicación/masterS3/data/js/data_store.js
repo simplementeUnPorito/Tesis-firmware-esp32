@@ -3,7 +3,7 @@
 // use fixed-capacity rings for live plotting and optional chunked stores for
 // the complete unlimited capture.
 
-import * as cfg from './config.js?v=field-study-47';
+import * as cfg from './config.js?v=field-study-48';
 
 /** Fixed-capacity ring buffer over a Float64Array — O(1) push, oldest evicted on overflow. */
 export class RingBuffer {
@@ -197,7 +197,8 @@ export class NodeData {
     this.pgaoutCode = 0;   // etapa PGAout (solo GEO); 0 si el nodo no la tiene
     this.adcConfigCode = 1;
     this.countsPerVolt = cfg.ADC_COUNTS_PER_VOLT;
-    this.decimationFactor = 1;   // 1=sin decimar; Fs efectiva = 2604/factor
+    this.decimationFactor = 1;   // 1=sin decimar; Fs efectiva = Fs nativa/factor
+    this.nativeRateMilliHz = 0;  // tasa antes de decimar informada por HELLO
     this.vdacByte = 128;
     this.calVdacs = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
     this.calVdacDetails = Array.from({ length: cfg.CAL_VDAC_STAGE_COUNT }, () => null);
@@ -207,6 +208,8 @@ export class NodeData {
     this.hwClass = 0xFF;  // 0=GEO, 1=HAMMER, 0xFF=unknown (reported by PSoC)
     this.linkModel = 0xFF; // 0=SERIAL, 1=I2C, 0xFF=legacy/unknown (reported by ESP)
     this.sdMarks = [];         // [indice absoluto de muestra, flags] de escrituras a SD
+    this.timeMarks = [];       // {token,sample,master_us,uncert,kind,source,ok}
+    this.timeMarkKeys = new Set();
     this.pendingMarkFlags = 0; // marca recibida que aplica a la próxima muestra
     this.ctlStatus = 0xFF; // lazo del PSoC I2C: bit0 en banda, bits1-3 estado, bit4 perfil
     this.sdPresent = false; // FAT/SD detectada por el PSoC (solo esclavos GEO, ver plan_2929_decimation_sd.md)
@@ -337,6 +340,8 @@ export class NodeData {
     this.batchCount = 0;
     this.totalSamples = 0;
     this.sdMarks = [];
+    this.timeMarks = [];
+    this.timeMarkKeys.clear();
     this.pendingMarkFlags = 0;
     this.gotFirst = false;
     this.tFirst = 0;
@@ -408,9 +413,10 @@ export class DataStore {
  * and wait, never substitute a constant. Mirrors MainWindow._effective_fs.
  */
 export function effectiveFs(dataStore) {
+  let fs = 0;
   for (let i = 1; i < dataStore.nodes.length; i++) {
     const nd = dataStore.nodes[i];
-    if (nd.fsKnown) return nd.fs;
+    if (nd.fsKnown && nd.fs > 0 && (!fs || nd.fs < fs)) fs = nd.fs;
   }
-  return 0;
+  return fs;
 }

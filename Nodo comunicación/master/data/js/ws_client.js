@@ -4,9 +4,9 @@
 // (packet_received / connection_changed / log_message signals) using
 // CustomEvents instead of Qt signals.
 
-import { decodePacket } from './protocol.js?v=field-study-47';
-import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-47';
-import { decodeGeoZ } from './geo_codec.js?v=field-study-47';
+import { decodePacket } from './protocol.js?v=field-study-48';
+import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-48';
+import { decodeGeoZ } from './geo_codec.js?v=field-study-48';
 
 const ZBATCH_HEADER = 0x57;
 
@@ -205,6 +205,10 @@ export class WsClient extends EventTarget {
             this.dispatchEvent(new CustomEvent('ftm', { detail: msg }));
           } else if (msg?.type === 'sync_start') {
             this.dispatchEvent(new CustomEvent('sync-start', { detail: msg }));
+          } else if (msg?.type === 'timemark') {
+            this.dispatchEvent(new CustomEvent('timemark', { detail: msg }));
+          } else if (msg?.type === 'sample_rate') {
+            this.dispatchEvent(new CustomEvent('sample-rate', { detail: msg }));
           } else if (msg?.type === 'link') {
             this.dispatchEvent(new CustomEvent('link-rssi', { detail: msg }));
           }

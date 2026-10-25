@@ -14,6 +14,10 @@
 #define PSOC_UART_TX 17
 #define PSOC_RESET_REQUEST_PIN 16
 #define SYNC_TO_PSOC_PIN 7
+#define SOC_OUT_PIN 1
+#define SOC_PERIOD_NS 500000ULL
+#define PSOC_CLK_OUT_ENABLE 1
+#define PSOC_CLK_OUT_PIN 2
 
 /* OLED y botones. */
 #define LOCAL_UI_ENABLE 1

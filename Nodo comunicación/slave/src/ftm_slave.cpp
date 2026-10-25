@@ -305,12 +305,16 @@ bool localEspToMasterMac(int64_t esp, uint32_t &masterMacUs)
     masterMacUs = (uint32_t)(masterPs / 1000000LL);
     return true;
 }
+int32_t modelSkewPpb() { return (int32_t)llround(s_mSlope * 1000.0); }
+uint32_t modelResidualNs() { return (uint32_t)llround(s_mResidNs); }
 #else
 void noteMasterBeacon(uint32_t, uint32_t) {}
 bool modelOk() { return false; }
 uint32_t modelAgeMs() { return 0xFFFFFFFFu; }
 bool masterMacToLocalEsp(uint32_t, int64_t &, uint32_t &) { return false; }
 bool localEspToMasterMac(int64_t, uint32_t &) { return false; }
+int32_t modelSkewPpb() { return 0; }
+uint32_t modelResidualNs() { return 0; }
 #endif
 
 static void absorb()
@@ -566,6 +570,8 @@ bool modelOk() { return false; }
 uint32_t modelAgeMs() { return 0xFFFFFFFFu; }
 bool masterMacToLocalEsp(uint32_t, int64_t &, uint32_t &) { return false; }
 bool localEspToMasterMac(int64_t, uint32_t &) { return false; }
+int32_t modelSkewPpb() { return 0; }
+uint32_t modelResidualNs() { return 0; }
 
 #endif
 

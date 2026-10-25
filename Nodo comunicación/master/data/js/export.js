@@ -1,9 +1,9 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-47';
+import * as cfg from './config.js?v=field-study-48';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-47';
-import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-47';
+import { effectiveFs } from './data_store.js?v=field-study-48';
+import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-48';
 
 const MARK_BITS = [
   [0x01, 'SD_IO'],
@@ -22,6 +22,20 @@ function noiseMarksCsv(marks) {
     if (!Number.isFinite(sample) || flags === 0) continue;
     const names = MARK_BITS.filter(([bit]) => (flags & bit) !== 0).map(([, name]) => name).join('|');
     lines.push(csvRow([Math.round(sample), flags, `0x${flags.toString(16).toUpperCase().padStart(2, '0')}`, names]));
+  }
+  return lines.join('\n') + '\n';
+}
+
+function timeMarksCsv(marks) {
+  const lines = ['sample,master_us,uncert,kind,ok'];
+  for (const mark of Array.isArray(marks) ? marks : []) {
+    const sample = Number(mark?.sample);
+    const masterUs = Number(mark?.master_us);
+    if (!Number.isFinite(sample) || !Number.isFinite(masterUs)) continue;
+    lines.push(csvRow([
+      Math.round(sample), Math.round(masterUs), Math.round(Number(mark?.uncert) || 0),
+      mark?.kind === 'start' ? 'start' : 'periodic', mark?.ok ? 1 : 0,
+    ]));
   }
   return lines.join('\n') + '\n';
 }
@@ -278,6 +292,8 @@ function nodeMetadata(nd, index, paths, connected) {
     geo_number: role === 'geo' ? geoNumberFromType(type) : null,
     slave_id: pcbId,
     fs: nd.fs,
+    sample_rate_mhz: Math.round((nd.fs || 0) * 1000),
+    native_rate_mhz: Math.round(nd.nativeRateMilliHz || 0),
     fs_known: !!nd.fsKnown,
     fs_exact_known: !!nd.fsExactKnown,
     connected: !!connected,
@@ -287,6 +303,7 @@ function nodeMetadata(nd, index, paths, connected) {
     raw_csv_file: paths ? paths.rawCsv : null,
     filt_csv_file: paths ? paths.filtCsv : null,
     noise_marks_file: paths ? paths.marksCsv : null,
+    time_marks_file: paths ? paths.timeMarksCsv : null,
     raw_count: nd.captureRawLength,
     filt_count: nd.captureFiltLength,
     batch_count: nd.batchCount,
@@ -321,6 +338,7 @@ function nodeMetadata(nd, index, paths, connected) {
     link_type: linkType,
     ctl_status: nd.ctlStatus,
     sd_marks: nd.sdMarksFor(nd.captureRawLength),
+    time_marks: nd.timeMarks.map((mark) => ({ ...mark })),
     hammer_offset_m: offsetM,
     offset_m_from_hammer: offsetM,
     position_m: offsetM,
@@ -366,6 +384,8 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     geo_number: role === 'geo' ? geoNumberFromType(type) : null,
     slave_id: pcbId,
     fs: node?.fs ?? 0,
+    sample_rate_mhz: node?.sample_rate_mhz ?? Math.round((node?.fs || 0) * 1000),
+    native_rate_mhz: node?.native_rate_mhz ?? 0,
     fs_known: !!node?.fs_known,
     fs_exact_known: !!node?.fs_exact_known,
     connected: !!connected,
@@ -375,6 +395,7 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     raw_csv_file: paths ? paths.rawCsv : null,
     filt_csv_file: paths ? paths.filtCsv : null,
     noise_marks_file: paths ? paths.marksCsv : null,
+    time_marks_file: paths ? paths.timeMarksCsv : null,
     raw_count: raw.length,
     filt_count: filt.length,
     batch_count: node?.batch_count ?? 0,
@@ -396,6 +417,7 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     sd_enabled: sdEnabledForNode(node),
     // [indice en raw, flags]: bits de interferencia conocida para esa muestra.
     sd_marks: Array.isArray(node?.sd_marks) ? node.sd_marks : [],
+    time_marks: Array.isArray(node?.time_marks) ? node.time_marks.map((mark) => ({ ...mark })) : [],
     vdac_byte: node?.vdac_byte ?? 128,
     cal_vdacs: calVdacsForNode(node),
     cal_vdac_details: calVdacDetailsForNode(node),
@@ -756,10 +778,12 @@ export function buildCaptureZip(dataStore, options = {}) {
       rawCsv: null,
       filtCsv: null,
       marksCsv: `${dir}/noise_marks.csv`,
+      timeMarksCsv: `${dir}/time_marks.csv`,
     };
     pathsByNode.set(i, paths);
     files.push({ name: paths.raw, data: float32Bytes(raw) });
     files.push({ name: paths.marksCsv, data: noiseMarksCsv(nd.sdMarksFor(raw.length)) });
+    files.push({ name: paths.timeMarksCsv, data: timeMarksCsv(nd.timeMarks) });
 
     visibleNodes.push(i);
     exportedNodes.push(i);
@@ -802,9 +826,11 @@ export function buildCaptureZip(dataStore, options = {}) {
           rawCsv: null,
           filtCsv: null,
           marksCsv: `${dir}/noise_marks.csv`,
+          timeMarksCsv: `${dir}/time_marks.csv`,
         };
         files.push({ name: paths.raw, data: float32Bytes(raw) });
         files.push({ name: paths.marksCsv, data: noiseMarksCsv(node.sd_marks) });
+        files.push({ name: paths.timeMarksCsv, data: timeMarksCsv(node.time_marks) });
       }
 
       capNodeMetas.push(captureNodeMetadata(node, index, paths, connected, captureOffset));
@@ -861,7 +887,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-47',
+    web_app_version: 'field-study-48',
     noise_signatures_file: noiseSignaturesPath,
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {

@@ -48,5 +48,9 @@ uint32_t modelAgeMs();
 bool masterMacToLocalEsp(uint32_t masterMacUs, int64_t &deadlineEsp, uint32_t &uncertNs);
 /* Instante local (esp_timer) expresado en el reloj MAC del maestro. */
 bool localEspToMasterMac(int64_t esp, uint32_t &masterMacUs);
+/* Ultima deriva y residuo aceptados. Siguen disponibles si el modelo envejece,
+ * para que el reloj de muestreo mantenga la ultima disciplina durante captura. */
+int32_t modelSkewPpb();
+uint32_t modelResidualNs();
 
 }  // namespace ftm

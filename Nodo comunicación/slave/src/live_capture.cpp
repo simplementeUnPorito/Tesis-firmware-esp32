@@ -48,6 +48,8 @@
 namespace live {
 namespace {
 
+constexpr uint32_t LEGACY_SAMPLE_RATE_HZ = 2604u;
+
 constexpr uint32_t PAGE_BATCHES    = 32;
 constexpr uint32_t MAX_PAGES       = 48;    /* 1536 lotes: mas de lo que entra sin PSRAM */
 constexpr uint32_t PSOC_RING       = 512;   /* anillo del PSoC, en lotes */
@@ -82,7 +84,7 @@ Config g_cfg = {};
 bool g_active = false;
 bool g_started = false;
 uint64_t g_t0 = 0;
-uint32_t g_fs = 2604;
+uint32_t g_fs = LEGACY_SAMPLE_RATE_HZ;
 
 SampleBytes *g_pages[MAX_PAGES] = {};
 uint32_t g_npages = 0;
@@ -189,7 +191,7 @@ uint64_t g_pairUs = 0;
 uint32_t g_pairCount = 0;
 uint32_t g_fitSample = 0;
 uint64_t g_fitUs = 0;
-uint32_t g_fsEstimate = 2604;
+uint32_t g_fsEstimate = LEGACY_SAMPLE_RATE_HZ;
 uint32_t g_highestStored = 0;
 portMUX_TYPE g_markMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -205,6 +207,18 @@ void pushMarkLocked(uint32_t s0, uint32_t s1, uint8_t bits)
     if (next == g_markTail) g_markTail = (uint16_t)((g_markTail + 1u) % MARK_RING);
     g_marks[g_markHead] = {s0, s1, bits};
     g_markHead = next;
+}
+
+bool latestAnchorLocked(uint32_t &sample, uint64_t &espUs, uint32_t &generation)
+{
+    bool ok;
+    portENTER_CRITICAL(&g_markMux);
+    ok = g_started && g_havePair;
+    sample = g_pairSample;
+    espUs = g_pairUs;
+    generation = g_pairCount;
+    portEXIT_CRITICAL(&g_markMux);
+    return ok;
 }
 
 uint32_t sampleForTimeLocked(uint64_t t)
@@ -346,7 +360,8 @@ uint32_t tailNow()
 
 uint64_t tsFor(uint32_t seq)
 {
-    return g_t0 + ((uint64_t)seq * SPI_BATCH_SAMPLES * 1000000ULL) / (g_fs ? g_fs : 2604u);
+    return g_t0 + ((uint64_t)seq * SPI_BATCH_SAMPLES * 1000000ULL) /
+                  (g_fs ? g_fs : LEGACY_SAMPLE_RATE_HZ);
 }
 
 void toStored(const PsocBatch &b, SampleBytes *dst)
@@ -867,6 +882,11 @@ void serviceRealtime()
 
 /* ── API ───────────────────────────────────────────────────────────────── */
 
+bool latestAnchor(uint32_t &sample, uint64_t &espUs, uint32_t &generation)
+{
+    return latestAnchorLocked(sample, espUs, generation);
+}
+
 void begin(PsocUART *psoc, RawSendFn send, uint8_t nodeId)
 {
     g_psoc = psoc;
@@ -1038,7 +1058,7 @@ void start(uint64_t tStartUs, uint32_t fsHz)
     if (!g_active) return;
     g_t0 = tStartUs;
     portENTER_CRITICAL(&g_markMux);
-    g_fs = fsHz ? fsHz : 2604u;
+    g_fs = fsHz ? fsHz : LEGACY_SAMPLE_RATE_HZ;
     g_fsEstimate = g_fs;
     g_started = true;
     portEXIT_CRITICAL(&g_markMux);

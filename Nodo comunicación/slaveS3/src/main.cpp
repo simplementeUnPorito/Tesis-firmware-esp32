@@ -32,6 +32,7 @@
 #include "live_capture.h"
 #include "ota_slave.h"
 #include "ftm_slave.h"
+#include "sample_clock.h"
 #if defined(SIM_SIN_HW) && SIM_SIN_HW
 #include "sim_psoc.h"
 #endif
@@ -92,7 +93,7 @@ static volatile uint16_t g_firSum = 0;
   /* Tope RAM-only de lotes DECIMADOS por captura. El PSoC guarda hasta 512
    * lotes decimados y el ESP32 usa paginas chicas en vez de un malloc gigante,
    * asi el limite ya no depende del bloque contiguo maximo con WiFi arriba.
-   * Duracion real = n*decim*30/2604. */
+   * Duración real = n*30/Fs efectiva, informada en el HELLO. */
   #define PSOC_CAPTURE_MAX_BATCHES 512
 #endif
 #ifndef PSOC_SD_CAPTURE_MAX_BATCHES
@@ -361,6 +362,7 @@ static          uint8_t    g_pga_code    = 0;
 static          uint8_t    g_pgaout      = 0;   /* GEO: etapa PGAout del pipeline nuevo */
 static          uint8_t    g_pgavdac     = 0;
 static          uint8_t    g_vdac_byte   = 128;
+static          uint8_t    g_decimation_factor = 1;
 static volatile bool       g_cfg_waiting = false;
 static          uint8_t    g_cfg_sub_cmd = 0;
 static          uint8_t    g_cfg_param   = 0;
@@ -1737,6 +1739,9 @@ static void applyConfirmedConfig(uint8_t sub_cmd, uint8_t value)
         case 0xA9:
             g_pgavdac = value;
             break;
+        case PSOC_CMD_SET_DECIMATION:
+            if (isDecimationFactor(value)) g_decimation_factor = value;
+            break;
         /* 0xAA ya no es un VDAC global de un byte. Su ACK devuelve p1
          * (signo|etapa), no una magnitud que tenga sentido en heartbeat. */
         case PSOC_CMD_SD_CAPTURE:
@@ -3104,6 +3109,24 @@ static bool g_radio_on = true;
 static bool g_radio_apagada_por_silencio = false;
 static esp_timer_handle_t g_radio_silencio_sync_timer = nullptr;
 
+#if defined(ARDUINO_ESP32S3_DEV)
+static constexpr uint16_t TIME_MARK_RING = 2048u;
+#else
+/* El clásico no tiene modelo FTM; evitamos reservar 36 KiB que nunca usaría. */
+static constexpr uint16_t TIME_MARK_RING = 4u;
+#endif
+static MsgTimeMark g_time_marks[TIME_MARK_RING];
+static uint16_t g_time_mark_head = 0, g_time_mark_tail = 0;
+static uint32_t g_time_capture_token = 0;
+static uint32_t g_time_last_generation = 0;
+static uint32_t g_time_last_ms = 0;
+static bool g_time_capture_active = false;
+static volatile bool g_time_start_pending = false;
+static volatile int64_t g_time_start_local_us = 0;
+static uint8_t g_time_start_kind = TIME_MARK_START_BROADCAST;
+static uint32_t g_time_start_master_us = 0;
+static uint32_t g_time_start_uncert_ns = 0;
+
 static void radioSilencioSyncTimerCb(void *)
 {
     digitalWrite(SYNC_TO_PSOC_PIN, HIGH);
@@ -3134,6 +3157,8 @@ static void schedSyncTimerCb(void *)
     portEXIT_CRITICAL(&g_sched_mux);
     g_sched_actual = real;
     g_sched_fired = true;
+    g_time_start_local_us = real;
+    g_time_start_pending = true;
 }
 
 static bool programarSyncFtm(uint32_t startMasterUs)
@@ -3159,6 +3184,7 @@ static bool programarSyncFtm(uint32_t startMasterUs)
     g_sched_fired = false;
     g_sched_master_us = startMasterUs;
     g_sched_uncert_ns = unc;
+    sample_clock::armStart(deadline, startMasterUs, true);
     const int64_t wait = deadline - SCHED_EARLY_US - esp_timer_get_time();
     if (esp_timer_start_once(g_sched_sync_timer, (uint64_t)(wait > 0 ? wait : 1)) != ESP_OK) return false;
     return true;
@@ -3205,6 +3231,7 @@ static bool programarSyncRx()
     g_sched_fired = false;
     g_sched_master_us = 0;
     g_sched_uncert_ns = 0;
+    sample_clock::armStart(deadline, 0u, false);
     const int64_t wait = deadline - SCHED_EARLY_US - esp_timer_get_time();
     return esp_timer_start_once(g_sched_sync_timer, (uint64_t)(wait > 0 ? wait : 1)) == ESP_OK;
 }
@@ -3297,6 +3324,97 @@ static bool syncModeLive()
 static bool radioSilActiva()
 {
     return g_radio_silencio || (g_syncMode == SYNCMODE_RADIO_OFF && !syncModeLive());
+}
+
+/* El anillo retiene marcas durante el silencio de radio. Cada una se manda dos
+ * veces; el navegador deduplica por token e índice de muestra. */
+static void queueTimeMark(uint32_t sample, uint32_t masterUs, uint32_t uncertNs,
+                          uint8_t kind, bool modelOk)
+{
+    const uint16_t next = (uint16_t)((g_time_mark_head + 1u) % TIME_MARK_RING);
+    if (next == g_time_mark_tail) {
+        SLAVE_LOG_RAW("#TIMEMARK ring lleno token=%lu sample=%lu\n",
+                      (unsigned long)g_time_capture_token, (unsigned long)sample);
+        return;
+    }
+    MsgTimeMark &m = g_time_marks[g_time_mark_head];
+    m = {};
+    m.cmd = CMD_TIME_MARK;
+    m.node_id = NODE_ID;
+    m.capture_token = g_time_capture_token;
+    m.sample = sample;
+    m.master_mac_us = masterUs;
+    m.uncert_ns = (uncertNs > 0xFFFFu) ? 0xFFFFu : (uint16_t)uncertNs;
+    m.kind = kind;
+    m.flags = modelOk ? TIME_MARK_MODEL_OK : 0u;
+    g_time_mark_head = next;
+}
+
+static void beginCaptureTimeMarks(uint32_t token, uint8_t kind,
+                                  uint32_t masterUs, uint32_t uncertNs,
+                                  int64_t localUs, bool waitScheduled)
+{
+    g_time_capture_token = token;
+    g_time_start_kind = kind;
+    g_time_start_master_us = masterUs;
+    g_time_start_uncert_ns = uncertNs;
+    g_time_last_generation = 0;
+    g_time_last_ms = 0;
+    g_time_capture_active = live::active();
+    if (g_time_capture_active && !waitScheduled) {
+        g_time_start_local_us = localUs;
+        g_time_start_pending = true;
+    }
+}
+
+static void serviceTimeMarks()
+{
+    if (g_time_capture_active && g_time_start_pending) {
+        g_time_start_pending = false;
+        uint32_t masterUs = g_time_start_master_us;
+        bool ok = ftm::modelOk();
+        if (g_time_start_kind != TIME_MARK_START_FTM) {
+            const bool converted = ftm::localEspToMasterMac(g_time_start_local_us, masterUs);
+            ok = converted && ok;
+            if (converted) {
+                const uint32_t modelUncertNs = ftm::modelResidualNs() + 1000u;
+                if (modelUncertNs > g_time_start_uncert_ns) {
+                    g_time_start_uncert_ns = modelUncertNs;
+                }
+            }
+        }
+        queueTimeMark(0u, masterUs, g_time_start_uncert_ns, g_time_start_kind, ok);
+    }
+    if (g_time_capture_active && g_state == SAMPLING &&
+        (uint32_t)(millis() - g_time_last_ms) >= 1000u) {
+        uint32_t sample = 0, generation = 0;
+        uint64_t localUs = 0;
+        if (live::latestAnchor(sample, localUs, generation) &&
+            generation != g_time_last_generation && ftm::modelOk()) {
+            uint32_t masterUs = 0;
+            if (ftm::localEspToMasterMac((int64_t)localUs, masterUs)) {
+                queueTimeMark(sample, masterUs, ftm::modelResidualNs(),
+                              TIME_MARK_PERIODIC, true);
+                g_time_last_generation = generation;
+                g_time_last_ms = millis();
+            }
+        }
+    }
+    const bool canSend = g_radio_on &&
+        !(g_state == SAMPLING && g_syncMode != SYNCMODE_FTM_ACTIVE && !syncModeLive());
+    /* Dos marcas por vuelta (cuatro tramas por la duplicación) no desbordan
+     * la cola del maestro durante el volcado de una captura larga. */
+    uint8_t budget = (g_state == SAMPLING) ? 1u : 2u;
+    while (canSend && budget-- && g_time_mark_tail != g_time_mark_head) {
+        const MsgTimeMark &m = g_time_marks[g_time_mark_tail];
+        const esp_err_t first = sendToMaster((const uint8_t *)&m, sizeof(m));
+        const esp_err_t second = sendToMaster((const uint8_t *)&m, sizeof(m));
+        if (first != ESP_OK || second != ESP_OK) break;
+        g_time_mark_tail = (uint16_t)((g_time_mark_tail + 1u) % TIME_MARK_RING);
+    }
+    if (g_time_capture_active && g_state != SAMPLING && !g_time_start_pending) {
+        g_time_capture_active = false;
+    }
 }
 
 static uint16_t radioSilDelayMs()
@@ -4628,6 +4746,7 @@ static void handleUsbCommand(const char *cmd)
         requestRadioFromUsb(true);
     } else if (usbCommandEquals(cmd, "ftm")) {
         ftm::printStatus(false);
+        sample_clock::printStatus();
         SLAVE_LOG_RAW("#SYNC modo=%u drops_pausado=%lu\n", (unsigned)g_syncMode,
                       (unsigned long)g_syncPausedDrops);
     } else if (usbCommandEquals(cmd, "ftm raw")) {
@@ -4843,7 +4962,27 @@ static uint8_t controlStatusForHello()
 
 static uint16_t effectivePsocSampleRateHz()
 {
+    if (sample_clock::enabled()) {
+        const uint32_t mhz = sample_clock::nominalRateMilliHz() / g_decimation_factor;
+        return (uint16_t)((mhz + 500u) / 1000u);
+    }
     return psoc.sampleRate();
+}
+
+static uint32_t effectivePsocSampleRateMilliHz()
+{
+    if (sample_clock::enabled()) {
+        return sample_clock::nominalRateMilliHz() / g_decimation_factor;
+    }
+    return (uint32_t)effectivePsocSampleRateHz() * 1000u;
+}
+
+static uint32_t nativePsocSampleRateMilliHz()
+{
+    if (sample_clock::enabled()) return sample_clock::nominalRateMilliHz();
+    const uint32_t effective = psoc.sampleRate();
+    if (!effective) return PSOC_NATIVE_SAMPLE_RATE_HZ * 1000u;
+    return effective * (uint32_t)g_decimation_factor * 1000u;
 }
 
 static uint16_t clampPsocCaptureBatches(uint16_t n)
@@ -5494,8 +5633,10 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
          * no al llegar el paquete. Sin modelo valido, como siempre. */
         const bool sched = len >= (int)sizeof(MsgStart) && msg->sched == 1u;
         bool programado = false;
+        bool programadoFtm = false;
         if (sched) {
-            programado = programarSyncFtm(msg->start_mac_us);
+            programadoFtm = programarSyncFtm(msg->start_mac_us);
+            programado = programadoFtm;
             SLAVE_LOG_PRINTF("[SYNCFTM] START programado=%d objetivo_maestro=%lu modelo=%d\n",
                              (int)programado, (unsigned long)msg->start_mac_us, (int)ftm::modelOk());
             if (programado && radioSilActiva()) g_radio_silencio_pedido = true;
@@ -5509,6 +5650,7 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 #endif
         if (!programado) {
             subirSyncConRadioSilencio();
+            sample_clock::armStart(esp_timer_get_time(), 0u, false);
         }
         int syncAfter = digitalRead(SYNC_TO_PSOC_PIN);
         /* No START_ACK here: once SYNC rises the PSoC is measuring, so RF stays
@@ -5524,6 +5666,12 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         g_start_fallback_sent = false;
         g_state = SAMPLING;
         if (live::active()) live::start(g_t_start_us, effectivePsocSampleRateHz());
+        beginCaptureTimeMarks(startToken,
+                              programadoFtm ? TIME_MARK_START_FTM
+                              : (programado ? TIME_MARK_START_RX : TIME_MARK_START_BROADCAST),
+                              programadoFtm ? msg->start_mac_us : 0u,
+                              programadoFtm ? g_sched_uncert_ns : 0u,
+                              esp_timer_get_time(), programado);
         radioSilencioAlEntrar();
         SLAVE_LOG_PRINTF("[SLAVE] START_OK target=%u token=%u sync=%d->%d bytes=%lu fill=%u/%u view=%u start=%u\n",
                          (unsigned)targetNode, (unsigned)startToken,
@@ -6040,6 +6188,8 @@ static void masterChannelService() {}
 
 void setup()
 {
+    /* El reloj opcional del PSoC tiene que estar estable antes de liberar reset. */
+    sample_clock::begin();
     /* Arduino: precargar HIGH y habilitar salida; reafirmar tras pinMode. */
     drivePsocResetRequestPin(true);
     dbgLogBegin(DBG_LOG_BAUD);   /* Serial USB del esclavo = canal de log */
@@ -6211,6 +6361,8 @@ void loop()
     serviceDeferredRx();
     serviceRemoteLog();
     serviceSchedSyncReport();
+    sample_clock::service();
+    serviceTimeMarks();
     serviceCoreDumpReport();
     if (g_reqBatchPendingFlag) {
         MsgReqBatch req;
@@ -6234,11 +6386,12 @@ void loop()
 
     /* Drenar siempre la UART del PSoC (onBatch ignora si no está SAMPLING). */
     if (g_state == SAMPLING && g_debug_mode) {
-        /* Debug ESP: un lote falso cada 30/2604 s. La expresión redondeada
-         * mantiene esta ruta de laboratorio ligada a la Fs nativa canónica. */
-        static const uint32_t DEBUG_BATCH_PERIOD_US =
-            (SPI_BATCH_SAMPLES * 1000000UL + PSOC_NATIVE_SAMPLE_RATE_HZ / 2UL) /
-            PSOC_NATIVE_SAMPLE_RATE_HZ;
+        /* Debug ESP: un lote falso cada 30/Fs s, usando la misma tasa que se
+         * anuncia al maestro. */
+        uint32_t debugFs = effectivePsocSampleRateHz();
+        if (debugFs == 0u) debugFs = PSOC_NATIVE_SAMPLE_RATE_HZ;
+        const uint32_t DEBUG_BATCH_PERIOD_US =
+            (SPI_BATCH_SAMPLES * 1000000UL + debugFs / 2UL) / debugFs;
         uint32_t nowUs = (uint32_t)micros();
         if ((uint32_t)(nowUs - g_debug_last_us) >= DEBUG_BATCH_PERIOD_US) {
             g_debug_last_us += DEBUG_BATCH_PERIOD_US;
@@ -6442,7 +6595,9 @@ void loop()
             live::ramCapacityBatches(),
             live::sdCapacityBatches(),
             (uint8_t)esp_reset_reason(),
-            (uint32_t)(millis() / 1000u)
+            (uint32_t)(millis() / 1000u),
+            effectivePsocSampleRateMilliHz(),
+            nativePsocSampleRateMilliHz()
         };
         esp_err_t err = sendToMaster((const uint8_t *)&h, sizeof(h));
 #if SLAVE_LOG_HELLO_TX

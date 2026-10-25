@@ -107,6 +107,7 @@ typedef void (*RtDataCallback)(const uint8_t *data, int len);
 typedef void (*RtEndCallback)(const MsgStreamEnd &msg);
 typedef void (*OtaStatusCallback)(const MsgOtaStatus &msg);
 typedef void (*FtmReportCallback)(const MsgFtmReport &msg);
+typedef void (*TimeMarkCallback)(const MsgTimeMark &msg);
 
 class EspNowRx {
 public:
@@ -127,6 +128,7 @@ public:
     /* Tiempo real (rt_stream.h): tramas MsgData32 y STREAM_END. */
     void setOtaHandler(OtaStatusCallback cb) { _otaCb = cb; }
     void setFtmHandler(FtmReportCallback cb) { _ftmCb = cb; }
+    void setTimeMarkHandler(TimeMarkCallback cb) { _timeMarkCb = cb; }
     bool enqueueBatch(const ReassembledBatch &batch);
     void service();
     void setRtHandlers(RtDataCallback data, RtEndCallback end)
@@ -151,8 +153,10 @@ private:
     RtEndCallback      _rtEndCb = nullptr;
     OtaStatusCallback  _otaCb = nullptr;
     FtmReportCallback  _ftmCb = nullptr;
+    TimeMarkCallback   _timeMarkCb = nullptr;
     ReassembledBatch   _bufs[MAX_NODES] = {};
     QueueHandle_t       _batchQueue = nullptr;
+    QueueHandle_t       _timeMarkQueue = nullptr;
     uint32_t           _pktsRx  = 0;
     uint32_t           _crcFail = 0;
     volatile uint32_t  _foreignRx = 0;
@@ -192,7 +196,8 @@ inline bool EspNowRx::begin(BatchReadyCallback cb,
     _hotWaitAckCb = hotWaitAckCb;
     instance = this;
     if (!_batchQueue) _batchQueue = xQueueCreate(4, sizeof(ReassembledBatch));
-    if (!_batchQueue) {
+    if (!_timeMarkQueue) _timeMarkQueue = xQueueCreate(128, sizeof(MsgTimeMark));
+    if (!_batchQueue || !_timeMarkQueue) {
         MASTER_LOG_PRINTLN("[ESPNOW-RX] cola de lotes sin memoria");
         return false;
     }
@@ -239,6 +244,10 @@ inline void EspNowRx::service()
     ReassembledBatch batch;
     for (uint8_t i = 0; i < 4 && xQueueReceive(_batchQueue, &batch, 0) == pdTRUE; i++) {
         _cb(batch);
+    }
+    MsgTimeMark mark;
+    for (uint8_t i = 0; i < 8 && xQueueReceive(_timeMarkQueue, &mark, 0) == pdTRUE; i++) {
+        if (_timeMarkCb) _timeMarkCb(mark);
     }
 }
 
@@ -294,6 +303,9 @@ inline void EspNowRx::onRecv(const uint8_t *mac, const uint8_t *data, int len)
         r.ev_status = 0xFFu;
         memcpy(&r, data, ((size_t)len < sizeof(r)) ? (size_t)len : sizeof(r));
         if (instance->_ftmCb) instance->_ftmCb(r);
+    } else if (first == CMD_TIME_MARK && (size_t)len >= sizeof(MsgTimeMark)) {
+        /* El callback WiFi solo copia; JSON/WebSocket se atiende en loop(). */
+        xQueueSend(instance->_timeMarkQueue, data, 0);
     } else if (first == CMD_SLAVE_LOG && len >= 3) {
         const MsgSlaveLog *l = (const MsgSlaveLog *)data;
         int n = l->len;

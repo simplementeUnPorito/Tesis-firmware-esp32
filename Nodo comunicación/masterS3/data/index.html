@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Geophone Scope — Maestro</title>
-  <link rel="stylesheet" href="/css/style.css?v=field-study-47">
+  <link rel="stylesheet" href="/css/style.css?v=field-study-48">
 </head>
 <body>
   <header>
@@ -62,9 +62,9 @@
             <button id="btn-arm">ARM</button>
           </div>
           <div class="row">
-            <label>N (decimación) <input id="capture-decim-n" type="number" min="1" max="100" step="1" value="1" title="Promedia N muestras (1=sin decimar). Fs efectiva = 2604/N. Se aplica a todos los nodos."></label>
+            <label>N (decimación) <input id="capture-decim-n" type="number" min="1" max="100" step="1" value="1" title="Promedia N muestras (1=sin decimar). Fs efectiva = Fs nativa/N. Se aplica a todos los nodos."></label>
             <button id="btn-apply-decim">Aplicar N</button>
-            <span id="decim-fs-preview" class="status-text">2604 Hz</span>
+            <span id="decim-fs-preview" class="status-text">esperando HELLO</span>
           </div>
           <div class="row">
             <label>Modo de captura
@@ -207,6 +207,6 @@
     </div>
   </div>
 
-  <script type="module" src="/js/app.js?v=field-study-47"></script>
+  <script type="module" src="/js/app.js?v=field-study-48"></script>
 </body>
 </html>

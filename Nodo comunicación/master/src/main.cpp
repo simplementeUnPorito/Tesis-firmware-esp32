@@ -340,6 +340,8 @@ struct CachedHello {
     bool valid = false;
     uint8_t psoc_ok = 0;
     uint16_t sample_rate = 0;
+    uint32_t sample_rate_mhz = 0;
+    uint32_t native_rate_mhz = 0;
     uint8_t hw_class = SLAVE_HW_UNKNOWN;
     uint8_t sd_present = 0;
     uint8_t link_model = SLAVE_LINK_UNKNOWN;
@@ -523,6 +525,14 @@ static void sendCachedStateToWeb()
                                    h.ctl_status, h.pga_code, h.pgaout_code,
                                    h.ram_batches, h.sd_batches,
                                    h.reset_reason, h.uptime_s);
+            if (h.sample_rate_mhz) {
+                char js[128];
+                snprintf(js, sizeof(js),
+                         "{\"type\":\"sample_rate\",\"node\":%u,\"mhz\":%lu,\"native_mhz\":%lu}",
+                         (unsigned)node, (unsigned long)h.sample_rate_mhz,
+                         (unsigned long)h.native_rate_mhz);
+                webRelayText(js);
+            }
         }
     }
     MASTER_LOG_PRINTLN("[WEB] cached READY/HELLO replay sent");
@@ -743,6 +753,9 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
         h.valid = true;
         h.psoc_ok = msg.psoc_ok;
         h.sample_rate = msg.sample_rate;
+        h.sample_rate_mhz = msg.sample_rate_mhz
+                          ? msg.sample_rate_mhz : (uint32_t)msg.sample_rate * 1000u;
+        h.native_rate_mhz = msg.native_rate_mhz;
         h.hw_class = msg.hw_class;
         h.sd_present = msg.sd_present;
         h.link_model = msg.link_model;
@@ -761,6 +774,14 @@ static void onHello(const MsgHello &msg, const uint8_t senderMac[6])
                           msg.ctl_status, msg.pga_code, msg.pgaout_code,
                           msg.ram_batches, msg.sd_batches,
                           msg.reset_reason, msg.uptime_s);
+    if (msg.sample_rate_mhz) {
+        char js[128];
+        snprintf(js, sizeof(js),
+                 "{\"type\":\"sample_rate\",\"node\":%u,\"mhz\":%lu,\"native_mhz\":%lu}",
+                 (unsigned)msg.node_id, (unsigned long)msg.sample_rate_mhz,
+                 (unsigned long)msg.native_rate_mhz);
+        webRelayText(js);
+    }
 }
 
 static void onStartAck(const MsgStartAck &msg)
@@ -881,11 +902,22 @@ static uint16_t effectiveSampleRateHz()
     return (fallback != 0u) ? fallback : 1u;
 }
 
+static uint32_t effectiveSampleRateMilliHz()
+{
+    uint32_t minFs = 0;
+    for (uint8_t i = 1; i <= NUM_SLAVES; i++) {
+        if ((g_armAckMask & (1UL << i)) == 0u) continue;
+        const uint32_t fs = g_cachedHello[i].sample_rate_mhz;
+        if (g_cachedHello[i].valid && fs > 0u && (minFs == 0u || fs < minFs)) minFs = fs;
+    }
+    return minFs ? minFs : (uint32_t)effectiveSampleRateHz() * 1000u;
+}
+
 static uint32_t captureDurationMs(uint16_t nBatches)
 {
     uint32_t samples = (uint32_t)nBatches * (uint32_t)(SAMPLES_PER_PART * 2);
-    uint16_t fs = effectiveSampleRateHz();
-    return (samples * 1000UL + (fs - 1)) / fs;
+    const uint32_t fsMhz = effectiveSampleRateMilliHz();
+    return (uint32_t)(((uint64_t)samples * 1000000ULL + fsMhz - 1u) / fsMhz);
 }
 
 /* El softAP responde FTM para que los esclavos S3 midan RTT y desfasaje. En
@@ -946,6 +978,26 @@ static void onFtmReport(const MsgFtmReport &m)
     } else if (m.ev_status == 0u) {
         g_ftmNoResp[m.node_id] = 0;
     }
+}
+
+static void onTimeMark(const MsgTimeMark &m)
+{
+    if (m.node_id == 0 || m.node_id > NUM_SLAVES) return;
+    const char *kind = (m.kind == TIME_MARK_PERIODIC) ? "periodic" : "start";
+    const char *source = (m.kind == TIME_MARK_START_FTM) ? "ftm_programado"
+                       : (m.kind == TIME_MARK_START_RX) ? "rx"
+                       : (m.kind == TIME_MARK_START_BROADCAST) ? "broadcast"
+                       : "periodic";
+    char js[224];
+    snprintf(js, sizeof(js),
+             "{\"type\":\"timemark\",\"node\":%u,\"token\":%lu,"
+             "\"sample\":%lu,\"master_us\":%lu,\"uncert\":%u,"
+             "\"kind\":\"%s\",\"source\":\"%s\",\"ok\":%u}",
+             (unsigned)m.node_id, (unsigned long)m.capture_token,
+             (unsigned long)m.sample, (unsigned long)m.master_mac_us,
+             (unsigned)m.uncert_ns, kind, source,
+             (unsigned)((m.flags & TIME_MARK_MODEL_OK) != 0u));
+    webRelayText(js);
 }
 
 /* ── Sincronia por FTM (solo S3 / IDF 5) ─────────────────────────────────────
@@ -1342,10 +1394,13 @@ static void handleDirectedCmd(uint8_t node_id, uint8_t sub_cmd, uint8_t param,
 #define AUTHORITY_RETRY_MS  5000u
 #define AUTHORITY_MAX_TRIES 5
 
-static uint16_t expectedFsForDecim(uint8_t decim)
+static uint32_t expectedFsMilliHzForDecim(const CachedHello &hello, uint8_t decim)
 {
     if (decim < 1) decim = 1;
-    return (uint16_t)(ADC_SAMPLE_RATE_HZ / decim);
+    const uint32_t nativeMhz = hello.native_rate_mhz
+                             ? hello.native_rate_mhz
+                             : (uint32_t)ADC_SAMPLE_RATE_HZ * 1000u;
+    return nativeMhz / decim;
 }
 
 static void serviceSlaveAuthority()
@@ -1354,22 +1409,24 @@ static void serviceSlaveAuthority()
     if (g_state != IDLE && g_state != ARMED) return;   /* config solo en reposo */
 
     const uint32_t now = millis();
-    const uint16_t wantFs = expectedFsForDecim(g_wantDecim);
     for (uint8_t node = 1; node <= NUM_SLAVES; node++) {
         CachedHello &h = g_cachedHello[node];
-        if (!h.valid || h.sample_rate == 0) continue;
-        if (h.sample_rate == wantFs) { g_authorityTries[node] = 0; continue; }
+        if (!h.valid || h.sample_rate_mhz == 0) continue;
+        const uint32_t wantMhz = expectedFsMilliHzForDecim(h, g_wantDecim);
+        const uint32_t deltaMhz = h.sample_rate_mhz > wantMhz
+                                ? h.sample_rate_mhz - wantMhz : wantMhz - h.sample_rate_mhz;
+        if (deltaMhz <= 500u) { g_authorityTries[node] = 0; continue; }
         if (g_authorityTries[node] >= AUTHORITY_MAX_TRIES) continue;
         if (g_authorityNextMs[node] != 0 &&
             (int32_t)(now - g_authorityNextMs[node]) < 0) continue;
 
         g_authorityNextMs[node] = now + AUTHORITY_RETRY_MS;
         g_authorityTries[node]++;
-        MASTER_LOG_PRINTF("[MASTER] autoridad node=%d: fs=%u != %u, impongo decim=%u (intento %u)\n",
-                          node, h.sample_rate, wantFs, g_wantDecim,
+        MASTER_LOG_PRINTF("[MASTER] autoridad node=%d: fs_mHz=%lu != %lu, impongo decim=%u (intento %u)\n",
+                          node, (unsigned long)h.sample_rate_mhz, (unsigned long)wantMhz, g_wantDecim,
                           (unsigned)g_authorityTries[node]);
-        LOGM("AUTHORITY_DECIM", "node=%u,fs=%u,want_fs=%u,decim=%u,try=%u",
-             (unsigned)node, (unsigned)h.sample_rate, (unsigned)wantFs,
+        LOGM("AUTHORITY_DECIM", "node=%u,fs_mhz=%lu,want_mhz=%lu,decim=%u,try=%u",
+             (unsigned)node, (unsigned long)h.sample_rate_mhz, (unsigned long)wantMhz,
              (unsigned)g_wantDecim, (unsigned)g_authorityTries[node]);
         handleDirectedCmd(node, SUBCMD_DECIMATION, g_wantDecim, 0, false, false);
         return;   /* uno por vuelta: no amontonar config en el aire */
@@ -1493,7 +1550,16 @@ static void broadcastStart()
 #if MASTER_FTM_SYNC
     if (ftmStartPosible(g_armAckMask)) {
         msg.sched = 1;
-        msg.start_mac_us = esp_wifi_internal_get_mac_clock_time() + FTM_START_LEAD_US;
+        uint32_t gridUs = 500u;
+        for (uint8_t n = 1; n <= NUM_SLAVES; n++) {
+            if ((g_armAckMask & (1UL << n)) && g_cachedHello[n].sample_rate_mhz) {
+                gridUs = (uint32_t)((1000000000ULL + g_cachedHello[n].sample_rate_mhz / 2u) /
+                                    g_cachedHello[n].sample_rate_mhz);
+                break;
+            }
+        }
+        const uint32_t candidate = esp_wifi_internal_get_mac_clock_time() + FTM_START_LEAD_US;
+        msg.start_mac_us = ((candidate + gridUs - 1u) / gridUs) * gridUs;
     }
 #endif
     if (g_espnowReady) {
@@ -2472,6 +2538,7 @@ void setup()
     espnowRx.setRtHandlers(rtOnData, rtOnEnd);
     espnowRx.setOtaHandler(otam::onStatus);
     espnowRx.setFtmHandler(onFtmReport);
+    espnowRx.setTimeMarkHandler(onTimeMark);
     webRelaySetFillHook(rtarc::pushFill);
     webRelaySetDropTestHook(setDropTest);
     webRelaySetFirHook(sendFirToNode);

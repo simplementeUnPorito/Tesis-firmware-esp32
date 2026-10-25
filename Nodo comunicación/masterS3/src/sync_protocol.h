@@ -1,7 +1,10 @@
 #pragma once
 /*
- * sync_protocol.h — copia del esclavo, idéntica.
- * (Mantener sincronizado manualmente si se modifica.)
+ * sync_protocol.h - Mensajes ESP-NOW entre maestro y esclavos.
+ *
+ * Mantener sincronizado con el proyecto master.
+ * Todos los structs son packed para serializacion directa.
+ * Tamano maximo ESP-NOW: 250 bytes.
  */
 
 #include <stdint.h>
@@ -10,14 +13,14 @@
 #define CMD_ARM_ACK    0x11
 #define CMD_START      0x12
 #define CMD_STOP       0x13
-#define CMD_DEBUG      0x14   /* broadcast debug ramp — todos los esclavos */
+#define CMD_DEBUG      0x14
 #define CMD_START_ACK  0x15   /* esclavo → maestro: recibió CMD_START */
 #define CMD_DATA       0x20
-#define CMD_SET_CONFIG 0x21   /* maestro → esclavo unicast: configurar parámetro */
-#define CMD_CFG_ACK    0x22   /* esclavo → maestro: confirmación de config */
-#define CMD_DEBUG_NODE 0x23   /* maestro → esclavo unicast: debug ramp individual */
-#define CMD_VIEW       0x24   /* maestro → esclavo unicast: captura única "Ver" (N lotes) */
-#define CMD_DEBUG_PSOC 0x25   /* maestro → esclavo unicast: rampa de debug del PSoC */
+#define CMD_SET_CONFIG 0x21
+#define CMD_CFG_ACK    0x22
+#define CMD_DEBUG_NODE 0x23
+#define CMD_VIEW       0x24   /* maestro → esclavo: captura única "Ver" (N lotes) */
+#define CMD_DEBUG_PSOC 0x25   /* maestro → esclavo: rampa de debug del PSoC */
 #define CMD_STATUS     0x30
 #define CMD_HELLO      0x40   /* beacon diagnóstico: esclavo → maestro */
 #define CMD_SET_RECLEN 0x50   /* master → todos: cuántos batches grabar (respuesta: CMD_CFG_ACK sub=0x50) */
@@ -31,6 +34,7 @@
 #define CMD_SELECT_STREAM 0x72 /* master → esclavo unicast: 0=crudo, 1=FIR hardware */
 #define CMD_STREAM_ACK  0x73  /* master → esclavo: tiempo real, lotes ya entregados */
 #define CMD_STREAM_END  0x74  /* esclavo → master: tiempo real, la captura cerro */
+#define CMD_TIME_MARK   0x78  /* esclavo → master: muestra vinculada al reloj MAC maestro */
 #define CMD_CAL_VDAC_STAGE_BASE       0x80 /* esclavo -> maestro ACK auxiliar: 0x80..0x83 stage VDAC code */
 #define CMD_CAL_TARGET_MV_HI_BASE     0x84 /* 0x84..0x87 signed int16 target mV high byte */
 #define CMD_CAL_TARGET_MV_LO_BASE     0x88 /* 0x88..0x8B signed int16 target mV low byte */
@@ -42,10 +46,6 @@
 #define SLAVE_HW_HAMMER  1u
 #define SLAVE_HW_UNKNOWN 0xFFu
 
-/* Generación del enlace interno PSoC <-> ESP. Es independiente de hw_class:
- * puede haber GEO o HAMMER tanto SERIAL como I2C. En la placa I2C actual los
- * comandos bajan por UART y las respuestas/muestras suben por I2C; el nombre
- * identifica esa generación de placa, no obliga a que ambos sentidos sean I2C. */
 #define SLAVE_LINK_SERIAL  0u
 #define SLAVE_LINK_I2C     1u
 #define SLAVE_LINK_UNKNOWN 0xFFu
@@ -55,18 +55,39 @@
  * bit0 = en banda, bits1..3 = estado (0 falta aprender, 1 aprendiendo,
  * 2 corriendo, 3 pausado, 4 falló), bit4 = perfil aprendido válido. */
 #define SLAVE_CTL_UNKNOWN      0xFFu
+#define SLAVE_CTL_BAND_BIT     0x01u
+#define SLAVE_CTL_STATE_SHIFT  1u
+#define SLAVE_CTL_STATE_MASK   0x0Eu
+#define SLAVE_CTL_PROFILE_BIT  0x10u
 
+/* Tamaños históricos de HELLO para aceptar esclavos con firmware anterior. */
 #define MSG_HELLO_LEGACY_BYTES 5u
 #define MSG_HELLO_HW_BYTES     6u
 #define MSG_HELLO_SD_BYTES     7u
 
 #pragma pack(push, 1)
 
-struct MsgArm    { uint8_t cmd; };
-struct MsgArmAck { uint8_t cmd; uint8_t node_id; uint8_t status; };
-struct MsgStart  { uint8_t cmd; uint64_t t_start_us; uint8_t target_node;
-                   /* Aditivo: START programado por FTM (ver la copia del esclavo). */
-                   uint8_t sched; uint32_t start_mac_us; };
+struct MsgArm {
+    uint8_t cmd;
+};
+
+struct MsgArmAck {
+    uint8_t cmd;
+    uint8_t node_id;
+    uint8_t status;
+};
+
+struct MsgStart {
+    uint8_t  cmd;
+    uint64_t t_start_us;
+    uint8_t  target_node;
+    /* Aditivo: START programado por FTM. sched=1 -> todos los esclavos suben
+     * SYNC cuando el reloj MAC del maestro vale start_mac_us (convertido con su
+     * modelo de reloj), no al recibir el paquete. */
+    uint8_t  sched;
+    uint32_t start_mac_us;
+};
+
 struct MsgStartAck {
     uint8_t  cmd;
     uint8_t  node_id;
@@ -74,8 +95,15 @@ struct MsgStartAck {
     uint32_t start_token;  /* low32(t_start_us), para asociar ACK con envío */
     uint32_t rx_us;
 };
-struct MsgStop   { uint8_t cmd; };
-struct MsgDebug  { uint8_t cmd; uint8_t enable; };
+
+struct MsgStop {
+    uint8_t cmd;
+};
+
+struct MsgDebug {
+    uint8_t cmd;
+    uint8_t enable;
+};
 
 #define DATA_PKT_MARKER  0xBC
 
@@ -154,9 +182,8 @@ struct MsgStatus {
     uint8_t  psoc_ok;   /* 1=PSoC detectado, 0=no */
 };
 
-/* Fase 2: configuración individual por esclavo */
 struct MsgSetConfig {
-    uint8_t cmd;      /* CMD_SET_CONFIG */
+    uint8_t cmd;
     uint8_t node_id;
     uint8_t sub_cmd;  /* 0xA6=PGA, 0xA8=PGAout, 0xAA=IDAC manual, 0xB5=calibrar */
     uint8_t param;    /* normal; para 0xAA: bit7=signo, bits0..3=etapa */
@@ -164,16 +191,16 @@ struct MsgSetConfig {
 };
 
 struct MsgCfgAck {
-    uint8_t cmd;      /* CMD_CFG_ACK */
+    uint8_t cmd;
     uint8_t node_id;
     uint8_t sub_cmd;
-    uint8_t ok;       /* 1=PSoC confirmó, 0=sin respuesta */
+    uint8_t ok;
 };
 
 struct MsgDebugNode {
-    uint8_t cmd;      /* CMD_DEBUG_NODE */
+    uint8_t cmd;
     uint8_t node_id;
-    uint8_t enable;   /* 1=activar ramp, 0=desactivar */
+    uint8_t enable;
 };
 
 struct MsgView {
@@ -194,13 +221,13 @@ struct MsgHello {
     uint8_t  psoc_ok;     /* 1=PSoC detectado en boot, 0=no detectado */
     uint16_t sample_rate; /* ADC sample rate en Hz reportado por PSoC; 0=desconocido */
     uint8_t  hw_class;    /* SLAVE_HW_* reportado por el PSoC (GEO/HAMMER/UNKNOWN) */
-    uint8_t  sd_present;  /* 1=módulo SD detectado en ese ESP32 (solo firmwares GEO
-                            * con pines SD compilados), 0=sin SD/sin detectar. Campo
-                            * agregado al final: HELLO viejos (sin este byte) llegan
-                            * con menos bytes y espnow_rx.h ya tolera eso (memcpy
-                            * parcial sobre un struct zero-init → sd_present=0). */
-    uint8_t  link_model;  /* SLAVE_LINK_*; agregado al final para que maestros y
-                            * esclavos anteriores sigan aceptando el prefijo. */
+    uint8_t  sd_present;  /* 1=módulo SD detectado en este ESP32 (solo firmwares GEO
+                            * compilados con pines SD), 0=sin SD o sin detectar. Campo
+                            * agregado al final del struct: aditivo, no rompe firmwares
+                            * viejos que no lo leen (quedaría en 0 si un binario viejo
+                            * arma el HELLO sin inicializarlo). */
+    uint8_t  link_model;  /* Generación del enlace PSoC<->ESP, independiente de
+                            * GEO/HAMMER. Campo aditivo al final del HELLO. */
     uint8_t  ctl_status;  /* SLAVE_CTL_*; aditivo, solo lo llena la placa I2C. */
     uint8_t  pga_code;    /* código de PGA confirmado por el PSoC (0xFF = sin dato) */
     uint8_t  pgaout_code; /* código de PGAout confirmado (0xFF = no existe / sin dato) */
@@ -209,6 +236,24 @@ struct MsgHello {
     uint8_t  reset_reason; /* esp_reset_reason() del ultimo arranque (9 = caida de
                             * tension); aditivo: detecta esclavos que se reinician */
     uint32_t uptime_s;     /* segundos desde el arranque; aditivo */
+    uint32_t sample_rate_mhz; /* Fs efectiva exacta en mHz; 0 = usar sample_rate legado */
+    uint32_t native_rate_mhz; /* Fs antes de decimar; permite validar N sin asumir 2604 Hz */
+};
+
+#define TIME_MARK_PERIODIC  0u
+#define TIME_MARK_START_FTM 1u
+#define TIME_MARK_START_RX  2u
+#define TIME_MARK_START_BROADCAST 3u
+#define TIME_MARK_MODEL_OK 0x01u
+struct MsgTimeMark {
+    uint8_t  cmd;
+    uint8_t  node_id;
+    uint32_t capture_token;
+    uint32_t sample;
+    uint32_t master_mac_us;
+    uint16_t uncert_ns;
+    uint8_t  kind;
+    uint8_t  flags;
 };
 
 struct MsgSetRecLen {

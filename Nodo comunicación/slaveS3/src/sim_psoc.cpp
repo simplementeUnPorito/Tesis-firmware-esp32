@@ -14,9 +14,16 @@
 #ifndef SYNC_TO_PSOC_PIN
 #define SYNC_TO_PSOC_PIN 27
 #endif
+#ifndef SOC_OUT_PIN
+#define SOC_OUT_PIN -1
+#endif
+#ifndef SOC_PERIOD_NS
+#define SOC_PERIOD_NS 500000ULL
+#endif
 
 namespace {
-constexpr uint32_t NATIVE_FS = 2604u;
+constexpr uint32_t NATIVE_FS = (SOC_OUT_PIN >= 0)
+    ? (uint32_t)(1000000000ULL / SOC_PERIOD_NS) : 2604u;
 constexpr uint32_t RAM_BATCHES = 512u;
 constexpr uint32_t LIVE_WINDOW = 16u;
 constexpr uint32_t SEND_TIME_US = 2500u;

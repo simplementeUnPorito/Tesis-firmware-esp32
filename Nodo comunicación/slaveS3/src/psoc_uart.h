@@ -150,8 +150,8 @@
 #define PSOC_CMD_SELECT_STREAM 0xB7
 #define PSOC_CMD_ADC_SNAPSHOT 0xB8
 #define PSOC_CMD_BLINK_LED    0xB9   /* Titilar el LED del PSoC para identificar el nodo */
-#define PSOC_CMD_ADC_CONFIG   0xBA   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; las 4 a 2604 Hz nativos */
-#define PSOC_CMD_SET_DECIMATION 0xBB /* factor 1..100 (1=sin decimar). Fs efectiva = 2604/factor */
+#define PSOC_CMD_ADC_CONFIG   0xBA   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; no cambia la Fs */
+#define PSOC_CMD_SET_DECIMATION 0xBB /* factor 1..100 (1=sin decimar). Fs efectiva = Fs nativa/factor */
 #define PSOC_CMD_SD_STATUS   0xBC    /* p=0 estado cacheado, p=1 re-init. Ack: byte de estado SD */
 #define PSOC_CMD_SD_TEST     0xBD    /* self-test FatFs GEOTEST.BIN. Ack: 1 OK / 0 fallo */
 /* Canal del AMux que el PSoC digitaliza: VISTA de diagnostico para mirar

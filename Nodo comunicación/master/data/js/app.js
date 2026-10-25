@@ -2,20 +2,20 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-47';
-import { WsClient } from './ws_client.js?v=field-study-47';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-47';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-47';
-import { PlotArea } from './plot.js?v=field-study-47';
-import { SpectrumArea } from './spectrum.js?v=field-study-47';
-import { SlavePanel } from './slave_panel.js?v=field-study-47';
-import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-47';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-47';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-47';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-47';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-47';
-import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-47';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-47';
+import * as cfg from './config.js?v=field-study-48';
+import { WsClient } from './ws_client.js?v=field-study-48';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-48';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-48';
+import { PlotArea } from './plot.js?v=field-study-48';
+import { SpectrumArea } from './spectrum.js?v=field-study-48';
+import { SlavePanel } from './slave_panel.js?v=field-study-48';
+import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-48';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-48';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-48';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-48';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-48';
+import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-48';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-48';
 
 const $ = (id) => document.getElementById(id);
 
@@ -397,7 +397,8 @@ function currentFsHz() {
 }
 
 // Sin HELLO todavia (p. ej. el maestro se reinicio y no tiene la Fs en cache)
-// la Fs NO es la nativa: es 2604/N con la N confirmada del nodo. Asumir 2604
+// la Fs NO es la nativa: es Fs_nativa/N. Para placas viejas sin ese dato se
+// conserva 2604 Hz como fallback de compatibilidad.
 // con N=4 pedia 4x lotes (20 s -> 1736 en vez de 434, o sea SD o recorte) y
 // guardaba la captura con una Fs 4x mayor, comprimiendo su eje de tiempo.
 function fallbackFsHz() {
@@ -407,6 +408,23 @@ function fallbackFsHz() {
     if (nd && nd.decimationFactor > f) f = nd.decimationFactor;
   }
   return Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f);
+}
+
+function nativeFsHz() {
+  let native = 0;
+  for (let i = 1; i < data.nodes.length; i++) {
+    const nd = data.nodes[i];
+    const reported = Number(nd?.nativeRateMilliHz) / 1000;
+    if (reported > 0 && (!native || reported < native)) native = reported;
+  }
+  if (native) return native;
+  for (let i = 1; i < data.nodes.length; i++) {
+    const nd = data.nodes[i];
+    const inferred = nd?.fsExactKnown && nd.fs > 0
+      ? nd.fs * (nd.decimationFactor || 1) : 0;
+    if (inferred > 0 && (!native || inferred < native)) native = inferred;
+  }
+  return native || cfg.DEFAULT_SAMPLE_RATE_HZ;
 }
 
 function displayFsHz() {
@@ -631,6 +649,8 @@ function nodeSnapshot(nd, index, options = {}) {
     geo_number: role === 'geo' ? geoNumberFromAlias(nd.alias) : null,
     slave_id: pcbId,
     fs: nd.fs,
+    sample_rate_mhz: Math.round((nd.fs || 0) * 1000),
+    native_rate_mhz: Math.round(nd.nativeRateMilliHz || 0),
     fs_known: !!nd.fsKnown,
     fs_exact_known: !!nd.fsExactKnown,
     connected: nodeConnectedForCapture(nd, index),
@@ -665,6 +685,7 @@ function nodeSnapshot(nd, index, options = {}) {
     link_type: slaveLinkModelName(nd.linkModel),
     ctl_status: nd.ctlStatus,
     sd_marks: nd.sdMarksFor(raw.length),
+    time_marks: nd.timeMarks.map((mark) => ({ ...mark })),
     hammer_offset_m: offsetM,
     offset_m_from_hammer: offsetM,
     position_m: offsetM,
@@ -2205,22 +2226,26 @@ function recompileNodeFirForFs(chIndex) {
   return true;
 }
 
-function applyGlobalFs(fsHz, logMessage = '') {
+function applyGlobalFs(fsHz, logMessage = '', propagate = true) {
   if (!(fsHz > 0)) return;
   const wasKnown = anySlaveFsKnown();
   let changed = false;
-  for (let i = 1; i < cfg.MAX_NODES; i++) {
-    const nd = data.nodes[i];
-    const nodeChanged = !nd.fsKnown || Math.abs(nd.fs - fsHz) > 1e-9;
-    nd.fs = fsHz;
-    nd.fsKnown = true;
-    if (nodeChanged) {
-      recompileNodeFirForFs(i);
-      changed = true;
+  if (propagate) {
+    for (let i = 1; i < cfg.MAX_NODES; i++) {
+      const nd = data.nodes[i];
+      const nodeChanged = !nd.fsKnown || Math.abs(nd.fs - fsHz) > 1e-9;
+      nd.fs = fsHz;
+      nd.fsKnown = true;
+      if (nodeChanged) {
+        recompileNodeFirForFs(i);
+        changed = true;
+      }
     }
+  } else {
+    changed = true;
   }
   // Reflejar y persistir la N derivada de la Fs efectiva en el control de
-  // captura (Fs = 2604/N). Reemplaza el viejo campo "Fs manual".
+  // captura (Fs = Fs_nativa/N). Reemplaza el viejo campo "Fs manual".
   syncDecimFieldFromFs(fsHz);
   if (!changed && wasKnown) return;
 
@@ -2250,13 +2275,20 @@ function updateNodeFsFromHello(chIndex, fsHz) {
   applyGlobalFs(fsHz, `Fs global actualizado por S${chIndex}: ${fsHz} Hz`);
 }
 
-function updateNodeExactFsFromHello(chIndex, fsHz) {
+function updateNodeExactFsFromHello(chIndex, fsHz, nativeMilliHz = 0) {
   if (!(fsHz > 0)) return;
   const nd = data.nodes[chIndex];
-  if (nd) nd.fsExactKnown = true;
+  if (nd) {
+    const changed = !nd.fsKnown || Math.abs(nd.fs - fsHz) > 1e-9;
+    nd.fs = fsHz;
+    nd.fsKnown = true;
+    nd.fsExactKnown = true;
+    if (nativeMilliHz > 0) nd.nativeRateMilliHz = nativeMilliHz;
+    if (changed) recompileNodeFirForFs(chIndex);
+  }
   saveSlaveSetting(chIndex, 'fs_hz', Math.round(fsHz));
   saveGlobalFs(fsHz);
-  applyGlobalFs(fsHz, `Fs global actualizado por S${chIndex}: ${fsHz} Hz`);
+  applyGlobalFs(hardwareFsHz(), `Fs exacta actualizada por S${chIndex}: ${fsHz} Hz`, false);
 }
 
 function restoreFsFromLocalCache() {
@@ -2266,7 +2298,8 @@ function restoreFsFromLocalCache() {
     const n = saveGlobalDecimation(parsedN);
     const inp = $('capture-decim-n');
     if (inp) inp.value = String(n);
-    const fsHz = Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n);
+    // Todavía no hubo HELLO: éste es deliberadamente el fallback legado.
+    const fsHz = cfg.DEFAULT_SAMPLE_RATE_HZ / n;
     updateDecimPreview();
     applyGlobalFs(fsHz, `N=${n} restaurado de cache local (Fs ${fsHz} Hz)`);
     return;
@@ -2425,7 +2458,7 @@ function onDecimationChanged(chIndex, factor) {
     if (panel) panel.setDecimationLock(2);
     sendDirected(chIndex, cfg.SUBCMD_DECIMATION, f);
     scheduleDecimationLockTimeout(chIndex, f);
-    appendLog(`S${chIndex} decimacion -> ${f} (${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f)} Hz)`);
+    appendLog(`S${chIndex} decimacion -> ${f} (${(nativeFsHz() / f).toFixed(3).replace(/\.000$/, '')} Hz)`);
   };
   // Serializar detras de cualquier config pendiente: el esclavo atiende un
   // config del PSoC a la vez (g_cfg_waiting) y rechazaba este 0xBB con ok=0.
@@ -3054,7 +3087,7 @@ function handleAck(pkt, idx) {
       // sin descargar deja de emitir HELLO, y con la Fs nativa vieja el tope sin
       // SD se calculaba mal (decim 2 + 6 s daba 521 lotes y se iba a la SD
       // cuando en realidad entran 261). El HELLO exacto lo refina despues.
-      const fsHz = Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / f);
+      const fsHz = nativeFsHz() / f;
       applyGlobalFs(fsHz);
       appendLog(`S${idx} decimacion confirmada: ${f} (${fsHz} Hz, sin SD hasta ` +
                 `${((cfg.PSOC_RAM_CAPTURE_MAX_BATCHES * cfg.SAMPLES_PER_BATCH) / fsHz).toFixed(2)} s)`);
@@ -3644,9 +3677,8 @@ $('btn-arm').addEventListener('click', () => {
   appendLog(`ARM solicitado n=${n || 'todos'}; esperando READY real`);
 });
 
-// N (decimación) global — reemplaza el viejo "Fs manual". El ADC del PSoC corre
-// siempre a 2604 Hz nativos; la Fs efectiva se deriva del factor de decimación
-// N (Fs = 2604/N, promediando N muestras). El operador fija N y se aplica a
+// N (decimación) global — reemplaza el viejo "Fs manual". La Fs efectiva se
+// deriva de la tasa nativa informada por HELLO y del factor N. El operador fija N y se aplica a
 // todos los nodos conectados (mismo camino que el control por-esclavo:
 // SUBCMD_DECIMATION con ACK/lock), además de alimentar el badge de Fs global.
 function captureDecimN() {
@@ -3657,12 +3689,12 @@ function captureDecimN() {
 function updateDecimPreview() {
   const n = captureDecimN();
   const span = $('decim-fs-preview');
-  if (span) span.textContent = `${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n)} Hz`;
+  if (span) span.textContent = `${(nativeFsHz() / n).toFixed(3).replace(/\.000$/, '')} Hz`;
   return n;
 }
 
 // Mantener el campo N y su preview en sync cuando la Fs efectiva cambia por
-// HELLO/cache (Fs = 2604/N ⇒ N = round(2604/Fs)). Si el operador ya aplicó
+// HELLO/cache (Fs = Fs_nativa/N). Si el operador ya aplicó
 // una N global, conservar esa preferencia en el control hasta que la cambie:
 // un HELLO de arranque no debe destruir el valor persistido en localStorage.
 function syncDecimFieldFromFs(fsHz) {
@@ -3673,17 +3705,17 @@ function syncDecimFieldFromFs(fsHz) {
   const saved = rawSaved === null ? NaN : parseInt(rawSaved, 10);
   const n = Number.isFinite(saved) && saved >= 1 && saved <= 100
     ? saved
-    : clamp(Math.round(cfg.DEFAULT_SAMPLE_RATE_HZ / fsHz), 1, 100);
+    : clamp(Math.round(nativeFsHz() / fsHz), 1, 100);
   inp.value = String(n);
   const span = $('decim-fs-preview');
-  if (span) span.textContent = `${Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n)} Hz`;
+  if (span) span.textContent = `${(nativeFsHz() / n).toFixed(3).replace(/\.000$/, '')} Hz`;
 }
 
 function applyGlobalDecimation() {
   const n = updateDecimPreview();
   const inp = $('capture-decim-n');
   if (inp) inp.value = String(n);
-  const fsHz = Math.floor(cfg.DEFAULT_SAMPLE_RATE_HZ / n);
+  const fsHz = nativeFsHz() / n;
   saveGlobalDecimation(n);
   saveGlobalFs(fsHz);
   applyGlobalFs(fsHz, `N=${n} → Fs ${fsHz} Hz`);
@@ -4032,6 +4064,32 @@ mountOtaPanel(document.getElementById('tab-slaves'), appendLog);
 // Sincronización FTM y distancia, también en Esclavos.
 const syncPanel = mountSyncPanel(document.getElementById('tab-slaves'), appendLog);
 ws.addEventListener('ftm', (ev) => syncPanel?.onReport(ev.detail));
+ws.addEventListener('sample-rate', (ev) => {
+  const node = ev.detail?.node | 0;
+  const mhz = Number(ev.detail?.mhz);
+  const nativeMhz = Number(ev.detail?.native_mhz);
+  if (node > 0 && node < cfg.MAX_NODES && mhz > 0) {
+    updateNodeExactFsFromHello(node, mhz / 1000, nativeMhz);
+  }
+});
+ws.addEventListener('timemark', (ev) => {
+  const mark = ev.detail || {};
+  const node = mark.node | 0;
+  if (node <= 0 || node >= cfg.MAX_NODES) return;
+  const nd = data.nodes[node];
+  const key = `${mark.token >>> 0}:${mark.sample >>> 0}`;
+  if (nd.timeMarkKeys.has(key)) return;
+  nd.timeMarkKeys.add(key);
+  nd.timeMarks.push({
+    token: mark.token >>> 0,
+    sample: mark.sample >>> 0,
+    master_us: mark.master_us >>> 0,
+    uncert: Math.max(0, Number(mark.uncert) || 0),
+    kind: mark.kind === 'start' ? 'start' : 'periodic',
+    source: String(mark.source || ''),
+    ok: mark.ok ? 1 : 0,
+  });
+});
 ws.addEventListener('sync-start', (ev) => {
   onSyncStart(ev.detail);
   appendLog(ev.detail.method === 'ftm_scheduled'

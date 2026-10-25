@@ -34,6 +34,7 @@
 #define CMD_SELECT_STREAM 0x72 /* master → esclavo unicast: 0=crudo, 1=FIR hardware */
 #define CMD_STREAM_ACK  0x73  /* master → esclavo: tiempo real, lotes ya entregados */
 #define CMD_STREAM_END  0x74  /* esclavo → master: tiempo real, la captura cerro */
+#define CMD_TIME_MARK   0x78  /* esclavo → master: muestra vinculada al reloj MAC maestro */
 #define CMD_CAL_VDAC_STAGE_BASE       0x80 /* esclavo -> maestro ACK auxiliar: 0x80..0x83 stage VDAC code */
 #define CMD_CAL_TARGET_MV_HI_BASE     0x84 /* 0x84..0x87 signed int16 target mV high byte */
 #define CMD_CAL_TARGET_MV_LO_BASE     0x88 /* 0x88..0x8B signed int16 target mV low byte */
@@ -58,6 +59,11 @@
 #define SLAVE_CTL_STATE_SHIFT  1u
 #define SLAVE_CTL_STATE_MASK   0x0Eu
 #define SLAVE_CTL_PROFILE_BIT  0x10u
+
+/* Tamaños históricos de HELLO para aceptar esclavos con firmware anterior. */
+#define MSG_HELLO_LEGACY_BYTES 5u
+#define MSG_HELLO_HW_BYTES     6u
+#define MSG_HELLO_SD_BYTES     7u
 
 #pragma pack(push, 1)
 
@@ -230,6 +236,24 @@ struct MsgHello {
     uint8_t  reset_reason; /* esp_reset_reason() del ultimo arranque (9 = caida de
                             * tension); aditivo: detecta esclavos que se reinician */
     uint32_t uptime_s;     /* segundos desde el arranque; aditivo */
+    uint32_t sample_rate_mhz; /* Fs efectiva exacta en mHz; 0 = usar sample_rate legado */
+    uint32_t native_rate_mhz; /* Fs antes de decimar; permite validar N sin asumir 2604 Hz */
+};
+
+#define TIME_MARK_PERIODIC  0u
+#define TIME_MARK_START_FTM 1u
+#define TIME_MARK_START_RX  2u
+#define TIME_MARK_START_BROADCAST 3u
+#define TIME_MARK_MODEL_OK 0x01u
+struct MsgTimeMark {
+    uint8_t  cmd;
+    uint8_t  node_id;
+    uint32_t capture_token;
+    uint32_t sample;
+    uint32_t master_mac_us;
+    uint16_t uncert_ns;
+    uint8_t  kind;
+    uint8_t  flags;
 };
 
 struct MsgSetRecLen {

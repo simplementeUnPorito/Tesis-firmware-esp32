@@ -39,8 +39,8 @@ export const SUBCMD_VER = 0xB2;
 export const SUBCMD_CALIBRATE     = 0xB5;
 export const SUBCMD_SAVE_EEPROM   = 0xB6;   /* mismo código que PSOC_CMD_SAVE_EEPROM */
 export const SUBCMD_SELECT_STREAM = 0xB7;   /* mismo código que PSOC_CMD_SELECT_STREAM */
-export const SUBCMD_ADC_CONFIG    = 0xBA;   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; las 4 a 2604 Hz nativos */
-export const SUBCMD_DECIMATION    = 0xBB;   /* factor 1..100 (1=sin decimar); Fs efectiva = 2604/factor */
+export const SUBCMD_ADC_CONFIG    = 0xBA;   /* 1=±2.5V, 2=±0.512V, 3=±1.024V, 4=±0.625V; la Fs llega por HELLO */
+export const SUBCMD_DECIMATION    = 0xBB;   /* factor 1..100 (1=sin decimar); Fs efectiva = Fs nativa/factor */
 /* 0xAB: obliga al lazo PI del PSoC a corregir sin congelarse por histeresis
  * durante N segundos (param). NO es la calibracion legacy por etapas (0xB5):
  * es el mismo lazo permanente, sin freno, para que rehaga el punto de trabajo
@@ -97,6 +97,7 @@ export const TEST_DEFAULT_SECONDS = 0.2;
 // (app.js) resize these for real the moment Fs becomes known, so the exact
 // values here only seed startup sizing before HELLO. Use the measured real
 // rate so the initial 3 s / 10 s windows are close even before the first HELLO.
+// Fallback exclusivo para firmware viejo que todavía no informa Fs por HELLO.
 export const DEFAULT_SAMPLE_RATE_HZ = 2604;
 export const DISP_SAMP = DEFAULT_SAMPLE_RATE_HZ * 3;
 export const MAX_BUF_S = 10;
@@ -122,14 +123,12 @@ export const VDAC_MAX = 255;
 export const VDAC_FULL_SCALE_V = VDAC_MAX * VDAC_STEP;
 export const VDAC_MV_PER_CODE = VDAC_STEP * 1000;
 
-// ADC scaling — configs expuestas del PSoC. Las 4 usan la misma Fs base nativa
-// (2604 Hz); la Fs efectiva real depende además del factor de decimación de
-// cada nodo y SIEMPRE se toma de su HELLO (fsHz acá es solo informativo).
+// Escalas del ADC. La frecuencia no depende del rango: se toma del HELLO.
 export const ADC_CONFIGS = [
-  { code: 1, label: '±2.5 V', rangeV: 2.5, fsHz: 2604, countsPerVolt: 131072 / 2.5 },
-  { code: 2, label: '±0.512 V', rangeV: 0.512, fsHz: 2604, countsPerVolt: 131072 / 0.512 },
-  { code: 3, label: '±1.024 V', rangeV: 1.024, fsHz: 2604, countsPerVolt: 131072 / 1.024 },
-  { code: 4, label: '±0.625 V', rangeV: 0.625, fsHz: 2604, countsPerVolt: 131072 / 0.625 },
+  { code: 1, label: '±2.5 V', rangeV: 2.5, countsPerVolt: 131072 / 2.5 },
+  { code: 2, label: '±0.512 V', rangeV: 0.512, countsPerVolt: 131072 / 0.512 },
+  { code: 3, label: '±1.024 V', rangeV: 1.024, countsPerVolt: 131072 / 1.024 },
+  { code: 4, label: '±0.625 V', rangeV: 0.625, countsPerVolt: 131072 / 0.625 },
 ];
 export const ADC_COUNTS_PER_VOLT = ADC_CONFIGS[0].countsPerVolt;
 
