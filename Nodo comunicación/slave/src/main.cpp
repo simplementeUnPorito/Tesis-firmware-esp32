@@ -3193,6 +3193,44 @@ static void serviceSchedSyncReport()
                      (unsigned long)g_sched_uncert_ns, (int)okConv);
 }
 
+/* Coredump del ultimo panico: los esclavos no tienen USB, asi que el resumen
+ * (tarea, PC, backtrace) sale por el log remoto a los 20, 40 y 60 s del
+ * arranque y despues se borra. Decodificar con xtensa-esp32s3-elf-addr2line
+ * contra el firmware.elf que estaba grabado. */
+#if defined(ESP32) && ESP_ARDUINO_VERSION_MAJOR >= 3
+#include <esp_core_dump.h>
+static void serviceCoreDumpReport()
+{
+    static uint8_t sent = 0;
+    if (sent >= 4u || millis() < 20000u * (uint32_t)(sent + 1u)) return;
+    sent++;
+    if (esp_core_dump_image_check() != ESP_OK) {
+        if (sent == 1u) SLAVE_LOG_PRINTF("[COREDUMP] no hay (reset=%d)\n", (int)esp_reset_reason());
+        sent = 4u;
+        return;
+    }
+    if (sent == 4u) {
+        SLAVE_LOG_PRINTF("[COREDUMP] borrado err=%d\n", (int)esp_core_dump_image_erase());
+        return;
+    }
+    esp_core_dump_summary_t s;
+    if (esp_core_dump_get_summary(&s) != ESP_OK) {
+        SLAVE_LOG_PRINTF("[COREDUMP] presente pero sin resumen\n");
+        return;
+    }
+    char bt[16 * 11 + 1];
+    size_t o = 0;
+    for (uint32_t i = 0; i < s.exc_bt_info.depth && i < 16u && o + 12 < sizeof(bt); i++)
+        o += snprintf(bt + o, sizeof(bt) - o, " 0x%08lx", (unsigned long)s.exc_bt_info.bt[i]);
+    bt[o] = 0;
+    SLAVE_LOG_PRINTF("[COREDUMP] tarea=%.16s pc=0x%08lx causa=%lu vaddr=0x%08lx corrupto=%d bt:%s\n",
+                     s.exc_task, (unsigned long)s.exc_pc, (unsigned long)s.ex_info.exc_cause,
+                     (unsigned long)s.ex_info.exc_vaddr, (int)s.exc_bt_info.corrupted, bt);
+}
+#else
+static void serviceCoreDumpReport() {}
+#endif
+
 static void iniciarTimerSyncRadioSilencio()
 {
     if (g_radio_silencio_sync_timer != nullptr) return;
@@ -5166,6 +5204,60 @@ static void handleDebugNode(const MsgDebugNode *dbg)
     SLAVE_LOG_PRINTF("[SLAVE] debug_node=%d\n", (int)g_debug_mode);
 }
 
+/* ARM y PRESTART sueltan y reservan la memoria de la captura (allocStore,
+ * live::close/prepare). Atendidos en el callback de ESP-NOW (tarea WiFi)
+ * liberaban el anillo mientras loop() retransmitia de el: panico
+ * LoadProhibited en live::sendBatch (nodo 3, 2026-10-25, por coredump). Se
+ * encolan tal como llegaron y loop() los procesa en orden con el mismo
+ * camino. */
+#if defined(ESP32)
+struct DeferredRx { uint8_t mac[6]; uint8_t len; uint8_t data[64]; };
+static constexpr uint8_t DEFERRED_RX_N = 8;
+static DeferredRx g_deferredRx[DEFERRED_RX_N];
+static volatile uint8_t g_deferredHead = 0, g_deferredTail = 0;
+static uint32_t g_deferredDrops = 0;
+static bool g_inDeferredRx = false;
+static portMUX_TYPE g_deferredMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool deferMasterRx(const uint8_t *mac, const uint8_t *data, int len)
+{
+    if (len > (int)sizeof(g_deferredRx[0].data)) return false;   /* se atiende como antes */
+    portENTER_CRITICAL(&g_deferredMux);
+    const uint8_t next = (uint8_t)((g_deferredHead + 1u) % DEFERRED_RX_N);
+    if (next != g_deferredTail) {
+        DeferredRx &e = g_deferredRx[g_deferredHead];
+        memcpy(e.mac, mac, 6);
+        memcpy(e.data, data, (size_t)len);
+        e.len = (uint8_t)len;
+        g_deferredHead = next;
+    } else {
+        g_deferredDrops++;
+    }
+    portEXIT_CRITICAL(&g_deferredMux);
+    return true;   /* lleno: se descarta; el maestro reintenta ARM/PRESTART */
+}
+
+static void serviceDeferredRx()
+{
+    for (;;) {
+        DeferredRx e;
+        portENTER_CRITICAL(&g_deferredMux);
+        const bool have = g_deferredTail != g_deferredHead;
+        if (have) {
+            e = g_deferredRx[g_deferredTail];
+            g_deferredTail = (uint8_t)((g_deferredTail + 1u) % DEFERRED_RX_N);
+        }
+        portEXIT_CRITICAL(&g_deferredMux);
+        if (!have) return;
+        g_inDeferredRx = true;
+        onDataRecv(e.mac, e.data, (int)e.len);
+        g_inDeferredRx = false;
+    }
+}
+#else
+static void serviceDeferredRx() {}
+#endif
+
 #if defined(ESP8266)
 static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len)
 #else
@@ -5199,6 +5291,12 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
             return;
         default: break;
     }
+#if defined(ESP32)
+    if (!g_inDeferredRx && (data[0] == CMD_ARM || data[0] == CMD_PRESTART) &&
+        deferMasterRx(mac, data, len + GEONET_TAG_LEN)) {
+        return;
+    }
+#endif
     if (!macIsMaster(mac)) {
         static uint32_t s_foreignLogMs = 0;
         if (millis() - s_foreignLogMs > 10000u) {
@@ -5209,6 +5307,9 @@ static void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
         }
         return;
     }
+#if defined(ESP32)
+    if (!g_inDeferredRx)
+#endif
     {
         const uint64_t now = (uint64_t)esp_timer_get_time();
         const uint64_t airtime = (uint64_t)(radioLen + 40) * 8ULL;
@@ -6054,8 +6155,10 @@ static void serviceRemoteLog()
 
 void loop()
 {
+    serviceDeferredRx();
     serviceRemoteLog();
     serviceSchedSyncReport();
+    serviceCoreDumpReport();
     if (g_reqBatchPendingFlag) {
         MsgReqBatch req;
         REQ_LOCK();
