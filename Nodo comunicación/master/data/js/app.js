@@ -2,21 +2,21 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-49';
-import { WsClient } from './ws_client.js?v=field-study-49';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-49';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-49';
-import { PlotArea } from './plot.js?v=field-study-49';
-import { SpectrumArea } from './spectrum.js?v=field-study-49';
-import { SlavePanel } from './slave_panel.js?v=field-study-49';
-import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-49';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-49';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-49';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-49';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-49';
-import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-49';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-49';
-import { factoryFirProfile } from './psoc_fir_profiles.js?v=field-study-49';
+import * as cfg from './config.js?v=field-study-50';
+import { WsClient } from './ws_client.js?v=field-study-50';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-50';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-50';
+import { PlotArea } from './plot.js?v=field-study-50';
+import { SpectrumArea } from './spectrum.js?v=field-study-50';
+import { SlavePanel } from './slave_panel.js?v=field-study-50';
+import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-50';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-50';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-50';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-50';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-50';
+import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-50';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-50';
+import { factoryFirProfile } from './psoc_fir_profiles.js?v=field-study-50';
 
 const $ = (id) => document.getElementById(id);
 
@@ -545,9 +545,9 @@ function applyNodeDecimation(nd, factor) {
     implementation: 'aa_decim.h:aa_configure/aa_push',
     coefficient_reference: null,
     verification_candidate: nativeFs === 2000
-      ? 'lab/antialias/coefficients_2000hz_q15.csv (72 dB; no se carga en el PSoC actual)'
+      ? 'lab/antialias/coefficients_2000hz_q23.csv (Q1.23; no se carga en el PSoC actual)'
       : null,
-    first_surviving_input_index: f > 1 ? f - 1 : 0,
+    first_surviving_input_index: 0,
   };
   return f;
 }
