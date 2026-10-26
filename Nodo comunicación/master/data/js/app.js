@@ -2,20 +2,21 @@
 // gui/main_window.py: WebSocket packets -> DataStore/UI, and UI actions ->
 // the same command bytes that handleMatlabCmd() already consumes.
 
-import * as cfg from './config.js?v=field-study-48';
-import { WsClient } from './ws_client.js?v=field-study-48';
-import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-48';
-import { DataStore, effectiveFs } from './data_store.js?v=field-study-48';
-import { PlotArea } from './plot.js?v=field-study-48';
-import { SpectrumArea } from './spectrum.js?v=field-study-48';
-import { SlavePanel } from './slave_panel.js?v=field-study-48';
-import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-48';
-import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-48';
-import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-48';
-import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-48';
-import { mountOtaPanel } from './ota_panel.js?v=field-study-48';
-import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-48';
-import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-48';
+import * as cfg from './config.js?v=field-study-49';
+import { WsClient } from './ws_client.js?v=field-study-49';
+import { encodeStd, encodeStd16, encodeDirected } from './protocol.js?v=field-study-49';
+import { DataStore, effectiveFs } from './data_store.js?v=field-study-49';
+import { PlotArea } from './plot.js?v=field-study-49';
+import { SpectrumArea } from './spectrum.js?v=field-study-49';
+import { SlavePanel } from './slave_panel.js?v=field-study-49';
+import { CausalFir, compileFirCmd, filtFilt, harmonicNotch, hilbertEnvelope, lastFirError } from './signal_proc.js?v=field-study-49';
+import { NOISE_BITS, cleanMarkedNoise, flagsFromMarks, removeMedianOffset, signatureLabel } from './noise_clean.js?v=field-study-49';
+import { initEnlaceTab, getServerUrl } from './enlace.js?v=field-study-49';
+import { buildCaptureZip, downloadBlob } from './export.js?v=field-study-49';
+import { mountOtaPanel } from './ota_panel.js?v=field-study-49';
+import { mountSyncPanel, loadSyncMode, saveSyncMode, syncSnapshotForStart, onSyncStart } from './sync_panel.js?v=field-study-49';
+import { mountFilterTab, firCommand } from './filter_tab.js?v=field-study-49';
+import { factoryFirProfile } from './psoc_fir_profiles.js?v=field-study-49';
 
 const $ = (id) => document.getElementById(id);
 
@@ -250,9 +251,11 @@ function applyFilterGroupToNode(chIndex, what = 'all') {
     nd.cleanRadio = !!st.clean.radio;
     nd.cleanBeacon = !!st.clean.beacon;
   }
-  if ((what === 'all' || what === 'firpsoc') && ws.connected &&
-      (what === 'firpsoc' || st.psocFir?.active)) {
+  if ((what === 'all' || what === 'firpsoc') && ws.connected) {
     sendPsocFir(chIndex, st.psocFir);
+  }
+  if (what === 'all' || what === 'firpsoc' || what === 'firhw') {
+    nd.psocFir = psocFirMetadata(st.psocFir, psocInputFs(nd), !!st.firHw);
   }
   if ((what === 'all' || what === 'firhw') && ws.connected) {
     sendDirected(chIndex, cfg.SUBCMD_SELECT_STREAM, st.firHw ? 1 : 0);
@@ -262,21 +265,10 @@ function applyFilterGroupToNode(chIndex, what = 'all') {
   return true;
 }
 
-/* FIR del bloque Filter del PSoC: 127 taps de fase lineal (retardo 63, el que
- * ya compensa el firmware) + un cero, cuantizados a Q1.23 y en hex. */
-function psocFirHex(spec, fs) {
-  if (!spec?.active) return '';
-  const cmd = (spec.type === 'lp' || spec.type === 'hp')
-    ? `numtaps 127 ${spec.type} ${spec.f1}`
-    : `numtaps 127 ${spec.type} ${spec.f1} ${spec.f2}`;
-  const b = compileFirCmd(cmd, fs);
-  if (!b) return null;
+function q23ToHex(coefficients) {
   let hex = '';
-  for (let i = 0; i < 128; i++) {
-    const v = i < b.length ? b[i] : 0;
-    let q = Math.round(v * 8388608);
-    q = Math.max(-8388608, Math.min(8388607, q));
-    const u = q & 0xFFFFFF;
+  for (const value of coefficients) {
+    const u = value & 0xFFFFFF;
     for (const byte of [u & 0xFF, (u >> 8) & 0xFF, (u >> 16) & 0xFF]) {
       hex += byte.toString(16).padStart(2, '0');
     }
@@ -284,18 +276,71 @@ function psocFirHex(spec, fs) {
   return hex;
 }
 
+/* FIR del bloque Filter del PSoC: 127 taps de fase lineal (retardo 63) más
+ * un cero para completar las 128 palabras Q1.23 que exige el DFB. */
+function customPsocFir(spec, fs) {
+  const cmd = (spec.type === 'lp' || spec.type === 'hp')
+    ? `numtaps 127 ${spec.type} ${spec.f1}`
+    : `numtaps 127 ${spec.type} ${spec.f1} ${spec.f2}`;
+  const b = compileFirCmd(cmd, fs);
+  if (!b) return null;
+  const coefficients = [];
+  for (let i = 0; i < 128; i++) {
+    const v = i < b.length ? b[i] : 0;
+    let q = Math.round(v * 8388608);
+    q = Math.max(-8388608, Math.min(8388607, q));
+    coefficients.push(q);
+  }
+  return {
+    id: `web_${spec.type}_${spec.f1}_${spec.f2}_fs${Math.round(fs)}`,
+    source: 'web_custom',
+    fs_hz: fs,
+    type: spec.type,
+    f1_hz: spec.f1,
+    f2_hz: spec.f2,
+    taps: 127,
+    storage_taps: 128,
+    group_delay_samples: 63,
+    coefficients_q23: coefficients,
+  };
+}
+
+function selectedPsocFir(spec, fs) {
+  return spec?.active ? customPsocFir(spec, fs) : factoryFirProfile(fs);
+}
+
+function psocFirMetadata(spec, fs, streamSelected) {
+  const profile = selectedPsocFir(spec, fs);
+  if (!profile) return null;
+  return {
+    ...profile,
+    stream_selected: !!streamSelected,
+    group_delay_s: fs > 0 ? profile.group_delay_samples / fs : null,
+    effective_group_delay_samples: streamSelected ? profile.group_delay_samples : 0,
+    effective_group_delay_s: streamSelected && fs > 0 ? profile.group_delay_samples / fs : 0,
+  };
+}
+
+function psocInputFs(nd) {
+  const reported = Number(nd?.nativeRateMilliHz) / 1000;
+  if (reported > 0) return reported;
+  if (nd?.fs > 0) return nd.fs * (nd.decimationFactor || 1);
+  return cfg.DEFAULT_SAMPLE_RATE_HZ;
+}
+
 function sendPsocFir(chIndex, spec) {
   const nd = data.nodes[chIndex];
-  const fs = nd.fs > 0 ? nd.fs : currentFsHz();
-  if (!spec?.active) {
-    ws.send(JSON.stringify({ cmd: 'FIRHW', node: chIndex, action: 0 }));
-    return;
-  }
-  const hex = psocFirHex(spec, fs);
-  if (!hex) {
+  const fs = psocInputFs(nd);
+  const profile = selectedPsocFir(spec, fs);
+  if (!profile) {
     appendLog(`S${chIndex} FIR del PSoC inválido: ${lastFirError() || ''}`);
     return;
   }
+  if (!profile.coefficients_q23) {
+    ws.send(JSON.stringify({ cmd: 'FIRHW', node: chIndex, action: 0 }));
+    return;
+  }
+  const hex = q23ToHex(profile.coefficients_q23);
   // 127 taps a la tasa del ADC: la transición mide ~3,3·fs/127 (Hamming)
   const trans = 3.3 * fs / 127;
   const edges = [spec.f1, spec.type === 'bp' || spec.type === 'bs' ? spec.f2 : null].filter((f) => f != null);
@@ -308,7 +353,10 @@ function sendPsocFir(chIndex, spec) {
 function onFilterGroupChanged(group, st, what) {
   let n = 0;
   for (let i = 1; i < cfg.MAX_NODES; i++) {
-    if (nodeRole(data.nodes[i]) === group && applyFilterGroupToNode(i, what)) n++;
+    const role = nodeRole(data.nodes[i]);
+    const commonFirChange = filterTab?.sameFir() && ['fir', 'firhw', 'firpsoc'].includes(what);
+    if ((role === group || (commonFirChange && (role === 'geo' || role === 'hammer'))) &&
+        applyFilterGroupToNode(i, what)) n++;
   }
   const detail = {
     fir: st.firActive ? firCommand(st) : 'sin FIR',
@@ -317,7 +365,9 @@ function onFilterGroupChanged(group, st, what) {
     firhw: st.firHw ? 'FIR hardware' : 'ADC crudo',
     firpsoc: st.psocFir?.active ? `FIR del PSoC ${st.psocFir.type} ${st.psocFir.f1} Hz` : 'FIR del PSoC de fábrica',
   }[what] || what;
-  appendLog(`Filtros ${group.toUpperCase()}: ${detail} (${n} nodo(s))`);
+  const scope = filterTab?.sameFir() && ['fir', 'firhw', 'firpsoc'].includes(what)
+    ? 'TODOS' : group.toUpperCase();
+  appendLog(`Filtros ${scope}: ${detail} (${n} nodo(s))`);
 }
 
 function applySignatures(value, source, persist = false) {
@@ -468,6 +518,37 @@ function applyNodeAdcConfig(nd, code) {
 function applyNodeDecimation(nd, factor) {
   const f = clamp(parseInt(factor, 10) || 1, 1, 100);
   nd.decimationFactor = f;
+  const nativeFs = Number(nd.nativeRateMilliHz) / 1000 || (nd.fs > 0 ? nd.fs * f : 0);
+  let taps = 1;
+  if (f > 1) {
+    const estimate = (90 - 8) / (2.285 * Math.PI * (0.4 / f)) + 1;
+    taps = Math.ceil(estimate);
+    if (taps % 2 === 0) taps += 1;
+    taps = Math.min(511, taps);
+  }
+  nd.decimationAntialias = {
+    id: f > 1 ? 'psoc_runtime_kaiser_q23_90db_v1' : 'none',
+    enabled: f > 1,
+    factor: f,
+    input_fs_hz: nativeFs || null,
+    output_fs_hz: nativeFs ? nativeFs / f : (nd.fs || null),
+    taps,
+    coefficient_format: 'Q1.23',
+    design_attenuation_db: f > 1 ? 90 : null,
+    design_target_met: f <= 17,
+    first_retained_input_sample: 0,
+    group_delay_input_samples: f > 1 ? (taps - 1) / 2 : 0,
+    group_delay_output_samples: f > 1 ? (taps - 1) / (2 * f) : 0,
+    group_delay_s: f > 1 && nativeFs ? (taps - 1) / (2 * nativeFs) : 0,
+    passband_end_hz: f > 1 && nativeFs ? 0.8 * nativeFs / (2 * f) : null,
+    stopband_start_hz: f > 1 && nativeFs ? 1.2 * nativeFs / (2 * f) : null,
+    implementation: 'aa_decim.h:aa_configure/aa_push',
+    coefficient_reference: null,
+    verification_candidate: nativeFs === 2000
+      ? 'lab/antialias/coefficients_2000hz_q15.csv (72 dB; no se carga en el PSoC actual)'
+      : null,
+    first_surviving_input_index: f > 1 ? f - 1 : 0,
+  };
   return f;
 }
 
@@ -670,6 +751,9 @@ function nodeSnapshot(nd, index, options = {}) {
     pgaout_gain: gainValue(nd.pgaoutCode),
     adc_config: nd.adcConfigCode,
     adc_config_label: adcConfigForCode(nd.adcConfigCode).label,
+    adc_mode: 'Single Sample',
+    adc_bits: 18,
+    adc_native_fs_hz: psocInputFs(nd),
     adc_range_v: adcConfigForCode(nd.adcConfigCode).rangeV,
     adc_counts_per_volt: nd.countsPerVolt || cfg.ADC_COUNTS_PER_VOLT,
     decimation_factor: nd.decimationFactor,
@@ -693,6 +777,10 @@ function nodeSnapshot(nd, index, options = {}) {
     mac: nd.mac || '',
     visible: !!nd.visible,
     fir_cmd: nd.filtCmd || '',
+    psoc_fir: nd.psocFir ? { ...nd.psocFir,
+      coefficients_q23: nd.psocFir.coefficients_q23
+        ? Array.from(nd.psocFir.coefficients_q23) : null } : null,
+    decimation_antialias: nd.decimationAntialias ? { ...nd.decimationAntialias } : null,
     filt_trim_samples: 0,
     dc_remove: !!nd.dcRemove,
     dc_removed_on_preserve: storeDcRemoved,
@@ -2284,7 +2372,11 @@ function updateNodeExactFsFromHello(chIndex, fsHz, nativeMilliHz = 0) {
     nd.fsKnown = true;
     nd.fsExactKnown = true;
     if (nativeMilliHz > 0) nd.nativeRateMilliHz = nativeMilliHz;
-    if (changed) recompileNodeFirForFs(chIndex);
+    if (changed) {
+      recompileNodeFirForFs(chIndex);
+      applyNodeDecimation(nd, nd.decimationFactor);
+      applyFilterGroupToNode(chIndex, 'firpsoc');
+    }
   }
   saveSlaveSetting(chIndex, 'fs_hz', Math.round(fsHz));
   saveGlobalFs(fsHz);
@@ -2820,7 +2912,9 @@ function loadSlavePanelState(chIndex, panel) {
   nd.pgaCode = loadSlaveInt(chIndex, 'pga_code', nd.pgaCode, 0, cfg.GAIN_CODES.length - 1);
   nd.pgaoutCode = loadSlaveInt(chIndex, 'pgaout_code', nd.pgaoutCode, 0, cfg.GAIN_CODES.length - 1);
   applyNodeAdcConfig(nd, loadSlaveInt(chIndex, 'adc_config_code', nd.adcConfigCode, 1, cfg.ADC_CONFIGS.length));
-  applyNodeDecimation(nd, loadSlaveInt(chIndex, 'decimation_factor', nd.decimationFactor, 1, 100));
+  const savedGlobalDecimation = parseInt(loadSetting(GLOBAL_DECIMATION_KEY), 10);
+  applyNodeDecimation(nd, Number.isFinite(savedGlobalDecimation)
+    ? clamp(savedGlobalDecimation, 1, 100) : 1);
   nd.dcRemove = loadSlaveBool(chIndex, 'dc_remove', nd.dcRemove);
 
   panel.setPga(nd.pgaCode);

@@ -4,9 +4,9 @@
 // (packet_received / connection_changed / log_message signals) using
 // CustomEvents instead of Qt signals.
 
-import { decodePacket } from './protocol.js?v=field-study-48';
-import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-48';
-import { decodeGeoZ } from './geo_codec.js?v=field-study-48';
+import { decodePacket } from './protocol.js?v=field-study-49';
+import { PKT_LEN, PKT_HEADER } from './config.js?v=field-study-49';
+import { decodeGeoZ } from './geo_codec.js?v=field-study-49';
 
 const ZBATCH_HEADER = 0x57;
 

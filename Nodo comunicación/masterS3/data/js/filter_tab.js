@@ -1,8 +1,9 @@
-// Pestaña Filtros: una sola configuracion de procesamiento por grupo (todos los
-// GEO comparten la suya; el HAMMER tiene otra). Reemplaza los controles de
-// filtro que antes tenia cada esclavo.
+// Pestaña Filtros. Por defecto el martillo y todos los geófonos comparten los
+// FIR; se puede separar explícitamente, con una advertencia temporal visible.
 
 const STORAGE_PREFIX = 'geophone_scope_web.filter_group_';
+const COMMON_FIR_KEY = 'geophone_scope_web.same_fir_geo_hammer_v1';
+const FIR_CHANGES = new Set(['fir', 'firhw', 'firpsoc']);
 export const FILTER_GROUPS = [
   ['geo', 'GEO (todos los geófonos)'],
   ['hammer', 'HAMMER'],
@@ -41,6 +42,25 @@ function saveGroupState(group, state) {
   try { localStorage.setItem(STORAGE_PREFIX + group, JSON.stringify(state)); } catch (_) {}
 }
 
+function loadCommonFir() {
+  try { return localStorage.getItem(COMMON_FIR_KEY) !== 'false'; } catch (_) { return true; }
+}
+
+function saveCommonFir(value) {
+  try { localStorage.setItem(COMMON_FIR_KEY, value ? 'true' : 'false'); } catch (_) {}
+}
+
+function copyFirState(source, target) {
+  target.firActive = !!source.firActive;
+  target.firType = source.firType;
+  target.f1 = source.f1;
+  target.f2 = source.f2;
+  target.taps = source.taps;
+  target.firHw = source.firHw ? 1 : 0;
+  if (!target.psocFir) target.psocFir = {};
+  Object.assign(target.psocFir, source.psocFir);
+}
+
 export function firCommand(state) {
   let taps = parseInt(state.taps, 10) || 101;
   if (taps % 2 === 0) taps += 1;
@@ -60,11 +80,40 @@ function labeled(text, input) {
  * archivo de firmas elegido.
  */
 export function mountFilterTab(container, { onChange, onSignatures, maxHarm = 12 }) {
-  const states = {};
+  const states = Object.fromEntries(FILTER_GROUPS.map(([group]) => [group, loadGroupState(group)]));
+  let sameFir = loadCommonFir();
+  if (sameFir) {
+    copyFirState(states.geo, states.hammer);
+    saveGroupState('hammer', states.hammer);
+  }
   const statusEls = {};
+  const refreshByGroup = {};
+
+  const commonBox = document.createElement('fieldset');
+  commonBox.className = 'panel';
+  commonBox.innerHTML = '<legend>Coherencia temporal</legend>';
+  const common = document.createElement('input');
+  common.type = 'checkbox';
+  common.checked = sameFir;
+  const warning = document.createElement('div');
+  warning.className = 'filter-status';
+  warning.textContent = 'AVISO: FIR distintos corren los tiempos de arribo entre martillo y geófonos.';
+  warning.hidden = sameFir;
+  commonBox.append(labeled('Mismo FIR para martillo y geófonos', common), warning);
+  container.append(commonBox);
+
+  const emitChange = (group, what) => {
+    if (sameFir && FIR_CHANGES.has(what)) {
+      const other = group === 'geo' ? 'hammer' : 'geo';
+      copyFirState(states[group], states[other]);
+      saveGroupState(other, states[other]);
+      if (refreshByGroup[other]) refreshByGroup[other]();
+    }
+    onChange(group, states[group], what);
+  };
+
   for (const [group, title] of FILTER_GROUPS) {
-    const st = loadGroupState(group);
-    states[group] = st;
+    const st = states[group];
     const box = document.createElement('fieldset');
     box.className = 'panel filter-group';
     box.innerHTML = `<legend>${title}</legend>`;
@@ -107,7 +156,7 @@ export function mountFilterTab(container, { onChange, onSignatures, maxHarm = 12
       st.firActive = !st.firActive;
       saveGroupState(group, st);
       refreshFir();
-      onChange(group, st, 'fir');
+      emitChange(group, 'fir');
     });
     const firRow = document.createElement('div');
     firRow.className = 'row';
@@ -152,7 +201,7 @@ export function mountFilterTab(container, { onChange, onSignatures, maxHarm = 12
     firHw.addEventListener('change', () => {
       st.firHw = firHw.checked ? 1 : 0;
       saveGroupState(group, st);
-      onChange(group, st, 'firhw');
+      emitChange(group, 'firhw');
     });
     const hwRow = document.createElement('div');
     hwRow.className = 'row';
@@ -190,13 +239,13 @@ export function mountFilterTab(container, { onChange, onSignatures, maxHarm = 12
       pf.active = true;
       saveGroupState(group, st);
       refreshPsoc();
-      onChange(group, st, 'firpsoc');
+      emitChange(group, 'firpsoc');
     });
     pFactory.addEventListener('click', () => {
       pf.active = false;
       saveGroupState(group, st);
       refreshPsoc();
-      onChange(group, st, 'firpsoc');
+      emitChange(group, 'firpsoc');
     });
     const psocRow = document.createElement('div');
     psocRow.className = 'row';
@@ -205,8 +254,33 @@ export function mountFilterTab(container, { onChange, onSignatures, maxHarm = 12
     refreshPsoc();
 
     refreshFir();
+    refreshByGroup[group] = () => {
+      type.value = st.firType;
+      f1.value = String(st.f1);
+      f2.value = String(st.f2);
+      taps.value = String(st.taps);
+      firHw.checked = !!st.firHw;
+      pType.value = st.psocFir.type;
+      pF1.value = String(st.psocFir.f1);
+      pF2.value = String(st.psocFir.f2);
+      refreshFir();
+      refreshPsoc();
+    };
     container.append(box);
   }
+
+  common.addEventListener('change', () => {
+    sameFir = common.checked;
+    saveCommonFir(sameFir);
+    warning.hidden = sameFir;
+    if (!sameFir) return;
+    copyFirState(states.geo, states.hammer);
+    saveGroupState('hammer', states.hammer);
+    refreshByGroup.hammer();
+    onChange('geo', states.geo, 'fir');
+    onChange('geo', states.geo, 'firpsoc');
+    onChange('geo', states.geo, 'firhw');
+  });
 
   // Firmas de ruido: una sola tabla para todos
   const sig = document.createElement('fieldset');
@@ -227,6 +301,7 @@ export function mountFilterTab(container, { onChange, onSignatures, maxHarm = 12
 
   return {
     state: (group) => states[group],
+    sameFir: () => sameFir,
     setSignatureInfo: (text) => { sigInfo.textContent = text; },
     setFirStatus: (group, text) => { if (statusEls[group]) statusEls[group].textContent = text; },
   };

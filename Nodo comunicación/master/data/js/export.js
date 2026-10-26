@@ -1,9 +1,9 @@
 // export.js - browser-side capture export.
 
-import * as cfg from './config.js?v=field-study-48';
+import * as cfg from './config.js?v=field-study-49';
 import { buildStoreZip } from './zip_store.js';
-import { effectiveFs } from './data_store.js?v=field-study-48';
-import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-48';
+import { effectiveFs } from './data_store.js?v=field-study-49';
+import { syncCaptureMetadata, syncNodeMetadata } from './sync_panel.js?v=field-study-49';
 
 const MARK_BITS = [
   [0x01, 'SD_IO'],
@@ -122,6 +122,55 @@ function adcRangeVForNode(node) {
 function decimationFactorForNode(node) {
   const f = node?.decimationFactor ?? node?.decimation_factor ?? 1;
   return Number.isFinite(f) && f >= 1 ? Math.round(f) : 1;
+}
+
+function cloneFilterMetadata(value) {
+  if (!value || typeof value !== 'object') return null;
+  return {
+    ...value,
+    coefficients_q23: Array.isArray(value.coefficients_q23)
+      ? value.coefficients_q23.slice() : null,
+  };
+}
+
+function filterTimingMetadata(nodes) {
+  const active = nodes.filter((node) => node && node.index > 0 && node.connected);
+  const hammer = active.find((node) => node.role === 'hammer');
+  const geos = active.filter((node) => node.role === 'geo');
+  const signature = (node) => JSON.stringify({
+    fir_cmd: node.fir_cmd || '',
+    psoc_fir_id: node.psoc_fir?.id || null,
+    psoc_fir_coefficients: node.psoc_fir?.coefficients_q23 || null,
+    stream_selected: !!node.psoc_fir?.stream_selected,
+  });
+  const sameFir = active.length < 2 || active.every((node) => signature(node) === signature(active[0]));
+  const delay = (node) => Number(node?.psoc_fir?.effective_group_delay_s || 0);
+  const factors = active.map((node) => node.decimation_factor || 1);
+  const phaseCompliant = active.every((node) =>
+    (node.decimation_antialias?.first_retained_input_sample ?? 0) === 0);
+  return {
+    same_fir_all_nodes: sameFir,
+    decimation_factor_common: active.length < 2 ||
+      active.every((node) => node.decimation_factor === active[0].decimation_factor),
+    decimation_phase_required: 'input samples 0, N, 2N, ...',
+    decimation_phase_observed: phaseCompliant
+      ? 'input samples 0, N, 2N, ...'
+      : 'unknown or non-zero phase',
+    decimation_phase_compliant: phaseCompliant,
+    hammer_geo_group_delay_differences: hammer ? geos.map((geo) => {
+      const differenceS = delay(hammer) - delay(geo);
+      return {
+        hammer_node: hammer.index,
+        geo_node: geo.index,
+        hammer_group_delay_samples: hammer.psoc_fir?.stream_selected
+          ? hammer.psoc_fir.group_delay_samples : 0,
+        geo_group_delay_samples: geo.psoc_fir?.stream_selected
+          ? geo.psoc_fir.group_delay_samples : 0,
+        hammer_minus_geo_s: differenceS,
+        hammer_minus_geo_samples_at_geo_fs: geo.fs > 0 ? differenceS * geo.fs : null,
+      };
+    }) : [],
+  };
 }
 
 function sdPresentForNode(node) {
@@ -321,6 +370,10 @@ function nodeMetadata(nd, index, paths, connected) {
     pgaout_gain: gainValue(nd.pgaoutCode),
     adc_config: adcConfigCodeForNode(nd),
     adc_config_label: adcConfigForCode(adcConfigCodeForNode(nd)).label,
+    adc_mode: 'Single Sample',
+    adc_bits: 18,
+    adc_native_fs_hz: Number(nd.nativeRateMilliHz) / 1000 ||
+      ((nd.fs || 0) * decimationFactorForNode(nd)) || null,
     adc_range_v: adcRangeVForNode(nd),
     adc_counts_per_volt: adcCountsPerVoltForNode(nd),
     decimation_factor: decimationFactorForNode(nd),
@@ -346,6 +399,8 @@ function nodeMetadata(nd, index, paths, connected) {
     mac: nd.mac || '',
     visible: !!nd.visible,
     fir_cmd: nd.filtCmd || '',
+    psoc_fir: cloneFilterMetadata(nd.psocFir),
+    decimation_antialias: nd.decimationAntialias ? { ...nd.decimationAntialias } : null,
     dc_remove: !!nd.dcRemove,
     notch_enabled: !!nd.notchEnabled,
     notch_harm: nd.notchHarm | 0,
@@ -410,6 +465,10 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     pgaout_gain: node?.pgaout_gain ?? gainValue(node?.pgaout_code ?? 0),
     adc_config: adcConfigCodeForNode(node),
     adc_config_label: adcConfigForCode(adcConfigCodeForNode(node)).label,
+    adc_mode: node?.adc_mode || 'Single Sample',
+    adc_bits: node?.adc_bits ?? 18,
+    adc_native_fs_hz: (node?.adc_native_fs_hz ??
+      ((node?.fs || 0) * decimationFactorForNode(node))) || null,
     adc_range_v: adcRangeVForNode(node),
     adc_counts_per_volt: adcCountsPerVoltForNode(node),
     decimation_factor: decimationFactorForNode(node),
@@ -433,6 +492,9 @@ function captureNodeMetadata(node, index, paths, connected, captureOffset = 0) {
     mac: node?.mac || '',
     visible: !!node?.visible,
     fir_cmd: node?.fir_cmd || '',
+    psoc_fir: cloneFilterMetadata(node?.psoc_fir),
+    decimation_antialias: node?.decimation_antialias
+      ? { ...node.decimation_antialias } : null,
     filt_trim_samples: node?.filt_trim_samples ?? 0,
     dc_remove: !!node?.dc_remove,
     dc_removed_on_preserve: !!node?.dc_removed_on_preserve,
@@ -864,6 +926,7 @@ export function buildCaptureZip(dataStore, options = {}) {
       raw_count: capNodeMetas.reduce((sum, node) => sum + node.raw_count, 0),
       filt_count: capNodeMetas.reduce((sum, node) => sum + node.filt_count, 0),
       nodes: capNodeMetas,
+      filter_timing: filterTimingMetadata(capNodeMetas),
     };
     files.push({ name: capMeta.metadata_file, data: JSON.stringify(capMeta, null, 2) + '\n' });
     captureMetas.push(capMeta);
@@ -887,7 +950,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     created_at: now.toISOString(),
     save_time: stamp,
     source: 'esp32_master_web_ui',
-    web_app_version: 'field-study-48',
+    web_app_version: 'field-study-49',
     noise_signatures_file: noiseSignaturesPath,
     layout: 'maestro_metadata_plus_capture_metadata_and_pcb_dirs',
     id_semantics: {
@@ -904,6 +967,12 @@ export function buildCaptureZip(dataStore, options = {}) {
     signal_units: 'V',
     adc_counts_per_volt: cfg.ADC_COUNTS_PER_VOLT,
     adc_configs: cfg.ADC_CONFIGS,
+    adc_sampling: {
+      mode: 'Single Sample',
+      bits: 18,
+      nominal_native_fs_hz: 2000,
+      soc_period_s: 0.0005,
+    },
     vdac_step_volts: cfg.VDAC_STEP,
     notch_f0: cfg.LINE_NOTCH_F0,
     display_secs: options.displaySecs ?? null,
@@ -935,6 +1004,7 @@ export function buildCaptureZip(dataStore, options = {}) {
     dtype: 'float32',
     endian: 'little',
     nodes,
+    filter_timing: filterTimingMetadata(nodes),
   };
 
   const masterConfig = {
@@ -958,6 +1028,8 @@ export function buildCaptureZip(dataStore, options = {}) {
     metadata_files: metadata.metadata_files,
     noise_signatures_file: metadata.noise_signatures_file,
     id_semantics: metadata.id_semantics,
+    adc_sampling: metadata.adc_sampling,
+    filter_timing: metadata.filter_timing,
     captures: captureMetas,
     slaves: nodes.filter((node) => node.index > 0),
   };
